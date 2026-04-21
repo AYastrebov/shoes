@@ -22,9 +22,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use jni::{EnvUnowned, Outcome};
 use jni::objects::{Global, JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
+use jni::{EnvUnowned, Outcome};
 use log::{Record, error, info};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
