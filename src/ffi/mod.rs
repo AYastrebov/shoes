@@ -38,8 +38,8 @@
 //! - `shoes_start` / `shoes_start_tun` starts a background thread for the TUN service
 //! - `shoes_stop` signals shutdown and waits for cleanup
 
-// Common utilities shared between iOS and Android
-#[cfg(any(target_os = "android", target_os = "ios"))]
+// Common utilities shared between all FFI targets
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
 mod common;
 
 #[cfg(target_os = "android")]
@@ -48,15 +48,16 @@ mod android;
 #[cfg(target_os = "android")]
 pub use android::*;
 
-#[cfg(target_os = "ios")]
+// iOS and macOS share the same C FFI (same Unix platform, same API surface)
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 mod ios;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub use ios::*;
 
-// Re-export for non-mobile platforms (stub implementations)
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+// Stub for platforms without FFI support
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 mod stub;
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 pub use stub::*;
