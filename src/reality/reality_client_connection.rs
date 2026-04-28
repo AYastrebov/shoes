@@ -200,44 +200,33 @@ impl RealityClientConnection {
         )?;
 
         // Now encrypt the SessionId using the ClientHello with zeroed SessionId as AAD
-        // Use slice directly from client_random to avoid copying
         let nonce = &client_random[20..32];
 
         // Zero out the SessionId in ClientHello to create AAD (matches what server will use)
         // SessionId is at offset 39 in ClientHello handshake
         client_hello[39..71].fill(0);
 
-        log::debug!("REALITY CLIENT: Encrypting SessionId");
-        log::debug!("  auth_key={:02x?}", &auth_key);
-        log::debug!("  nonce={:02x?}", nonce);
-        log::debug!("  plaintext={:02x?}", &session_id_plaintext);
-        log::debug!(
-            "  aad_len={} (ClientHello with zero SessionId)",
-            client_hello.len()
-        );
-        log::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
-
         let encrypted_session_id =
             encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        log::debug!(
-            "REALITY CLIENT: Encrypted SessionId={:02x?}",
-            &encrypted_session_id
-        );
-
+        // Restore the encrypted session_id into the ClientHello.
+        // This is what goes on the wire AND what goes into the transcript hash.
+        // Xray-core restores the encrypted bytes after AEAD decryption
+        // (copy(hs.clientHello.sessionId, ciphertext)) so the transcript
+        // uses the original wire bytes with encrypted session_id.
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
         let mut record = write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
         record.extend_from_slice(&client_hello);
         self.ciphertext_write_buf.extend_from_slice(&record);
 
-        // Update state - store raw ClientHello bytes for transcript hash computation
-        // after we learn the cipher suite from ServerHello
+        // Store the ClientHello bytes WITH ENCRYPTED session_id for transcript hash.
+        // Must match what Xray-core uses: originalBytes() returns the wire bytes.
         self.handshake_state = HandshakeState::AwaitingServerHello {
-            client_hello_bytes: client_hello, // Save the actual ClientHello bytes
+            client_hello_bytes: client_hello,
             client_private_key: our_private_bytes,
-            auth_key, // Save auth_key for HMAC certificate verification
+            auth_key,
         };
 
         log::debug!(
@@ -391,6 +380,10 @@ impl RealityClientConnection {
         full_transcript.update(server_hello); // ServerHello already includes handshake header
         let server_hello_hash = full_transcript.finish();
         let server_hello_hash_vec: Vec<u8> = server_hello_hash.as_ref().to_vec();
+        eprintln!("REALITY DEBUG: client_hello_bytes[0..6] = {:02x?}", &client_hello_bytes[..6]);
+        eprintln!("REALITY DEBUG: client_hello_bytes[39..45] = {:02x?}", &client_hello_bytes[39..45]);
+        eprintln!("REALITY DEBUG: server_hello_hash = {:02x?}", server_hello_hash_vec);
+        eprintln!("REALITY DEBUG: cipher_suite = {:?}", cipher_suite);
 
         let client_hello_hash_vec: Vec<u8> = {
             let mut ctx = digest::Context::new(cipher_suite.digest_algorithm());
@@ -497,11 +490,9 @@ impl RealityClientConnection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
             as usize;
 
-        log::debug!(
-            "REALITY CLIENT: TLS record header: type=0x{:02x}, version=0x{:04x}, len={}",
-            record_type,
-            tls_version,
-            record_len
+        eprintln!(
+            "REALITY CLIENT: Encrypted record: type=0x{:02x}, version=0x{:04x}, len={}",
+            record_type, tls_version, record_len
         );
 
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
@@ -555,14 +546,26 @@ impl RealityClientConnection {
         );
 
         // Decrypt using current sequence number
-        let plaintext = decrypt_handshake_message(
+        eprintln!("REALITY CLIENT: Decrypting record #{}, ciphertext_len={}, key[..4]={:02x?}, iv={:02x?}",
+            handshake_seq, ciphertext.len(), &server_hs_key[..4], &server_hs_iv);
+        let plaintext = match decrypt_handshake_message(
             cipher_suite,
             &server_hs_key,
             &server_hs_iv,
             handshake_seq,
             &ciphertext,
             record_len as u16,
-        )?;
+        ) {
+            Ok(pt) => {
+                eprintln!("REALITY CLIENT: Decrypted OK, plaintext_len={}, first_bytes={:02x?}",
+                    pt.len(), &pt[..pt.len().min(20)]);
+                pt
+            }
+            Err(e) => {
+                eprintln!("REALITY CLIENT: Decryption FAILED: {}", e);
+                return Err(e);
+            }
+        };
 
         log::debug!(
             "REALITY CLIENT: Decrypted record #{} ({} bytes plaintext)",
