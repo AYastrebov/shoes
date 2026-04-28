@@ -161,7 +161,8 @@ pub fn decrypt_handshake_message(
     let aead_key = AeadKey::new(cipher_suite, key)?;
     let mut plaintext = aead_key.open(ciphertext, iv, seq, &aad)?;
 
-    // Strip content type and optional padding (external implementations may pad)
+    // Strip content type and optional padding (RFC 8446 Section 5.4:
+    // TLSInnerPlaintext = content || type || zeros)
     let _ = strip_content_type_with_padding(&mut plaintext)?;
 
     Ok(plaintext)

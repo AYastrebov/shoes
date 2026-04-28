@@ -6,7 +6,7 @@
 // - Building TLS record headers
 // - Managing sequence numbers
 
-use std::io::{self, Error};
+use std::io::{self, Error, ErrorKind};
 
 use super::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
@@ -301,10 +301,31 @@ impl<'a> RecordDecryptor<'a> {
             .checked_add(1)
             .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
 
-        // Strip content type (returns content_type and valid length)
-        let (content_type, valid_len) = strip_content_type_slice(plaintext)?;
+        // Strip content type and optional zero padding (RFC 8446 Section 5.4).
+        // Xray-core Reality pads application data records with trailing zeros
+        // for traffic analysis resistance — must strip before reading content type.
+        // Find last non-zero byte = content type, everything before it = content.
+        let mut valid_end = plaintext.len();
+        while valid_end > 0 && plaintext[valid_end - 1] == 0 {
+            valid_end -= 1;
+        }
+        if valid_end == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
+        }
+        let content_type = plaintext[valid_end - 1];
+        valid_end -= 1;
 
-        Ok((content_type, &plaintext[..valid_len]))
+        if content_type != CONTENT_TYPE_HANDSHAKE
+            && content_type != CONTENT_TYPE_APPLICATION_DATA
+            && content_type != CONTENT_TYPE_ALERT
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid content type: 0x{:02x}", content_type),
+            ));
+        }
+
+        Ok((content_type, &plaintext[..valid_end]))
     }
 }
 

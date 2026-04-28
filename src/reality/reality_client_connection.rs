@@ -700,6 +700,13 @@ impl RealityClientConnection {
             ));
         }
 
+        eprintln!("REALITY CLIENT: transcript_bytes.len()={}, accumulated_plaintext.len()={}",
+            transcript_bytes.len(), accumulated_plaintext.len());
+        eprintln!("REALITY CLIENT: accumulated_plaintext first 20: {:02x?}",
+            &accumulated_plaintext[..accumulated_plaintext.len().min(20)]);
+        eprintln!("REALITY CLIENT: accumulated_plaintext last 20: {:02x?}",
+            &accumulated_plaintext[accumulated_plaintext.len().saturating_sub(20)..]);
+
         let mut handshake_transcript = digest::Context::new(cipher_suite.digest_algorithm());
         handshake_transcript.update(&transcript_bytes);
         handshake_transcript.update(&accumulated_plaintext);
@@ -753,6 +760,10 @@ impl RealityClientConnection {
         let client_app_key = AeadKey::new(cipher_suite, &client_app_key_bytes)?;
         let server_app_key = AeadKey::new(cipher_suite, &server_app_key_bytes)?;
 
+        eprintln!("REALITY CLIENT: server_app_key[..4]={:02x?}, server_app_iv={:02x?}",
+            &server_app_key_bytes[..4], &server_app_iv);
+        eprintln!("REALITY CLIENT: handshake_hash for app keys={:02x?}", &handshake_hash_vec[..16]);
+
         self.app_read_key = Some(server_app_key);
         self.app_read_iv = Some(server_app_iv);
         self.app_write_key = Some(client_app_key);
@@ -774,6 +785,12 @@ impl RealityClientConnection {
             (Some(key), Some(iv)) => (key, iv),
             _ => unreachable!(), // Wrong state
         };
+        eprintln!("REALITY CLIENT: process_application_data called, buf_len={}, read_seq={}",
+            self.ciphertext_read_buf.len(), self.read_seq);
+        if self.ciphertext_read_buf.len() >= 5 {
+            eprintln!("REALITY CLIENT: First 5 bytes of remaining buf: {:02x?}",
+                &self.ciphertext_read_buf.as_slice()[..5]);
+        }
 
         while self.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
             let record_len = self
