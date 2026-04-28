@@ -356,11 +356,19 @@ pub fn construct_client_hello(
     }
 
     // signature_algorithms extension (type 13)
+    // Must include standard algorithms — Go's crypto/tls rejects ClientHello
+    // if it can't find a compatible algorithm for certificate verification.
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
+        extensions.extend_from_slice(&[0x00, 0x10]); // Extension length: 16
+        extensions.extend_from_slice(&[0x00, 0x0e]); // Signature algorithms length: 14
+        extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
+        extensions.extend_from_slice(&[0x05, 0x03]); // ecdsa_secp384r1_sha384
+        extensions.extend_from_slice(&[0x06, 0x03]); // ecdsa_secp521r1_sha512
         extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+        extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
+        extensions.extend_from_slice(&[0x08, 0x05]); // rsa_pss_rsae_sha384
+        extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
     }
 
     // ALPN extension (type 16)
