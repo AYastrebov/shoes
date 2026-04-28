@@ -356,8 +356,9 @@ pub fn construct_client_hello(
     }
 
     // signature_algorithms extension (type 13)
-    // Must include standard algorithms — Go's crypto/tls rejects ClientHello
-    // if it can't find a compatible algorithm for certificate verification.
+    // Must include the standard TLS 1.3 algorithms. Go's crypto/tls (used by
+    // Xray-core) rejects ClientHello if no compatible algorithm is found for
+    // certificate verification during the handshake.
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
         extensions.extend_from_slice(&[0x00, 0x10]); // Extension length: 16

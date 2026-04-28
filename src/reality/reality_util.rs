@@ -278,70 +278,41 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
 pub fn extract_server_public_key(server_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
-    eprintln!(
-        "REALITY: extract_server_public_key: total_len={}, hex={:02x?}",
-        server_hello.len(),
-        &server_hello[..server_hello.len().min(120)]
-    );
-
     if server_hello.len() < TLS_HEADER_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("ServerHello too short: {} bytes", server_hello.len()),
+            "ServerHello too short",
         ));
     }
-
-    let content_type = server_hello[0];
-    let record_version = u16::from_be_bytes([server_hello[1], server_hello[2]]);
-    let record_len = u16::from_be_bytes([server_hello[3], server_hello[4]]) as usize;
-    eprintln!(
-        "REALITY: TLS record: content_type=0x{:02x}, version=0x{:04x}, record_len={}, actual_payload={}",
-        content_type, record_version, record_len, server_hello.len() - TLS_HEADER_LEN
-    );
 
     let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
 
     // Parse handshake header
-    let handshake_type = reader.read_u8()?;
-    let handshake_len = reader.read_u24_be()?;
-    let protocol_version = reader.read_u16_be()?;
-    eprintln!(
-        "REALITY: Handshake: type=0x{:02x}, len={}, version=0x{:04x}",
-        handshake_type, handshake_len, protocol_version
-    );
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
 
     // Skip random
     reader.skip(32)?;
 
     // Read session ID (ServerHello can echo it back)
     let session_id_len = reader.read_u8()? as usize;
-    eprintln!("REALITY: ServerHello session_id_len={}, reader_pos={}, remaining={}",
-        session_id_len, reader.position(), reader.remaining());
     reader.skip(session_id_len)?;
 
     // Read cipher suite (single 2-byte value in ServerHello)
-    let cipher_suite_val = reader.read_u16_be()?;
-    eprintln!("REALITY: ServerHello cipher_suite=0x{:04x}", cipher_suite_val);
+    reader.skip(2)?;
 
     // Read compression method (single byte in ServerHello)
-    let compression = reader.read_u8()?;
-    eprintln!("REALITY: ServerHello compression=0x{:02x}, reader_pos={}, remaining={}",
-        compression, reader.position(), reader.remaining());
+    reader.skip(1)?;
 
     // Parse extensions
     let extensions_len = reader.read_u16_be()? as usize;
-    eprintln!("REALITY: ServerHello extensions_len={}, remaining_after={}",
-        extensions_len, reader.remaining());
     let extensions_start = reader.position();
     let extensions_end = extensions_start + extensions_len;
 
     while reader.position() < extensions_end {
         let ext_type = reader.read_u16_be()?;
         let ext_len = reader.read_u16_be()? as usize;
-        eprintln!(
-            "REALITY: ServerHello extension: type=0x{:04x}, len={}, reader_pos={}, remaining={}",
-            ext_type, ext_len, reader.position(), reader.remaining()
-        );
 
         if ext_type == 51 {
             // KeyShare extension (0x0033)

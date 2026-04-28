@@ -301,10 +301,12 @@ impl<'a> RecordDecryptor<'a> {
             .checked_add(1)
             .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
 
-        // Strip content type and optional zero padding (RFC 8446 Section 5.4).
-        // Xray-core Reality pads application data records with trailing zeros
-        // for traffic analysis resistance — must strip before reading content type.
-        // Find last non-zero byte = content type, everything before it = content.
+        // Strip trailing zero padding and content type byte per RFC 8446 §5.4:
+        //   TLSInnerPlaintext = content || ContentType || zeros
+        //
+        // Xray-core Reality pads records with trailing zeros for traffic analysis
+        // resistance. The previous strip_content_type_slice assumed no padding,
+        // causing "Invalid content type: 0x00" errors.
         let mut valid_end = plaintext.len();
         while valid_end > 0 && plaintext[valid_end - 1] == 0 {
             valid_end -= 1;
