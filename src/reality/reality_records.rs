@@ -11,7 +11,6 @@ use std::io::{self, Error, ErrorKind};
 use super::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
     MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
-    strip_content_type_slice,
 };
 use super::reality_aead::AeadKey;
 #[cfg(test)]
