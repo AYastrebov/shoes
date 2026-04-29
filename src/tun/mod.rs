@@ -30,6 +30,7 @@
 
 mod tcp_conn;
 mod tcp_stack_direct;
+pub mod traffic;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
@@ -155,6 +156,15 @@ pub async fn run_tun_server(
 
     info!("TUN server started successfully");
 
+    // Periodic traffic stats reporting (every 1 second)
+    let traffic_task = tokio::spawn(async {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            traffic::report_traffic();
+        }
+    });
+
     // Wait for shutdown signal or stack thread exit
     tokio::select! {
         _ = &mut shutdown_rx => {
@@ -169,6 +179,8 @@ pub async fn run_tun_server(
             warn!("Stack thread ended unexpectedly");
         }
     }
+
+    traffic_task.abort();
 
     if let Some(t) = tcp_task {
         t.abort();
@@ -226,6 +238,8 @@ async fn handle_tcp_connection(
 
                     match result {
                         Ok((client_to_remote, remote_to_client)) => {
+                            traffic::add_upload_bytes(client_to_remote);
+                            traffic::add_download_bytes(remote_to_client);
                             debug!(
                                 "TCP connection to {} completed: {} bytes sent, {} bytes received",
                                 remote_location.location(),
