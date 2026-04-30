@@ -55,7 +55,8 @@ impl TunnelRuntime {
             0,
             None,
             amnezia,
-        );
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("AmneziaWG tunnel config error: {}", e)))?;
         let tunn = Arc::new(ParkingMutex::new(tunn));
 
         // Create endpoint UDP socket

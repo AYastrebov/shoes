@@ -260,7 +260,7 @@ dependencies = [
 [[package]]
 name = "boringtun"
 version = "0.7.0"
-source = "git+https://github.com/AYastrebov/boringtun?branch=amnezia#fef9d843757424311c81d886049fa376cdf03414"
+source = "git+https://github.com/AYastrebov/boringtun?branch=amnezia#e40e1ccd107cbef7ef38ad7da4c3fe1e8825cc00"
 dependencies = [
  "aead",
  "base64",
