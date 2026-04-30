@@ -63,7 +63,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 }
 
 /// Load config from a string (used by FFI targets)
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos", feature = "ffi"))]
+#[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
     serde_yaml::from_str::<Vec<Config>>(&config_str).map_err(|e| {
         std::io::Error::new(
