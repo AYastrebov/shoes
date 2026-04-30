@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig};
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
@@ -51,6 +51,20 @@ pub fn build_client_proxy_chain(
 
     if hops.is_empty() {
         panic!("Client chain must have at least one hop");
+    }
+
+    // Check if this is a virtual network tunnel chain (WireGuard/AmneziaWG).
+    // Must be a single hop (validated during config validation).
+    if hops.len() == 1
+        && hops[0].len() == 1
+        && hops[0][0].protocol.is_virtual_network()
+    {
+        let config = hops.into_iter().next().unwrap().into_iter().next().unwrap();
+        let connector = crate::amneziawg::AmneziaWgConnector::from_client_config(
+            config.protocol,
+            config.address,
+        );
+        return ClientProxyChain::new_virtual(std::sync::Arc::new(connector));
     }
 
     // Build initial hop entries from hop 0.
