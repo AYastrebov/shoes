@@ -74,7 +74,7 @@ impl TunnelRuntime {
         #[cfg(target_os = "android")]
         {
             use std::os::fd::AsRawFd;
-            crate::tun::platform::protect_socket(udp_socket.as_raw_fd());
+            crate::tun::protect_socket(udp_socket.as_raw_fd());
         }
 
         info!("AmneziaWG tunnel started, endpoint={}", endpoint_addr);
