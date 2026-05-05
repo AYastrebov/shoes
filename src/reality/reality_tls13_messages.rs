@@ -356,11 +356,20 @@ pub fn construct_client_hello(
     }
 
     // signature_algorithms extension (type 13)
+    // Must include the standard TLS 1.3 algorithms. Go's crypto/tls (used by
+    // Xray-core) rejects ClientHello if no compatible algorithm is found for
+    // certificate verification during the handshake.
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
+        extensions.extend_from_slice(&[0x00, 0x10]); // Extension length: 16
+        extensions.extend_from_slice(&[0x00, 0x0e]); // Signature algorithms length: 14
+        extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
+        extensions.extend_from_slice(&[0x05, 0x03]); // ecdsa_secp384r1_sha384
+        extensions.extend_from_slice(&[0x06, 0x03]); // ecdsa_secp521r1_sha512
         extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+        extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
+        extensions.extend_from_slice(&[0x08, 0x05]); // rsa_pss_rsae_sha384
+        extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
     }
 
     // ALPN extension (type 16)
@@ -472,5 +481,57 @@ mod tests {
         assert_eq!(header[1], 0x03); // TLS 1.2
         assert_eq!(header[2], 0x03);
         assert_eq!(u16::from_be_bytes([header[3], header[4]]), 100);
+    }
+
+    /// Verify that construct_client_hello includes all 7 standard TLS 1.3
+    /// signature algorithms required for Xray-core / Go crypto/tls compatibility.
+    ///
+    /// This is Fix 1: Go's crypto/tls rejects ClientHello with handshake_failure
+    /// if no algorithm in signature_algorithms is compatible with the server cert.
+    #[test]
+    fn test_client_hello_includes_standard_signature_algorithms() {
+        let client_random = [0u8; 32];
+        let session_id = [0u8; 32];
+        let client_public_key = [0u8; 32];
+
+        let hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &client_public_key,
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+
+        // Find signature_algorithms extension by type bytes 0x00 0x0d.
+        let pos = hello
+            .windows(2)
+            .position(|w| w == [0x00, 0x0d])
+            .expect("signature_algorithms extension (0x000d) not found in ClientHello");
+
+        // Layout after type (2 bytes): ext_len (2) || list_len (2) || alg pairs
+        let after_type = &hello[pos + 2..];
+        let list_len = u16::from_be_bytes([after_type[2], after_type[3]]) as usize;
+        let alg_bytes = &after_type[4..4 + list_len];
+
+        // All 7 standard TLS 1.3 algorithms must be present.
+        let expected: &[[u8; 2]] = &[
+            [0x04, 0x03], // ecdsa_secp256r1_sha256
+            [0x05, 0x03], // ecdsa_secp384r1_sha384
+            [0x06, 0x03], // ecdsa_secp521r1_sha512
+            [0x08, 0x07], // ed25519
+            [0x08, 0x04], // rsa_pss_rsae_sha256
+            [0x08, 0x05], // rsa_pss_rsae_sha384
+            [0x08, 0x06], // rsa_pss_rsae_sha512
+        ];
+        for alg in expected {
+            assert!(
+                alg_bytes.windows(2).any(|w| w == alg),
+                "Missing signature algorithm {:02x?} in extension",
+                alg
+            );
+        }
+        assert_eq!(list_len, 14, "Expected exactly 7 algorithms (14 bytes)");
     }
 }
