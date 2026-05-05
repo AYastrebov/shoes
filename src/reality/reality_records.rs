@@ -6,12 +6,11 @@
 // - Building TLS record headers
 // - Managing sequence numbers
 
-use std::io::{self, Error};
+use std::io::{self, Error, ErrorKind};
 
 use super::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
     MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
-    strip_content_type_slice,
 };
 use super::reality_aead::AeadKey;
 #[cfg(test)]
@@ -301,10 +300,33 @@ impl<'a> RecordDecryptor<'a> {
             .checked_add(1)
             .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
 
-        // Strip content type (returns content_type and valid length)
-        let (content_type, valid_len) = strip_content_type_slice(plaintext)?;
+        // Strip trailing zero padding and content type byte per RFC 8446 §5.4:
+        //   TLSInnerPlaintext = content || ContentType || zeros
+        //
+        // Xray-core Reality pads records with trailing zeros for traffic analysis
+        // resistance. The previous strip_content_type_slice assumed no padding,
+        // causing "Invalid content type: 0x00" errors.
+        let mut valid_end = plaintext.len();
+        while valid_end > 0 && plaintext[valid_end - 1] == 0 {
+            valid_end -= 1;
+        }
+        if valid_end == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
+        }
+        let content_type = plaintext[valid_end - 1];
+        valid_end -= 1;
 
-        Ok((content_type, &plaintext[..valid_len]))
+        if content_type != CONTENT_TYPE_HANDSHAKE
+            && content_type != CONTENT_TYPE_APPLICATION_DATA
+            && content_type != CONTENT_TYPE_ALERT
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid content type: 0x{:02x}", content_type),
+            ));
+        }
+
+        Ok((content_type, &plaintext[..valid_end]))
     }
 }
 
@@ -916,6 +938,63 @@ mod tests {
         let result = decrypt_record(&mut decryptor, ciphertext, record_len);
         // Will fail either due to decryption (wrong nonce) or seq exhaustion
         assert!(result.is_err());
+    }
+
+    /// Verify that a record padded with trailing zeros (RFC 8446 §5.4 / Xray-core style)
+    /// decrypts correctly.
+    ///
+    /// This is Fix 3: Xray-core appends zero bytes after the content type byte for
+    /// traffic analysis resistance.  The decryptor must strip them before returning.
+    #[test]
+    fn test_decrypt_record_with_xray_zero_padding() {
+        let key = [0x01u8; 16];
+        let iv = [0x02u8; 12];
+        let aead_key = AeadKey::new(CS, &key).unwrap();
+
+        let content = vec![0xAAu8; 50];
+
+        // Simulate Xray-core TLSInnerPlaintext: content || ContentType || zeros*
+        let mut padded = content.clone();
+        padded.push(CONTENT_TYPE_HANDSHAKE);
+        padded.extend_from_slice(&[0x00u8; 5]); // 5 trailing zero bytes
+
+        // ciphertext = AEAD-encrypt(padded), tag appended
+        let ciphertext_len = padded.len() + 16;
+        let aad = make_record_header(ciphertext_len);
+        let ciphertext = aead_key.seal(&padded, &iv, 0, &aad).unwrap();
+        assert_eq!(ciphertext.len(), ciphertext_len);
+
+        let mut dec_seq = 0u64;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
+        let (ct, plaintext) =
+            decrypt_record(&mut decryptor, &ciphertext, ciphertext_len as u16).unwrap();
+
+        assert_eq!(ct, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(plaintext, content, "trailing zeros must be stripped");
+    }
+
+    /// Verify that a record whose entire plaintext is zeros (no content type byte)
+    /// is rejected with a clear error.
+    #[test]
+    fn test_decrypt_all_zeros_plaintext_fails() {
+        let key = [0x03u8; 16];
+        let iv = [0x04u8; 12];
+        let aead_key = AeadKey::new(CS, &key).unwrap();
+
+        let all_zeros = vec![0x00u8; 16];
+        let ciphertext_len = all_zeros.len() + 16;
+        let aad = make_record_header(ciphertext_len);
+        let ciphertext = aead_key.seal(&all_zeros, &iv, 0, &aad).unwrap();
+
+        let mut dec_seq = 0u64;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
+        let result = decrypt_record(&mut decryptor, &ciphertext, ciphertext_len as u16);
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("all zeros"),
+            "error should mention 'all zeros'"
+        );
     }
 
     #[test]
