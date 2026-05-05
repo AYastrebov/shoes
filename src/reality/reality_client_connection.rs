@@ -226,6 +226,11 @@ impl RealityClientConnection {
             &encrypted_session_id
         );
 
+        // Restore the encrypted session_id into the ClientHello.
+        // This is what goes on the wire AND what goes into the transcript hash.
+        // Xray-core restores the encrypted bytes after AEAD decryption
+        // (copy(hs.clientHello.sessionId, ciphertext)) so the transcript
+        // uses the original wire bytes with encrypted session_id.
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
         let mut record = write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
@@ -233,7 +238,9 @@ impl RealityClientConnection {
         self.ciphertext_write_buf.extend_from_slice(&record);
 
         // Update state - store raw ClientHello bytes for transcript hash computation
-        // after we learn the cipher suite from ServerHello
+        // after we learn the cipher suite from ServerHello.
+        // NOTE: client_hello now contains the ENCRYPTED session_id (wire bytes),
+        // which matches what Xray-core uses via originalBytes() for its transcript.
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
             client_private_key: our_private_bytes,
@@ -982,4 +989,55 @@ pub fn feed_reality_client_connection(
         i += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the ClientHello stored in ciphertext_write_buf has the *encrypted*
+    /// session_id at wire bytes [44..76], not the zeroed placeholder.
+    ///
+    /// This is Fix 2: Xray-core computes the transcript hash from the wire bytes
+    /// (originalBytes()), which include the encrypted session_id.  If shoes stores
+    /// the zeroed session_id instead, key derivation produces wrong keys and all
+    /// encrypted handshake records fail to decrypt.
+    #[test]
+    fn test_client_hello_wire_bytes_use_encrypted_session_id() {
+        // Generate a valid X25519 server key pair for the test config.
+        let server_private = [0x42u8; 32];
+        let server_private_key =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &server_private).unwrap();
+        let server_pub_bytes = server_private_key.compute_public_key().unwrap();
+        let mut server_public = [0u8; 32];
+        server_public.copy_from_slice(server_pub_bytes.as_ref());
+
+        let config = RealityClientConfig {
+            public_key: server_public,
+            short_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            server_name: "example.com".to_string(),
+            cipher_suites: vec![],
+        };
+
+        let mut conn = RealityClientConnection::new(config).unwrap();
+
+        // Flush the buffered ClientHello record into a Vec.
+        let mut wire = Vec::new();
+        conn.write_tls(&mut wire).unwrap();
+
+        // Wire layout: TLS record header (5 bytes) || ClientHello
+        // ClientHello layout: type(1) + length(3) + version(2) + random(32)
+        //                     + session_id_len(1) + session_id(32) + ...
+        // => session_id starts at wire offset 5 + 1 + 3 + 2 + 32 + 1 = 44
+        assert!(wire.len() >= 76, "wire bytes too short: {}", wire.len());
+        let session_id_in_wire = &wire[44..76];
+
+        // The session_id MUST be the AES-GCM-encrypted form — not all zeros.
+        // If this assertion fails, Fix 2 has regressed: shoes is hashing the
+        // zeroed session_id instead of the wire bytes.
+        assert_ne!(
+            session_id_in_wire, &[0u8; 32],
+            "session_id in wire bytes must be encrypted (non-zero); Fix 2 regression"
+        );
+    }
 }
