@@ -16,6 +16,7 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
+use crate::sniff::SniffSettings;
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
@@ -30,6 +31,7 @@ async fn start_quic_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
@@ -55,12 +57,15 @@ async fn start_quic_server(
 
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
+        let sniff = sniff.clone();
         let join_handle = tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
+                let sniff = sniff.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(resolver, server_handler, conn).await {
+                    if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
+                    {
                         error!("Connection ended with error: {e}");
                     }
                 });
@@ -77,6 +82,7 @@ async fn process_connection(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
 
@@ -93,8 +99,11 @@ async fn process_connection(
         };
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
+        let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
+            if let Err(e) =
+                process_streams(cloned_resolver, cloned_handler, stream, cloned_sniff).await
+            {
                 error!("Failed to process streams: {e}");
             }
         });
@@ -107,6 +116,7 @@ async fn process_streams(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<()> {
     let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
@@ -148,6 +158,7 @@ async fn process_streams(
                 initial_remote_data,
                 proxy_selector,
                 resolver,
+                sniff,
             })
             .await
         }
@@ -224,10 +235,14 @@ pub async fn start_quic_servers(
         quic_settings,
         protocol,
         rules,
+        sniff,
         ..
     } = config;
 
     println!("Starting {} QUIC server at {}", protocol, bind_location);
+
+    // Resolved once per listener rather than per connection.
+    let sniff = sniff.as_ref().and_then(|s| s.to_settings());
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // A direct entry must always exist
@@ -350,6 +365,7 @@ pub async fn start_quic_servers(
                     resolver,
                     tcp_handler,
                     num_endpoints,
+                    sniff.clone(),
                 )
                 .await?;
 

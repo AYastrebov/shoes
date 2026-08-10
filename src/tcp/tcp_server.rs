@@ -18,6 +18,7 @@ use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
+use crate::sniff::SniffSettings;
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -29,6 +30,7 @@ async fn run_tcp_server(
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
@@ -57,8 +59,11 @@ async fn run_tcp_server(
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
+        let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
+            if let Err(e) =
+                process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await
+            {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
                 debug!("{}:{} finished successfully", addr.ip(), addr.port());
@@ -72,6 +77,7 @@ async fn run_unix_server(
     path_buf: PathBuf,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -94,8 +100,11 @@ async fn run_unix_server(
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
+        let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
+            if let Err(e) =
+                process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await
+            {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
                 debug!("{addr:?} finished successfully");
@@ -119,6 +128,7 @@ pub async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
+    sniff: Option<SniffSettings>,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -161,6 +171,7 @@ where
                 initial_remote_data,
                 proxy_selector,
                 resolver,
+                sniff,
             })
             .await
         }
@@ -330,10 +341,15 @@ async fn start_tcp_servers(
         tcp_settings,
         protocol,
         rules,
+        sniff,
         ..
     } = config;
 
     println!("Starting {} TCP server at {}", protocol, bind_location);
+
+    // Resolved once per listener rather than per connection: the protocol list
+    // and the timeout do not change while the server runs.
+    let sniff = sniff.as_ref().and_then(|s| s.to_settings());
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // We should always have a direct entry.
@@ -370,8 +386,9 @@ async fn start_tcp_servers(
                 let tcp_config = tcp_config.clone();
                 let tcp_handler = tcp_handler.clone();
                 let resolver = resolver.clone();
+                let sniff = sniff.clone();
                 let handle = tokio::spawn(async move {
-                    run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
+                    run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler, sniff)
                         .await
                         .unwrap();
                 });
@@ -383,7 +400,7 @@ async fn start_tcp_servers(
             {
                 let tcp_handler = tcp_handler.clone();
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler)
+                    run_unix_server(path_buf, resolver, tcp_handler, sniff)
                         .await
                         .unwrap();
                 });
