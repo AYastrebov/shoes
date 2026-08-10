@@ -183,6 +183,9 @@ pub struct ServerConfig {
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
+    /// Protocol sniffing for this listener. Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sniff: Option<super::sniff::SniffConfig>,
 }
 
 impl<'de> serde::de::Deserialize<'de> for ServerConfig {
@@ -208,6 +211,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "rules",
             "rule",
             "dns",
+            "sniff",
         ];
 
         // Check for unknown fields
@@ -289,6 +293,14 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid dns: {e}")))?;
 
+        // Parse sniff (optional)
+        let sniff: Option<super::sniff::SniffConfig> = map
+            .get("sniff")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid sniff: {e}")))?;
+
         Ok(ServerConfig {
             bind_location,
             protocol,
@@ -297,6 +309,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             quic_settings,
             rules,
             dns,
+            sniff,
         })
     }
 }
@@ -857,6 +870,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -875,6 +889,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -893,6 +908,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -919,6 +935,7 @@ mod tests {
             }),
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -939,6 +956,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -989,6 +1007,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -1007,6 +1026,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -1032,6 +1052,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -1051,6 +1072,7 @@ mod tests {
             quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -1075,6 +1097,7 @@ mod tests {
             }),
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
@@ -1100,6 +1123,7 @@ mod tests {
             }),
             rules: NoneOrSome::None,
             dns: None,
+            sniff: None,
         }
     }
 
