@@ -6,6 +6,12 @@ mod buf_reader;
 mod client_proxy_chain;
 mod client_proxy_selector;
 mod config;
+// The control-API HTTP endpoints (metrics_counters/snapshot/subscribe_events)
+// land in a later task and will call into this module from here; until then
+// this binary only feeds the registry (register/counted) from the accept
+// paths, so the read side is legitimately unused in this target.
+#[allow(dead_code, unused_imports)]
+mod connection_registry;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;

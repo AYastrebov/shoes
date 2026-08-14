@@ -95,6 +95,24 @@ impl<S: AsyncPing + Unpin> AsyncPing for CountingStream<S> {
 
 impl<S: AsyncStream> AsyncStream for CountingStream<S> {}
 
+/// Wrap a client stream so its bytes are counted, using the handle's counters.
+/// Feature-off: identity (returns the stream unchanged), so there is no wrapper
+/// in the hot path.
+#[cfg(feature = "control-api")]
+pub fn counted<S: crate::async_stream::AsyncStream>(
+    stream: S,
+    handle: &ConnectionHandle,
+) -> CountingStream<S> {
+    let (up, down) = handle.counters();
+    CountingStream::new(stream, up, down)
+}
+
+#[cfg(not(feature = "control-api"))]
+#[inline(always)]
+pub fn counted<S: crate::async_stream::AsyncStream>(stream: S, _handle: &ConnectionHandle) -> S {
+    stream
+}
+
 use std::net::SocketAddr;
 
 #[cfg(feature = "control-api")]

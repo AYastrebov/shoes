@@ -33,6 +33,7 @@ async fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
     sniff: Option<SniffSettings>,
+    inbound_label: &'static str,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
@@ -65,7 +66,9 @@ async fn start_quic_server(
                 let server_handler = server_handler.clone();
                 let sniff = sniff.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
+                    if let Err(e) =
+                        process_connection(resolver, server_handler, conn, sniff, inbound_label)
+                            .await
                     {
                         error!("Connection ended with error: {e}");
                     }
@@ -84,8 +87,10 @@ async fn process_connection(
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
     sniff: Option<SniffSettings>,
+    inbound_label: &'static str,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+    let client_addr = connection.remote_address();
 
     loop {
         let stream = match connection.accept_bi().await {
@@ -102,8 +107,15 @@ async fn process_connection(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_streams(cloned_resolver, cloned_handler, stream, cloned_sniff).await
+            if let Err(e) = process_streams(
+                cloned_resolver,
+                cloned_handler,
+                stream,
+                cloned_sniff,
+                client_addr,
+                inbound_label,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -118,8 +130,14 @@ async fn process_streams(
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
     sniff: Option<SniffSettings>,
+    client_addr: SocketAddr,
+    inbound_label: &'static str,
 ) -> std::io::Result<()> {
-    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let handle = crate::connection_registry::register(client_addr, inbound_label);
+    let quic_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
 
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
@@ -141,6 +159,10 @@ async fn process_streams(
             ));
         }
     };
+
+    if let Some(loc) = crate::tcp::tcp_server::setup_result_remote_location(&setup_result) {
+        handle.set_target(loc.to_string());
+    }
 
     match setup_result {
         TcpServerSetupResult::TcpForward {
@@ -356,6 +378,10 @@ pub async fn start_quic_servers(
         tcp_protocol => {
             let bind_ip = bind_addresses.first().map(|addr| addr.ip());
 
+            // Leaked once per listener (not per connection) so the registry can
+            // tag every connection from this listener with a cheap `&'static str`.
+            let inbound_label: &'static str = Box::leak(format!("{tcp_protocol}").into_boxed_str());
+
             let tcp_handler: Arc<dyn TcpServerHandler> =
                 create_tcp_server_handler(tcp_protocol, &client_proxy_selector, &resolver, bind_ip)
                     .into();
@@ -371,6 +397,7 @@ pub async fn start_quic_servers(
                     tcp_handler,
                     num_endpoints,
                     sniff.clone(),
+                    inbound_label,
                 )
                 .await?;
 

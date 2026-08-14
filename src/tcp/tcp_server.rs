@@ -31,6 +31,7 @@ async fn run_tcp_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    inbound_label: &'static str,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
@@ -61,8 +62,16 @@ async fn run_tcp_server(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await
+            let handle = crate::connection_registry::register(addr, inbound_label);
+            let stream = crate::connection_registry::counted(stream, &handle);
+            if let Err(e) = process_stream(
+                stream,
+                cloned_handler,
+                cloned_resolver,
+                cloned_sniff,
+                handle,
+            )
+            .await
             {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -78,6 +87,7 @@ async fn run_unix_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    inbound_label: &'static str,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -102,8 +112,17 @@ async fn run_unix_server(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await
+            let client_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            let handle = crate::connection_registry::register(client_addr, inbound_label);
+            let stream = crate::connection_registry::counted(stream, &handle);
+            if let Err(e) = process_stream(
+                stream,
+                cloned_handler,
+                cloned_resolver,
+                cloned_sniff,
+                handle,
+            )
+            .await
             {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
@@ -124,11 +143,29 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
+/// Extracts the remote location from the `TcpServerSetupResult` variants that
+/// carry one, so the caller can record it on the connection's registry handle
+/// before the result is consumed by the dispatch match below.
+pub(crate) fn setup_result_remote_location(
+    r: &TcpServerSetupResult,
+) -> Option<&crate::address::NetLocation> {
+    match r {
+        TcpServerSetupResult::TcpForward {
+            remote_location, ..
+        } => Some(remote_location),
+        TcpServerSetupResult::BidirectionalUdp {
+            remote_location, ..
+        } => Some(remote_location),
+        _ => None,
+    }
+}
+
 pub async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     sniff: Option<SniffSettings>,
+    handle: crate::connection_registry::ConnectionHandle,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -153,6 +190,10 @@ where
             ));
         }
     };
+
+    if let Some(loc) = setup_result_remote_location(&setup_result) {
+        handle.set_target(loc.to_string());
+    }
 
     match setup_result {
         TcpServerSetupResult::TcpForward {
@@ -347,6 +388,10 @@ async fn start_tcp_servers(
 
     println!("Starting {} TCP server at {}", protocol, bind_location);
 
+    // Leaked once per listener (not per connection) so the registry can tag
+    // every connection from this listener with a cheap `&'static str`.
+    let inbound_label: &'static str = Box::leak(format!("{protocol}").into_boxed_str());
+
     // Resolved once per listener rather than per connection: the protocol list
     // and the timeout do not change while the server runs.
     let sniff = sniff.as_ref().and_then(|s| s.to_settings());
@@ -388,9 +433,16 @@ async fn start_tcp_servers(
                 let resolver = resolver.clone();
                 let sniff = sniff.clone();
                 let handle = tokio::spawn(async move {
-                    run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler, sniff)
-                        .await
-                        .unwrap();
+                    run_tcp_server(
+                        socket_addr,
+                        tcp_config,
+                        resolver,
+                        tcp_handler,
+                        sniff,
+                        inbound_label,
+                    )
+                    .await
+                    .unwrap();
                 });
                 handles.push(handle);
             }
@@ -400,7 +452,7 @@ async fn start_tcp_servers(
             {
                 let tcp_handler = tcp_handler.clone();
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler, sniff)
+                    run_unix_server(path_buf, resolver, tcp_handler, sniff, inbound_label)
                         .await
                         .unwrap();
                 });
