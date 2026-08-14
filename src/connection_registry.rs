@@ -347,6 +347,10 @@ mod tests {
         assert_eq!(down.load(Ordering::Relaxed), 3);
     }
 
+    // Exercises the feature-on-only registry (`snapshot`, `ConnectionSnapshot`),
+    // which the feature-off shim does not provide; gate it so `cargo test` without
+    // the feature still compiles.
+    #[cfg(feature = "control-api")]
     #[test]
     fn register_deregister_and_snapshot() {
         // Registry state is process-global; use a unique client_addr so this test
