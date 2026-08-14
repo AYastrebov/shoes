@@ -24,7 +24,7 @@ path = "src/main.rs"
 [features]
 default = []
 ffi = []  # Enable FFI module for non-Android builds
-control-api = []  # Enable the feature-gated control API
+control-api = ["dep:serde_json"]  # Enable the feature-gated control API
 
 [dependencies]
 async-trait = "*"
@@ -72,6 +72,7 @@ rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
+serde_json = { version = "*", optional = true }
 serde_yaml = "*"
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }

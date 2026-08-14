@@ -123,3 +123,7 @@ pub mod tun;
 /// FFI bindings for mobile platforms.
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 pub mod ffi;
+
+/// Feature-gated HTTP control API for a management panel.
+#[cfg(feature = "control-api")]
+pub mod api;
