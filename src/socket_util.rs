@@ -135,7 +135,7 @@ pub fn new_socket2_udp_socket_with_buffer_size(
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
+        panic!("Could not bind to device {interface}, unsupported platform.");
     }
 
     if let Some(bind_address) = bind_address {
@@ -237,7 +237,7 @@ pub fn new_tcp_listener(
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
+        panic!("Could not bind to device {interface}, unsupported platform.");
     }
 
     socket.bind(&SockAddr::from(bind_address))?;
