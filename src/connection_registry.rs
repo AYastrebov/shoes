@@ -123,7 +123,6 @@ mod imp {
     use std::sync::LazyLock;
     use tokio::sync::broadcast;
 
-    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     // Global counters for O(1) /metrics. These are updated per connection (in
@@ -209,7 +208,6 @@ mod imp {
     }
 
     pub fn register(client_addr: SocketAddr, inbound: &'static str) -> ConnectionHandle {
-        LazyLock::force(&EPOCH);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(Entry {
             inbound,

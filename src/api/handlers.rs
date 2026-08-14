@@ -8,7 +8,7 @@ pub(crate) fn status(state: &ApiState) -> Response<ApiBody> {
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": state.started.elapsed().as_secs(),
-        "connections": crate::connection_registry::snapshot().len(),
+        "connections": crate::connection_registry::metrics_counters().active_connections,
     });
     super::json(StatusCode::OK, body.to_string())
 }

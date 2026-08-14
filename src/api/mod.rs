@@ -39,7 +39,13 @@ pub async fn serve_on(
         started: std::time::Instant::now(),
     });
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("control API accept failed: {e}");
+                continue;
+            }
+        };
         let state = state.clone();
         let io = hyper_util::rt::TokioIo::new(stream);
         tokio::spawn(async move {
@@ -290,6 +296,8 @@ mod tests {
         let ok = http_get(addr, "/api/status", Some(&token)).await;
         assert_eq!(ok.0, 200);
         assert!(ok.1.contains("version"));
+        let wrong = http_get(addr, "/api/status", Some("definitely-not-the-token")).await;
+        assert_eq!(wrong.0, 401);
     }
 
     #[tokio::test]

@@ -69,6 +69,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked -- -D warnings
 
+      - name: Run clippy (control-api feature)
+        run: cargo clippy --locked --features control-api -- -D warnings
+
   clippy-android:
     name: Clippy (aarch64-linux-android)
     runs-on: ubuntu-latest
