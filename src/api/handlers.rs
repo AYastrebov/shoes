@@ -1,10 +1,10 @@
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
 
-use super::ApiState;
+use super::{ApiBody, ApiState};
 
-pub(crate) fn status(state: &ApiState) -> Response<Full<Bytes>> {
+pub(crate) fn status(state: &ApiState) -> Response<ApiBody> {
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": state.started.elapsed().as_secs(),
@@ -13,12 +13,12 @@ pub(crate) fn status(state: &ApiState) -> Response<Full<Bytes>> {
     super::json(StatusCode::OK, body.to_string())
 }
 
-pub(crate) fn connections(_state: &ApiState) -> Response<Full<Bytes>> {
+pub(crate) fn connections(_state: &ApiState) -> Response<ApiBody> {
     let snap = crate::connection_registry::snapshot();
     super::json(StatusCode::OK, serde_json::to_string(&snap).unwrap())
 }
 
-pub(crate) fn metrics(_state: &ApiState) -> Response<Full<Bytes>> {
+pub(crate) fn metrics(_state: &ApiState) -> Response<ApiBody> {
     // O(1): read the global counters, do NOT scan the connection map. Byte
     // totals are cumulative over closed connections (a still-open connection's
     // bytes are attributed when it closes), which is correct counter semantics.
@@ -33,11 +33,11 @@ pub(crate) fn metrics(_state: &ApiState) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
 }
 
-pub(crate) fn get_config(state: &ApiState) -> Response<Full<Bytes>> {
+pub(crate) fn get_config(state: &ApiState) -> Response<ApiBody> {
     match std::fs::read_to_string(&state.config_path) {
         Ok(text) => match serde_yaml::from_str::<serde_yaml::Value>(&text) {
             // A hand-edited config with non-string YAML map keys serializes to
@@ -63,7 +63,7 @@ pub(crate) fn get_config(state: &ApiState) -> Response<Full<Bytes>> {
     }
 }
 
-pub(crate) async fn put_config(state: &ApiState, body: Bytes) -> Response<Full<Bytes>> {
+pub(crate) async fn put_config(state: &ApiState, body: Bytes) -> Response<ApiBody> {
     // 1. JSON body -> yaml text.
     let value: serde_yaml::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,

@@ -1,13 +1,15 @@
 //! Feature-gated HTTP control API for a management panel.
 pub mod config_section;
 pub mod handlers;
-// logsink module added in a later task
+pub mod logsink;
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use http_body_util::Full;
-use hyper::body::Bytes;
+use futures::StreamExt;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use subtle::ConstantTimeEq;
@@ -63,15 +65,51 @@ fn authorized(headers: &hyper::HeaderMap, token: &str) -> bool {
     bearer.as_bytes().ct_eq(token.as_bytes()).into()
 }
 
-pub(crate) fn json(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+pub(crate) type ApiBody = BoxBody<Bytes, Infallible>;
+
+pub(crate) fn json(status: StatusCode, body: String) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
 }
 
-async fn route(req: Request<hyper::body::Incoming>, state: Arc<ApiState>) -> Response<Full<Bytes>> {
+// GET /api/logs returns a text/event-stream body built from a broadcast
+// receiver. Lagged receivers get a "data: {\"lag\":N}\n\n" marker rather than
+// backpressure; the loop continues.
+fn sse_response<S>(stream: S) -> Response<ApiBody>
+where
+    S: futures::Stream<Item = Result<Bytes, Infallible>> + Send + Sync + 'static,
+{
+    let body = StreamBody::new(stream.map(|res| res.map(Frame::data)));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(BodyExt::boxed(body))
+        .unwrap()
+}
+
+fn logs_stream() -> impl futures::Stream<Item = Result<Bytes, Infallible>> + Send + Sync + 'static {
+    let (replay, rx) = logsink::global_log_stream();
+    let replay_stream = futures::stream::iter(
+        replay
+            .into_iter()
+            .map(|line| Ok(Bytes::from(format!("data: {line}\n\n")))),
+    );
+    let tail_stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(line) => Some((Ok(Bytes::from(format!("data: {line}\n\n"))), rx)),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                Some((Ok(Bytes::from(format!("data: {{\"lag\":{n}}}\n\n"))), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    replay_stream.chain(tail_stream)
+}
+
+async fn route(req: Request<hyper::body::Incoming>, state: Arc<ApiState>) -> Response<ApiBody> {
     if !authorized(req.headers(), &state.token) {
         return json(
             StatusCode::UNAUTHORIZED,
@@ -85,6 +123,7 @@ async fn route(req: Request<hyper::body::Incoming>, state: Arc<ApiState>) -> Res
         (&hyper::Method::GET, "/api/connections") => handlers::connections(&state),
         (&hyper::Method::GET, "/api/metrics") => handlers::metrics(&state),
         (&hyper::Method::GET, "/api/config") => handlers::get_config(&state),
+        (&hyper::Method::GET, "/api/logs") => sse_response(logs_stream()),
         (&hyper::Method::PUT, "/api/config") => {
             let bytes = match http_body_util::BodyExt::collect(req.into_body()).await {
                 Ok(c) => c.to_bytes(),
@@ -277,6 +316,73 @@ mod tests {
         assert_eq!(
             before, after,
             "file must be unchanged on validation failure"
+        );
+    }
+
+    /// SSE is long-lived, so we can't `read_to_end` like `http_get` does.
+    /// Read only until the header block terminates, then drop the
+    /// connection instead of waiting for EOF (which would never come).
+    ///
+    /// This deliberately does NOT assert that a specific line was delivered
+    /// over the wire: `BroadcastLogWriter`'s global ring buffer is
+    /// process-global and shared with `api::logsink::tests::
+    /// broadcast_log_writer_delivers`, which asserts the ring is empty
+    /// before it emits. Constructing a second writer here and emitting a
+    /// marker line would race with that assertion under the parallel test
+    /// runner. Frame delivery (replay + live tail + lag handling) is
+    /// already covered by that unit test; this test only needs to confirm
+    /// the route is wired up and returns the right status/headers.
+    async fn http_get_sse_headers(
+        addr: std::net::SocketAddr,
+        path: &str,
+        token: &str,
+    ) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for response headers")
+                .unwrap();
+            assert!(n > 0, "connection closed before headers arrived");
+            buf.extend_from_slice(&chunk[..n]);
+            if String::from_utf8_lossy(&buf).contains("\r\n\r\n") {
+                break;
+            }
+        }
+        let response = String::from_utf8_lossy(&buf).to_string();
+        let head = response
+            .splitn(2, "\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        let status_line = head.splitn(2, "\r\n").next().unwrap_or("");
+        let code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        (code, head)
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_returns_event_stream() {
+        let (addr, token) = spawn().await;
+        let (code, head) = http_get_sse_headers(addr, "/api/logs", &token).await;
+        assert_eq!(code, 200, "head was: {head}");
+        assert!(
+            head.to_lowercase()
+                .contains("content-type: text/event-stream"),
+            "head was: {head}"
         );
     }
 
