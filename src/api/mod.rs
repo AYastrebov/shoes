@@ -397,13 +397,9 @@ mod tests {
             }
         }
         let response = String::from_utf8_lossy(&buf).to_string();
-        let head = response
-            .splitn(2, "\r\n\r\n")
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let head = response.split("\r\n\r\n").next().unwrap_or("").to_string();
 
-        let status_line = head.splitn(2, "\r\n").next().unwrap_or("");
+        let status_line = head.split("\r\n").next().unwrap_or("");
         let code: u16 = status_line
             .split_whitespace()
             .nth(1)
