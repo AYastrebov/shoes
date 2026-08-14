@@ -29,7 +29,7 @@ pub async fn serve(config: ControlApiConfig) -> std::io::Result<()> {
     serve_on(listener, config).await
 }
 
-async fn serve_on(
+pub async fn serve_on(
     listener: tokio::net::TcpListener,
     config: ControlApiConfig,
 ) -> std::io::Result<()> {

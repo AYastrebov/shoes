@@ -1,15 +1,18 @@
 mod address;
 mod amneziawg;
 mod anytls;
+#[cfg(feature = "control-api")]
+mod api;
 mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
 mod client_proxy_selector;
 mod config;
 // The control-API HTTP endpoints (metrics_counters/snapshot/subscribe_events)
-// land in a later task and will call into this module from here; until then
-// this binary only feeds the registry (register/counted) from the accept
-// paths, so the read side is legitimately unused in this target.
+// read from this registry via `mod api`, which is only compiled in with the
+// control-api feature; this binary always feeds the registry
+// (register/counted) from the accept paths, but the read side is only
+// consumed feature-on, so it's legitimately unused when the feature is off.
 #[allow(dead_code, unused_imports)]
 mod connection_registry;
 mod copy_bidirectional;
@@ -141,6 +144,8 @@ fn print_usage_and_exit(arg0: String) {
     );
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
+    #[cfg(feature = "control-api")]
+    eprintln!("    --control-api PATH   Start the control API using this standalone YAML config");
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("COMMANDS:");
@@ -161,6 +166,8 @@ fn main() {
     let mut dry_run = false;
     let mut no_reload = false;
     let mut log_files: Vec<String> = Vec::new();
+    #[cfg(feature = "control-api")]
+    let mut control_api_path: Option<String> = None;
 
     while !args.is_empty() && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
@@ -192,6 +199,22 @@ fn main() {
         } else if args[0] == "--no-reload" {
             args.remove(0);
             no_reload = true;
+        } else if args[0] == "--control-api" {
+            args.remove(0);
+            if args.is_empty() {
+                eprintln!("Missing --control-api argument.");
+                print_usage_and_exit(arg0);
+                return;
+            }
+            #[cfg(feature = "control-api")]
+            {
+                control_api_path = Some(args.remove(0));
+            }
+            #[cfg(not(feature = "control-api"))]
+            {
+                eprintln!("--control-api requires a build with the control-api feature");
+                std::process::exit(1);
+            }
         } else if args[0] == "--version" || args[0] == "-V" {
             println!("shoes {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -219,6 +242,29 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    #[cfg(feature = "control-api")]
+    let control_api_config: Option<api::config_section::ControlApiConfig> = match &control_api_path
+    {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(text) => match serde_yaml::from_str(&text) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    eprintln!("Invalid --control-api config {p}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("Cannot read --control-api config {p}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    #[cfg(feature = "control-api")]
+    if control_api_config.is_some() {
+        writers.push(Box::new(api::logsink::BroadcastLogWriter::new()));
     }
 
     logging::init_multi_logger(writers, directives);
@@ -352,6 +398,11 @@ fn main() {
             let (watcher, rx) = start_notify_thread(args.clone());
             Some((watcher, rx))
         };
+
+        #[cfg(feature = "control-api")]
+        if let Some(cfg) = control_api_config {
+            tokio::spawn(api::serve(cfg));
+        }
 
         loop {
             let configs = match config::load_configs(&args).await {
