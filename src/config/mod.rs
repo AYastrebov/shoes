@@ -23,12 +23,24 @@ pub use validate::{ValidatedConfigs, create_server_configs};
 
 /// Validates a config given as a YAML string, without applying it: parses it
 /// through the same `Vec<Config>` shape `load_configs` produces, then runs it
-/// through the real (pure, side-effect-free) validator. This does NOT resolve
-/// relative rule-set paths the way `load_configs` does for on-disk files
-/// (that resolution needs the source filename, which a bare string doesn't
-/// have) — a config that references rule-sets by relative path will fail
-/// here even though it would succeed once written to disk and loaded
-/// normally.
+/// through the real validator (`create_server_configs`).
+///
+/// Not side-effect-free: `create_server_configs` loads any declared rule-set
+/// files, so a config whose `rule_set` entries carry a `path` causes that path
+/// to be read from disk here (`std::fs::read`) as part of validation, before
+/// any accept/reject decision. The bytes are used only to validate and are
+/// discarded on failure (nothing is cached or written), but a caller therefore
+/// learns whether an arbitrary local path exists/readable from the differing
+/// error text. This is acceptable in context — the only caller is the
+/// authenticated `PUT /api/config` handler, which already grants full remote
+/// reconfiguration of the process — but do NOT treat this function as safe to
+/// run on untrusted input in an unauthenticated or sandboxed context.
+///
+/// This also does NOT resolve relative rule-set paths the way `load_configs`
+/// does for on-disk files (that resolution needs the source filename, which a
+/// bare string doesn't have) — a config that references rule-sets by relative
+/// path will fail here even though it would succeed once written to disk and
+/// loaded normally.
 ///
 /// `allow(dead_code)`: `src/main.rs` re-declares its own module tree and does
 /// not (yet) include `mod api`, so in the `shoes` binary target this function

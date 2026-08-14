@@ -40,7 +40,16 @@ pub(crate) fn metrics(_state: &ApiState) -> Response<Full<Bytes>> {
 pub(crate) fn get_config(state: &ApiState) -> Response<Full<Bytes>> {
     match std::fs::read_to_string(&state.config_path) {
         Ok(text) => match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-            Ok(value) => super::json(StatusCode::OK, serde_json::to_string(&value).unwrap()),
+            // A hand-edited config with non-string YAML map keys serializes to
+            // no valid JSON; return 500 rather than panicking the handler.
+            Ok(value) => match serde_json::to_string(&value) {
+                Ok(json) => super::json(StatusCode::OK, json),
+                Err(e) => super::json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": format!("stored config is not representable as json: {e}")})
+                        .to_string(),
+                ),
+            },
             Err(e) => super::json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({"error": format!("stored config is not valid yaml: {e}")})
