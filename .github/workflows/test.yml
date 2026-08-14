@@ -52,3 +52,6 @@ jobs:
       # are target_os = "android" / "ios".
       - name: Run tests with the FFI surface enabled
         run: cargo test --locked --features ffi
+
+      - name: Run tests with the control API enabled
+        run: cargo test --locked --features control-api

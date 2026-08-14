@@ -55,6 +55,21 @@ jobs:
       - name: Build XCFramework
         run: bash scripts/build-ios.sh
 
+      - name: Assert the control API is not built into the mobile library
+        run: |
+          set -euo pipefail
+          # The control API must never ship in a mobile artifact. Because the
+          # `control-api` feature is non-default, the only way it could be
+          # included is a mobile build script enabling it. A symbol/string check
+          # on the built .a/.so is unreliable here — the artifacts are stripped
+          # and fat-LTO dead-code-eliminates the unreferenced api module even
+          # when the feature is on — so guard the source of truth: the build
+          # commands themselves.
+          if grep -REn -- 'control-api' scripts/build-ios.sh scripts/build-android.sh; then
+            echo "ERROR: a mobile build script enables the control-api feature"; exit 1
+          fi
+          echo "OK: mobile build scripts do not enable control-api"
+
       - name: Upload XCFramework
         uses: actions/upload-artifact@v4
         with:
@@ -137,6 +152,21 @@ jobs:
             echo "$libs" | grep -q "^jni/$abi/libshoes\.so$" \
               || { echo "Missing libshoes.so for $abi"; exit 1; }
           done
+
+      - name: Assert the control API is not built into the mobile library
+        run: |
+          set -euo pipefail
+          # The control API must never ship in a mobile artifact. Because the
+          # `control-api` feature is non-default, the only way it could be
+          # included is a mobile build script enabling it. A symbol/string check
+          # on the built .a/.so is unreliable here — the artifacts are stripped
+          # and fat-LTO dead-code-eliminates the unreferenced api module even
+          # when the feature is on — so guard the source of truth: the build
+          # commands themselves.
+          if grep -REn -- 'control-api' scripts/build-ios.sh scripts/build-android.sh; then
+            echo "ERROR: a mobile build script enables the control-api feature"; exit 1
+          fi
+          echo "OK: mobile build scripts do not enable control-api"
 
       - name: Upload AAR
         uses: actions/upload-artifact@v4

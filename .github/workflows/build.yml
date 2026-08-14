@@ -115,11 +115,11 @@ jobs:
 
       - name: Build binary (using cross)
         if: matrix.use_cross == true
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --locked --features control-api --target ${{ matrix.target }}
 
       - name: Build binary (native)
         if: matrix.use_cross == false
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --features control-api --target ${{ matrix.target }}
 
       # This step used to end in `|| echo "Binary test failed, but file
       # exists"`, so the binary could fail to run and the job still went green.
