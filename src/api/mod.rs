@@ -86,6 +86,8 @@ where
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
+        // Conventional for SSE: stop intermediaries buffering the stream.
+        .header("cache-control", "no-cache")
         .body(BodyExt::boxed(body))
         .unwrap()
 }

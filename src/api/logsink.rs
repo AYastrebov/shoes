@@ -70,7 +70,9 @@ pub fn global_log_stream() -> (Vec<String>, broadcast::Receiver<String>) {
 }
 
 /// Test-only helper: returns a `BroadcastLogWriter` bound to the same global
-/// `SHARED` state used by `global_log_stream`.
+/// `SHARED` state used by `global_log_stream`. Gated to test builds so it is
+/// not part of the crate's release public API.
+#[cfg(test)]
 pub fn install_for_test() -> (BroadcastLogWriter, ()) {
     (BroadcastLogWriter::new(), ())
 }
