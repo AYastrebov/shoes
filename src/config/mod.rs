@@ -21,6 +21,31 @@ pub use pem::convert_cert_paths;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
 
+/// Validates a config given as a YAML string, without applying it: parses it
+/// through the same `Vec<Config>` shape `load_configs` produces, then runs it
+/// through the real (pure, side-effect-free) validator. This does NOT resolve
+/// relative rule-set paths the way `load_configs` does for on-disk files
+/// (that resolution needs the source filename, which a bare string doesn't
+/// have) — a config that references rule-sets by relative path will fail
+/// here even though it would succeed once written to disk and loaded
+/// normally.
+///
+/// `allow(dead_code)`: `src/main.rs` re-declares its own module tree and does
+/// not (yet) include `mod api`, so in the `shoes` binary target this function
+/// has no caller even though `src/api/handlers.rs` (compiled only into the
+/// lib target so far) calls it — same situation as `connection_registry`'s
+/// read side in `src/main.rs`. This goes away once a later task wires
+/// `crate::api::serve` into `main.rs`.
+#[cfg(feature = "control-api")]
+#[allow(dead_code)]
+pub fn validate_config_str(config_str: &str) -> Result<(), String> {
+    let configs = serde_yaml::from_str::<Vec<Config>>(config_str)
+        .map_err(|e| format!("could not parse config YAML: {e}"))?;
+    create_server_configs(configs)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Rewrite relative rule-set paths so they resolve against the config file that
 /// declared them, letting a config directory be relocated intact.
 ///
