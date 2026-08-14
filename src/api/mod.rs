@@ -92,6 +92,42 @@ where
         .unwrap()
 }
 
+// GET /api/events returns a text/event-stream body of connection open/close
+// events plus a periodic metrics snapshot tick. Subscribing before entering
+// the select loop matters: `connection_registry::register`/`Drop` only send
+// an event when `receiver_count() > 0`, so subscribing first guarantees this
+// handler observes every open/close that happens after the client connects.
+fn events_stream() -> impl futures::Stream<Item = Result<Bytes, Infallible>> + Send + Sync + 'static
+{
+    let rx = crate::connection_registry::subscribe_events();
+    let interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    futures::stream::unfold((rx, interval), |(mut rx, mut interval)| async move {
+        tokio::select! {
+            ev = rx.recv() => {
+                let frame = match ev {
+                    Ok(ev) => Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&ev).unwrap()
+                    )),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        Bytes::from(format!("data: {{\"event\":\"lag\",\"skipped\":{n}}}\n\n"))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                };
+                Some((Ok(frame), (rx, interval)))
+            }
+            _ = interval.tick() => {
+                let m = crate::connection_registry::metrics_counters();
+                let frame = Bytes::from(format!(
+                    "data: {{\"event\":\"metrics\",\"active_connections\":{},\"total_connections\":{},\"total_up_bytes\":{},\"total_down_bytes\":{}}}\n\n",
+                    m.active_connections, m.total_connections, m.total_up_bytes, m.total_down_bytes,
+                ));
+                Some((Ok(frame), (rx, interval)))
+            }
+        }
+    })
+}
+
 fn logs_stream() -> impl futures::Stream<Item = Result<Bytes, Infallible>> + Send + Sync + 'static {
     let (replay, rx) = logsink::global_log_stream();
     let replay_stream = futures::stream::iter(
@@ -126,6 +162,7 @@ async fn route(req: Request<hyper::body::Incoming>, state: Arc<ApiState>) -> Res
         (&hyper::Method::GET, "/api/metrics") => handlers::metrics(&state),
         (&hyper::Method::GET, "/api/config") => handlers::get_config(&state),
         (&hyper::Method::GET, "/api/logs") => sse_response(logs_stream()),
+        (&hyper::Method::GET, "/api/events") => sse_response(events_stream()),
         (&hyper::Method::PUT, "/api/config") => {
             let bytes = match http_body_util::BodyExt::collect(req.into_body()).await {
                 Ok(c) => c.to_bytes(),
@@ -386,6 +423,71 @@ mod tests {
                 .contains("content-type: text/event-stream"),
             "head was: {head}"
         );
+    }
+
+    /// Reads from an already-connected SSE stream until `needle` appears in
+    /// the accumulated buffer, or the overall timeout elapses. SSE is an
+    /// infinite stream, so `read_to_end` (as `http_get` uses) would hang
+    /// forever; this polls incrementally instead.
+    async fn read_sse_until(
+        stream: &mut tokio::net::TcpStream,
+        buf: &mut String,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut chunk = [0u8; 4096];
+        while !buf.contains(needle) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                remaining > std::time::Duration::ZERO,
+                "timed out waiting for {needle:?}; buffer so far: {buf}"
+            );
+            let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("timed out waiting for {needle:?}; buffer so far: {buf}")
+                })
+                .unwrap();
+            assert!(
+                n > 0,
+                "connection closed before {needle:?} arrived; buffer so far: {buf}"
+            );
+            buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    }
+
+    #[tokio::test]
+    async fn events_stream() {
+        let (addr, token) = spawn().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            format!("GET /api/events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut buf = String::new();
+        let per_phase = std::time::Duration::from_secs(5);
+
+        // The immediate first tick of `tokio::time::interval` fires right
+        // after connecting, before any real 5s has elapsed. Its arrival
+        // proves the handler has already subscribed to the events channel
+        // (subscribe happens before the select loop that produces the
+        // tick), which is the precondition for `register()` below to emit
+        // an "open" event at all (it only sends when receiver_count() > 0).
+        read_sse_until(&mut stream, &mut buf, "\"event\":\"metrics\"", per_phase).await;
+
+        let addr_for_event: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let handle = crate::connection_registry::register(addr_for_event, "test");
+        buf.clear();
+        read_sse_until(&mut stream, &mut buf, "\"event\":\"open\"", per_phase).await;
+        assert!(
+            buf.contains("54321"),
+            "open event should carry our unique client_addr; buffer was: {buf}"
+        );
+
+        drop(handle);
+        buf.clear();
+        read_sse_until(&mut stream, &mut buf, "\"event\":\"close\"", per_phase).await;
     }
 
     #[tokio::test]
