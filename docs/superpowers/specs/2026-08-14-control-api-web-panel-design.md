@@ -156,9 +156,12 @@ channel write.
 - **TUN is packet-based**, not stream-based; TUN inbounds are out of scope for the
   counting wrapper in v1 (they may register with approximate/no byte counts). This
   is a follow-up.
-- **hysteria2 and tuic inbounds run their own accept loops** that are not wired to
-  the connection registry, so connections via those protocols are invisible to
-  `/api/connections` and undercount `/api/metrics`. This is a follow-up.
+- **hysteria2 and tuic proxied TCP streams are registered and byte-counted** (each
+  bidirectional QUIC stream registers with the inbound label `hysteria2`/`tuic` and
+  is wrapped in the counting stream, like the TCP/QUIC paths). Their **UDP sessions**
+  (datagram-based, not `AsyncStream`) are still **not** tracked, so UDP-relayed
+  traffic through these protocols is invisible to `/api/connections` and undercounts
+  `/api/metrics`. Wiring UDP-session accounting is a follow-up.
 - **`PUT /api/config` only takes effect** if the configured `config_path` is one
   of the running config files and automatic reload is enabled (not `--no-reload`);
   otherwise the write succeeds (200) but is not applied.

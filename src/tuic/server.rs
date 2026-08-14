@@ -276,6 +276,7 @@ async fn run_bidirectional_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let client_addr = connection.remote_address();
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
             Ok(s) => s,
@@ -296,8 +297,14 @@ async fn run_bidirectional_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                client_addr,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -321,7 +328,13 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    client_addr: SocketAddr,
 ) -> std::io::Result<()> {
+    // Register with the connection registry; the handle deregisters on drop
+    // when this task ends. Feature-off (`control-api` disabled) this is a
+    // zero-sized no-op and `counted` below is the identity function.
+    let handle = crate::connection_registry::register(client_addr, "tuic");
+
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
     if tuic_version != TUIC_VERSION {
@@ -341,8 +354,12 @@ async fn process_tcp_stream(
     let remote_location = read_address(&mut recv, &mut stream_reader)
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
+    handle.set_target(remote_location.to_string());
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(

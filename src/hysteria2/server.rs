@@ -778,6 +778,7 @@ async fn run_tcp_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let client_addr = connection.remote_address();
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
             Ok(s) => s,
@@ -797,8 +798,14 @@ async fn run_tcp_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                client_addr,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -878,7 +885,13 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    client_addr: SocketAddr,
 ) -> std::io::Result<()> {
+    // Register with the connection registry; the handle deregisters on drop
+    // when this task ends. Feature-off (`control-api` disabled) this is a
+    // zero-sized no-op and `counted` below is the identity function.
+    let handle = crate::connection_registry::register(client_addr, "hysteria2");
+
     let (remote_location, stream_reader) = match handle_tcp_header(&mut send, &mut recv).await {
         Ok(res) => res,
         Err(e) => {
@@ -886,8 +899,12 @@ async fn process_tcp_stream(
             return Err(e);
         }
     };
+    handle.set_target(remote_location.to_string());
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
