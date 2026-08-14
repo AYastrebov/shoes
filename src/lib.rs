@@ -62,6 +62,7 @@ mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
 mod client_proxy_selector;
+pub mod connection_registry;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;

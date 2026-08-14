@@ -24,6 +24,7 @@ path = "src/main.rs"
 [features]
 default = []
 ffi = []  # Enable FFI module for non-Android builds
+control-api = []  # Enable the feature-gated control API
 
 [dependencies]
 async-trait = "*"
