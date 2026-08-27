@@ -6,6 +6,12 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ master, mobile ]
+  # For the audit job alone (the other jobs skip scheduled runs): an advisory
+  # published against an unchanged lockfile used to go unnoticed until
+  # something else landed — the chacha20 yank sat exactly there, failing the
+  # first push that came along instead of the day it happened.
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 # Read-only by default. The only job that needs more is the release step in
@@ -31,6 +37,8 @@ env:
 jobs:
   fmt:
     name: Format
+    # Code did not change on a schedule tick; only the advisory database did.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,6 +55,7 @@ jobs:
 
   clippy:
     name: Clippy (host)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -62,6 +71,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: clippy-host
+          cache-on-failure: true
 
       # Scoped to lib and bins on purpose. --all-targets currently reports
       # around fifteen further lints in test code; widening this needs that
@@ -71,6 +81,7 @@ jobs:
 
   clippy-android:
     name: Clippy (aarch64-linux-android)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -87,6 +98,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: clippy-android
+          cache-on-failure: true
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2

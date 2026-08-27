@@ -12,6 +12,12 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ master, mobile ]
+    # A docs-only PR does not need two macOS runners and an NDK build; Test
+    # and Lint still run on it.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
@@ -45,6 +51,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ios
+          cache-on-failure: true
 
       # cbindgen has no taiki-e/install-action manifest, so it is cached as a
       # binary the same way cargo-ndk is below. Building it from source on
@@ -88,6 +95,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: macos-ffi
+          cache-on-failure: true
 
       # The desktop client's privileged host on macOS is a Network Extension
       # provider, which is Swift and so consumes the same C API as iOS -- the
@@ -160,6 +168,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: android
+          cache-on-failure: true
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
