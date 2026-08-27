@@ -1,0 +1,35 @@
+name: aws-lc build tools
+description: >
+  Install what aws-lc-sys needs to assemble its crypto on windows-msvc:
+  NASM on x64, clang-cl (LLVM) on arm64 — NASM is an x86 assembler and does
+  not exist there; aws-lc-rs documents clang-cl instead
+  (https://aws.github.io/aws-lc-rs/requirements/windows.html).
+
+  One definition, used by test.yml and build.yml both: these steps were
+  duplicated across workflows once, which is the same silent-drift shape the
+  TUN backends had before StackHandle. Installed through choco rather than a
+  third-party action so this adds no new pinned dependency.
+
+runs:
+  using: composite
+  steps:
+    - name: Install NASM
+      if: runner.arch == 'X64'
+      shell: pwsh
+      run: |
+        choco install nasm --no-progress -y
+        echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+    # The x64 runner image ships LLVM; the arm64 image may or may not, and
+    # the choco download is hundreds of megabytes — skip it when clang-cl is
+    # already there.
+    - name: Install LLVM (clang-cl)
+      if: runner.arch == 'ARM64'
+      shell: pwsh
+      run: |
+        if (Test-Path "C:\Program Files\LLVM\bin\clang-cl.exe") {
+          Write-Host "clang-cl already present; skipping the install"
+        } else {
+          choco install llvm --no-progress -y
+        }
+        echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH

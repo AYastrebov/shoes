@@ -12,6 +12,12 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ master, mobile ]
+    # A docs-only PR does not need seven release builds; Test and Lint still
+    # run on it and are the checks with jurisdiction over prose.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
@@ -88,24 +94,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # aws-lc-sys assembles its own crypto on windows-msvc, as in test.yml's
-      # Windows jobs: NASM on x64; on arm64 NASM does not exist (an x86
-      # assembler) and aws-lc-rs documents clang-cl instead.
-      - name: Install NASM
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: choco install nasm --no-progress -y
-
-      - name: Add NASM to PATH
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
-
-      - name: Install LLVM (clang-cl)
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        run: choco install llvm --no-progress -y
-
-      - name: Add LLVM to PATH
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        run: echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+      - name: Install aws-lc build tools
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/aws-lc-tools
 
       # musl-gcc from musl-tools targets the host architecture, which is the
       # target architecture on these native runners — the whole reason cross
@@ -116,10 +107,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # cache-on-failure, because the run that needs the cache most is the
+      # retry of one that just failed.
       - name: Setup cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
+          cache-on-failure: true
 
       # The musl env vars point cargo's linker and cc-rs (aws-lc-sys,
       # jemalloc, blake3 all compile C) at musl-gcc for the musl targets;
@@ -152,36 +146,29 @@ jobs:
       # port, and they cover the config paths the mobile work added. Only
       # cert-free examples can be used -- the rest reference PEM files that
       # are not in the repository.
-      # The Windows arm of validation is target-gated code that no other
-      # runner can execute, and tun_windows.yaml is the config it guards, so
-      # the release binary dry-runs it here — on both architectures, since
-      # each builds on a runner that can run what it built. The Unix-shaped
-      # TUN examples would be refused by that same arm and are left to the
-      # Linux leg.
-      - name: Smoke test binary (Windows)
-        if: runner.os == 'Windows'
+      #
+      # Every leg runs this, not just x86_64-linux-gnu: the binaries run on
+      # the runner that built them now, and an arm64 or musl artifact that
+      # failed on startup used to be exactly what this could not catch. Only
+      # the example list varies — TUN configs are validated by target-gated
+      # arms, so each platform dry-runs the ones its own arm accepts;
+      # tun_windows.yaml in particular is the one config no non-Windows
+      # runner can push through the Windows validation it exists to exercise.
+      - name: Smoke test binary
         shell: bash
         run: |
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
           "$bin" --version
-          for cfg in socks_basic multi_hop_chain tun_windows sniff \
-                     hysteria2_client tuic_client mieru_client; do
-            echo "==> dry run: examples/$cfg.yaml"
-            "$bin" --dry-run "examples/$cfg.yaml"
-          done
 
-      # Every Linux leg, not just x86_64-gnu: the binaries run on the runner
-      # that built them now, and an arm64 or musl artifact that fails on
-      # startup used to be exactly what this could not catch.
-      - name: Smoke test binary
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
-          "$bin" --version
-          for cfg in socks_basic multi_hop_chain tun_vpn tun_fake_ip tun_windows amneziawg_client sniff \
-                     hysteria2_client tuic_client mieru_client; do
+          configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client"
+          case "$RUNNER_OS" in
+            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client" ;;
+            Windows) configs="$configs tun_windows" ;;
+            macOS) configs="$configs amneziawg_client" ;;
+          esac
+
+          for cfg in $configs; do
             echo "==> dry run: examples/$cfg.yaml"
             "$bin" --dry-run "examples/$cfg.yaml"
           done
