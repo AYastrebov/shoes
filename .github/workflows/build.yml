@@ -65,13 +65,18 @@ jobs:
             binary_name: shoes
             asset_name: macos-arm64
 
-          # Windows builds
-          # TODO: enable when working
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_cross: false
-          #   binary_name: shoes.exe
-          #   asset_name: windows-x86_64
+          # Windows build. wintun.dll is deliberately not bundled: it is
+          # WireGuard's signed binary with its own license, the loader
+          # verifies its signature at runtime, and CONFIG.md tells users
+          # where to get it.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            binary_name: shoes.exe
+            asset_name: windows-x86_64
+          # Windows arm64 stays off: the TUN backend is scoped to Windows 11
+          # x64 (see docs/specs/2026-08-27-windows-tun-backend.md), and the
+          # aws-lc-sys cross-build to aarch64-pc-windows-msvc is untested.
           # - target: aarch64-pc-windows-msvc
           #   os: windows-latest
           #   use_cross: false
@@ -85,6 +90,16 @@ jobs:
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
+
+      # aws-lc-sys assembles its own crypto on windows-msvc and wants NASM
+      # for it, as in test.yml's Windows job.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
+      - name: Add NASM to PATH
+        if: runner.os == 'Windows'
+        run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
       - name: Install system dependencies
         if: matrix.use_cross == true
@@ -126,7 +141,11 @@ jobs:
       # This step used to end in `|| echo "Binary test failed, but file
       # exists"`, so the binary could fail to run and the job still went green.
       # A check that cannot fail is not a check.
+      #
+      # shell: bash on every runner: the Windows runner's default is
+      # PowerShell, which parses none of this.
       - name: Verify binary
+        shell: bash
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
@@ -139,6 +158,23 @@ jobs:
       # port, and they cover the config paths the mobile work added. Only
       # cert-free examples can be used -- the rest reference PEM files that
       # are not in the repository.
+      # The Windows arm of validation is target-gated code that no other
+      # runner can execute, and tun_windows.yaml is the config it guards, so
+      # the release binary dry-runs it here. The Unix-shaped TUN examples
+      # would be refused by that same arm and are left to the Linux leg.
+      - name: Smoke test binary (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          "$bin" --version
+          for cfg in socks_basic multi_hop_chain tun_windows sniff \
+                     hysteria2_client tuic_client mieru_client; do
+            echo "==> dry run: examples/$cfg.yaml"
+            "$bin" --dry-run "examples/$cfg.yaml"
+          done
+
       - name: Smoke test binary
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
@@ -163,7 +199,10 @@ jobs:
 
       # No `strip` here: the release profile already sets strip = true
       # (Cargo.toml), so running it again was a no-op that could only fail.
+      # tar.gz on Windows too: Windows 11 opens it natively, and one format
+      # keeps the release job's collection glob honest.
       - name: Package binary
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p artifacts
