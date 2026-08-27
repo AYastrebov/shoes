@@ -36,53 +36,47 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds (using cross for cross-compilation).
+          # Every leg builds natively on a runner of its own architecture —
+          # the arm64 hosted runners are free for public repositories — so
+          # every leg can also run the binary it built. `cross` and its
+          # docker images are gone with the cross-compilation; the musl legs
+          # need only the musl-tools package and a linker setting.
           # asset_name is the friendly name used for the release download; the
           # target triple (with its "unknown" vendor) is still what we build.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
             binary_name: shoes
             asset_name: linux-x86_64
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            use_cross: true
             binary_name: shoes
             asset_name: linux-x86_64-musl
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
+            os: ubuntu-24.04-arm
             binary_name: shoes
             asset_name: linux-arm64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: true
+            os: ubuntu-24.04-arm
             binary_name: shoes
             asset_name: linux-arm64-musl
 
-          # macOS build (native compilation). Intel macOS was dropped
-          # deliberately: nothing deploys there.
+          # macOS build. Intel macOS was dropped deliberately: nothing
+          # deploys there.
           - target: aarch64-apple-darwin
             os: macos-latest
-            use_cross: false
             binary_name: shoes
             asset_name: macos-arm64
 
           # Windows builds. wintun.dll is deliberately not bundled: it is
           # WireGuard's signed binary with its own license, the loader
           # verifies its signature at runtime, and CONFIG.md tells users
-          # where to get it. arm64 builds natively on the windows-11-arm
-          # runner (free for public repositories) rather than cross-compiling
-          # from x64, which is what lets its smoke test actually run the
-          # binary it built.
+          # where to get it.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            use_cross: false
             binary_name: shoes.exe
             asset_name: windows-x86_64
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm
-            use_cross: false
             binary_name: shoes.exe
             asset_name: windows-arm64
 
@@ -113,41 +107,29 @@ jobs:
         if: matrix.target == 'aarch64-pc-windows-msvc'
         run: echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
-      - name: Install system dependencies
-        if: matrix.use_cross == true
+      # musl-gcc from musl-tools targets the host architecture, which is the
+      # target architecture on these native runners — the whole reason cross
+      # could go.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
-          case "${{ matrix.target }}" in
-            "aarch64-unknown-linux-gnu")
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              ;;
-            "aarch64-unknown-linux-musl")
-              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-              ;;
-            "x86_64-unknown-linux-musl")
-              sudo apt-get install -y musl-tools
-              ;;
-          esac
-
-      # Was `cargo install cross`, which compiled cross from source once per
-      # matrix leg that needed it. install-action fetches a release binary.
-      - name: Install cross-compilation tool
-        if: matrix.use_cross == true
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
-        with:
-          tool: cross
+          sudo apt-get install -y musl-tools
 
       - name: Setup cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build binary (using cross)
-        if: matrix.use_cross == true
-        run: cross build --release --locked --target ${{ matrix.target }}
-
-      - name: Build binary (native)
-        if: matrix.use_cross == false
+      # The musl env vars point cargo's linker and cc-rs (aws-lc-sys,
+      # jemalloc, blake3 all compile C) at musl-gcc for the musl targets;
+      # they name a specific triple each, so every other leg ignores them.
+      - name: Build binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # This step used to end in `|| echo "Binary test failed, but file
@@ -189,8 +171,11 @@ jobs:
             "$bin" --dry-run "examples/$cfg.yaml"
           done
 
+      # Every Linux leg, not just x86_64-gnu: the binaries run on the runner
+      # that built them now, and an arm64 or musl artifact that fails on
+      # startup used to be exactly what this could not catch.
       - name: Smoke test binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
