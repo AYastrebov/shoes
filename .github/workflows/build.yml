@@ -26,7 +26,10 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    # Named by the friendly asset name, not the target triple: the triple's
+    # "unknown" vendor is rustc's identifier and still what we build, but it
+    # has no business in a check list a human scans.
+    name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
