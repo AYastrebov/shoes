@@ -65,23 +65,23 @@ jobs:
             binary_name: shoes
             asset_name: macos-arm64
 
-          # Windows build. wintun.dll is deliberately not bundled: it is
+          # Windows builds. wintun.dll is deliberately not bundled: it is
           # WireGuard's signed binary with its own license, the loader
           # verifies its signature at runtime, and CONFIG.md tells users
-          # where to get it.
+          # where to get it. arm64 builds natively on the windows-11-arm
+          # runner (free for public repositories) rather than cross-compiling
+          # from x64, which is what lets its smoke test actually run the
+          # binary it built.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
             binary_name: shoes.exe
             asset_name: windows-x86_64
-          # Windows arm64 stays off: the TUN backend is scoped to Windows 11
-          # x64 (see docs/specs/2026-08-27-windows-tun-backend.md), and the
-          # aws-lc-sys cross-build to aarch64-pc-windows-msvc is untested.
-          # - target: aarch64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_cross: false
-          #   binary_name: shoes.exe
-          #   asset_name: windows-arm64
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            use_cross: false
+            binary_name: shoes.exe
+            asset_name: windows-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -91,15 +91,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # aws-lc-sys assembles its own crypto on windows-msvc and wants NASM
-      # for it, as in test.yml's Windows job.
+      # aws-lc-sys assembles its own crypto on windows-msvc, as in test.yml's
+      # Windows jobs: NASM on x64; on arm64 NASM does not exist (an x86
+      # assembler) and aws-lc-rs documents clang-cl instead.
       - name: Install NASM
-        if: runner.os == 'Windows'
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: choco install nasm --no-progress -y
 
       - name: Add NASM to PATH
-        if: runner.os == 'Windows'
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Install LLVM (clang-cl)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: choco install llvm --no-progress -y
+
+      - name: Add LLVM to PATH
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Install system dependencies
         if: matrix.use_cross == true
@@ -160,10 +169,12 @@ jobs:
       # are not in the repository.
       # The Windows arm of validation is target-gated code that no other
       # runner can execute, and tun_windows.yaml is the config it guards, so
-      # the release binary dry-runs it here. The Unix-shaped TUN examples
-      # would be refused by that same arm and are left to the Linux leg.
+      # the release binary dry-runs it here — on both architectures, since
+      # each builds on a runner that can run what it built. The Unix-shaped
+      # TUN examples would be refused by that same arm and are left to the
+      # Linux leg.
       - name: Smoke test binary (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail

@@ -65,10 +65,18 @@ jobs:
   # elevation. The wintun-specific half (adapter creation, the event wait) is
   # behind an #[ignore]d test that needs Administrator and wintun.dll, run by
   # hand -- see docs/specs/2026-08-27-windows-tun-backend.md.
+  #
+  # Both architectures, natively: windows-11-arm runners are free for public
+  # repositories, so arm64 gets the same suite instead of a cross-compiled
+  # binary nothing ever ran.
   windows-test:
-    name: Test Windows build
-    runs-on: windows-latest
+    name: Test Windows build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
 
     steps:
       - uses: actions/checkout@v4
@@ -79,16 +87,29 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: windows-check
+          key: windows-check-${{ matrix.runner }}
 
-      # aws-lc-sys assembles its own crypto on windows-msvc and wants NASM for
-      # it. Installed through choco rather than a third-party action so this
-      # job adds no new pinned dependency.
+      # aws-lc-sys assembles its own crypto on windows-msvc. On x64 that
+      # wants NASM; on arm64 NASM does not exist (it is an x86 assembler) and
+      # aws-lc-rs documents clang-cl as the compiler instead
+      # (https://aws.github.io/aws-lc-rs/requirements/windows.html).
+      # Installed through choco rather than a third-party action so this job
+      # adds no new pinned dependency.
       - name: Install NASM
+        if: matrix.runner == 'windows-latest'
         run: choco install nasm --no-progress -y
 
       - name: Add NASM to PATH
+        if: matrix.runner == 'windows-latest'
         run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Install LLVM (clang-cl)
+        if: matrix.runner == 'windows-11-arm'
+        run: choco install llvm --no-progress -y
+
+      - name: Add LLVM to PATH
+        if: matrix.runner == 'windows-11-arm'
+        run: echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       # --bins as well as --lib: src/main.rs declares its module tree
       # independently (the trap AGENTS.md documents), so a Windows-only
