@@ -464,8 +464,12 @@ and the new code's argument is the shared loop plus a thin device.
   example and CONFIG.md show the manual commands.
 - **The Windows service, IPC, GUI, packaging.** Sub-projects #4–#6 of the
   desktop client.
-- **Windows-on-ARM and Windows 10.** Windows 11 x64 only for now; nothing
-  checks a version, but nothing older is tested or promised.
+- **Windows 10.** Nothing checks a version, but nothing older than
+  Windows 11 is tested or promised. Windows-on-ARM moved out of this list
+  after the fact: CI builds `aarch64-pc-windows-msvc` natively on a
+  `windows-11-arm` runner and runs the full suite there, so the stack layer
+  is tested — the wintun driver path itself has still not been exercised by
+  hand on arm hardware.
 - **BorrowedFd on Windows.** A future host handing over an existing adapter
   (by name or handle) would be a new `DevicePolicy` shape; nothing needs it
   yet.
