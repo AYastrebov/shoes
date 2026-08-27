@@ -21,9 +21,17 @@ env:
 
 jobs:
   test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
+    # Both architectures, natively — the arm64 runners are free for public
+    # repositories, and the release ships arm64 Linux binaries whose code
+    # paths (the unix TUN backend included) otherwise only ever ran on
+    # x86_64.
+    name: Unit Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
 
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +46,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: test
+          key: test-${{ matrix.runner }}
 
       # No separate `cargo build` step: `cargo test` builds what it needs, and
       # doing both compiled the tree twice. No --verbose either -- it buried
