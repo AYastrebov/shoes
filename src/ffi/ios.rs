@@ -276,12 +276,7 @@ unsafe fn start_service(
     // cannot run is reported as a failed start. Doing it inside the spawned
     // task meant shoes_start() returned success and the app had to discover
     // the failure by noticing shoes_is_running() had gone false on its own.
-    let prepared = match runtime.block_on(async {
-        match device_fd {
-            Some(fd) => common::prepare_from_config_with_fd(&config_str, fd).await,
-            None => common::prepare_from_config(&config_str).await,
-        }
-    }) {
+    let prepared = match runtime.block_on(common::prepare_from_config(&config_str, device_fd)) {
         Ok(prepared) => prepared,
         Err(e) => {
             let msg = e.to_string();
@@ -563,7 +558,9 @@ mod tests {
     /// section, it does not stand in for one.
     #[test]
     fn start_with_fd_reports_a_rejected_config() {
+        // Registry first, then the error lock, in that order everywhere.
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         let yaml = CString::new("---\n[]\n").unwrap();
         let handle = unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic) };
         assert_eq!(handle, -1);
@@ -574,6 +571,7 @@ mod tests {
 
     #[test]
     fn start_with_fd_rejects_a_null_config_and_says_so() {
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic) };
         assert_eq!(handle, -1);
         assert_eq!(

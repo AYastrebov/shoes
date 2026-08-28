@@ -274,7 +274,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // cannot run is reported as a failed start. Doing it inside the spawned
     // task meant start() returned success and the app had to discover the
     // failure by noticing isRunning() had gone false on its own.
-    let prepared = match runtime.block_on(common::prepare_from_config(&config_str)) {
+    let prepared = match runtime.block_on(common::prepare_from_config(&config_str, None)) {
         Ok(prepared) => prepared,
         Err(e) => {
             let msg = e.to_string();

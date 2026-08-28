@@ -27,17 +27,18 @@ pub use crate::control::ServiceHandle as TunServiceHandle;
 /// closes one it did not open.
 pub async fn prepare_from_config(
     config_yaml: &str,
+    device_fd: Option<i32>,
 ) -> std::io::Result<crate::control::PreparedService> {
-    crate::control::prepare_from_config(config_yaml, crate::control::DevicePolicy::BorrowedFd).await
-}
-
-/// [`prepare_from_config`] with the descriptor passed rather than parsed.
-/// See `crate::control::prepare_from_config_with_fd`.
-pub async fn prepare_from_config_with_fd(
-    config_yaml: &str,
-    device_fd: i32,
-) -> std::io::Result<crate::control::PreparedService> {
-    crate::control::prepare_from_config_with_fd(config_yaml, device_fd).await
+    match device_fd {
+        Some(fd) => crate::control::prepare_from_config_with_fd(config_yaml, fd).await,
+        None => {
+            crate::control::prepare_from_config(
+                config_yaml,
+                crate::control::DevicePolicy::BorrowedFd,
+            )
+            .await
+        }
+    }
 }
 
 /// Global log file handle for file-based logging.
@@ -156,17 +157,20 @@ pub fn is_service_running() -> bool {
     false
 }
 
+/// Serialize tests that mutate the shared LAST_ERROR state. pub(crate)
+/// because two suites touch it -- these tests and `ffi::ios::tests`, which
+/// asserts on the message a failed start leaves -- and cargo runs them on
+/// different threads; two lock domains over one global is a flake.
+#[cfg(test)]
+pub(crate) static LAST_ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialize tests that mutate shared LAST_ERROR state.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_set_and_get_last_error() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = LAST_ERROR_TEST_LOCK.lock().unwrap();
         clear_last_error();
 
         assert!(get_last_error().is_none());
@@ -177,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_clear_last_error() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = LAST_ERROR_TEST_LOCK.lock().unwrap();
 
         set_last_error("some error".to_string());
         assert!(get_last_error().is_some());
@@ -188,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_set_overwrites_previous_error() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = LAST_ERROR_TEST_LOCK.lock().unwrap();
         clear_last_error();
 
         set_last_error("first error".to_string());
