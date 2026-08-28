@@ -1,0 +1,108 @@
+name: Release Apple
+
+# Release, then tag. A remote binaryTarget in Package.swift needs the
+# checksum of the zip for the tag it is on, and that zip comes from that
+# tag's build -- so no tag-triggered flow can produce a manifest that names
+# its own release. This one builds first, computes the checksum, commits
+# Package.swift, tags that commit, and publishes. The tag therefore points
+# at a manifest that is correct, and nothing force-moves a published tag.
+#
+# It is the only producer of Shoes.xcframework.zip. mobile.yml's tag run
+# attaches the AAR alone.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the v (e.g. 0.2.15). Must match Cargo.toml.'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-apple
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, checksum, tag, publish
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the version matches Cargo.toml
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "$cargo_version" != "${{ inputs.version }}" ]; then
+            echo "Cargo.toml says $cargo_version, input says ${{ inputs.version }}"
+            exit 1
+          fi
+          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "tag v${{ inputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: apple
+
+      - name: Cache cbindgen binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-v1
+
+      - name: Install cbindgen
+        run: command -v cbindgen || cargo install cbindgen --locked
+
+      - name: Build the XCFramework
+        run: bash scripts/build-apple.sh
+
+      - name: Zip and checksum
+        id: zip
+        run: |
+          set -euo pipefail
+          (cd output/apple && zip -r -q Shoes.xcframework.zip Shoes.xcframework/)
+          # From the package root: compute-checksum is a package command.
+          checksum=$(swift package compute-checksum output/apple/Shoes.xcframework.zip)
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "sha256 $checksum"
+
+      - name: Point Package.swift at this release
+        run: |
+          set -euo pipefail
+          sed -i '' 's/^let shoesRelease = ".*"$/let shoesRelease = "v${{ inputs.version }}"/' Package.swift
+          sed -i '' 's/^let shoesChecksum = ".*"$/let shoesChecksum = "${{ steps.zip.outputs.checksum }}"/' Package.swift
+          git diff Package.swift
+
+      # Committed as the release author, not as the bot: this is a change to
+      # the tree that a tag will point at.
+      - name: Commit and tag
+        run: |
+          set -euo pipefail
+          git config user.name "Andrey Yastrebov"
+          git config user.email "ayastrebov@gmail.com"
+          git add Package.swift
+          git commit -m "release: ${{ inputs.version }}"
+          git tag -a "v${{ inputs.version }}" -m "${{ inputs.version }}"
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "v${{ inputs.version }}"
+
+      - name: Publish the release with the XCFramework
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ inputs.version }}
+          files: output/apple/Shoes.xcframework.zip
+          draft: false
+          generate_release_notes: true

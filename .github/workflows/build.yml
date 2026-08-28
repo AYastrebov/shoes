@@ -18,6 +18,10 @@ on:
       - '**.md'
       - 'docs/**'
       - 'LICENSE'
+      # Swift-only changes are mobile.yml's business.
+      - 'swift/**'
+      - 'Package.swift'
+      - '.swift-format'
   workflow_dispatch:
 
 permissions:

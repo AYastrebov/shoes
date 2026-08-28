@@ -1,15 +1,31 @@
 name: Build Mobile Libraries
 
-# Tags only, plus pull requests and manual runs. A branch push runs Test and
-# Lint; it does not spend five macOS-runner minutes producing artifacts that
-# nothing downloads. The cost of that is real and worth knowing: the Android
-# and iOS cross-builds are not compiled on a branch push, so a break in them is
-# caught when a tag is pushed rather than when the code lands. Run this
-# workflow by hand (Actions -> Run workflow) before tagging if a change touched
-# the FFI, the JNI layer or the build scripts.
+# Tags, pull requests and manual runs, as before -- plus branch pushes that
+# touch the Swift package or what it wraps. The Swift under swift/ is this
+# repository's own code and no other workflow compiles it (test.yml runs on
+# ubuntu), so leaving it to the tag would let a push that breaks the package
+# stay green until someone opened a PR. The Android and release jobs keep
+# the old policy through their `if:` below, so a Swift push buys the Apple
+# jobs and nothing else. Path filters are not evaluated for tag pushes, so
+# a tag still runs everything.
+#
+# The cost the old policy accepted still stands for Android: its build is
+# not compiled on a branch push, so a break there is caught when a tag is
+# pushed rather than when the code lands. Run this workflow by hand
+# (Actions -> Run workflow) before tagging if a change touched the JNI
+# layer or build-android.sh.
 on:
   push:
     tags: [ 'v*' ]
+    branches: [ master, mobile ]
+    paths:
+      - 'swift/**'
+      - 'Package.swift'
+      - '.swift-format'
+      - 'include/**'
+      - 'src/ffi/**'
+      - 'scripts/build-apple.sh'
+      - '.github/workflows/mobile.yml'
   pull_request:
     branches: [ master, mobile ]
     # A docs-only PR does not need two macOS runners and an NDK build; Test
@@ -76,11 +92,59 @@ jobs:
           if-no-files-found: error
 
   # ──────────────────────────────────────────────────────────────────────────
-  # macOS — staticlib for the desktop Network Extension provider
+  # Swift — the ShoesTunnel package against the framework the apple job built
+  # ──────────────────────────────────────────────────────────────────────────
+  swift:
+    name: Build and test ShoesTunnel
+    needs: [ apple ]
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than inherited: Swift 6 language mode and the iOS 18
+      # SDK have a floor, and macos-latest moves without notice.
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          swift --version
+
+      # Downloaded, not rebuilt: the apple job already spent the minutes.
+      - name: Download the XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: Shoes.xcframework
+          path: output/apple/Shoes.xcframework
+
+      - name: Lint
+        run: swift format lint --strict --recursive swift Package.swift
+
+      - name: Build and test (macOS)
+        env:
+          SHOES_LOCAL_XCFRAMEWORK: "1"
+        run: |
+          swift build
+          swift test
+
+      # The macOS build above exercises the macos-arm64 slice only. This
+      # typechecks the package against the iOS SDK so the slice a consumer
+      # links on a phone cannot rot while only macOS is tested.
+      - name: Typecheck (iOS)
+        env:
+          SHOES_LOCAL_XCFRAMEWORK: "1"
+        run: xcodebuild -scheme ShoesTunnel -destination 'generic/platform=iOS' build | tail -20
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # macOS — the C surface the desktop Network Extension provider links
   # ──────────────────────────────────────────────────────────────────────────
   macos:
     name: Check the macOS C surface
     runs-on: macos-latest
+    # Not on a branch push: see the trigger comment at the top.
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
     timeout-minutes: 45
 
     steps:
@@ -151,7 +215,7 @@ jobs:
       # src/ffi/ios.rs carries tests that only compile where the module does;
       # test.yml runs on ubuntu and never sees them.
       - name: Test the FFI module
-        run: cargo test --locked --lib --features ffi,control-stats --target aarch64-apple-darwin ffi::
+        run: "cargo test --locked --lib --features ffi,control-stats --target aarch64-apple-darwin ffi::"
 
   # ──────────────────────────────────────────────────────────────────────────
   # Android — AAR with JNI .so for arm64-v8a, armeabi-v7a, x86_64 (emulator)
@@ -159,6 +223,8 @@ jobs:
   android:
     name: Build Android AAR
     runs-on: ubuntu-latest
+    # Not on a branch push: see the trigger comment at the top.
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
     timeout-minutes: 60
 
     steps:
@@ -288,18 +354,17 @@ jobs:
         with:
           path: artifacts
 
-      - name: Zip XCFramework
-        run: |
-          set -euo pipefail
-          cd artifacts
-          zip -r Shoes.xcframework.zip Shoes.xcframework/
-
       - name: Attach to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            artifacts/Shoes.xcframework.zip
-            artifacts/shoes-android/shoes-release.aar
+          # The AAR only. Shoes.xcframework.zip is attached by
+          # release-apple.yml, which computes the checksum Package.swift
+          # names and commits it before the tag exists. Re-attaching a
+          # rebuilt zip here would overwrite that asset with a byte-different
+          # one -- zip timestamps alone -- and break every consumer's
+          # checksum. This job must be unable to touch it, not merely
+          # unlikely to.
+          files: artifacts/shoes-android/shoes-release.aar
           # Published, not a draft, matching build.yml. This job and build.yml's
           # release both target the same tag; softprops/action-gh-release is
           # idempotent per tag, so whichever runs first creates the release and
