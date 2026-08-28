@@ -4,11 +4,18 @@ name: Release Apple
 # checksum of the zip for the tag it is on, and that zip comes from that
 # tag's build -- so no tag-triggered flow can produce a manifest that names
 # its own release. This one builds first, computes the checksum, commits
-# Package.swift, tags that commit, and publishes. The tag therefore points
-# at a manifest that is correct, and nothing force-moves a published tag.
+# Package.swift, pushes the branch, stages a DRAFT release carrying the zip,
+# and only then publishes it -- publishing is what creates the tag, at the
+# manifest commit. Nothing irreversible happens before the asset is safely
+# attached, and a failure after the draft exists is recovered by re-running
+# the workflow, which finds the draft and publishes it instead of rebuilding.
 #
-# It is the only producer of Shoes.xcframework.zip. mobile.yml's tag run
-# attaches the AAR alone.
+# The tag this creates is made by the API with the workflow's token, and
+# GitHub does not fire on:push workflows for that -- so mobile.yml and
+# build.yml are dispatched here, on the tag ref, to attach the AAR and the
+# desktop binaries. This workflow is the only producer of
+# Shoes.xcframework.zip; mobile.yml's release job attaches the AAR alone and
+# checks the manifest actually names its tag.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-apple
@@ -28,81 +36,89 @@ jobs:
     name: Build, checksum, tag, publish
     runs-on: macos-latest
     timeout-minutes: 90
+    env:
+      # Through env, never interpolated into scripts: an expression inside
+      # run: is expanded before the shell parses, which is an injection.
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check the version matches Cargo.toml
+      - name: Decide what this run has to do
+        id: plan
         run: |
           set -euo pipefail
-          cargo_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          if [ "$cargo_version" != "${{ inputs.version }}" ]; then
-            echo "Cargo.toml says $cargo_version, input says ${{ inputs.version }}"
-            exit 1
-          fi
-          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
-            echo "tag v${{ inputs.version }} already exists"
-            exit 1
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "version '$VERSION' is not MAJOR.MINOR.PATCH"; exit 1; }
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "tag v$VERSION already exists -- this version is released"; exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: apple
-
-      - name: Cache cbindgen binary
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-v1
-
-      - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen --locked
+          if gh release view "v$VERSION" --json isDraft,assets \
+               --jq '.isDraft and ([.assets[].name] | index("Shoes.xcframework.zip") != null)' \
+               2>/dev/null | grep -q true; then
+            # A previous run built, committed and staged the draft, then
+            # failed at publish. The zip and the committed checksum agree;
+            # rebuilding would break that. Publish what exists.
+            echo "mode=publish" >> "$GITHUB_OUTPUT"
+            echo "recovering: draft v$VERSION already carries the zip"
+          else
+            cargo_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+            [ "$cargo_version" = "$VERSION" ] \
+              || { echo "Cargo.toml says $cargo_version, input says $VERSION"; exit 1; }
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build the XCFramework
-        run: bash scripts/build-apple.sh
+        if: steps.plan.outputs.mode == 'full'
+        uses: ./.github/actions/build-apple
 
-      - name: Zip and checksum
-        id: zip
+      - name: Zip, checksum, commit the manifest, stage the draft
+        if: steps.plan.outputs.mode == 'full'
         run: |
           set -euo pipefail
           (cd output/apple && zip -r -q Shoes.xcframework.zip Shoes.xcframework/)
           # From the package root: compute-checksum is a package command.
           checksum=$(swift package compute-checksum output/apple/Shoes.xcframework.zip)
-          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
           echo "sha256 $checksum"
 
-      - name: Point Package.swift at this release
-        run: |
-          set -euo pipefail
-          sed -i '' 's/^let shoesRelease = ".*"$/let shoesRelease = "v${{ inputs.version }}"/' Package.swift
-          sed -i '' 's/^let shoesChecksum = ".*"$/let shoesChecksum = "${{ steps.zip.outputs.checksum }}"/' Package.swift
+          sed -i '' "s/^let shoesRelease = \".*\"\$/let shoesRelease = \"v$VERSION\"/" Package.swift
+          sed -i '' "s/^let shoesChecksum = \".*\"\$/let shoesChecksum = \"$checksum\"/" Package.swift
           git diff Package.swift
 
-      # Committed as the release author, not as the bot: this is a change to
-      # the tree that a tag will point at.
-      - name: Commit and tag
-        run: |
-          set -euo pipefail
+          # Committed as the release author, not as the bot: this is a
+          # change to the tree the tag will point at.
           git config user.name "Andrey Yastrebov"
           git config user.email "ayastrebov@gmail.com"
           git add Package.swift
-          git commit -m "release: ${{ inputs.version }}"
-          git tag -a "v${{ inputs.version }}" -m "${{ inputs.version }}"
-          git push origin HEAD:${{ github.ref_name }}
-          git push origin "v${{ inputs.version }}"
+          git commit -m "release: $VERSION"
+          git push origin "HEAD:$GITHUB_REF_NAME"
 
-      - name: Publish the release with the XCFramework
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: v${{ inputs.version }}
-          files: output/apple/Shoes.xcframework.zip
-          draft: false
-          generate_release_notes: true
+          # Draft: carries the tag NAME and the asset, creates no tag yet.
+          gh release create "v$VERSION" \
+            --draft \
+            --target "$(git rev-parse HEAD)" \
+            --title "v$VERSION" \
+            --generate-notes \
+            output/apple/Shoes.xcframework.zip
+
+      # Publishing the draft is the one irreversible step: it creates the
+      # tag at the draft's target commit -- the manifest commit.
+      - name: Publish
+        run: gh release edit "v$VERSION" --draft=false
+
+      # The tag now exists, made by the API with this workflow's token, which
+      # fires no on:push workflow. Dispatch the two that attach the rest of
+      # the release on the tag ref; their release jobs see refs/tags/v* and
+      # run, and action-gh-release appends to the existing release.
+      - name: Dispatch the AAR and desktop-binary builds onto the tag
+        run: |
+          set -euo pipefail
+          gh workflow run mobile.yml --ref "v$VERSION"
+          gh workflow run build.yml --ref "v$VERSION"
+          echo "Dispatched mobile.yml and build.yml on v$VERSION; their release"
+          echo "jobs attach the AAR and the desktop binaries."

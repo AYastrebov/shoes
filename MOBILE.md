@@ -101,11 +101,20 @@ x86 slice. The Apple framework ships iOS device, iOS simulator and macOS slices,
 arm64.
 
 CI (`.github/workflows/mobile.yml`) triggers on `v*` tags, on pull requests to
-`master` and `mobile`, and manually — not on a branch push, which runs Test and
-Lint only. The AAR content check therefore runs when a tag is pushed, or when
-you run the workflow by hand from the Actions tab. Do that before tagging if a
-change touched the FFI, the JNI layer or the build scripts: nothing else
-compiles the Android or iOS targets.
+`master` and `mobile`, manually, and on branch pushes that touch the Swift
+package or the FFI (`swift/**`, `Package.swift`, `include/**`, `src/ffi/**`) —
+those pushes run the Apple jobs and the macOS surface checks, not Android. The
+AAR content check runs when a tag is pushed or when you run the workflow by
+hand; do that before tagging if a change touched the JNI layer or
+`build-android.sh`, since nothing else compiles the Android targets.
+
+**Releases are cut by the `Release Apple` workflow, not by `git tag`.** It
+builds the XCFramework, writes its checksum into `Package.swift`, commits,
+publishes the release with the zip — publishing creates the tag at that
+commit — and then dispatches this workflow and `build.yml` on the tag to
+attach the AAR and the desktop binaries. A hand-pushed tag ships a manifest
+whose framework asset does not exist; the tag-triggered release job checks
+for exactly that and fails rather than publishing it.
 
 ## FFI surface
 

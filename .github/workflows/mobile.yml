@@ -58,31 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: apple
-          cache-on-failure: true
-
-      # cbindgen has no taiki-e/install-action manifest, so it is cached as a
-      # binary the same way cargo-ndk is below. Building it from source on
-      # every run cost minutes on the most expensive runner in the pipeline.
-      - name: Cache cbindgen binary
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cbindgen
-          key: cbindgen-${{ runner.os }}-v1
-
-      - name: Install cbindgen
-        run: command -v cbindgen || cargo install cbindgen --locked
-
-      - name: Build XCFramework
-        run: bash scripts/build-apple.sh
+      # The build itself is a composite action, shared with release-apple.yml
+      # so the artifact that ships is built exactly as the one CI tested.
+      - name: Build the XCFramework
+        uses: ./.github/actions/build-apple
 
       - name: Upload XCFramework
         uses: actions/upload-artifact@v4
@@ -365,6 +344,26 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
+      # A tag pushed by hand -- git tag && git push, the old habit -- reaches
+      # here with a manifest that names no published framework, and every
+      # SwiftPM consumer of that tag would fail to resolve. Fail the release
+      # loudly instead of shipping it quietly broken.
+      - name: Check the manifest names this release
+        run: |
+          set -euo pipefail
+          release=$(grep -m1 '^let shoesRelease' Package.swift | sed 's/.*"\(.*\)"/\1/')
+          checksum=$(grep -m1 '^let shoesChecksum' Package.swift | sed 's/.*"\(.*\)"/\1/')
+          zeros=$(printf '0%.0s' $(seq 64))
+          if [ "$release" != "$GITHUB_REF_NAME" ] || [ "$checksum" = "$zeros" ]; then
+            echo "Package.swift names '$release' (checksum ${checksum:0:8}...) but the tag is '$GITHUB_REF_NAME'."
+            echo "This tag was pushed by hand. Apple releases are cut by the 'Release Apple'"
+            echo "workflow, which publishes the XCFramework and commits its checksum into"
+            echo "Package.swift before tagging. Delete this tag and run Release Apple."
+            exit 1
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
