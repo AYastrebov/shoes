@@ -150,15 +150,80 @@ pub unsafe extern "C" fn shoes_start(
     protect_callback: ProtectSocketCallback,
     traffic_callback: ShoesTrafficCallback,
 ) -> c_long {
+    // SAFETY: forwarded from the caller's guarantee on `config_yaml`.
+    unsafe {
+        start_service(
+            "shoes_start",
+            config_yaml,
+            None,
+            protect_callback,
+            traffic_callback,
+        )
+    }
+}
+
+/// Start the shoes VPN service with the TUN descriptor passed as a parameter.
+///
+/// Identical to `shoes_start` in every other respect, including that the
+/// descriptor is borrowed and never closed. The difference is where the
+/// descriptor comes from: `device_fd` here overrides a `device_fd` the YAML
+/// carries and fills one it omits, so a config generated before the
+/// descriptor existed -- by the app, for an extension that learns its fd from
+/// `packetFlow` -- needs no textual patching before it is handed over. A
+/// generator may write `device_fd: 0` as a stand-in or leave the field out.
+///
+/// The config must still contain a `tun` section; the parameter names the
+/// descriptor for it, it does not create one.
+///
+/// # Arguments
+/// * `config_yaml` - YAML configuration string
+/// * `device_fd` - the TUN descriptor, owned by the caller, open until
+///   `shoes_stop` returns
+/// * `protect_callback` - as for `shoes_start`
+/// * `traffic_callback` - as for `shoes_start`
+///
+/// # Returns
+/// * Handle (> 0) on success
+/// * -1 on error; `shoes_get_last_error` says why
+///
+/// # Safety
+/// `config_yaml` must be a valid null-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn shoes_start_with_fd(
+    config_yaml: *const c_char,
+    device_fd: c_int,
+    protect_callback: ProtectSocketCallback,
+    traffic_callback: ShoesTrafficCallback,
+) -> c_long {
+    // SAFETY: forwarded from the caller's guarantee on `config_yaml`.
+    unsafe {
+        start_service(
+            "shoes_start_with_fd",
+            config_yaml,
+            Some(device_fd),
+            protect_callback,
+            traffic_callback,
+        )
+    }
+}
+
+/// The body both start symbols share. `who` names the caller in log lines.
+unsafe fn start_service(
+    who: &str,
+    config_yaml: *const c_char,
+    device_fd: Option<c_int>,
+    protect_callback: ProtectSocketCallback,
+    traffic_callback: ShoesTrafficCallback,
+) -> c_long {
     if config_yaml.is_null() {
-        error!("shoes_start: config_yaml is null");
+        error!("{who}: config_yaml is null");
         return -1;
     }
 
     // Overwriting a live handle would drop its Runtime on this thread, which
     // blocks until the old tasks finish while they still own the TUN fd.
     if common::is_service_running() {
-        error!("shoes_start: service already running, call shoes_stop first");
+        error!("{who}: service already running, call shoes_stop first");
         common::set_last_error("service already running".to_string());
         return -1;
     }
@@ -168,12 +233,12 @@ pub unsafe extern "C" fn shoes_start(
     let config_str = match unsafe { CStr::from_ptr(config_yaml) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
-            error!("shoes_start: invalid UTF-8 in config_yaml: {}", e);
+            error!("{who}: invalid UTF-8 in config_yaml: {}", e);
             return -1;
         }
     };
 
-    info!("shoes_start: config length = {} bytes", config_str.len());
+    info!("{who}: config length = {} bytes", config_str.len());
 
     {
         let mut callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
@@ -195,7 +260,7 @@ pub unsafe extern "C" fn shoes_start(
     {
         Ok(rt) => rt,
         Err(e) => {
-            error!("shoes_start: failed to create runtime: {}", e);
+            error!("{who}: failed to create runtime: {}", e);
             return -1;
         }
     };
@@ -206,11 +271,16 @@ pub unsafe extern "C" fn shoes_start(
     // cannot run is reported as a failed start. Doing it inside the spawned
     // task meant shoes_start() returned success and the app had to discover
     // the failure by noticing shoes_is_running() had gone false on its own.
-    let prepared = match runtime.block_on(common::prepare_from_config(&config_str)) {
+    let prepared = match runtime.block_on(async {
+        match device_fd {
+            Some(fd) => common::prepare_from_config_with_fd(&config_str, fd).await,
+            None => common::prepare_from_config(&config_str).await,
+        }
+    }) {
         Ok(prepared) => prepared,
         Err(e) => {
             let msg = e.to_string();
-            error!("shoes_start: invalid config: {}", msg);
+            error!("{who}: invalid config: {}", msg);
             common::set_last_error(msg);
             crate::tun::traffic::clear_traffic_callback();
             crate::socket_protector::clear_global_socket_protector();
@@ -469,5 +539,37 @@ pub unsafe extern "C" fn shoes_free_string(ptr: *mut c_char) {
         // `shoes_get_last_error` or `shoes_get_stats`, and has not already
         // been freed.
         drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    extern "C" fn protect(_fd: c_int) -> bool {
+        true
+    }
+    extern "C" fn traffic(_up: u64, _down: u64) {}
+
+    /// A config with no TUN section is refused before anything is spawned,
+    /// and the reason reaches the caller through shoes_get_last_error. The
+    /// fd parameter does not change that: it names a descriptor for a TUN
+    /// section, it does not stand in for one.
+    #[test]
+    fn start_with_fd_reports_a_rejected_config() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let yaml = CString::new("---\n[]\n").unwrap();
+        let handle = unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic) };
+        assert_eq!(handle, -1);
+        let err = common::get_last_error().unwrap_or_default();
+        assert!(err.contains("No TUN config found"), "got: {err}");
+        assert!(!shoes_is_running());
+    }
+
+    #[test]
+    fn start_with_fd_rejects_a_null_config() {
+        let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic) };
+        assert_eq!(handle, -1);
     }
 }

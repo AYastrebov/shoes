@@ -304,6 +304,30 @@ pub async fn prepare_from_config(
     config_yaml: &str,
     policy: DevicePolicy,
 ) -> std::io::Result<PreparedService> {
+    prepare_configs(config_yaml, policy, None).await
+}
+
+/// [`prepare_from_config`] under [`DevicePolicy::BorrowedFd`], with the
+/// descriptor supplied by the caller rather than read from the document.
+///
+/// For the host that learns its descriptor last: an Apple packet tunnel
+/// provider is handed the config by the app and the descriptor by
+/// `packetFlow`, in that order, and has no YAML parser to marry them. The
+/// parameter overrides a `device_fd` the document carries and fills one it
+/// omits, so a generator may write `device_fd: 0` as a stand-in or leave the
+/// field out.
+pub async fn prepare_from_config_with_fd(
+    config_yaml: &str,
+    device_fd: i32,
+) -> std::io::Result<PreparedService> {
+    prepare_configs(config_yaml, DevicePolicy::BorrowedFd, Some(device_fd)).await
+}
+
+async fn prepare_configs(
+    config_yaml: &str,
+    policy: DevicePolicy,
+    device_fd: Option<i32>,
+) -> std::io::Result<PreparedService> {
     info!("Parsing config for TUN server");
 
     let configs: Vec<Config> = load_config_str(config_yaml)?;
@@ -329,12 +353,17 @@ pub async fn prepare_from_config(
 
     for config in validated_configs {
         match config {
-            Config::TunServer(tc) => {
+            Config::TunServer(mut tc) => {
                 if tun_config.is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "Multiple TUN configs found - only one is allowed",
                     ));
+                }
+                // Before validate: under BorrowedFd a missing descriptor is
+                // an error, and the parameter is how this host supplies it.
+                if let Some(fd) = device_fd {
+                    tc.device_fd = Some(fd);
                 }
                 device::validate(&tc, policy)?;
                 // unwrap_or(-1) rather than {:?} on the Option: an Owned host
@@ -500,6 +529,46 @@ mod tests {
             err.to_string().contains("Multiple TUN configs"),
             "expected a multiple-TUN complaint, got: {err}"
         );
+    }
+
+    /// The Apple host learns its descriptor only inside the extension, after
+    /// the document was generated somewhere else. So the fd arrives as a
+    /// parameter and must win over whatever the document says -- the
+    /// consumer's generator emits `device_fd: 0` as a stand-in.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_prepare_with_fd_overrides_the_documents_descriptor() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let prepared = current_thread_runtime()
+            .block_on(prepare_from_config_with_fd("---\n- device_fd: 0\n", 7))
+            .unwrap();
+        assert_eq!(prepared.tun_config.device_fd, Some(7));
+    }
+
+    /// And fills an absent one, so a generator can also omit the field.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_prepare_with_fd_fills_an_absent_descriptor() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let prepared = current_thread_runtime()
+            .block_on(prepare_from_config_with_fd(
+                "---\n- device_name: utun9\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n",
+                7,
+            ))
+            .unwrap();
+        assert_eq!(prepared.tun_config.device_fd, Some(7));
+    }
+
+    /// A config with no TUN section is still refused: the parameter names a
+    /// descriptor for the TUN, it does not conjure one.
+    #[test]
+    fn test_prepare_with_fd_still_needs_a_tun_section() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let err = current_thread_runtime()
+            .block_on(prepare_from_config_with_fd("---\n[]\n", 7))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("No TUN config found"));
     }
 }
 

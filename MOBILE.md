@@ -120,11 +120,12 @@ Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `getLastError()` | `android.rs:348` | string or null |
 | `getStats()` | `android.rs` | JSON string, or null (see below) |
 
-iOS — 11 symbols, declared in `include/shoes.h`:
+iOS and macOS — 12 symbols, declared in `include/shoes.h`:
 
 ```c
 int   shoes_init(const char *log_level);
 long  shoes_start(const char *config_yaml, /* protect cb */, /* traffic cb */);
+long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb */, /* traffic cb */);
 void  shoes_stop(long _handle);
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);
@@ -135,6 +136,12 @@ char *shoes_get_last_error(void);   // caller frees
 char *shoes_get_stats(void);        // caller frees; NULL, see below
 void  shoes_free_string(char *ptr);
 ```
+
+`shoes_start_with_fd` is `shoes_start` with the descriptor as a parameter,
+overriding a `device_fd` the document carries and filling one it omits. It
+exists for the Apple extension, which is handed the config by the app and the
+descriptor by `packetFlow`, in that order, and has no YAML parser to marry
+them; before it, the consumer patched a placeholder into the string.
 
 `shoes_get_last_error` and `shoes_get_stats` both return owned strings. Pass
 them back to `shoes_free_string` or they leak.

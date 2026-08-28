@@ -31,6 +31,15 @@ pub async fn prepare_from_config(
     crate::control::prepare_from_config(config_yaml, crate::control::DevicePolicy::BorrowedFd).await
 }
 
+/// [`prepare_from_config`] with the descriptor passed rather than parsed.
+/// See `crate::control::prepare_from_config_with_fd`.
+pub async fn prepare_from_config_with_fd(
+    config_yaml: &str,
+    device_fd: i32,
+) -> std::io::Result<crate::control::PreparedService> {
+    crate::control::prepare_from_config_with_fd(config_yaml, device_fd).await
+}
+
 /// Global log file handle for file-based logging.
 pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();
 
