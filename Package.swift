@@ -72,6 +72,19 @@ let package = Package(
             name: "ShoesTunnelTests",
             dependencies: ["ShoesTunnel"],
             path: "swift/Tests/ShoesTunnelTests"),
+        // Link-check fixtures, not examples. Not declared as products: a root
+        // package's executableTarget gets an automatic executable product,
+        // which is what `xcodebuild -scheme HostLinkCheck` resolves, and
+        // Xcode's add-package dialog lists library products only. Do not
+        // "fix" this by declaring them.
+        .executableTarget(
+            name: "HostLinkCheck",
+            dependencies: ["ShoesTunnelHost"],
+            path: "swift/LinkCheck/HostLinkCheck"),
+        .executableTarget(
+            name: "ExtensionLinkCheck",
+            dependencies: ["ShoesTunnel"],
+            path: "swift/LinkCheck/ExtensionLinkCheck"),
     ],
     swiftLanguageModes: [.v6]
 )

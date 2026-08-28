@@ -135,7 +135,39 @@ jobs:
         shell: bash
         env:
           SHOES_LOCAL_XCFRAMEWORK: "1"
-        run: xcodebuild -scheme ShoesTunnel -destination 'generic/platform=iOS' build | tail -20
+        run: |
+          xcodebuild -scheme ShoesTunnel     -destination 'generic/platform=iOS' build | tail -20
+          xcodebuild -scheme ShoesTunnelHost -destination 'generic/platform=iOS' build | tail -20
+
+      # The property the ShoesTunnelHost product exists for: an app that
+      # links it carries no engine. Host is guaranteed by the graph (Host
+      # never depends on ShoesFFI), so the count is a guard against that
+      # dependency coming back; the extension count > 0 proves the check
+      # reads real binaries. __TEXT is printed so the README number can be
+      # re-measured from the log. ARCHS=arm64 because the framework's
+      # simulator slice is arm64 only and the generic destination would
+      # otherwise ask for x86_64 too.
+      - name: Link check (iOS Simulator, Release)
+        shell: bash
+        env:
+          SHOES_LOCAL_XCFRAMEWORK: "1"
+        run: |
+          set -euo pipefail
+          for s in HostLinkCheck ExtensionLinkCheck; do
+            xcodebuild -scheme "$s" -configuration Release \
+              -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
+              CODE_SIGNING_ALLOWED=NO -derivedDataPath build/linkcheck build | tail -5
+          done
+          host=$(find build/linkcheck/Build/Products -type f -perm +111 -name HostLinkCheck | head -1)
+          ext=$(find build/linkcheck/Build/Products -type f -perm +111 -name ExtensionLinkCheck | head -1)
+          test -n "$host" && test -n "$ext"
+          host_n=$(nm -U "$host" | grep -c ' T _shoes_' || true)
+          ext_n=$(nm -U "$ext" | grep -c ' T _shoes_' || true)
+          echo "shoes_* in host: $host_n; in extension: $ext_n"
+          size -m "$host" | grep __TEXT
+          size -m "$ext"  | grep __TEXT
+          [ "$host_n" -eq 0 ] || { echo "engine symbols reached the host executable"; exit 1; }
+          [ "$ext_n" -gt 0 ] || { echo "no engine symbols in the extension: check is not reading real binaries"; exit 1; }
 
   # ──────────────────────────────────────────────────────────────────────────
   # macOS — the C surface the desktop Network Extension provider links
