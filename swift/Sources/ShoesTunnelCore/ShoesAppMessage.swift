@@ -10,6 +10,8 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
     case version
     case status
     case stats
+    /// The last error the provider reported; see `ShoesAppReply.lastError`.
+    case lastError
     case setLogLevel(ShoesLogLevel)
 
     private enum CodingKeys: String, CodingKey { case kind, level }
@@ -20,6 +22,7 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
         case .version: try c.encode("version", forKey: .kind)
         case .status: try c.encode("status", forKey: .kind)
         case .stats: try c.encode("stats", forKey: .kind)
+        case .lastError: try c.encode("lastError", forKey: .kind)
         case .setLogLevel(let level):
             try c.encode("setLogLevel", forKey: .kind)
             try c.encode(level.rawValue, forKey: .level)
@@ -32,6 +35,7 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
         case "version": self = .version
         case "status": self = .status
         case "stats": self = .stats
+        case "lastError": self = .lastError
         case "setLogLevel":
             let raw = try c.decode(String.self, forKey: .level)
             guard let level = ShoesLogLevel(rawValue: raw) else {
@@ -65,10 +69,16 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
     case version(String)
     case status(running: Bool)
     case stats(ShoesStats?)
+    /// The last error the provider reported, or nil. Answers while the
+    /// extension is alive -- a failed rebind, a refused setLogLevel. After an
+    /// engine death the provider cancels the tunnel and the process exits;
+    /// the app then sees `.disconnected` and nobody is left to answer, so a
+    /// host persists fatal reasons from `report(error:)` instead.
+    case lastError(ShoesError?)
     case ok
     case error(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, version, running, stats, message }
+    private enum CodingKeys: String, CodingKey { case kind, version, running, stats, error, message }
 
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -82,6 +92,9 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
         case .stats(let stats):
             try c.encode("stats", forKey: .kind)
             try c.encodeIfPresent(stats, forKey: .stats)
+        case .lastError(let error):
+            try c.encode("lastError", forKey: .kind)
+            try c.encodeIfPresent(error, forKey: .error)
         case .ok: try c.encode("ok", forKey: .kind)
         case .error(let message):
             try c.encode("error", forKey: .kind)
@@ -95,6 +108,7 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
         case "version": self = .version(try c.decode(String.self, forKey: .version))
         case "status": self = .status(running: try c.decode(Bool.self, forKey: .running))
         case "stats": self = .stats(try c.decodeIfPresent(ShoesStats.self, forKey: .stats))
+        case "lastError": self = .lastError(try c.decodeIfPresent(ShoesError.self, forKey: .error))
         case "ok": self = .ok
         case "error": self = .error(try c.decode(String.self, forKey: .message))
         case let other:
