@@ -1,6 +1,6 @@
 import Testing
 
-@testable import ShoesTunnel
+@testable import ShoesTunnelCore
 
 /// The configuration is opaque on purpose: the consumer generates its YAML
 /// elsewhere (KVN's is Kotlin) and the descriptor arrives as a parameter to

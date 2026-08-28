@@ -1,6 +1,10 @@
 import Foundation
 import ShoesFFI
 
+// Re-exported so `import ShoesTunnel` alone sees ShoesConfiguration and
+// the rest of the wire types, as it did before the split.
+@_exported import ShoesTunnelCore
+
 /// The shoes engine, as a Swift host sees it.
 ///
 /// One per process, because the library is: `shoes_is_running` is a

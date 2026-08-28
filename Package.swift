@@ -39,14 +39,23 @@ let package = Package(
     ],
     targets: [
         shoesFFI,
+        // The wire format and the types both processes share. Foundation
+        // only: it must build where the XCFramework was never downloaded.
+        .target(
+            name: "ShoesTunnelCore",
+            path: "swift/Sources/ShoesTunnelCore"),
         .target(
             name: "ShoesTunnel",
-            dependencies: ["ShoesFFI"],
+            dependencies: ["ShoesTunnelCore", "ShoesFFI"],
             path: "swift/Sources/ShoesTunnel",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),
                 .linkedFramework("SystemExtensions", .when(platforms: [.macOS])),
             ]),
+        .testTarget(
+            name: "ShoesTunnelCoreTests",
+            dependencies: ["ShoesTunnelCore"],
+            path: "swift/Tests/ShoesTunnelCoreTests"),
         .testTarget(
             name: "ShoesTunnelTests",
             dependencies: ["ShoesTunnel"],

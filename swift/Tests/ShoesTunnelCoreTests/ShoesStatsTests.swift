@@ -1,6 +1,6 @@
 import Testing
 
-@testable import ShoesTunnel
+@testable import ShoesTunnelCore
 
 /// The document `shoes_get_stats` returns, as described on that function in
 /// include/shoes.h. Later releases may add keys, and a host must ignore ones

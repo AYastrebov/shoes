@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import ShoesTunnel
+@testable import ShoesTunnelCore
 
 @Suite struct ShoesAppMessageTests {
     @Test func messagesRoundTrip() throws {
