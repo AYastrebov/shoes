@@ -55,10 +55,11 @@ alone today.
   ShoesTunnel; `SystemExtensions` (macOS only) on Host.
 - `@_exported import ShoesTunnelCore` in both `ShoesTunnel` and
   `ShoesTunnelHost`, so `import ShoesTunnel` alone still sees
-  `ShoesConfiguration` and the provider subclass compiles as before. The
-  README says the preferred spelling: `import ShoesTunnel` in the extension,
-  `import ShoesTunnelHost` in the app, never `import ShoesTunnelCore`
-  directly.
+  `ShoesConfiguration` and the provider subclass compiles as before.
+  `@_exported` is underscored API; it is stable in practice and the README
+  says the choice is deliberate. The README also says the preferred
+  spelling: `import ShoesTunnel` in the extension, `import ShoesTunnelHost`
+  in the app; `import ShoesTunnelCore` is not recommended but keeps working.
 - Public API is unchanged: a `ShoesPacketTunnelProvider` subclass and a
   `ShoesTunnelManager` caller compile as before once they import the right
   product. Extension consumers need only a version bump; the app side swaps
@@ -70,7 +71,12 @@ alone today.
 ## The property, as a test
 
 The reason for the split is a link-time property and it must not regress
-silently. Two `executableTarget`s are added to the manifest, named as
+silently. To be precise about what the check proves: the host side is
+guaranteed by the graph, not by the linker — `ShoesTunnelHost` never depends
+on `ShoesFFI`, so `libshoes.a` is not on the app's link line at all and the
+`nm` count cannot be non-zero today. The check guards against someone adding
+that dependency back; the extension-side positive count is what makes the
+pair meaningful. Two `executableTarget`s are added to the manifest, named as
 fixtures rather than examples:
 
 - `swift/LinkCheck/HostLinkCheck` — `import ShoesTunnelHost`, constructs a
@@ -78,28 +84,39 @@ fixtures rather than examples:
 - `swift/LinkCheck/ExtensionLinkCheck` — `import ShoesTunnel`, references
   `ShoesEngine.shared`, so the engine is live.
 
-Neither is a product; consumers do not build them. A new step in
-`mobile.yml`'s `swift` job, after the macOS test run, builds both for the
-iOS Simulator in Release:
+Neither is declared as a product. A root package's `executableTarget` gets
+an automatic executable product anyway — that is what makes `--product
+HostLinkCheck` resolvable — and Xcode's add-package dialog lists only
+declared library products, so consumers never see them; the manifest says
+this in a comment so nobody "fixes" it by declaring them. The macOS
+`swift build` / `swift test` run builds them too (SystemExtensions links
+there); that is expected. They are under `swift/`, so `swift format lint
+--strict` covers them and they must pass it.
+
+A new step in `mobile.yml`'s `swift` job, after the macOS test run, builds
+both for the iOS Simulator in Release. The first attempt is `xcodebuild`,
+because the repo already has a working iOS invocation of it and linking an
+executable against `NetworkExtension.framework` under `swift build --sdk`
+is the shaky part:
 
 ```
-swift build -c release \
-  --triple arm64-apple-ios18.0-simulator \
-  --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
-  --product HostLinkCheck --product ExtensionLinkCheck
+xcodebuild -scheme HostLinkCheck -configuration Release \
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO -derivedDataPath build/linkcheck build
 ```
 
-and asserts, with `shell: bash` so the pipe cannot hide a failure:
+(and the same for `ExtensionLinkCheck`); `swift build -c release --triple
+arm64-apple-ios18.0-simulator --sdk "$(xcrun --sdk iphonesimulator
+--show-sdk-path)"` is the fallback if the scheme route does not yield an
+executable. Either way the step asserts, with `shell: bash` so the pipe
+cannot hide a failure:
 
 - `nm -U <HostLinkCheck> | grep -c ' T _shoes_'` is `0`;
 - `nm -U <ExtensionLinkCheck> | grep -c ' T _shoes_'` is greater than `0`,
   which proves the check reads real binaries.
 
 The step also prints `size -m` `__TEXT` for both; those two numbers are the
-measurement the README quotes. If `swift build` cannot produce a simulator
-executable with this toolchain, the fallback is `xcodebuild` on the same two
-targets with `-destination 'generic/platform=iOS Simulator'` and
-`CODE_SIGNING_ALLOWED=NO`; the assertion is the same.
+measurement the README quotes.
 
 ## Tests
 
@@ -127,3 +144,8 @@ targets with `-destination 'generic/platform=iOS Simulator'` and
 
 A sample app, a `ShoesTunnelCore` product, and any change to the release
 workflow or the checksum mechanism.
+
+Follow-up, not in this change: `ShoesTunnelManager` throws
+`ShoesError.engine("no tunnel session")` for a host-side condition. Once the
+enum lives in Core the natural fix is a `.noSession` case; that is an API
+addition and gets its own change.
