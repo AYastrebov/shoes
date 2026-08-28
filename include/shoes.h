@@ -80,6 +80,39 @@ long shoes_start(const char *config_yaml,
                  ShoesTrafficCallback traffic_callback);
 
 /**
+ * Start the shoes VPN service with the TUN descriptor passed as a parameter.
+ *
+ * Identical to `shoes_start` in every other respect, including that the
+ * descriptor is borrowed and never closed. The difference is where the
+ * descriptor comes from: `device_fd` here overrides a `device_fd` the YAML
+ * carries and fills one it omits, so a config generated before the
+ * descriptor existed -- by the app, for an extension that learns its fd from
+ * `packetFlow` -- needs no textual patching before it is handed over. A
+ * generator may write `device_fd: 0` as a stand-in or leave the field out.
+ *
+ * The config must still contain a `tun` section; the parameter names the
+ * descriptor for it, it does not create one.
+ *
+ * # Arguments
+ * * `config_yaml` - YAML configuration string
+ * * `device_fd` - the TUN descriptor, owned by the caller, open until
+ *   `shoes_stop` returns
+ * * `protect_callback` - as for `shoes_start`
+ * * `traffic_callback` - as for `shoes_start`
+ *
+ * # Returns
+ * * Handle (> 0) on success
+ * * -1 on error; `shoes_get_last_error` says why
+ *
+ * # Safety
+ * `config_yaml` must be a valid null-terminated C string.
+ */
+long shoes_start_with_fd(const char *config_yaml,
+                         int device_fd,
+                         ProtectSocketCallback protect_callback,
+                         ShoesTrafficCallback traffic_callback);
+
+/**
  * Stop the shoes VPN service.
  *
  * Signals shutdown and blocks until the engine has released the TUN

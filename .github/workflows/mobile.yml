@@ -148,6 +148,11 @@ jobs:
       - name: Check the FFI surface with stats off
         run: cargo check --locked --release --lib --features ffi --target aarch64-apple-darwin
 
+      # src/ffi/ios.rs carries tests that only compile where the module does;
+      # test.yml runs on ubuntu and never sees them.
+      - name: Test the FFI module
+        run: cargo test --locked --lib --features ffi,control-stats --target aarch64-apple-darwin ffi::
+
   # ──────────────────────────────────────────────────────────────────────────
   # Android — AAR with JNI .so for arm64-v8a, armeabi-v7a, x86_64 (emulator)
   # ──────────────────────────────────────────────────────────────────────────
