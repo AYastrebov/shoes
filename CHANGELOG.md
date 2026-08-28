@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### macOS slice and the ShoesTunnel Swift package
+
+`scripts/build-apple.sh` (was `build-ios.sh`) emits `Shoes.xcframework` with a
+`macos-arm64` slice beside the two iOS ones, and every slice now carries a
+module map so a Swift package can import the C surface without a bridging
+header. Deployment targets are iOS 18 and macOS 15.
+
+The Swift that drives shoes in a packet tunnel provider ships from this
+repository: `ShoesTunnel` (`Package.swift` at the root, sources under
+`swift/`), with `ShoesPacketTunnelProvider` to subclass, `ShoesTunnelManager`
+for the app side, `ShoesEngine` over the FFI, and typed stats and messages.
+Swift 6. Integration is described in `swift/README.md`; what is specific to a
+macOS system extension is in `docs/MACOS.md`.
+
+Releases that carry the package are cut by the `Release Apple` workflow,
+which publishes the XCFramework and commits its checksum into `Package.swift`
+before tagging. `mobile.yml`'s tag run attaches the AAR only.
+
 ### `shoes_start_with_fd`
 
 `shoes_start` with the TUN descriptor as a parameter. It overrides a `device_fd`

@@ -3,6 +3,9 @@
 State of the `mobile` branch as a core library for an Android/iOS VPN app, and
 what still stands between it and a shipping product.
 
+macOS is covered by the same FFI and by the `ShoesTunnel` Swift package
+(`swift/README.md`); what differs there is in [docs/MACOS.md](./docs/MACOS.md).
+
 Everything in "What works" is verified on this branch. Every finding cites the
 line that produced it. Findings marked *fixed* have landed; the rest are still
 open and are ordered at the end. Line references were last checked against
