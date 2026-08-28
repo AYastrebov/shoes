@@ -53,6 +53,14 @@ jobs:
   apple:
     name: Build Apple XCFramework
     runs-on: macos-latest
+    # Not on a tag: by then this commit was built here as a PR, and the tag
+    # itself was created by release-apple.yml, which built and published the
+    # framework minutes earlier. Rebuilding it on the tag spent twenty macOS
+    # minutes on an artifact nothing may touch -- the release job attaches
+    # the AAR alone, deliberately. Sentry's tag CI makes the same call: the
+    # release pipeline is the sole builder. The swift job follows this gate
+    # through needs:.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     timeout-minutes: 60
 
     steps:
@@ -336,7 +344,9 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   release:
     name: Attach to Release
-    needs: [ apple, android ]
+    # android only: apple is skipped on tags (above), and this job attaches
+    # nothing the apple job makes.
+    needs: [ android ]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
