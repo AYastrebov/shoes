@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.16
 
 ### `ShoesTunnelHost`
 
@@ -20,9 +20,10 @@ on a Release simulator build.
 `shoes_start_with_fd` takes a `ShoesStoppedCallback`, called once from a
 worker thread when the engine stops without `shoes_stop` -- the failure
 message, or NULL. Never for a requested stop; a call already in flight when
-`shoes_stop` begins may still complete after `shoes_stop` returns. The reason is in `shoes_get_last_error` as well. `shoes_start` is
-unchanged; the `_with_fd` signature changes one release after it appeared,
-with the Swift package its only consumer. The surface count stays at 12.
+`shoes_stop` begins may still complete after `shoes_stop` returns. The
+reason is in `shoes_get_last_error` as well. `shoes_start` is unchanged; the
+`_with_fd` signature changes one release after it appeared, with the Swift
+package its only consumer. The surface count stays at 12.
 
 In the package, `ShoesEngine.start` gains a required `onStopped:` and
 `ShoesPacketTunnelProvider` reports an engine death at once instead of
