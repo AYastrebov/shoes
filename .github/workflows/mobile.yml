@@ -140,7 +140,12 @@ jobs:
       # The macOS build above exercises the macos-arm64 slice only. This
       # typechecks the package against the iOS SDK so the slice a consumer
       # links on a phone cannot rot while only macOS is tested.
+      # shell: bash is load-bearing: GitHub's explicit-bash form runs with
+      # -o pipefail, so xcodebuild's exit status survives the pipe. The
+      # default shell for a bare `run:` does not, and this step -- the only
+      # iOS compile in the pipeline -- was green on failure.
       - name: Typecheck (iOS)
+        shell: bash
         env:
           SHOES_LOCAL_XCFRAMEWORK: "1"
         run: xcodebuild -scheme ShoesTunnel -destination 'generic/platform=iOS' build | tail -20
@@ -151,8 +156,11 @@ jobs:
   macos:
     name: Check the macOS C surface
     runs-on: macos-latest
-    # Not on a branch push: see the trigger comment at the top.
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
+    # On branch pushes too, unlike android: the push paths include
+    # src/ffi/** and include/**, and this job holds the symbol-count check
+    # and the FFI tests -- the checks those paths exist to trigger. The
+    # apple job regenerates the header rather than verifying it, so without
+    # this a push could drift the surface and stay green until a PR.
     timeout-minutes: 45
 
     steps:
