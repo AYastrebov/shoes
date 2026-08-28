@@ -26,15 +26,31 @@ callback and carry it through to the app.
 
 `control::start` takes `on_exit: impl FnOnce(Option<String>) + Send +
 'static` instead of `on_error`. It is called from a drop guard wrapped
-around the service task, so it runs on `Ok`, on `Err`, and when the task
-panics; `Some(message)` for an error, `None` otherwise. `ServiceHandle`
+around the service task, so it runs whether `run_prepared` returns `Ok` or
+`Err`; `Some(message)` for an error, `None` otherwise. `ServiceHandle`
 gains a `stop_requested: Arc<AtomicBool>`; `control::stop_handle` sets it
 before signalling `shutdown_tx`, and the guard does not call `on_exit` when
 it is set. A stop the host asked for is a stop the host knows about.
 
-`run_prepared`'s only `Ok` return is the shutdown signal, so `None` reaches
-a host only for a task that ended some other way (a panic, or a future
-change in the engine); the callback treats it as "stopped without a reason".
+Order inside the guard: store `running = false`, then call `on_exit`.
+`stop_handle` waits for the engine by polling `running`
+(`src/control/mod.rs:108-113`, five seconds); a callback that calls
+`shoes_stop` -- which `fire_stopped` below explicitly permits -- would
+otherwise spin for the whole timeout. It also means `shoes_is_running()`
+is already false when the callback runs, which is what a host expects.
+
+A panic does not reach the guard. The crate builds with `panic = "abort"`
+(`Cargo.toml:187`: "a panic is the last thing the process does"), so a
+panicking task takes the extension with it and the app sees
+`.disconnected` with no callback. The test profile unwinds regardless of
+that setting, so no test is written for the panic path; it would pass and
+describe nothing that ships.
+
+`run_prepared`'s only `Ok` return today is the shutdown signal, so `None`
+is reserved for a future `Ok` that is not one; the callback treats it as
+"stopped without a reason". That property is a test, not prose (see
+Tests), because it is what keeps `None` from meaning "requested stop" some
+day.
 
 Both FFI platforms keep the current `set_last_error` behaviour by wrapping:
 `ios.rs` passes `|reason| { if let Some(m) = &reason { set_last_error(m) }
@@ -52,7 +68,10 @@ nothing else calls `control::start`.
  * `shoes_stop` having been called: a failure, or a task that ended on its
  * own. `reason` is the failure message, or NULL when there is none; it is
  * valid for the duration of the call only. Never called for a stop the
- * host requested, and never after `shoes_stop` has returned.
+ * host requested, and never after `shoes_stop` has returned. Runs on a
+ * shoes worker thread; do not block in it. `shoes_is_running()` is
+ * already false when it runs, and calling `shoes_stop` from inside it is
+ * allowed.
  */
 typedef void (*ShoesStoppedCallback)(const char *reason);
 
@@ -70,10 +89,20 @@ long shoes_start_with_fd(const char *config_yaml,
 - `stopped_callback` may be NULL, in which case nothing is called.
 - The slot is `STOPPED_CALLBACK` in `ios.rs`, the same
   `OnceLock<RwLock<Option<Arc<dyn Fn(Option<String>) + Send + Sync>>>>`
-  shape as the traffic callback in `src/tun/traffic.rs`. `shoes_stop`
-  clears it before `stop_service`, as it does the traffic callback, so a
-  requested stop is doubly silent; a failed `shoes_start_with_fd` clears it
-  before returning -1.
+  shape as the traffic callback in `src/tun/traffic.rs`. It is installed
+  before `control::start`, like the traffic callback, and cleared on the
+  failed-prepare branch (`ios.rs:284`) before returning -1. `shoes_stop`
+  clears it *before* `stop_service`, so a requested stop is silent at both
+  layers. That is the opposite order from the traffic callback, which
+  `shoes_stop` clears after (`ios.rs:335-337`) -- a traffic tick during
+  shutdown is harmless, an exit event during a requested shutdown is the
+  thing this slot must never deliver. The traffic order is left as it is.
+- `shoes_start` (no descriptor) shares the start path and installs an
+  empty stopped slot, so a callback left by an earlier `_with_fd` session
+  can never fire for it.
+- The callback runs on a worker of the two-thread iOS runtime and must not
+  block, the same rule the traffic callback carries; the Swift side hops
+  to the actor, but the C doc is the contract.
 - `fire_stopped` takes the slot's `Arc` out under the lock, releases the
   lock, then calls, so a callback that itself calls `shoes_stop` cannot
   deadlock. It also copies the reason into `LAST_ERROR` first, so
@@ -99,7 +128,11 @@ long shoes_start_with_fd(const char *config_yaml,
     `report(error:)`, then `cancelTunnelWithError`.
   - The health check is removed: `healthCheckInterval`, `healthCheck`,
     `startHealthCheck()` and the tick loop. It could only notice what the
-    callback now reports, thirty seconds later. `healthCheckInterval` was
+    callback now reports, thirty seconds later. The equivalence is exact:
+    both observe the service task ending. A hang where the task lives but
+    nothing flows was invisible to `shoes_is_running()` too, so nothing is
+    lost there -- and nothing is gained; that failure mode stays
+    unobserved. `healthCheckInterval` was
     `open`; a subclass that overrode it stops compiling, which is the
     honest signal that the override no longer does anything.
   - `lastError: ShoesError?` on the provider, set at the three
@@ -108,7 +141,9 @@ long shoes_start_with_fd(const char *config_yaml,
   - `report(error:)` doc gains: after an engine death the provider cancels
     the tunnel and the extension process exits; a host that needs the
     reason in the app must persist it from this hook, because the message
-    channel below cannot answer once the process is gone.
+    channel below cannot answer once the process is gone -- and a Rust
+    panic aborts without any hook at all, which is one more reason the
+    app must treat a bare `.disconnected` as a possible failure.
 
 ## Swift, `ShoesTunnelCore`
 
@@ -138,8 +173,11 @@ long shoes_start_with_fd(const char *config_yaml,
 ## Tests
 
 - Rust, `src/control/mod.rs`: `on_exit` fires with `Some` when
-  `run_prepared` fails; fires with `None` when the task panics; does not
-  fire after `stop_handle`. `src/ffi/ios.rs`: `shoes_stop` before an exit
+  `run_prepared` fails; does not fire after `stop_handle`; `running` is
+  already false when it fires (the callback asserts it). A test that a
+  `run_prepared` ended by the shutdown signal returns `Ok(())` and one
+  ended any other way does not, so `None` cannot come to mean "requested
+  stop" without a test going red. `src/ffi/ios.rs`: `shoes_stop` before an exit
   leaves the slot empty and the callback uncalled; a failed
   `shoes_start_with_fd` never calls it.
 - Swift Core: `ShoesError` Codable round-trip for every case, including
