@@ -8,8 +8,9 @@ import Foundation
 /// `shoes_is_running` is process-wide and `shoes_stop` ignores its handle --
 /// so one slot is the right number, not a registry.
 ///
-/// This is the only `@unchecked Sendable` in the package. The lock is what
-/// makes it true; do not add a second global instead of reaching for this.
+/// One of the package's two `@unchecked Sendable`s -- the other is the
+/// provider, whose state is actor-isolated. Here the lock is what makes it
+/// true; do not add a second global instead of reaching for this.
 final class TrafficCallbackBridge: @unchecked Sendable {
     static let shared = TrafficCallbackBridge()
 
