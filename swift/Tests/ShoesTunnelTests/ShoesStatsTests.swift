@@ -16,9 +16,10 @@ import Testing
         #expect(stats.uploadBytes == 10)
         #expect(stats.downloadBytes == 20)
         #expect(stats.activeConnections == 3)
-        #expect(stats.outbounds == [
-            ShoesStats.Outbound(name: "Frankfurt", uploadBytes: 1, downloadBytes: 2, activeConnections: 1)
-        ])
+        #expect(
+            stats.outbounds == [
+                ShoesStats.Outbound(name: "Frankfurt", uploadBytes: 1, downloadBytes: 2, activeConnections: 1)
+            ])
     }
 
     @Test func ignoresKeysItDoesNotKnow() throws {

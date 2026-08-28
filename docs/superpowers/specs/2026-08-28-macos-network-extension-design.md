@@ -317,7 +317,7 @@ committed either way yet.
 | `ShoesStats` | `Codable` over `shoes_get_stats` JSON, unknown keys ignored | nothing | pure, fully |
 | `ShoesError` | `shoes_get_last_error` → typed error, owns the `shoes_free_string` pairing | `ShoesFFI` | pure, fully |
 | `ShoesEngine` | `init`/`start(fd:)`/`stop`/`isRunning`/`networkChanged`/`stats`/`version`/`setLogFile`/`setLogLevel`; owns the ordering rules | `ShoesFFI` | integration, really runs |
-| `ShoesPacketTunnelProvider` | NE glue only: lifecycle overrides, fd extraction, health check, path observation | NetworkExtension, `ShoesEngine` | not unit-testable, kept thin |
+| `ShoesPacketTunnelProvider` | NE glue only: lifecycle overrides, fd extraction, health check, `NWPathMonitor` observation | NetworkExtension, `ShoesEngine` | not unit-testable, kept thin |
 | `ShoesTunnelManager` | host side: the TN3120 sequence, status as an `AsyncStream`, typed app messages | NetworkExtension | not unit-testable, kept thin |
 | `SystemExtensionInstaller` | `OSSystemExtensionRequest` activation, `#if os(macOS)` | SystemExtensions | not unit-testable |
 
@@ -426,17 +426,36 @@ worth adding before someone measures.
 `.macOS(.v15)`.
 
 Swift 6 strict concurrency is a deliberate choice here rather than a default,
-and it has one concrete consequence for the design. A C function pointer cannot
+and it has concrete consequences for the design. A C function pointer cannot
 capture context, so the traffic callback needs somewhere process-global to send
 its result; the existing consumer uses a `private weak var activeProvider`,
 which is exactly the mutable global state Swift 6 rejects. The package instead
 holds the callback in a `final class`, `@unchecked Sendable`, guarding a single
-stored closure with an `NSLock` — the escape hatch taken once, in one file, with
-its reason written next to it, rather than `nonisolated(unsafe)` sprinkled at
-each call site. shoes supports one running engine per process anyway
-(`shoes_is_running` is process-global and `shoes_stop` ignores the handle it is
-given), so a registry keyed by handle would be inventing a multiplicity the
-engine does not have.
+stored closure with an `NSLock`, with its reason written next to it. shoes
+supports one running engine per process anyway (`shoes_is_running` is
+process-global and `shoes_stop` ignores the handle it is given), so a registry
+keyed by handle would be inventing a multiplicity the engine does not have.
+
+Implementation found the provider needs a second one, and this document said
+there would be only one. `ShoesPacketTunnelProvider` is `@MainActor` — every
+stored property is actor-isolated and the compiler checks each access — but
+the system calls it on its own queues, so each override is `nonisolated` and
+hands `self` to the actor, and a non-`Sendable` reference cannot be handed
+across. `@unchecked Sendable` on the class asserts only that the reference may
+cross; the state it guards is still checked. The alternatives were an isolated
+override, which the compiler accepts and which would trip a runtime isolation
+check on the system's queue inside an extension that cannot be run here, or a
+lock over state the actor already guards. Two hatches, then, each in one file
+with its reason, plus a `nonisolated(unsafe)` local for `startTunnel`'s ObjC
+completion block, which is safe to call from any thread by contract and is
+not annotated as such — an async override of an ObjC method may not take a
+non-`Sendable` parameter, so that one override keeps the block form.
+
+Also found there: `NEProvider.defaultPath` is deprecated from macOS 15 and
+iOS 18, exactly this package's floors, so it is unavailable to Swift here.
+The consumer's KVO on it works only because their app floor is 16.2. Path
+changes come from `NWPathMonitor` instead, delivered onto the actor through a
+stream.
 
 The platform floor is a product decision with a consumer-visible cost:
 SwiftPM's `platforms:` is a minimum, so any app importing this package inherits

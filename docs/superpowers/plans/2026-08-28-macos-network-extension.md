@@ -1807,6 +1807,22 @@ Swift 6 will very likely object to `self` -- a non-`Sendable` `NEPacketTunnelPro
 
 Not acceptable: a second `@unchecked Sendable` in the package, or `nonisolated(unsafe)` on the stored properties. The design's one escape hatch is `TrafficCallbackBridge`, and it is documented as the only one.
 
+**Execution notes (what step 8 actually found).** Option 1 held for the state
+but not on its own. Three things the plan did not anticipate: `NEProvider.defaultPath`
+is deprecated at exactly the package's floors and unavailable to Swift, so
+path observation is an `NWPathMonitor` feeding an `AsyncStream` consumed on
+the actor; an async override of an ObjC method may not take a non-`Sendable`
+parameter, so `startTunnel` keeps the completion-handler form and its block
+gets a `nonisolated(unsafe)` local; and a `nonisolated` override cannot hand a
+non-`Sendable` `self` to the actor at all, so the class is `@unchecked Sendable`
+with every stored property actor-isolated — the second escape hatch, taken
+because the alternatives were a runtime isolation check inside an extension
+that cannot be run here, or a lock over state the actor already guards. The
+traffic hook also moved onto the actor, through a `@MainActor` closure the C
+callback hops into, so all four hooks share one rule. `@preconcurrency import
+NetworkExtension` in the provider and manager. `.swift-format` at the root
+pins four-space indentation and 120 columns, matching the consumer's Swift.
+
 - [ ] **Step 9: Run the whole suite and commit**
 
 Run: `SHOES_LOCAL_XCFRAMEWORK=1 swift test 2>&1 | tail -2`
