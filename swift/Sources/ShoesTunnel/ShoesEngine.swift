@@ -80,10 +80,13 @@ public final class ShoesEngine: Sendable {
     /// library. Runs `shoes_stop` off the caller's executor, so it is safe
     /// to await from a provider callback that has a deadline of its own.
     public func stop() async {
+        // Cleared first, as the library clears its own slot before it stops:
+        // a requested stop is not an event, and a traffic tick during it is
+        // not worth delivering.
+        CallbackBridge.shared.clear()
         await Task.detached(priority: .userInitiated) {
             shoes_stop(1)
         }.value
-        CallbackBridge.shared.clear()
     }
 
     /// Tell the engine the network changed. Returns the number of tunnel

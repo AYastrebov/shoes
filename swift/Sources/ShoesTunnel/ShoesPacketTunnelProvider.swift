@@ -161,12 +161,13 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             }
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
-            log.error("startTunnel failed: \(shoesError.localizedDescription, privacy: .public)")
-            lastError = shoesError
-            report(error: shoesError)
+            fail(shoesError, prefix: "startTunnel failed")
             if case .timedOut = shoesError {
                 // The engine call may still be running and may yet succeed;
-                // stop whatever it produces once it lands.
+                // stop whatever it produces once it lands. The session is
+                // abandoned either way, so a death it reports before that
+                // stop is not a second error.
+                isStopping = true
                 Task { @MainActor in
                     if self.engine.isRunning { await self.engine.stop() }
                 }
@@ -203,7 +204,9 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                     try engine.setLogLevel(level)
                     return .ok
                 } catch {
-                    return .error(error.localizedDescription)
+                    let shoesError = (error as? ShoesError) ?? .engine(error.localizedDescription)
+                    record(shoesError)
+                    return .error(shoesError.localizedDescription)
                 }
             }
         }
@@ -308,9 +311,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             log.info("rebind succeeded")
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
-            log.error("rebind failed: \(shoesError.localizedDescription, privacy: .public)")
-            lastError = shoesError
-            report(error: shoesError)
+            fail(shoesError, prefix: "rebind failed")
             cancelTunnelWithError(shoesError)
         }
     }
@@ -318,16 +319,30 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     // MARK: Engine exit
 
     /// The engine stopped and nobody asked it to. A rebind stops the engine
-    /// on purpose and the library clears its slot before that stop, so this
-    /// does not fire for one; the checks are for the window between a
-    /// stopTunnel or rebind beginning on the actor and the C call landing.
+    /// on purpose, and both slots are cleared before that stop, so an event
+    /// that arrives during a rebind can only be the new session's death and
+    /// is handled like any other. Only a tunnel already on its way down
+    /// ignores it: that stop is the host's, and the stop reason is known.
     private func engineStopped(reason: String?) {
-        if isRebinding || isStopping { return }
+        if isStopping { return }
         let error = ShoesError.engineStopped(reason)
+        fail(error, prefix: "engine stopped")
+        cancelTunnelWithError(error)
+    }
+
+    // MARK: Errors
+
+    /// Remember an error for `.lastError` and log it.
+    private func record(_ error: ShoesError) {
         log.error("\(error.localizedDescription, privacy: .public)")
         lastError = error
+    }
+
+    /// Remember, log, and hand to the host.
+    private func fail(_ error: ShoesError, prefix: String) {
+        log.error("\(prefix): \(error.localizedDescription, privacy: .public)")
+        lastError = error
         report(error: error)
-        cancelTunnelWithError(error)
     }
 }
 
