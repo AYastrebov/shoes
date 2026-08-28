@@ -45,14 +45,12 @@ public final class ShoesEngine: Sendable {
         initialized.set()
     }
 
-    /// Start a session. Returns once the config has been accepted; a thrown
-    /// `.startFailed` carries what `shoes_get_last_error` had to say.
+    /// Start on a borrowed descriptor. `onTraffic` arrives about once a
+    /// second while the counts change; `onStopped` arrives once if the engine
+    /// stops without `stop()` having been called, with the reason when it
+    /// gave one. Both run on a shoes worker thread; hop before touching an
+    /// actor. A failed start calls neither.
     ///
-    /// - Parameter deviceFD: the TUN descriptor, borrowed. On an Apple
-    ///   platform this is `packetFlow`'s `socket.fileDescriptor`. It must
-    ///   stay open until `stop()` returns; the engine never closes it.
-    /// - Parameter onTraffic: cumulative upload and download bytes, about
-    ///   once a second while they change, from a shoes worker thread.
     /// `async`, and off the caller's executor: `shoes_start_with_fd` parses
     /// the config, loads PEM files and builds the DNS resolvers under a
     /// blocking `block_on` before it returns, which is work an extension must
@@ -60,17 +58,19 @@ public final class ShoesEngine: Sendable {
     public func start(
         _ config: ShoesConfiguration,
         deviceFD: Int32,
-        onTraffic: @escaping @Sendable (_ upload: UInt64, _ download: UInt64) -> Void
+        onTraffic: @escaping @Sendable (_ upload: UInt64, _ download: UInt64) -> Void,
+        onStopped: @escaping @Sendable (_ reason: String?) -> Void
     ) async throws {
         guard initialized.isSet else { throw ShoesError.notInitialized }
         guard !isRunning else { throw ShoesError.alreadyRunning }
 
-        TrafficCallbackBridge.shared.install(onTraffic)
+        CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped)
         let handle = await Task.detached(priority: .userInitiated) {
-            shoes_start_with_fd(config.yaml, deviceFD, shoesProtectCallback, shoesTrafficCallback)
+            shoes_start_with_fd(
+                config.yaml, deviceFD, shoesProtectCallback, shoesTrafficCallback, shoesStoppedCallback)
         }.value
         guard handle > 0 else {
-            TrafficCallbackBridge.shared.clear()
+            CallbackBridge.shared.clear()
             throw ShoesError.startFailed(lastError() ?? "shoes_start_with_fd returned \(handle)")
         }
     }
@@ -83,7 +83,7 @@ public final class ShoesEngine: Sendable {
         await Task.detached(priority: .userInitiated) {
             shoes_stop(1)
         }.value
-        TrafficCallbackBridge.shared.clear()
+        CallbackBridge.shared.clear()
     }
 
     /// Tell the engine the network changed. Returns the number of tunnel

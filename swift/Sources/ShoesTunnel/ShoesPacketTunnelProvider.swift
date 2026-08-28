@@ -6,7 +6,7 @@ import os
 /// An `NEPacketTunnelProvider` that runs shoes.
 ///
 /// A template method: this class owns the sequence -- settings, descriptor,
-/// engine, health check, path observation, and the ordering against
+/// engine, the engine's stop callback, path observation, and the ordering against
 /// `shoes_stop` -- and a subclass supplies only what is its own through the
 /// four `open` hooks below. Everything the subclass does not override is
 /// inherited, so the rules cannot be got wrong by omission.
@@ -23,7 +23,7 @@ import os
 /// `@unchecked Sendable` is what lets a `nonisolated` override hand `self`
 /// to the actor. It asserts only that the reference may cross a thread; every
 /// stored property is actor-isolated and the compiler still checks each
-/// access. This and `TrafficCallbackBridge` are the package's two escape
+/// access. This and `CallbackBridge` are the package's two escape
 /// hatches, and each says why.
 @MainActor
 open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
@@ -49,7 +49,11 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     }
 
     /// An error the host should surface. Called for a failed start, a failed
-    /// rebind, and an engine that stopped on its own.
+    /// rebind, and an engine that stopped on its own. After that last one the
+    /// provider cancels the tunnel and the extension process exits, so a host
+    /// that needs the reason in the app must persist it from here; the
+    /// `.lastError` message cannot answer once the process is gone, and a
+    /// Rust panic aborts the process with no hook at all.
     open func report(error: ShoesError) {}
 
     /// Cumulative bytes, about once a second while they change. The engine
@@ -62,18 +66,17 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// own limit is about a minute; failing earlier makes the reason ours.
     open var startTimeout: Duration { .seconds(14) }
 
-    /// How often the engine is checked for having stopped on its own.
-    open var healthCheckInterval: Duration { .seconds(30) }
-
     // MARK: State
 
     private let log = Logger(subsystem: "shoes", category: "ShoesPacketTunnelProvider")
     private let engine = ShoesEngine.shared
     private var configuration: ShoesConfiguration?
-    private var healthCheck: Task<Void, Never>?
+    /// What `report(error:)` last carried; answers `.lastError`.
+    private var lastError: ShoesError?
     private var pathObservation: Task<Void, Never>?
     private var rebind: Task<Void, Never>?
     private var isRebinding = false
+    private var isStopping = false
 
     // MARK: Overrides
 
@@ -125,6 +128,8 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         let config = try await loadConfiguration()
         configuration = config
         try engine.initialize(logLevel: config.logLevel)
+        lastError = nil
+        isStopping = false
 
         do {
             // Raced against the timeout, first-wins: a task group would
@@ -157,6 +162,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             log.error("startTunnel failed: \(shoesError.localizedDescription, privacy: .public)")
+            lastError = shoesError
             report(error: shoesError)
             if case .timedOut = shoesError {
                 // The engine call may still be running and may yet succeed;
@@ -168,14 +174,12 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             throw shoesError
         }
 
-        startHealthCheck()
         startPathObservation()
     }
 
     private func stop(reason: NEProviderStopReason) async {
         log.info("stopTunnel: \(reason.rawValue)")
-        healthCheck?.cancel()
-        healthCheck = nil
+        isStopping = true
         rebind?.cancel()
         rebind = nil
         pathObservation?.cancel()
@@ -193,6 +197,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             case .version: return .version(engine.version)
             case .status: return .status(running: engine.isRunning)
             case .stats: return .stats(engine.stats())
+            case .lastError: return .lastError(lastError)
             case .setLogLevel(let level):
                 do {
                     try engine.setLogLevel(level)
@@ -223,9 +228,13 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         let deliver: @MainActor @Sendable (UInt64, UInt64) -> Void = { [weak self] upload, download in
             self?.report(upload: upload, download: download)
         }
-        try await engine.start(config, deviceFD: fd) { upload, download in
-            Task { @MainActor in deliver(upload, download) }
+        let stopped: @MainActor @Sendable (String?) -> Void = { [weak self] reason in
+            self?.engineStopped(reason: reason)
         }
+        try await engine.start(
+            config, deviceFD: fd,
+            onTraffic: { upload, download in Task { @MainActor in deliver(upload, download) } },
+            onStopped: { reason in Task { @MainActor in stopped(reason) } })
         log.info("shoes \(self.engine.version, privacy: .public) started on fd \(fd)")
     }
 
@@ -300,33 +309,25 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             log.error("rebind failed: \(shoesError.localizedDescription, privacy: .public)")
+            lastError = shoesError
             report(error: shoesError)
             cancelTunnelWithError(shoesError)
         }
     }
 
-    // MARK: Health
+    // MARK: Engine exit
 
-    private func startHealthCheck() {
-        healthCheck?.cancel()
-        let interval = healthCheckInterval
-        healthCheck = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: interval)
-                guard let self, !Task.isCancelled else { return }
-                // A rebind stops the engine for seconds on purpose; a tick
-                // in that window must not read it as a death.
-                if self.isRebinding { continue }
-                if !self.engine.isRunning {
-                    let reason = self.engine.lastError() ?? "engine stopped unexpectedly"
-                    self.log.error("\(reason, privacy: .public)")
-                    let error = ShoesError.engine(reason)
-                    self.report(error: error)
-                    self.cancelTunnelWithError(error)
-                    return
-                }
-            }
-        }
+    /// The engine stopped and nobody asked it to. A rebind stops the engine
+    /// on purpose and the library clears its slot before that stop, so this
+    /// does not fire for one; the checks are for the window between a
+    /// stopTunnel or rebind beginning on the actor and the C call landing.
+    private func engineStopped(reason: String?) {
+        if isRebinding || isStopping { return }
+        let error = ShoesError.engineStopped(reason)
+        log.error("\(error.localizedDescription, privacy: .public)")
+        lastError = error
+        report(error: error)
+        cancelTunnelWithError(error)
     }
 }
 

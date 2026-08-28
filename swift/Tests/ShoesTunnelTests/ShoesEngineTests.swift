@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import ShoesTunnel
@@ -27,7 +28,7 @@ import Testing
         try engine.initialize(logLevel: .error)
         let config = ShoesConfiguration(yaml: "---\n[]\n")
         let error = await #expect(throws: ShoesError.self) {
-            try await engine.start(config, deviceFD: 7) { _, _ in }
+            try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
         }
         guard case .startFailed(let reason) = error else {
             Issue.record("expected .startFailed, got \(String(describing: error))")
@@ -60,7 +61,27 @@ import Testing
         // refuse, but this is the error a host should see first.
         let fresh = ShoesEngine(forTesting: ())
         await #expect(throws: ShoesError.notInitialized) {
-            try await fresh.start(ShoesConfiguration(yaml: ""), deviceFD: 7) { _, _ in }
+            try await fresh.start(
+                ShoesConfiguration(yaml: ""), deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
         }
     }
+
+    @Test func aFailedStartNeverReportsAStop() async throws {
+        try engine.initialize(logLevel: .error)
+        let fired = Fired()
+        let config = ShoesConfiguration(yaml: "---\n[]\n")
+        _ = await #expect(throws: ShoesError.self) {
+            try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in fired.set() })
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(fired.isSet == false)
+    }
+}
+
+/// A set-once flag readable from any thread, for the test above.
+private final class Fired: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
 }
