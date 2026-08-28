@@ -19,7 +19,11 @@ and desktop sub-project #2 closed — which also turned the Windows CI job from
 a check into the full test suite, and fixed two Windows defects the suite
 surfaced the first time it ran there: QUIC inbounds panicking on SO_REUSEPORT,
 and dual-stack UDP relays losing all their IPv4 traffic because Windows
-defaults IPV6_V6ONLY on.
+defaults IPV6_V6ONLY on. Refreshed 2026-08-28 against `mobile` at `2cccb2e`
+(v0.2.16), after the first external consumer of the Swift package measured
+what it cost and asked for what it lacked: the package split into a host and
+an extension product, the engine gained a stop callback that replaced the
+provider's health check, and the rest of that list is a section of its own.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -32,6 +36,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 2 — worth doing after Tier 1](#tier-2--worth-doing-after-tier-1)
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
 - [Desktop clients](#desktop-clients)
+- [Apple integration: what the first consumer asked for](#apple-integration-what-the-first-consumer-asked-for)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
@@ -69,7 +74,7 @@ The gap is not in protocols. It is in everything around them.
 | Per-connection statistics | global counters, a live connection count, and per-outbound bytes — readable from a mobile host over FFI | Clash API |
 | Extra transports | WebSocket, HTTPUpgrade, H2MUX | + gRPC, HTTP/2 |
 | Hysteria2 / TUIC as a *client* | yes | yes |
-| Desktop client | control API only, no GUI | full GUI on three platforms |
+| Desktop client | control API and a Swift package for the Apple extension and app; no GUI | full GUI on three platforms |
 
 ## Tier 1 — closes most of the gap
 
@@ -267,13 +272,13 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
   `redirect` is the cheap half and the better first move: `SO_ORIGINAL_DST` by
   `getsockopt` on the accepted socket, no privileged listener, plain `iptables
   REDIRECT`, and it works on macOS pf as well. `tproxy` TCP is then incremental
-  — `IP_TRANSPARENT` goes in `new_tcp_listener` (`src/socket_util.rs:219`)
+  — `IP_TRANSPARENT` goes in `new_tcp_listener` (`src/socket_util.rs:230`)
   beside the existing `set_reuse_address`, and on such a listener the accepted
   socket's `local_addr()` *is* the original destination. Both need the same
   plumbing: `AsyncStream` (`src/async_stream.rs:173`) carries no `local_addr`
   and `setup_server_stream` only receives `Box<dyn AsyncStream>`, so the
   destination has to be captured in `run_tcp_server`
-  (`src/tcp/tcp_server.rs:41`) while the concrete `TcpStream` is still in hand.
+  (`src/tcp/tcp_server.rs:31`) while the concrete `TcpStream` is still in hand.
   A day between them.
 
   UDP is the part that is actually work, and a separate decision. The generic
@@ -316,6 +321,18 @@ stack offers no readiness signal, so a GUI that shows "connected" at that moment
 is lying. Adding one is a change to `run_tun_from_config`, and it should land
 before a tray icon does. And `ServiceHandle` must not be stopped or dropped from
 async code — it owns a `Runtime`, and dropping a runtime inside another panics.
+
+Since v0.2.16 the handle also reports its own end. `start` takes
+`on_exit(Option<String>)`, called from the service task for any exit the host
+did not ask for — the error's message, or `None` for a clean but unrequested
+return — with `running` already false, so a callback that stops the engine
+does not wait out the five-second poll. Three consequences worth knowing:
+dropping a handle instead of calling `stop_handle` cancels the task and
+counts as an exit the host did not ask for; a host that keeps the handle
+somewhere the callback can see wants `start_and_install`, which stores the
+handle before the task can run; and a panic reaches none of it, because the
+crate builds with `panic = "abort"`. The mobile FFI is the first user; a
+desktop helper polling `status()` gets the same fact from `StopReason`.
 
 ### 2. Windows TUN backend — done
 
@@ -376,7 +393,21 @@ declined, because system proxy settings bind only cooperating applications.
 
 Not verified: the tunnel has never run on macOS, because activating the
 extension needs the NetworkExtension entitlement in a real profile. Steps up
-to the C boundary are tested in CI; the rest compiles.
+to the C boundary are tested in CI; the rest compiles. On iOS it has: KVN,
+a KMP VPN client, adopted the package from v0.2.15, and what it found is the
+[Apple integration](#apple-integration-what-the-first-consumer-asked-for)
+section.
+
+The package is two products since v0.2.16. `ShoesTunnel` is what the
+extension links; `ShoesTunnelHost` is what the app links, and it never
+depends on the engine — with one product the app carried every `shoes_*`
+symbol, about 15 MB of `__TEXT` for code it never ran, because
+`ShoesEngine.shared` roots the engine and SwiftPM compiles a module whole.
+Both sit on a `ShoesTunnelCore` target holding the wire types, so the two
+processes cannot disagree about a message, and `mobile.yml` builds one
+executable per product for the simulator and asserts with `nm` that the
+host has no engine symbol and the extension does. Design:
+[docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md](./docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md).
 
 ### 4. Privileged helper and IPC contract
 
@@ -415,6 +446,67 @@ today — the only mention in the tree is a doc comment at
 parameters onto the config types. Belongs in the GUI repository rather than
 here: no mobile caller wants it, and it would cost mobile bytes for no mobile
 benefit.
+
+## Apple integration: what the first consumer asked for
+
+KVN adopted `ShoesTunnel` at v0.2.15 and sent back a list, in value order.
+Three of its eight items shipped in v0.2.16; the rest are here so they are
+not lost. Nothing below is protocol work: it is all about how an engine
+inside a packet tunnel provider talks to the app that owns it.
+
+### Done in v0.2.16
+
+- **Errors are pushed, not polled.** The provider used to learn of an engine
+  death from a 30-second health check. `shoes_start_with_fd` takes a
+  `ShoesStoppedCallback` now, fired from the service task the instant it
+  ends without `shoes_stop` having been called; the provider reports it and
+  cancels the tunnel at once, and the health check is gone — it observed the
+  same event, the service task ending, thirty seconds later. What neither
+  could see, a task that lives while nothing flows, is still unobserved.
+  Design:
+  [docs/superpowers/specs/2026-08-28-engine-stopped-callback-design.md](./docs/superpowers/specs/2026-08-28-engine-stopped-callback-design.md).
+- **Host conditions have their own error cases.** `ShoesTunnelManager.send`
+  threw `.engine("no tunnel session")` for a condition that was the host's;
+  it throws `.noSession` and `.providerNoReply` now, and `.engineStopped`
+  carries the callback's reason. `ShoesError` is `Codable`.
+- **The message channel carries errors.** `.lastError` asks the provider for
+  the last error it reported, as the case. It answers while the extension is
+  alive; after an engine death the process exits and the app sees only
+  `.disconnected`, so a host still persists fatal reasons from
+  `report(error:)` — that half of KVN's App Group file stays.
+
+### Open
+
+- **Log growth.** `shoes_set_log_file` appends forever
+  (`src/ffi/common.rs:66`), and on iOS an App Group log outlives the
+  process, so it grows across sessions. Truncating on set is the wrong fix —
+  it is called once per start and would discard the log of the previous
+  crash, which is the one worth reading. Size-capped rotation in Rust, one
+  `.1` kept, is small.
+- **The compiled log ceiling.** Release builds carry
+  `release_max_level_info` (`Cargo.toml`), so `debug` and `trace` behave as
+  `info` and a support session asks for logs the build cannot produce. A
+  `shoes_max_log_level()` returning the ceiling, surfaced as
+  `ShoesEngine.effectiveLogLevel`, ends that conversation. Ship it with the
+  rotation.
+- **Path changes.** The provider wakes on every `.satisfied` path after the
+  first (`ShoesPacketTunnelProvider.swift`, `startPathObservation`). A wake
+  costs one `shoes_network_changed` call and a full rebind only when the
+  engine says it did not recover, so a captive-portal flap is cheap rather
+  than disruptive. Comparing `availableInterfaces` and gateways against the
+  last path would be fine hygiene; it is not worth a release on its own.
+- **Stats push.** The traffic callback carries bytes only; `active_connections`
+  and the per-outbound figures are a JSON poll. Pushing them changes a C
+  signature for something the UI polls at its own rate anyway. If it ever
+  happens, it rides the stop callback's channel as a general event callback
+  rather than a third function pointer.
+
+### Not asked for, and worth deciding
+
+The same callback does not exist on Android: the JNI `start` still gets its
+failures through `getLastError()` and a poll of `isRunning()`. The Rust side
+is shared, so the Kotlin half is a `StopListener` interface and a global
+reference; the question is whether anyone is asking.
 
 ## Hysteria: the rest of the surface
 
