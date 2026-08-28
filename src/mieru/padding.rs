@@ -311,24 +311,45 @@ mod tests {
     /// And the padding must actually move the combined distribution. It cannot
     /// always reach the 0.325 target - the flip count is clamped to the
     /// padding's own size - but it must not leave the input where it was.
+    ///
+    /// Sampled until a non-empty padding turns up rather than judged from a
+    /// single build: the length is drawn from `0..=MAX_PADDING_LEN`, so an
+    /// empty padding is a valid ~1-in-256 outcome that carries no distribution
+    /// to move. Asserting non-empty on one draw is a flaky test, not a defect
+    /// being caught - the sibling above skips short paddings for the same
+    /// reason.
     #[test]
     fn test_entropy_padding_improves_a_skewed_distribution() {
         let existing = [0u8; 256];
-        let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
-        assert!(!padding.is_empty(), "skewed data needs padding");
 
-        let total_bits = (existing.len() + padding.len()) * 8;
-        let ones: usize = existing
-            .iter()
-            .chain(padding.iter())
-            .map(|b| b.count_ones() as usize)
-            .sum();
-        let after = ones.min(total_bits - ones) as f64 / total_bits as f64;
+        let mut moved = false;
+        for _ in 0..200 {
+            let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
+            if padding.is_empty() {
+                continue;
+            }
 
-        // Before the padding the rarer bit is absent entirely.
+            let total_bits = (existing.len() + padding.len()) * 8;
+            let ones: usize = existing
+                .iter()
+                .chain(padding.iter())
+                .map(|b| b.count_ones() as usize)
+                .sum();
+            let after = ones.min(total_bits - ones) as f64 / total_bits as f64;
+
+            // Before the padding the rarer bit is absent entirely, so any
+            // non-empty padding must lift it above zero.
+            assert!(
+                after > 0.0,
+                "the padding did not move the distribution at all"
+            );
+            moved = true;
+        }
+
         assert!(
-            after > 0.0,
-            "the padding did not move the distribution at all"
+            moved,
+            "200 draws produced no non-empty padding, which is astronomically \
+             unlikely unless build_entropy_padding stopped padding at all"
         );
     }
 
