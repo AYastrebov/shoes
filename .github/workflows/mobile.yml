@@ -108,9 +108,17 @@ jobs:
       - name: Select Xcode
         run: |
           set -euo pipefail
-          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
-          sudo xcode-select -s "$xcode"
+          # The newest Xcode 26 the image carries, else whatever is default;
+          # either way the toolchain must be Swift 6, which the check below
+          # says in the log rather than leaving to a compile error later.
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$xcode" ]; then
+            sudo xcode-select -s "$xcode"
+          fi
+          xcode-select -p
           swift --version
+          swift --version 2>&1 | grep -qE 'Swift version ([6-9]|[1-9][0-9])\.' \
+            || { echo "Swift 6 or newer is required"; exit 1; }
 
       # Downloaded, not rebuilt: the apple job already spent the minutes.
       - name: Download the XCFramework
