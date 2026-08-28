@@ -1,6 +1,10 @@
 import Foundation
 @preconcurrency import NetworkExtension
 
+// Re-exported so `import ShoesTunnelHost` alone sees ShoesAppMessage,
+// ShoesError and the other wire types.
+@_exported import ShoesTunnelCore
+
 /// The app-process half: Apple's TN3120 sequence, status as a stream, and
 /// typed messages to the provider.
 ///

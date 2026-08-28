@@ -35,7 +35,12 @@ let package = Package(
     name: "ShoesTunnel",
     platforms: [.iOS(.v18), .macOS(.v15)],
     products: [
-        .library(name: "ShoesTunnel", targets: ["ShoesTunnel"])
+        // The extension links this: the provider base class over the engine.
+        .library(name: "ShoesTunnel", targets: ["ShoesTunnel"]),
+        // The app links this. It never depends on ShoesFFI, so no shoes_*
+        // symbol can reach the app executable -- the link check in
+        // mobile.yml holds the package to that.
+        .library(name: "ShoesTunnelHost", targets: ["ShoesTunnelHost"]),
     ],
     targets: [
         shoesFFI,
@@ -45,12 +50,19 @@ let package = Package(
             name: "ShoesTunnelCore",
             path: "swift/Sources/ShoesTunnelCore"),
         .target(
+            name: "ShoesTunnelHost",
+            dependencies: ["ShoesTunnelCore"],
+            path: "swift/Sources/ShoesTunnelHost",
+            linkerSettings: [
+                .linkedFramework("NetworkExtension"),
+                .linkedFramework("SystemExtensions", .when(platforms: [.macOS])),
+            ]),
+        .target(
             name: "ShoesTunnel",
             dependencies: ["ShoesTunnelCore", "ShoesFFI"],
             path: "swift/Sources/ShoesTunnel",
             linkerSettings: [
-                .linkedFramework("NetworkExtension"),
-                .linkedFramework("SystemExtensions", .when(platforms: [.macOS])),
+                .linkedFramework("NetworkExtension")
             ]),
         .testTarget(
             name: "ShoesTunnelCoreTests",
