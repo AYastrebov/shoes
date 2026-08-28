@@ -128,11 +128,13 @@ That is the entire Rust change.
 forwards it only under `target_os = "ios"`. That looks like a defect that would
 feed the utun 4-byte protocol header into smoltcp as packet data.
 
-It is not. `tun-0.8.14`'s macOS `PlatformConfig` defaults `packet_information`
-to `true` (`platform/macos/mod.rs:35`, *"default is true in macOS"*), and its
-doc comment covers the Network Extension case explicitly: an fd obtained from
-`packetFlow`'s `socket.fileDescriptor` carries the header. iOS is the platform
-whose default differs, which is why iOS is the platform with the explicit call.
+It is not. `tun-0.8.14` defaults `packet_information` to `true` on **both**
+Apple platforms (`platform/macos/mod.rs:35`, `platform/ios/mod.rs:33`), and the
+macOS doc comment covers the Network Extension case explicitly: an fd obtained
+from `packetFlow`'s `socket.fileDescriptor` carries the header. An earlier
+draft here claimed iOS's default differed; review checked the crate and it does
+not — the iOS arm merely forwards the same `true` the default already is, and
+the macOS arm forwards nothing because the default is already right.
 
 Behaviour is correct today. The builder field is dead on macOS, which is worth
 tidying with a comment saying why it is a no-op, and is not worth calling a fix.

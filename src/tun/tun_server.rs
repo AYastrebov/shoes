@@ -273,11 +273,15 @@ impl TunServerConfig {
             config.up();
         }
 
-        // iOS only, deliberately. The tun crate's macOS PlatformConfig defaults
-        // packet_information to true, which is what a descriptor read off
-        // NEPacketTunnelProvider.packetFlow carries, so the field
-        // run_tun_from_config sets for macOS is a no-op there and stays one.
-        // iOS is the platform whose default differs.
+        // iOS only, and the difference is which side sets it, not the
+        // defaults: the tun crate defaults packet_information to true on
+        // BOTH Apple platforms, which is what a descriptor read off
+        // NEPacketTunnelProvider.packetFlow carries. On iOS this forwards
+        // the value run_tun_from_config sets for fd devices (the same
+        // true); on macOS nothing forwards it and the crate default is
+        // already right, so the builder field is a no-op there and stays
+        // one. Forwarding it on macOS too would be harmless and equally
+        // pointless.
         #[cfg(target_os = "ios")]
         {
             config.platform_config(|p| {
