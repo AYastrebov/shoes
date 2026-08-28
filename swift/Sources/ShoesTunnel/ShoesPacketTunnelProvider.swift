@@ -31,8 +31,9 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     // MARK: Hooks
 
     /// The config to run. Called on every start and on every full rebind.
-    /// Throw to fail the start with that error.
-    open func loadConfiguration() throws -> ShoesConfiguration {
+    /// Throw to fail the start with that error. `async` so a slow source --
+    /// a file, a keychain -- need not block the actor; a sync body is fine.
+    open func loadConfiguration() async throws -> ShoesConfiguration {
         throw ShoesError.startFailed("loadConfiguration() is not overridden")
     }
 
@@ -72,6 +73,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private var healthCheck: Task<Void, Never>?
     private var pathObservation: Task<Void, Never>?
     private var rebind: Task<Void, Never>?
+    private var isRebinding = false
 
     // MARK: Overrides
 
@@ -120,27 +122,49 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // Awaited, not blocked on: shoes_stop can take up to five seconds.
         if engine.isRunning { await engine.stop() }
 
-        let config = try loadConfiguration()
+        let config = try await loadConfiguration()
         configuration = config
         try engine.initialize(logLevel: config.logLevel)
 
         do {
-            // Raced against the timeout: the system's own limit is about a
-            // minute, and failing earlier makes the reason ours.
+            // Raced against the timeout, first-wins: a task group would
+            // await its children on exit, and the engine call cannot be
+            // cancelled mid-C, so the race is by continuation instead --
+            // the timeout genuinely bounds startTunnel. Work that finishes
+            // after losing the race is cleaned up below, so a tunnel that
+            // came up late does not linger behind a failed start.
             let limit = startTimeout
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await self.applySettingsAndStartEngine(config) }
-                group.addTask {
-                    try await Task.sleep(for: limit)
-                    throw ShoesError.timedOut(seconds: Int(limit.components.seconds))
+            let work = Task { @MainActor in
+                try await self.applySettingsAndStartEngine(config)
+            }
+            let claim = ClaimFlag()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                Task { @MainActor in
+                    do {
+                        try await work.value
+                        if await claim.claim() { cont.resume() }
+                    } catch {
+                        if await claim.claim() { cont.resume(throwing: error) }
+                    }
                 }
-                try await group.next()
-                group.cancelAll()
+                Task {
+                    try? await Task.sleep(for: limit)
+                    if await claim.claim() {
+                        cont.resume(throwing: ShoesError.timedOut(seconds: Int(limit.components.seconds)))
+                    }
+                }
             }
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             log.error("startTunnel failed: \(shoesError.localizedDescription, privacy: .public)")
             report(error: shoesError)
+            if case .timedOut = shoesError {
+                // The engine call may still be running and may yet succeed;
+                // stop whatever it produces once it lands.
+                Task { @MainActor in
+                    if self.engine.isRunning { await self.engine.stop() }
+                }
+            }
             throw shoesError
         }
 
@@ -185,10 +209,10 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     private func applySettingsAndStartEngine(_ config: ShoesConfiguration) async throws {
         try await setTunnelNetworkSettings(makeNetworkSettings())
-        try startEngine(config)
+        try await startEngine(config)
     }
 
-    private func startEngine(_ config: ShoesConfiguration) throws {
+    private func startEngine(_ config: ShoesConfiguration) async throws {
         guard let fd = packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32, fd >= 0 else {
             throw ShoesError.tunnelDescriptorUnavailable
         }
@@ -199,7 +223,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         let deliver: @MainActor @Sendable (UInt64, UInt64) -> Void = { [weak self] upload, download in
             self?.report(upload: upload, download: download)
         }
-        try engine.start(config, deviceFD: fd) { upload, download in
+        try await engine.start(config, deviceFD: fd) { upload, download in
             Task { @MainActor in deliver(upload, download) }
         }
         log.info("shoes \(self.engine.version, privacy: .public) started on fd \(fd)")
@@ -257,14 +281,21 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     private func rebindTunnel() async {
         guard let config = configuration else { return }
+        // One at a time. The actor is reentrant at every await below, so a
+        // second debounced rebind could otherwise interleave with this one.
+        guard !isRebinding else { return }
+        isRebinding = true
         reasserting = true
-        defer { reasserting = false }
+        defer {
+            isRebinding = false
+            reasserting = false
+        }
         await engine.stop()
         do {
             // Nil then re-apply, so the system re-evaluates the default path.
             try await setTunnelNetworkSettings(nil)
             try await setTunnelNetworkSettings(makeNetworkSettings())
-            try startEngine(config)
+            try await startEngine(config)
             log.info("rebind succeeded")
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
@@ -283,6 +314,9 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             while !Task.isCancelled {
                 try? await Task.sleep(for: interval)
                 guard let self, !Task.isCancelled else { return }
+                // A rebind stops the engine for seconds on purpose; a tick
+                // in that window must not read it as a death.
+                if self.isRebinding { continue }
                 if !self.engine.isRunning {
                     let reason = self.engine.lastError() ?? "engine stopped unexpectedly"
                     self.log.error("\(reason, privacy: .public)")
@@ -293,5 +327,17 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 }
             }
         }
+    }
+}
+
+/// First-wins for the start race: exactly one of the two racers resumes the
+/// continuation. An actor rather than a lock, so it needs no unchecked
+/// Sendable of its own.
+private actor ClaimFlag {
+    private var claimed = false
+    func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
