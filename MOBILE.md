@@ -13,7 +13,7 @@ open and are ordered at the end. Line references were last checked against
 | | Android | iOS |
 |---|---|---|
 | Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64` clean | `cargo build --target aarch64-apple-ios` clean |
-| Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-ios.sh` |
+| Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-apple.sh` |
 | Entry points | 10 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 11 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
 | Traffic stats | `TrafficListener.onTrafficUpdate`, `getStats()` | `ShoesTrafficCallback`, `shoes_get_stats()` |
@@ -23,9 +23,10 @@ open and are ordered at the end. Line references were last checked against
 | AmneziaWG 2.0/3.0/3.1 | yes | yes |
 | Fake IP / DNS leak | yes, via TUN interception | yes, via TUN interception |
 
-The iOS build needs `IPHONEOS_DEPLOYMENT_TARGET=16.0`; `aws-lc-sys` references
-`___chkstk_darwin`, which is iOS 13+. `scripts/build-ios.sh` sets it, but a
-plain `cargo build --target aarch64-apple-ios` fails at link time without it.
+The iOS build needs `IPHONEOS_DEPLOYMENT_TARGET=18.0` (the package's floor;
+`aws-lc-sys` itself only needs iOS 13+ for `___chkstk_darwin`).
+`scripts/build-apple.sh` sets it, but a plain
+`cargo build --target aarch64-apple-ios` fails at link time without it.
 
 ---
 
@@ -64,9 +65,9 @@ the findings below assume.
 # Needs ANDROID_NDK_HOME, ANDROID_HOME and gradle on PATH.
 bash scripts/build-android.sh
 
-# iOS XCFramework -> output/ios/Shoes.xcframework
+# iOS + macOS XCFramework -> output/apple/Shoes.xcframework
 # macOS + Xcode only. Regenerates include/shoes.h via cbindgen if installed.
-bash scripts/build-ios.sh
+bash scripts/build-apple.sh
 
 # Native libs only, skipping Gradle. --features control-stats because that is
 # what the scripts above build and what the size baseline is recorded against:
@@ -77,7 +78,7 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 21 \
     --features control-stats
 
 # iOS device slice by hand — the deployment target is not optional
-IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+IPHONEOS_DEPLOYMENT_TARGET=18.0 \
     cargo build --profile release-mobile --features control-stats \
     --target aarch64-apple-ios
 
@@ -93,7 +94,8 @@ cargo test --features ffi
 The Android build ships `arm64-v8a`, `armeabi-v7a` and `x86_64` — the last one
 so the stock x86_64 emulator can load the library at all; without it,
 `System.loadLibrary` fails at startup on any non-ARM image. There is no 32-bit
-x86 slice. iOS ships the device and Apple Silicon simulator slices only.
+x86 slice. The Apple framework ships iOS device, iOS simulator and macOS slices, all
+arm64.
 
 CI (`.github/workflows/mobile.yml`) triggers on `v*` tags, on pull requests to
 `master` and `mobile`, and manually — not on a branch push, which runs Test and
