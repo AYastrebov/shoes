@@ -105,11 +105,15 @@ pub async fn run_tun_server(
     // device itself. validate.rs enforces the same shape at config time;
     // this is the backstop for callers that skip validation, and it must
     // agree with validate.rs rather than invent looser rules of its own.
+    // Every rejection here is InvalidInput, the kind validate.rs uses for the
+    // same config mistakes: the backstop's whole purpose is to agree with
+    // validation for callers that skipped it, so a config that is bad in one
+    // place must be bad the same way in the other.
     #[cfg(windows)]
     let wintun = {
         if let Some(fd) = config.raw_fd {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
+                std::io::ErrorKind::InvalidInput,
                 format!("device_fd {fd} is not supported on Windows; shoes creates the device"),
             ));
         }
@@ -118,7 +122,7 @@ pub async fn run_tun_server(
         // host's to manage, not shoes'.
         if config.destination.is_some() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
+                std::io::ErrorKind::InvalidInput,
                 "TUN 'destination' is not supported on Windows: it would install \
                  a default route through the adapter, and routes stay the host's",
             ));
@@ -134,7 +138,7 @@ pub async fn run_tun_server(
         let (std::net::IpAddr::V4(address), std::net::IpAddr::V4(netmask)) = (address, netmask)
         else {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
+                std::io::ErrorKind::InvalidInput,
                 "TUN on Windows requires an IPv4 'address' and 'netmask': \
                  the wintun configuration path cannot express IPv6",
             ));
