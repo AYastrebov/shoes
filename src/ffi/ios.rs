@@ -215,8 +215,11 @@ unsafe fn start_service(
     protect_callback: ProtectSocketCallback,
     traffic_callback: ShoesTrafficCallback,
 ) -> c_long {
+    // Every -1 below leaves a reason in shoes_get_last_error, so a caller
+    // that reads it never sees the previous failure's message instead.
     if config_yaml.is_null() {
         error!("{who}: config_yaml is null");
+        common::set_last_error("config_yaml is null".to_string());
         return -1;
     }
 
@@ -234,6 +237,7 @@ unsafe fn start_service(
         Ok(s) => s.to_string(),
         Err(e) => {
             error!("{who}: invalid UTF-8 in config_yaml: {}", e);
+            common::set_last_error(format!("invalid UTF-8 in config_yaml: {e}"));
             return -1;
         }
     };
@@ -261,6 +265,7 @@ unsafe fn start_service(
         Ok(rt) => rt,
         Err(e) => {
             error!("{who}: failed to create runtime: {}", e);
+            common::set_last_error(format!("failed to create runtime: {e}"));
             return -1;
         }
     };
@@ -568,8 +573,12 @@ mod tests {
     }
 
     #[test]
-    fn start_with_fd_rejects_a_null_config() {
+    fn start_with_fd_rejects_a_null_config_and_says_so() {
         let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic) };
         assert_eq!(handle, -1);
+        assert_eq!(
+            common::get_last_error().as_deref(),
+            Some("config_yaml is null")
+        );
     }
 }
