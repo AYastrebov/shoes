@@ -226,14 +226,18 @@ mod tests {
 
     /// Entropy padding exists to pull the bit distribution toward the target.
     /// Feed it all-zero data and the padding must carry ones.
+    ///
+    /// The length is drawn from 0..=MAX_PADDING_LEN, so an empty padding is a
+    /// valid ~1-in-256 outcome that carries nothing to measure; sampled until
+    /// a non-empty one turns up, like the two siblings below. This test
+    /// failed on two CI legs of one PR on exactly that draw.
     #[test]
     fn test_entropy_padding_balances_a_skewed_input() {
         let existing = [0u8; 200];
-        let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
-        assert!(
-            !padding.is_empty(),
-            "all-zero data needs padding to balance"
-        );
+        let padding = (0..200)
+            .map(|_| build_entropy_padding(MAX_PADDING_LEN, &existing))
+            .find(|p| !p.is_empty())
+            .expect("200 draws never produced a non-empty padding");
         let ones: u32 = padding.iter().map(|b| b.count_ones()).sum();
         assert!(ones > 0, "the padding must carry the rarer bit");
     }
