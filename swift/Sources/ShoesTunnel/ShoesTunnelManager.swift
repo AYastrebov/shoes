@@ -20,13 +20,16 @@ public final class ShoesTunnelManager {
     }
 
     /// Find the saved configuration for this provider, or prepare a new one.
-    public func load() async throws {
+    @discardableResult
+    public func load() async throws -> NETunnelProviderManager {
         let all = try await NETunnelProviderManager.loadAllFromPreferences()
-        manager =
+        let found =
             all.first {
                 ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                     == providerBundleIdentifier
             } ?? NETunnelProviderManager()
+        manager = found
+        return found
     }
 
     /// Configure, save, reload and start.
@@ -38,8 +41,14 @@ public final class ShoesTunnelManager {
         #if os(macOS)
             try await SystemExtensionInstaller.activate(bundleIdentifier: providerBundleIdentifier)
         #endif
-        if manager == nil { try await load() }
-        guard let manager else { return }
+        // load() always yields a manager; the binding makes that a
+        // compile-time fact rather than a guard that silently returns.
+        let manager: NETunnelProviderManager
+        if let existing = self.manager {
+            manager = existing
+        } else {
+            manager = try await load()
+        }
 
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = providerBundleIdentifier
@@ -62,15 +71,19 @@ public final class ShoesTunnelManager {
 
     /// Status changes for this connection, starting with the current value.
     public var statusUpdates: AsyncStream<NEVPNStatus> {
-        let connection = manager?.connection
-        return AsyncStream { continuation in
+        AsyncStream { continuation in
             continuation.yield(status)
             let task = Task { @MainActor [weak self] in
                 // Filtered here rather than by `object:`, whose parameter
                 // wants a Sendable object and NEVPNConnection is not one.
-                for await note in NotificationCenter.default.notifications(named: .NEVPNStatusDidChange)
-                where note.object as AnyObject === connection {
-                    continuation.yield(self?.status ?? .invalid)
+                // Against the LIVE connection, read per notification: the
+                // stream may be created before load(), and a connection
+                // captured at creation would be nil and match nothing, ever.
+                for await note in NotificationCenter.default.notifications(named: .NEVPNStatusDidChange) {
+                    guard let self, let connection = self.manager?.connection,
+                        note.object as AnyObject === connection
+                    else { continue }
+                    continuation.yield(self.status)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
