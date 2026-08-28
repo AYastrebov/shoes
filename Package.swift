@@ -21,7 +21,7 @@ import PackageDescription
 // then tags -- so the tag points at a manifest that names its own release.
 // A checksum of all zeros means no release has published this manifest yet.
 let shoesRelease = "v0.2.15"
-let shoesChecksum = "0000000000000000000000000000000000000000000000000000000000000000"
+let shoesChecksum = "52f76368cdcc3c5918b3e733464ed9e755c82b87bb2e99ef10335ba41e21b4ee"
 
 let shoesFFI: Target =
     ProcessInfo.processInfo.environment["SHOES_LOCAL_XCFRAMEWORK"] != nil
