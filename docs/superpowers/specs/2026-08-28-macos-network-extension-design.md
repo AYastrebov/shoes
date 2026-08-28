@@ -74,29 +74,30 @@ Not in this work, and deferred to the GUI repository:
 
 ## What reading the tree found
 
-### A macOS build that does not compile
+### The FFI is a feature on macOS, and that is right
 
-`src/ffi/mod.rs:57` compiles `src/ffi/ios.rs` on macOS as well as iOS, by
-target, and that module calls `crate::socket_protector` at three sites
-(`ios.rs:54`, `:189`, `:216`). But `src/lib.rs:135` gates the module it calls:
+`src/lib.rs:135` gates the whole FFI module:
 
 ```rust
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+pub mod ffi;
 ```
 
-macOS is absent. So `cargo build --target aarch64-apple-darwin` with default
-features does not compile. Nothing catches it: every macOS job in
-`.github/workflows/mobile.yml` passes `--features ffi`, and `test.yml` runs on
-Ubuntu where the FFI module is `cfg`'d out entirely.
+On iOS and Android the module is compiled by target; on macOS only with
+`--features ffi`. An earlier draft of this document read that gate as a defect
+that broke the default-features macOS build. It does not: with the feature off
+the module is absent and the crate builds, which is what the desktop binary
+and any Rust host linking the crate want — twelve `#[no_mangle]` exports have
+no business in `target/release/shoes`. The gate stays.
 
-The fix is to add `target_os = "macos"` to that list rather than to require the
-feature at every call site. The module that needs `socket_protector` is
-target-gated onto macOS, so its dependency should be too — and then the build
-script needs no per-slice feature divergence.
+What follows for this work is one flag: the macOS slice of the XCFramework is
+built with `--features ffi,control-stats`, where the iOS slices need only
+`control-stats`. `.github/workflows/mobile.yml`'s `macos` job already does
+exactly that, and `test.yml`'s macOS leg covers the feature-off build.
 
 ### The descriptor as a parameter
 
-The second Rust change, and the only addition to the C surface. Today the fd
+The one Rust change, and the only addition to the C surface. Today the fd
 travels inside the YAML: `device_fd: 42` in the `tun` section, and
 `DevicePolicy::BorrowedFd` refuses a config without it
 (`src/control/device.rs:39`). That is fine for a host that generates the YAML
@@ -118,7 +119,7 @@ by a placeholder convention. It exports on every platform that builds the FFI,
 so the symbol count the CI check compares against `include/shoes.h` becomes
 twelve.
 
-Those two are the entire Rust change.
+That is the entire Rust change.
 
 ### A scare that was not one
 
@@ -403,10 +404,10 @@ down to `ShoesFFI`, which stays public for exactly that escape hatch.
 `aarch64-apple-darwin`. Deployment targets rise to
 `IPHONEOS_DEPLOYMENT_TARGET=18.0` and `MACOSX_DEPLOYMENT_TARGET=15.0`, matching
 the package's declared platforms — a split floor between the Rust objects and
-the Swift that wraps them is a trap nobody would enjoy debugging. Features stay
-`--features control-stats` uniformly, which the `src/lib.rs` cfg fix is what
-makes possible. `control-logs` stays off on every slice: it is a Rust-side
-subscribable sink that no C caller can reach.
+the Swift that wraps them is a trap nobody would enjoy debugging. The iOS
+slices build with `--features control-stats`; the macOS slice adds `ffi`,
+since that is what compiles the module there. `control-logs` stays off on
+every slice: it is a Rust-side subscribable sink that no C caller can reach.
 
 **Profile: `release-mobile` for the macOS slice too, and not for size.** There is
 no `catch_unwind` anywhere in `src/ffi/`, so the only thing preventing a panic
@@ -467,9 +468,7 @@ What is not solved by that is an ordering problem, addressed under CI below.
 macOS slice is covered with no new job and the uploaded artifact keeps its
 name. The `macos` job keeps both things that earn its runtime — the symbol count
 against `include/shoes.h`, and the only compile of the `not(control-stats)`
-arms — gains a step building `aarch64-apple-darwin` with **default features**
-(the combination that does not compile today, and the regression the cfg fix
-closes), and is renamed from "Build macOS staticlib", since the check
+arms — and is renamed from "Build macOS staticlib", since the check
 deliberately reads the dylib.
 
 `build.yml`'s `paths-ignore` gains `swift/**` and `Package.swift`: a Swift-only
@@ -573,7 +572,6 @@ of this document.
 
 What can be proven with no Apple Developer account, which is the situation today:
 
-- `cargo build --target aarch64-apple-darwin` with default features compiles.
 - `build-apple.sh` emits an XCFramework whose `Info.plist` lists a `macos-arm64`
   slice, and `nm` finds the same 12 `shoes_*` symbols in it.
 - `swift build` and `swift test` succeed on a macOS runner.
@@ -626,7 +624,7 @@ but the encoding should tolerate an unknown request rather than crash on one.
 
 ## Order of work
 
-1. `src/lib.rs` cfg fix, plus the CI step that would have caught it.
+1. A comment on the macOS `packet_information` no-op, and the CI job rename.
 2. `shoes_start_with_fd` in `src/ffi/ios.rs` and `src/control`, header
    regenerated, symbol count in CI raised to twelve.
 3. `build-apple.sh` with the macOS slice, and `include/module.modulemap`.
