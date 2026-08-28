@@ -9,10 +9,22 @@ and macOS, from the repository that owns the C API it wraps.
 .package(url: "https://github.com/AYastrebov/shoes.git", from: "0.2.15")
 ```
 
-and depend on the `ShoesTunnel` product from both the app target and the
-extension target. Platforms: iOS 18, macOS 15. The package pulls
-`Shoes.xcframework.zip` from the matching release; the checksum in
-`Package.swift` names that release and is written by the release workflow.
+Two products: the extension target depends on `ShoesTunnel`, the app target
+on `ShoesTunnelHost`. They share one `ShoesTunnelCore` target with the wire
+types, so the two processes cannot disagree about a message. Linking
+`ShoesTunnel` into the app is what the split avoids: it kept all `shoes_*`
+symbols in the app executable -- `__TEXT` is 80 KB for an executable over the
+host product against 7.1 MB for one over the engine, in a Release simulator
+build (the numbers come from the link check in `mobile.yml`). Platforms: iOS
+18, macOS 15. The package pulls `Shoes.xcframework.zip` from the matching
+release; the checksum in `Package.swift` names that release and is written by
+the release workflow.
+
+Write `import ShoesTunnel` in the extension and `import ShoesTunnelHost` in
+the app; both re-export Core (`@_exported`, deliberately -- it is the one
+underscored attribute in the package), so `ShoesConfiguration` and friends
+are visible without a second import. `import ShoesTunnelCore` also works but
+is not the recommended spelling.
 
 To develop against an unreleased shoes: `bash scripts/build-apple.sh`, then
 `SHOES_LOCAL_XCFRAMEWORK=1 swift build`. Xcode does not see that variable --
@@ -51,6 +63,8 @@ messages. The class is `@MainActor`; all four hooks run there.
 ## The app
 
 ```swift
+import ShoesTunnelHost
+
 let tunnel = ShoesTunnelManager(providerBundleIdentifier: "com.example.app.tunnel")
 try await tunnel.start { proto in
     proto.serverAddress = "shoes"

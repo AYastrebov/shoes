@@ -10,7 +10,7 @@ use it -- is in [swift/README.md](../swift/README.md); the mobile notes in
 A packet tunnel provider distributed outside the Mac App Store ships as a
 `.systemextension` under `Contents/Library/SystemExtensions`, activated at
 runtime with `OSSystemExtensionRequest` (`SystemExtensionInstaller` in the
-package does this) and approved once by the user in System Settings. An
+package's `ShoesTunnelHost` product does this) and approved once by the user in System Settings. An
 `.appex` under `Contents/PlugIns` is the Mac App Store shape, and App Store
 Review Guideline 5.4 requires an organization account to publish a VPN app
 there. This project ships under Developer ID: signed, notarized, stapled, as

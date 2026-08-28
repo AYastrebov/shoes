@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### `ShoesTunnelHost`
+
+The Swift package now has two products. `ShoesTunnel` is unchanged for the
+extension: same name, same API, a version bump is the whole migration.
+`ShoesTunnelHost` is new for the app: `ShoesTunnelManager` and
+`SystemExtensionInstaller` over a shared `ShoesTunnelCore` target, with no
+dependency on the engine, so an app that links it carries no `shoes_*`
+symbol -- previously linking the one product into the app kept the whole
+engine in the app binary. Apps swap their dependency from `ShoesTunnel` to
+`ShoesTunnelHost` and `import ShoesTunnelHost`. Source-compatible for
+extension consumers, additive for hosts. CI asserts the link-time property
+on a Release simulator build.
+
 ## v0.2.15
 
 ### macOS slice and the ShoesTunnel Swift package
