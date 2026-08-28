@@ -15,6 +15,27 @@ engine in the app binary. Apps swap their dependency from `ShoesTunnel` to
 extension consumers, additive for hosts. CI asserts the link-time property
 on a Release simulator build.
 
+### The engine says when it stops
+
+`shoes_start_with_fd` takes a `ShoesStoppedCallback`, called once from a
+worker thread when the engine stops without `shoes_stop` -- the failure
+message, or NULL. Never for a requested stop, never after `shoes_stop`
+returns; the reason is in `shoes_get_last_error` as well. `shoes_start` is
+unchanged; the `_with_fd` signature changes one release after it appeared,
+with the Swift package its only consumer. The surface count stays at 12.
+
+In the package, `ShoesEngine.start` gains a required `onStopped:` and
+`ShoesPacketTunnelProvider` reports an engine death at once instead of
+noticing it on a 30-second health check, which is removed together with
+`healthCheckInterval` (a subclass that overrode it no longer compiles; the
+override did nothing). `ShoesError` gains `.noSession` and
+`.providerNoReply` -- what `ShoesTunnelManager.send` now throws instead of
+`.engine` -- and `.engineStopped(String?)`; it is `Codable`. An exhaustive
+`switch` over `ShoesError` needs the new cases. `ShoesAppMessage.lastError`
+asks the provider for the last error it reported, as the case; it answers
+while the extension is alive, and after an engine death the process is gone
+and the app sees only `.disconnected`.
+
 ## v0.2.15
 
 ### macOS slice and the ShoesTunnel Swift package
