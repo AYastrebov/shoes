@@ -67,6 +67,9 @@ pub struct ServiceHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     /// Flag indicating if service is running.
     running: Arc<AtomicBool>,
+    /// Set by `stop_handle` before the shutdown signal, so the exit guard
+    /// can tell a stop the host asked for from one it must be told about.
+    stop_requested: Arc<AtomicBool>,
     /// When `start` spawned the service, for `uptime`.
     started_at: std::time::Instant,
     /// Set if the stack stopped with an error, so `status` can tell a failure
@@ -99,6 +102,7 @@ const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// anything the app needs back, so it happens on a thread of its own and the
 /// caller does not pay for it.
 pub fn stop_handle(mut handle: ServiceHandle) -> StopOutcome {
+    handle.stop_requested.store(true, Ordering::SeqCst);
     if let Some(tx) = handle.shutdown_tx.take() {
         let _ = tx.send(());
     }
@@ -219,10 +223,19 @@ impl ServiceHandle {
 /// both services. Each privileged host runs exactly one tunnel, so this costs
 /// nothing in practice — but it is an invariant this API depends on rather than
 /// an accident.
+/// Start a prepared service on `runtime`.
+///
+/// `on_exit` runs once, from the service task, when the service ends for
+/// any reason the host did not ask for: `Some(message)` when it failed,
+/// `None` when it returned without an error. It is not called after
+/// [`stop_handle`]. By the time it runs `running` is already false, so a
+/// callback that stops the engine does not wait out [`STOP_TIMEOUT`].
+///
+/// A panic does not reach it: the crate builds with `panic = "abort"`.
 pub fn start(
     runtime: tokio::runtime::Runtime,
     prepared: PreparedService,
-    on_error: impl Fn(String) + Send + 'static,
+    on_exit: impl FnOnce(Option<String>) + Send + 'static,
 ) -> ServiceHandle {
     // From zero, so a second session does not report the first one's bytes
     // against a fresh uptime. Both FFI platforms already do this in their own
@@ -230,38 +243,89 @@ pub fn start(
     #[cfg(any(unix, windows))]
     crate::tun::traffic::reset_traffic_counters();
 
+    start_with(
+        runtime,
+        |shutdown_rx| run_prepared(prepared, shutdown_rx),
+        on_exit,
+    )
+}
+
+/// `start` with the service future injectable, so the exit contract can be
+/// tested without a TUN device.
+pub fn start_with<F, Fut>(
+    runtime: tokio::runtime::Runtime,
+    make_service: F,
+    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+) -> ServiceHandle
+where
+    F: FnOnce(oneshot::Receiver<()>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
+    let stop_requested = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(parking_lot::Mutex::new(None));
-    let failure_clone = failure.clone();
+
+    let service = make_service(shutdown_rx);
+    let guard = ExitGuard {
+        running: running.clone(),
+        stop_requested: stop_requested.clone(),
+        failure: failure.clone(),
+        on_exit: Some(Box::new(on_exit)),
+        outcome: None,
+    };
 
     runtime.spawn(async move {
+        let mut guard = guard;
         info!("shoes service task started");
-
-        match run_prepared(prepared, shutdown_rx).await {
+        match service.await {
             Ok(()) => info!("shoes service stopped normally"),
             Err(e) => {
                 let msg = e.to_string();
                 error!("shoes service error: {}", msg);
-                // Recorded for status() as well as handed to the caller: a
-                // Rust host wants StopReason::Failed, the FFI wants a string
-                // for LAST_ERROR, and neither should have to read the other's
-                // channel to get it.
-                *failure_clone.lock() = Some(msg.clone());
-                on_error(msg);
+                guard.outcome = Some(msg);
             }
         }
-
-        running_clone.store(false, Ordering::SeqCst);
+        // `guard` drops here, at the end of the task.
     });
 
     ServiceHandle {
         runtime,
         shutdown_tx: Some(shutdown_tx),
         running,
+        stop_requested,
         started_at: std::time::Instant::now(),
         failure,
+    }
+}
+
+/// Runs at the end of the service task. Order matters: `running` goes
+/// false first, then the failure is recorded for `status`, then the host is
+/// told -- so `shoes_is_running()` is already false inside the callback and
+/// a host that calls `shoes_stop` from it returns at once.
+struct ExitGuard {
+    running: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    failure: Arc<parking_lot::Mutex<Option<String>>>,
+    on_exit: Option<Box<dyn FnOnce(Option<String>) + Send>>,
+    outcome: Option<String>,
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(msg) = &self.outcome {
+            // Recorded for status() as well as handed to the caller: a Rust
+            // host wants StopReason::Failed, the FFI wants a string for
+            // LAST_ERROR, and neither should have to read the other's channel.
+            *self.failure.lock() = Some(msg.clone());
+        }
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(on_exit) = self.on_exit.take() {
+            on_exit(self.outcome.take());
+        }
     }
 }
 
@@ -569,6 +633,67 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("No TUN config found"));
+    }
+
+    use std::sync::mpsc;
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// A failing service reports its message, and by then `running` is
+    /// already false -- a callback that stops the engine must not wait out
+    /// STOP_TIMEOUT for a flag the task was about to clear.
+    #[test]
+    fn on_exit_reports_a_failure_after_running_is_false() {
+        let (tx, rx) = mpsc::channel();
+        let handle = start_with(
+            test_runtime(),
+            |_shutdown| async { Err(std::io::Error::other("boom")) },
+            move |reason| tx.send(reason).unwrap(),
+        );
+        let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(reason.as_deref(), Some("boom"));
+        assert!(!handle.running.load(Ordering::SeqCst));
+        let _ = stop_handle(handle);
+    }
+
+    /// A stop the host asked for is a stop the host knows about: no call.
+    #[test]
+    fn on_exit_is_silent_for_a_requested_stop() {
+        let (tx, rx) = mpsc::channel();
+        let handle = start_with(
+            test_runtime(),
+            |shutdown| async move {
+                let _ = shutdown.await;
+                Ok(())
+            },
+            move |reason| tx.send(reason).unwrap(),
+        );
+        assert!(matches!(stop_handle(handle), StopOutcome::Released));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    /// An Ok that nobody requested is still an exit the host must hear
+    /// about; `None` is what it hears.
+    #[test]
+    fn on_exit_reports_an_unrequested_ok_as_none() {
+        let (tx, rx) = mpsc::channel();
+        let handle = start_with(
+            test_runtime(),
+            |_shutdown| async { Ok(()) },
+            move |reason| tx.send(reason).unwrap(),
+        );
+        let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(reason, None);
+        let _ = stop_handle(handle);
     }
 }
 

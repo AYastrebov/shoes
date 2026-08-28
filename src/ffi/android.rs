@@ -289,7 +289,11 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // Runtime::new() above, not a pinned worker count: Android has no Network
     // Extension memory limit to stay under, so it takes the cores it can get.
     // That is why control::start receives a runtime rather than building one.
-    let handle = crate::control::start(runtime, prepared, common::set_last_error);
+    let handle = crate::control::start(runtime, prepared, |reason| {
+        if let Some(msg) = reason {
+            common::set_last_error(msg);
+        }
+    });
 
     let service = TUN_SERVICE.get_or_init(|| parking_lot::Mutex::new(None));
     *service.lock() = Some(handle);

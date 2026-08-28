@@ -292,7 +292,11 @@ unsafe fn start_service(
     // The runtime is built here, with two worker threads, rather than inside
     // control::start: a Network Extension's memory limit is what sets that
     // number, and Android wants all the cores instead.
-    let handle = crate::control::start(runtime, prepared, common::set_last_error);
+    let handle = crate::control::start(runtime, prepared, |reason| {
+        if let Some(msg) = reason {
+            common::set_last_error(msg);
+        }
+    });
 
     // get_or_init, not get().unwrap(): a caller that reaches shoes_start
     // without shoes_init would otherwise panic across the FFI boundary.
