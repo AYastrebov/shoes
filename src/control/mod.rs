@@ -72,10 +72,10 @@ pub struct ServiceHandle {
     stop_requested: Arc<AtomicBool>,
     /// When `start` spawned the service, for `uptime`.
     started_at: std::time::Instant,
-    /// Set if the stack stopped with an error, so `status` can tell a failure
-    /// from a stop the host asked for. The FFI gets the same string through
-    /// its `on_error` callback, because a C caller cannot receive an enum
-    /// carrying a String.
+    /// Set if the service ended without being asked -- the error's message,
+    /// or a fixed one for a clean but unrequested end -- so `status` can tell
+    /// that from a stop the host asked for. The FFI gets the error through
+    /// `on_exit`, because a C caller cannot receive an enum carrying a String.
     failure: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
@@ -143,16 +143,28 @@ pub fn stop_handle(mut handle: ServiceHandle) -> StopOutcome {
             }
         })
     {
-        warn!("Could not spawn the runtime shutdown thread ({e}); dropping inline");
-        // Falling back to an inline drop is worse than a background one, but it
-        // is much better than leaking the runtime and its threads.
-        drop(runtime.lock().take());
+        warn!("Could not spawn the runtime shutdown thread ({e}); shutting down in place");
+        // shutdown_background, not drop: this may be running on one of the
+        // runtime's own workers -- a host is allowed to call shoes_stop from
+        // the stopped callback -- and dropping a runtime from inside itself
+        // panics, which under panic = "abort" ends the process.
+        if let Some(runtime) = runtime.lock().take() {
+            runtime.shutdown_background();
+        }
     }
 
     outcome
 }
 
 impl ServiceHandle {
+    /// Release a handle whose service has already ended, without waiting.
+    /// The runtime shuts down in the background, so this is safe from any
+    /// thread -- including one of that runtime's own workers, which is
+    /// where a host's stopped callback runs.
+    pub fn discard(self) {
+        self.runtime.shutdown_background();
+    }
+
     /// Whether the service task is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
@@ -204,26 +216,12 @@ impl ServiceHandle {
     }
 }
 
-/// Start a prepared service on `runtime`, and hand back a handle to it.
+/// Start a prepared service on `runtime`.
 ///
 /// The runtime is the caller's rather than ours: iOS pins it to two worker
 /// threads to stay inside a Network Extension's memory limit, while Android
 /// takes `Runtime::new()` and all the cores it can get. That is a policy this
-/// module has no business deciding, and folding the two into one default would
-/// quietly change one of them.
-///
-/// `on_error` is called from the service task if the stack stops with an error.
-/// The FFI uses it to fill `LAST_ERROR`, which is how a C caller — which cannot
-/// receive a Rust enum carrying a String — learns what happened.
-///
-/// # One service per process
-///
-/// The traffic counters in `crate::tun::traffic` are process-global statics, so
-/// a second concurrent `ServiceHandle` in one process would report the sum of
-/// both services. Each privileged host runs exactly one tunnel, so this costs
-/// nothing in practice — but it is an invariant this API depends on rather than
-/// an accident.
-/// Start a prepared service on `runtime`.
+/// module has no business deciding.
 ///
 /// `on_exit` runs once, from the service task, when the service ends for
 /// any reason the host did not ask for: `Some(message)` when it failed,
@@ -231,23 +229,52 @@ impl ServiceHandle {
 /// [`stop_handle`]. By the time it runs `running` is already false, so a
 /// callback that stops the engine does not wait out [`STOP_TIMEOUT`].
 ///
-/// A panic does not reach it: the crate builds with `panic = "abort"`.
+/// A panic does not reach it: the crate builds with `panic = "abort"`. And a
+/// handle that is dropped rather than stopped cancels the task, which
+/// counts as an exit the host did not ask for -- prefer [`stop_handle`].
+///
+/// The task is running before this returns. A host that keeps the handle
+/// somewhere `on_exit` can observe -- the FFI's process-global -- wants
+/// [`start_and_install`] instead, which stores the handle first.
+///
+/// # One service per process
+///
+/// The traffic counters in `crate::tun::traffic` are process-global statics, so
+/// a second concurrent `ServiceHandle` in one process would report the sum of
+/// both services. Each privileged host runs exactly one tunnel, so this costs
+/// nothing in practice -- but it is an invariant this API depends on rather
+/// than an accident.
 pub fn start(
     runtime: tokio::runtime::Runtime,
     prepared: PreparedService,
     on_exit: impl FnOnce(Option<String>) + Send + 'static,
 ) -> ServiceHandle {
-    // From zero, so a second session does not report the first one's bytes
-    // against a fresh uptime. Both FFI platforms already do this in their own
-    // start path; a Rust host had no equivalent.
-    #[cfg(any(unix, windows))]
-    crate::tun::traffic::reset_traffic_counters();
-
+    reset_counters();
     start_with(
         runtime,
         |shutdown_rx| run_prepared(prepared, shutdown_rx),
         on_exit,
     )
+}
+
+/// [`start`], with the handle given to `install` before the service task is
+/// spawned. `on_exit` can fire in the service's first instant; a host whose
+/// callback looks the handle up -- `shoes_stop` from inside it, say -- must
+/// already find it there.
+pub fn start_and_install(
+    runtime: tokio::runtime::Runtime,
+    prepared: PreparedService,
+    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+    install: impl FnOnce(ServiceHandle),
+) {
+    reset_counters();
+    let (handle, go) = spawn_service(
+        runtime,
+        |shutdown_rx| run_prepared(prepared, shutdown_rx),
+        on_exit,
+    );
+    install(handle);
+    go();
 }
 
 /// `start` with the service future injectable, so the exit contract can be
@@ -257,6 +284,31 @@ pub fn start_with<F, Fut>(
     make_service: F,
     on_exit: impl FnOnce(Option<String>) + Send + 'static,
 ) -> ServiceHandle
+where
+    F: FnOnce(oneshot::Receiver<()>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let (handle, go) = spawn_service(runtime, make_service, on_exit);
+    go();
+    handle
+}
+
+fn reset_counters() {
+    // From zero, so a second session does not report the first one's bytes
+    // against a fresh uptime. Both FFI platforms already do this in their own
+    // start path; a Rust host had no equivalent.
+    #[cfg(any(unix, windows))]
+    crate::tun::traffic::reset_traffic_counters();
+}
+
+/// Build the handle and the task, and hand back the task's spawn as a
+/// closure, so a caller can put the handle where it belongs before the
+/// task exists.
+fn spawn_service<F, Fut>(
+    runtime: tokio::runtime::Runtime,
+    make_service: F,
+    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+) -> (ServiceHandle, impl FnOnce())
 where
     F: FnOnce(oneshot::Receiver<()>) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
@@ -272,59 +324,67 @@ where
         stop_requested: stop_requested.clone(),
         failure: failure.clone(),
         on_exit: Some(Box::new(on_exit)),
-        outcome: None,
     };
-
-    runtime.spawn(async move {
-        let mut guard = guard;
+    let spawner = runtime.handle().clone();
+    let task = async move {
+        let _guard = guard;
         info!("shoes service task started");
         match service.await {
             Ok(()) => info!("shoes service stopped normally"),
             Err(e) => {
                 let msg = e.to_string();
                 error!("shoes service error: {}", msg);
-                guard.outcome = Some(msg);
+                // Written before the guard runs, so `running` never reads
+                // false while the reason is still missing.
+                *_guard.failure.lock() = Some(msg);
             }
         }
-        // `guard` drops here, at the end of the task.
-    });
+        // `_guard` drops here, at the end of the task.
+    };
 
-    ServiceHandle {
+    let handle = ServiceHandle {
         runtime,
         shutdown_tx: Some(shutdown_tx),
         running,
         stop_requested,
         started_at: std::time::Instant::now(),
         failure,
-    }
+    };
+    (handle, move || {
+        spawner.spawn(task);
+    })
 }
 
-/// Runs at the end of the service task. Order matters: `running` goes
-/// false first, then the failure is recorded for `status`, then the host is
-/// told -- so `shoes_is_running()` is already false inside the callback and
-/// a host that calls `shoes_stop` from it returns at once.
+/// What `status` and `on_exit` say about a service that returned `Ok` on its
+/// own. `run_prepared` does that only for the shutdown signal today, so this
+/// is reserved rather than expected.
+const ENDED_UNREQUESTED: &str = "service ended without being asked";
+
+/// Runs at the end of the service task, however it ends. Order matters:
+/// `running` goes false first, then the host is told -- so
+/// `shoes_is_running()` is already false inside the callback and a host that
+/// calls `shoes_stop` from it returns at once.
 struct ExitGuard {
     running: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     failure: Arc<parking_lot::Mutex<Option<String>>>,
     on_exit: Option<Box<dyn FnOnce(Option<String>) + Send>>,
-    outcome: Option<String>,
 }
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(msg) = &self.outcome {
-            // Recorded for status() as well as handed to the caller: a Rust
-            // host wants StopReason::Failed, the FFI wants a string for
-            // LAST_ERROR, and neither should have to read the other's channel.
-            *self.failure.lock() = Some(msg.clone());
-        }
         if self.stop_requested.load(Ordering::SeqCst) {
             return;
         }
+        let error = self.failure.lock().clone();
+        if error.is_none() {
+            // The callback says None -- no error -- but status must not say
+            // Requested for a stop nobody requested.
+            *self.failure.lock() = Some(ENDED_UNREQUESTED.to_string());
+        }
         if let Some(on_exit) = self.on_exit.take() {
-            on_exit(self.outcome.take());
+            on_exit(error);
         }
     }
 }
@@ -693,6 +753,39 @@ mod tests {
         );
         let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(reason, None);
+        assert_eq!(
+            handle.failure.lock().as_deref(),
+            Some(ENDED_UNREQUESTED),
+            "status must not call this a requested stop"
+        );
+        let _ = stop_handle(handle);
+    }
+
+    /// The handle is where `install` put it before the service can end, so a
+    /// callback that fires in the first instant finds it.
+    #[test]
+    fn start_and_install_stores_the_handle_before_the_task_runs() {
+        let slot: Arc<parking_lot::Mutex<Option<ServiceHandle>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let seen = Arc::new(AtomicBool::new(false));
+        let (slot_cb, seen_cb) = (slot.clone(), seen.clone());
+        let (handle, go) = spawn_service(
+            test_runtime(),
+            |_shutdown| async { Err(std::io::Error::other("instant")) },
+            move |_| seen_cb.store(slot_cb.lock().is_some(), Ordering::SeqCst),
+        );
+        *slot.lock() = Some(handle);
+        go();
+        let started = std::time::Instant::now();
+        while !seen.load(Ordering::SeqCst) && started.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "the callback found no handle installed"
+        );
+        let handle = slot.lock().take().unwrap();
         let _ = stop_handle(handle);
     }
 }

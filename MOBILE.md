@@ -139,7 +139,7 @@ iOS and macOS — 12 symbols, declared in `include/shoes.h`:
 ```c
 int   shoes_init(const char *log_level);
 long  shoes_start(const char *config_yaml, /* protect cb */, /* traffic cb */);
-long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb */, /* traffic cb */);
+long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb */, /* traffic cb */, /* stopped cb */);
 void  shoes_stop(long _handle);
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);

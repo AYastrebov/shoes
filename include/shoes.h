@@ -38,9 +38,10 @@ typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_by
  * own. `reason` is the failure message, or NULL when there is none; it is
  * valid for the duration of the call only, and `shoes_get_last_error`
  * returns the same text afterwards. Never called for a stop the host
- * requested, never after `shoes_stop` has returned, and never for a start
- * that failed. `shoes_is_running()` is already false when it runs, and
- * calling `shoes_stop` from inside it is allowed. Do not block in it.
+ * requested and never for a start that failed; a call already in flight
+ * when `shoes_stop` begins may still complete after `shoes_stop` returns.
+ * `shoes_is_running()` is already false when it runs, and calling
+ * `shoes_stop` from inside it is allowed. Do not block in it.
  *
  * May be NULL, in which case nothing is called.
  */
