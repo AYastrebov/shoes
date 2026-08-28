@@ -56,9 +56,11 @@ final class Provider: ShoesPacketTunnelProvider {
 ```
 
 Everything else is inherited: the start timeout, `shoes_stop` awaited before
-`stopTunnel` completes, a health check, path observation with the engine asked
-first and a full rebind only when it did not recover in place, and typed app
-messages. The class is `@MainActor`; all four hooks run there.
+`stopTunnel` completes, the engine's stop callback delivered to
+`report(error:)` the moment the engine ends on its own, path observation
+with the engine asked first and a full rebind only when it did not recover
+in place, and typed app messages. The class is `@MainActor`; all four hooks
+run there.
 
 ## The app
 
@@ -73,7 +75,13 @@ try await tunnel.start { proto in
 }
 for await status in tunnel.statusUpdates { /* update the UI */ }
 let reply = try await tunnel.send(.stats)
+if case .lastError(let error?) = try await tunnel.send(.lastError) { /* a non-fatal error */ }
 ```
+
+`.lastError` answers while the extension is alive. When the engine dies the
+provider cancels the tunnel and the process exits; the app sees
+`.disconnected` and nobody is left to ask, so persist fatal reasons from
+`report(error:)` in the provider.
 
 On macOS `start` activates the system extension first. See
 [docs/MACOS.md](../docs/MACOS.md) for what that needs.
