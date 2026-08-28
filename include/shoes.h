@@ -31,6 +31,22 @@ typedef bool (*ProtectSocketCallback)(int fd);
 typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_bytes);
 
 /**
+ * Engine-stopped callback type.
+ *
+ * Called once, from a shoes worker thread, when the engine stops without
+ * `shoes_stop` having been called: a failure, or a task that ended on its
+ * own. `reason` is the failure message, or NULL when there is none; it is
+ * valid for the duration of the call only, and `shoes_get_last_error`
+ * returns the same text afterwards. Never called for a stop the host
+ * requested, never after `shoes_stop` has returned, and never for a start
+ * that failed. `shoes_is_running()` is already false when it runs, and
+ * calling `shoes_stop` from inside it is allowed. Do not block in it.
+ *
+ * May be NULL, in which case nothing is called.
+ */
+typedef void (*ShoesStoppedCallback)(const char *reason);
+
+/**
  * Initialize the shoes library.
  *
  * # Arguments
@@ -72,6 +88,8 @@ int shoes_init(const char *log_level);
  * * Handle (> 0) on success
  * * -1 on error
  *
+ * Installs no stopped callback; use `shoes_start_with_fd` for one.
+ *
  * # Safety
  * `config_yaml` must be a valid null-terminated C string.
  */
@@ -99,6 +117,7 @@ long shoes_start(const char *config_yaml,
  *   `shoes_stop` returns
  * * `protect_callback` - as for `shoes_start`
  * * `traffic_callback` - as for `shoes_start`
+ * * `stopped_callback` - see `ShoesStoppedCallback`; may be NULL
  *
  * # Returns
  * * Handle (> 0) on success
@@ -110,7 +129,8 @@ long shoes_start(const char *config_yaml,
 long shoes_start_with_fd(const char *config_yaml,
                          int device_fd,
                          ProtectSocketCallback protect_callback,
-                         ShoesTrafficCallback traffic_callback);
+                         ShoesTrafficCallback traffic_callback,
+                         ShoesStoppedCallback stopped_callback);
 
 /**
  * Stop the shoes VPN service.

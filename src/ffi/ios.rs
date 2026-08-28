@@ -45,6 +45,58 @@ pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 /// Invoked from a Rust worker thread, not the caller's thread.
 pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes: u64);
 
+/// Engine-stopped callback type.
+///
+/// Called once, from a shoes worker thread, when the engine stops without
+/// `shoes_stop` having been called: a failure, or a task that ended on its
+/// own. `reason` is the failure message, or NULL when there is none; it is
+/// valid for the duration of the call only, and `shoes_get_last_error`
+/// returns the same text afterwards. Never called for a stop the host
+/// requested, never after `shoes_stop` has returned, and never for a start
+/// that failed. `shoes_is_running()` is already false when it runs, and
+/// calling `shoes_stop` from inside it is allowed. Do not block in it.
+///
+/// May be NULL, in which case nothing is called.
+pub type ShoesStoppedCallback = Option<extern "C" fn(reason: *const c_char)>;
+
+/// The stopped callback for the running session. One slot, like the traffic
+/// callback: shoes runs one engine per process. Taken, not read, when it
+/// fires, so it can call at most once per session.
+static STOPPED_CALLBACK: OnceLock<Mutex<ShoesStoppedCallback>> = OnceLock::new();
+
+fn install_stopped_callback(callback: ShoesStoppedCallback) {
+    *STOPPED_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = callback;
+}
+
+fn clear_stopped_callback() {
+    install_stopped_callback(None);
+}
+
+#[cfg(test)]
+fn stopped_slot_is_empty() -> bool {
+    STOPPED_CALLBACK
+        .get()
+        .is_none_or(|slot| slot.lock().is_none())
+}
+
+/// Deliver an exit to the host. The reason is stored for
+/// `shoes_get_last_error` first, and the lock is released before the call
+/// so a callback that calls `shoes_stop` cannot deadlock on this slot.
+fn fire_stopped(reason: Option<String>) {
+    if let Some(msg) = &reason {
+        common::set_last_error(msg.clone());
+    }
+    let callback = STOPPED_CALLBACK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .take();
+    let Some(callback) = callback else { return };
+    match reason.and_then(|r| CString::new(r).ok()) {
+        Some(c) => callback(c.as_ptr()),
+        None => callback(std::ptr::null()),
+    }
+}
+
 /// Global socket protector callback.
 static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLock::new();
 
@@ -142,6 +194,8 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
 /// * Handle (> 0) on success
 /// * -1 on error
 ///
+/// Installs no stopped callback; use `shoes_start_with_fd` for one.
+///
 /// # Safety
 /// `config_yaml` must be a valid null-terminated C string.
 #[unsafe(no_mangle)]
@@ -158,6 +212,7 @@ pub unsafe extern "C" fn shoes_start(
             None,
             protect_callback,
             traffic_callback,
+            None,
         )
     }
 }
@@ -181,6 +236,7 @@ pub unsafe extern "C" fn shoes_start(
 ///   `shoes_stop` returns
 /// * `protect_callback` - as for `shoes_start`
 /// * `traffic_callback` - as for `shoes_start`
+/// * `stopped_callback` - see `ShoesStoppedCallback`; may be NULL
 ///
 /// # Returns
 /// * Handle (> 0) on success
@@ -194,6 +250,7 @@ pub unsafe extern "C" fn shoes_start_with_fd(
     device_fd: c_int,
     protect_callback: ProtectSocketCallback,
     traffic_callback: ShoesTrafficCallback,
+    stopped_callback: ShoesStoppedCallback,
 ) -> c_long {
     // SAFETY: forwarded from the caller's guarantee on `config_yaml`.
     unsafe {
@@ -203,6 +260,7 @@ pub unsafe extern "C" fn shoes_start_with_fd(
             Some(device_fd),
             protect_callback,
             traffic_callback,
+            stopped_callback,
         )
     }
 }
@@ -214,6 +272,7 @@ unsafe fn start_service(
     device_fd: Option<c_int>,
     protect_callback: ProtectSocketCallback,
     traffic_callback: ShoesTrafficCallback,
+    stopped_callback: ShoesStoppedCallback,
 ) -> c_long {
     // Every -1 below leaves a reason in shoes_get_last_error, so a caller
     // that reads it never sees the previous failure's message instead.
@@ -254,6 +313,10 @@ unsafe fn start_service(
     crate::tun::traffic::set_traffic_callback(Arc::new(move |upload, download| {
         traffic_callback(upload, download);
     }));
+    // Installed before control::start so an exit in the first instant is
+    // not lost, and always (re)installed -- an empty slot for shoes_start --
+    // so a callback from an earlier session can never fire for this one.
+    install_stopped_callback(stopped_callback);
 
     crate::socket_protector::set_global_socket_protector(Arc::new(IosSocketProtector));
 
@@ -283,6 +346,7 @@ unsafe fn start_service(
             error!("{who}: invalid config: {}", msg);
             common::set_last_error(msg);
             crate::tun::traffic::clear_traffic_callback();
+            clear_stopped_callback();
             crate::socket_protector::clear_global_socket_protector();
             *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = None;
             return -1;
@@ -292,11 +356,7 @@ unsafe fn start_service(
     // The runtime is built here, with two worker threads, rather than inside
     // control::start: a Network Extension's memory limit is what sets that
     // number, and Android wants all the cores instead.
-    let handle = crate::control::start(runtime, prepared, |reason| {
-        if let Some(msg) = reason {
-            common::set_last_error(msg);
-        }
-    });
+    let handle = crate::control::start(runtime, prepared, fire_stopped);
 
     // get_or_init, not get().unwrap(): a caller that reaches shoes_start
     // without shoes_init would otherwise panic across the FFI boundary.
@@ -337,6 +397,10 @@ unsafe fn start_service(
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_stop(_handle: c_long) {
+    // Before stop_service, not after like the traffic callback: the service
+    // task exits during the stop, and that exit is one the host asked for.
+    // A late traffic tick is harmless; a stop event here is a lie.
+    clear_stopped_callback();
     common::stop_service();
     crate::tun::traffic::clear_traffic_callback();
 
@@ -566,7 +630,7 @@ mod tests {
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         let yaml = CString::new("---\n[]\n").unwrap();
-        let handle = unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic) };
+        let handle = unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, None) };
         assert_eq!(handle, -1);
         let err = common::get_last_error().unwrap_or_default();
         assert!(err.contains("No TUN config found"), "got: {err}");
@@ -576,11 +640,60 @@ mod tests {
     #[test]
     fn start_with_fd_rejects_a_null_config_and_says_so() {
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
-        let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic) };
+        let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic, None) };
         assert_eq!(handle, -1);
         assert_eq!(
             common::get_last_error().as_deref(),
             Some("config_yaml is null")
         );
+    }
+
+    use std::sync::atomic::AtomicUsize;
+
+    static STOPPED_CALLS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn count_stopped(_reason: *const c_char) {
+        STOPPED_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A start that never spawns the service leaves the slot empty and the
+    /// callback uncalled: there is no exit to report.
+    #[test]
+    fn a_failed_start_never_calls_the_stopped_callback() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
+        STOPPED_CALLS.store(0, Ordering::SeqCst);
+        let yaml = CString::new("---\n[]\n").unwrap();
+        let handle =
+            unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, Some(count_stopped)) };
+        assert_eq!(handle, -1);
+        assert!(stopped_slot_is_empty());
+        assert_eq!(STOPPED_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    /// shoes_stop empties the slot before it stops anything, so nothing
+    /// that happens during the stop can reach the host.
+    #[test]
+    fn stop_clears_the_stopped_slot_first() {
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
+        install_stopped_callback(Some(count_stopped));
+        assert!(!stopped_slot_is_empty());
+        shoes_stop(1);
+        assert!(stopped_slot_is_empty());
+    }
+
+    /// fire_stopped records the reason for shoes_get_last_error before it
+    /// calls out, and calls exactly once.
+    #[test]
+    fn fire_stopped_records_then_calls() {
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
+        STOPPED_CALLS.store(0, Ordering::SeqCst);
+        install_stopped_callback(Some(count_stopped));
+        fire_stopped(Some("engine fell over".to_string()));
+        assert_eq!(STOPPED_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            common::get_last_error().as_deref(),
+            Some("engine fell over")
+        );
+        assert!(stopped_slot_is_empty(), "the slot is one-shot");
     }
 }
