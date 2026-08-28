@@ -52,9 +52,10 @@ pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes:
 /// own. `reason` is the failure message, or NULL when there is none; it is
 /// valid for the duration of the call only, and `shoes_get_last_error`
 /// returns the same text afterwards. Never called for a stop the host
-/// requested, never after `shoes_stop` has returned, and never for a start
-/// that failed. `shoes_is_running()` is already false when it runs, and
-/// calling `shoes_stop` from inside it is allowed. Do not block in it.
+/// requested and never for a start that failed; a call already in flight
+/// when `shoes_stop` begins may still complete after `shoes_stop` returns.
+/// `shoes_is_running()` is already false when it runs, and calling
+/// `shoes_stop` from inside it is allowed. Do not block in it.
 ///
 /// May be NULL, in which case nothing is called.
 pub type ShoesStoppedCallback = Option<extern "C" fn(reason: *const c_char)>;
@@ -301,6 +302,18 @@ unsafe fn start_service(
         }
     };
 
+    // Everything installed from here on is undone by this on any failure
+    // below, so no arm can forget one of the four.
+    let fail = |msg: String| -> c_long {
+        error!("{who}: {msg}");
+        common::set_last_error(msg);
+        crate::tun::traffic::clear_traffic_callback();
+        clear_stopped_callback();
+        crate::socket_protector::clear_global_socket_protector();
+        *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = None;
+        -1
+    };
+
     info!("{who}: config length = {} bytes", config_str.len());
 
     {
@@ -326,11 +339,7 @@ unsafe fn start_service(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => {
-            error!("{who}: failed to create runtime: {}", e);
-            common::set_last_error(format!("failed to create runtime: {e}"));
-            return -1;
-        }
+        Err(e) => return fail(format!("failed to create runtime: {e}")),
     };
 
     common::clear_last_error();
@@ -341,27 +350,29 @@ unsafe fn start_service(
     // the failure by noticing shoes_is_running() had gone false on its own.
     let prepared = match runtime.block_on(common::prepare_from_config(&config_str, device_fd)) {
         Ok(prepared) => prepared,
-        Err(e) => {
-            let msg = e.to_string();
-            error!("{who}: invalid config: {}", msg);
-            common::set_last_error(msg);
-            crate::tun::traffic::clear_traffic_callback();
-            clear_stopped_callback();
-            crate::socket_protector::clear_global_socket_protector();
-            *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = None;
-            return -1;
-        }
+        Err(e) => return fail(format!("invalid config: {e}")),
     };
 
     // The runtime is built here, with two worker threads, rather than inside
     // control::start: a Network Extension's memory limit is what sets that
     // number, and Android wants all the cores instead.
-    let handle = crate::control::start(runtime, prepared, fire_stopped);
-
-    // get_or_init, not get().unwrap(): a caller that reaches shoes_start
-    // without shoes_init would otherwise panic across the FFI boundary.
-    let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
-    *guard = Some(handle);
+    //
+    // The handle is stored before the task is spawned, so a stopped callback
+    // that fires in the first instant and calls shoes_stop finds it. The
+    // previous session's handle, if any, is taken out under the lock and
+    // released after it, in the background: dropping its runtime in place
+    // would wait for its workers, one of which may be inside that session's
+    // stopped callback and about to take this very lock.
+    let mut previous = None;
+    crate::control::start_and_install(runtime, prepared, fire_stopped, |handle| {
+        // get_or_init, not get().unwrap(): a caller that reaches shoes_start
+        // without shoes_init would otherwise panic across the FFI boundary.
+        let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
+        previous = guard.replace(handle);
+    });
+    if let Some(previous) = previous {
+        previous.discard();
+    }
 
     1
 }
