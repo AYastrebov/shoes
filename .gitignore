@@ -4,3 +4,5 @@
 *.pem
 .claude/
 *.log
+/.build
+/.swiftpm
