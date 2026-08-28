@@ -79,7 +79,7 @@ jobs:
   # macOS — staticlib for the desktop Network Extension provider
   # ──────────────────────────────────────────────────────────────────────────
   macos:
-    name: Build macOS staticlib
+    name: Check the macOS C surface
     runs-on: macos-latest
     timeout-minutes: 45
 
