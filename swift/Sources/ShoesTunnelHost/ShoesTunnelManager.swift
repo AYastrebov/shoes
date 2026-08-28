@@ -98,7 +98,7 @@ public final class ShoesTunnelManager {
     /// connected or the provider gave no answer.
     public func send(_ message: ShoesAppMessage) async throws -> ShoesAppReply {
         guard let session = manager?.connection as? NETunnelProviderSession else {
-            throw ShoesError.engine("no tunnel session")
+            throw ShoesError.noSession
         }
         let request = try message.encoded()
         let response: Data? = try await withCheckedThrowingContinuation { continuation in
@@ -108,7 +108,7 @@ public final class ShoesTunnelManager {
                 continuation.resume(throwing: error)
             }
         }
-        guard let response else { throw ShoesError.engine("provider gave no reply") }
+        guard let response else { throw ShoesError.providerNoReply }
         return try ShoesAppReply.decode(response)
     }
 }
