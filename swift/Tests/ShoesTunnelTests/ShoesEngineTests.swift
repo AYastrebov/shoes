@@ -23,11 +23,11 @@ import Testing
         #expect(engine.isRunning == false)
     }
 
-    @Test func aConfigWithoutATunSectionIsRefusedWithAReason() throws {
+    @Test func aConfigWithoutATunSectionIsRefusedWithAReason() async throws {
         try engine.initialize(logLevel: .error)
         let config = ShoesConfiguration(yaml: "---\n[]\n")
-        let error = #expect(throws: ShoesError.self) {
-            try engine.start(config, deviceFD: 7) { _, _ in }
+        let error = await #expect(throws: ShoesError.self) {
+            try await engine.start(config, deviceFD: 7) { _, _ in }
         }
         guard case .startFailed(let reason) = error else {
             Issue.record("expected .startFailed, got \(String(describing: error))")
@@ -55,12 +55,12 @@ import Testing
         #expect(engine.isRunning == false)
     }
 
-    @Test func startBeforeInitializeIsRefused() {
+    @Test func startBeforeInitializeIsRefused() async {
         // `initialized` is an engine-side flag; the FFI itself would also
         // refuse, but this is the error a host should see first.
         let fresh = ShoesEngine(forTesting: ())
-        #expect(throws: ShoesError.notInitialized) {
-            try fresh.start(ShoesConfiguration(yaml: ""), deviceFD: 7) { _, _ in }
+        await #expect(throws: ShoesError.notInitialized) {
+            try await fresh.start(ShoesConfiguration(yaml: ""), deviceFD: 7) { _, _ in }
         }
     }
 }

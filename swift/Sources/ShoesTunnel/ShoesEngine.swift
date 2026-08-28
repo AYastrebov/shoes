@@ -49,16 +49,22 @@ public final class ShoesEngine: Sendable {
     ///   stay open until `stop()` returns; the engine never closes it.
     /// - Parameter onTraffic: cumulative upload and download bytes, about
     ///   once a second while they change, from a shoes worker thread.
+    /// `async`, and off the caller's executor: `shoes_start_with_fd` parses
+    /// the config, loads PEM files and builds the DNS resolvers under a
+    /// blocking `block_on` before it returns, which is work an extension must
+    /// not do on its main thread.
     public func start(
         _ config: ShoesConfiguration,
         deviceFD: Int32,
         onTraffic: @escaping @Sendable (_ upload: UInt64, _ download: UInt64) -> Void
-    ) throws {
+    ) async throws {
         guard initialized.isSet else { throw ShoesError.notInitialized }
         guard !isRunning else { throw ShoesError.alreadyRunning }
 
         TrafficCallbackBridge.shared.install(onTraffic)
-        let handle = shoes_start_with_fd(config.yaml, deviceFD, shoesProtectCallback, shoesTrafficCallback)
+        let handle = await Task.detached(priority: .userInitiated) {
+            shoes_start_with_fd(config.yaml, deviceFD, shoesProtectCallback, shoesTrafficCallback)
+        }.value
         guard handle > 0 else {
             TrafficCallbackBridge.shared.clear()
             throw ShoesError.startFailed(lastError() ?? "shoes_start_with_fd returned \(handle)")
