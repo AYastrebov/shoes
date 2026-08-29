@@ -67,6 +67,7 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
+mod fatal;
 mod h2mux;
 mod http_handler;
 mod http_parse;
