@@ -11,6 +11,12 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 mod dns;
+// The tunnel reports into this module in both builds, but only the
+// library's control layer subscribes -- the standalone server must not
+// die because one outbound lost a socket. So the subscribing half has no
+// caller in this binary, which is a property of the build.
+#[allow(dead_code)]
+mod fatal;
 mod h2mux;
 mod http_handler;
 mod http_parse;
