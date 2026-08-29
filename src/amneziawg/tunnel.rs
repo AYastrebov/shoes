@@ -28,6 +28,109 @@ const MAX_UDP_SIZE: usize = 65536;
 /// for a peer that disagrees about trailers.
 const TRAILER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// What a recv error on the connected endpoint socket means.
+///
+/// On a connected UDP socket nearly every recv error is an asynchronous
+/// echo of the past -- an ICMP reply to something sent earlier, latched
+/// on the socket and delivered by the next syscall (udp(7)). None of them
+/// say the socket itself is broken, so none of them justify killing
+/// inbound for the rest of the session: the cost of wrongly continuing is
+/// a log line, the cost of wrongly stopping is a tunnel that is deaf
+/// until the user reconnects.
+#[derive(Debug, PartialEq, Eq)]
+enum RecvErrorAction {
+    /// Routine. Log at debug and keep receiving.
+    Ignore,
+    /// EMSGSIZE: a datagram *we* sent exceeded the path MTU. With
+    /// AmneziaWG 3.1 random trailers that means the trailer window has
+    /// outgrown the path -- it is sized from a high-water mark of
+    /// datagrams seen, which a higher-MTU peer pushes past what this
+    /// path carries. Warn, shrink the window, keep receiving.
+    ResetTrailerWindow,
+    /// Unrecognised. Warn and keep receiving -- but a socket producing
+    /// nothing but errors is dead, which is RecvErrorStreak's call.
+    Suspect,
+}
+
+fn classify_recv_error(e: &std::io::Error) -> RecvErrorAction {
+    use std::io::ErrorKind;
+    // No stable ErrorKind exists for EMSGSIZE; endpoint.rs matches raw
+    // errno the same way for EINVAL.
+    if e.raw_os_error() == Some(libc::EMSGSIZE) {
+        return RecvErrorAction::ResetTrailerWindow;
+    }
+    match e.kind() {
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::HostUnreachable
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::NetworkDown
+        | ErrorKind::Interrupted => RecvErrorAction::Ignore,
+        _ => RecvErrorAction::Suspect,
+    }
+}
+
+/// An error within this much of the previous one continues the streak;
+/// a longer gap starts a new streak of one. A blocked recv produces
+/// neither success nor error, so only a socket returning errors
+/// continuously can accumulate.
+const RECV_ERROR_STREAK_WINDOW: Duration = Duration::from_secs(1);
+
+/// Streak length past which the loop sleeps before the next recv, so a
+/// socket stuck returning errors does not spin hot.
+const RECV_ERROR_BACKOFF_AFTER: u32 = 4;
+
+/// How long that sleep is.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Streak length at which the receive path is declared dead: with the
+/// backoff, roughly five seconds of a socket producing nothing but
+/// errors. Reaching this is the only way out of the decapsulate loop.
+const RECV_ERROR_FATAL_STREAK: u32 = 100;
+
+/// Consecutive-error accounting for the receive loop. Time is a
+/// parameter rather than read here, so tests inject it.
+struct RecvErrorStreak {
+    count: u32,
+    last: Option<std::time::Instant>,
+}
+
+#[derive(Debug)]
+enum StreakVerdict {
+    KeepGoing,
+    Backoff,
+    GiveUp,
+}
+
+impl RecvErrorStreak {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            last: None,
+        }
+    }
+
+    fn on_success(&mut self) {
+        self.count = 0;
+        self.last = None;
+    }
+
+    fn on_error(&mut self, now: std::time::Instant) -> StreakVerdict {
+        self.count = match self.last {
+            Some(prev) if now.duration_since(prev) <= RECV_ERROR_STREAK_WINDOW => self.count + 1,
+            _ => 1,
+        };
+        self.last = Some(now);
+        if self.count >= RECV_ERROR_FATAL_STREAK {
+            StreakVerdict::GiveUp
+        } else if self.count > RECV_ERROR_BACKOFF_AFTER {
+            StreakVerdict::Backoff
+        } else {
+            StreakVerdict::KeepGoing
+        }
+    }
+}
+
 /// Tunnel runtime state shared between tasks.
 pub struct TunnelRuntime {
     /// Channel to send IP packets from the virtual stack to be encapsulated and sent.
@@ -760,6 +863,97 @@ mod tests {
                 .is_none(),
             "a peer with the wrong header protection key must not recognise it"
         );
+    }
+
+    /// EMSGSIZE on a connected UDP socket is a deferred send-path error --
+    /// an ICMP Fragmentation Needed for a datagram *we* sent, latched on
+    /// the socket and delivered by the next syscall (udp(7)). One of these
+    /// killed inbound for an entire session (KVN, 2026-08-29); it must be
+    /// survivable, and it must shrink the trailer window whose growth
+    /// produces the oversized sends.
+    #[test]
+    fn emsgsize_is_survivable_and_resets_the_trailer_window() {
+        let e = std::io::Error::from_raw_os_error(libc::EMSGSIZE);
+        assert_eq!(
+            classify_recv_error(&e),
+            RecvErrorAction::ResetTrailerWindow
+        );
+    }
+
+    #[test]
+    fn icmp_echoes_are_ignored() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::Interrupted,
+        ] {
+            assert_eq!(
+                classify_recv_error(&std::io::Error::from(kind)),
+                RecvErrorAction::Ignore,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_error_is_suspect_but_not_fatal_on_its_own() {
+        let e = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(classify_recv_error(&e), RecvErrorAction::Suspect);
+    }
+
+    #[test]
+    fn back_to_back_errors_back_off_and_eventually_give_up() {
+        let t0 = std::time::Instant::now();
+        let mut streak = RecvErrorStreak::new();
+        let mut gave_up_at = None;
+        for i in 1..=RECV_ERROR_FATAL_STREAK {
+            // 10ms apart: well inside the streak window.
+            let now = t0 + std::time::Duration::from_millis(10 * u64::from(i));
+            match streak.on_error(now) {
+                StreakVerdict::KeepGoing => {
+                    assert!(i <= RECV_ERROR_BACKOFF_AFTER, "no backoff at error {i}")
+                }
+                StreakVerdict::Backoff => {
+                    assert!(i > RECV_ERROR_BACKOFF_AFTER, "backoff too early at {i}")
+                }
+                StreakVerdict::GiveUp => {
+                    gave_up_at = Some(i);
+                    break;
+                }
+            }
+        }
+        assert_eq!(gave_up_at, Some(RECV_ERROR_FATAL_STREAK));
+    }
+
+    /// A peer that is merely down produces one latched ICMP echo per
+    /// handshake retry, seconds apart -- that must never accumulate into
+    /// a death, no matter how long the outage lasts.
+    #[test]
+    fn spaced_errors_never_accumulate() {
+        let t0 = std::time::Instant::now();
+        let mut streak = RecvErrorStreak::new();
+        for i in 0..500u64 {
+            let now = t0 + std::time::Duration::from_secs(5 * i);
+            assert!(matches!(streak.on_error(now), StreakVerdict::KeepGoing));
+        }
+    }
+
+    #[test]
+    fn a_successful_recv_resets_the_streak() {
+        let t0 = std::time::Instant::now();
+        let mut streak = RecvErrorStreak::new();
+        for i in 1..=20u64 {
+            streak.on_error(t0 + std::time::Duration::from_millis(10 * i));
+        }
+        streak.on_success();
+        assert!(matches!(
+            streak.on_error(t0 + std::time::Duration::from_millis(500)),
+            StreakVerdict::KeepGoing
+        ));
     }
 
     /// The probe fires only for the shape a trailer mismatch actually has.
