@@ -971,10 +971,7 @@ mod tests {
     #[test]
     fn emsgsize_is_survivable_and_resets_the_trailer_window() {
         let e = std::io::Error::from_raw_os_error(libc::EMSGSIZE);
-        assert_eq!(
-            classify_recv_error(&e),
-            RecvErrorAction::ResetTrailerWindow
-        );
+        assert_eq!(classify_recv_error(&e), RecvErrorAction::ResetTrailerWindow);
     }
 
     #[test]

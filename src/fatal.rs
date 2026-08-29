@@ -18,8 +18,7 @@ use std::sync::LazyLock;
 use log::{error, info};
 use tokio::sync::watch;
 
-static FATAL: LazyLock<watch::Sender<Option<String>>> =
-    LazyLock::new(|| watch::channel(None).0);
+static FATAL: LazyLock<watch::Sender<Option<String>>> = LazyLock::new(|| watch::channel(None).0);
 
 /// Report a condition the engine cannot survive. The first report of a
 /// session wins; later ones are logged and dropped, because the host
@@ -75,6 +74,12 @@ mod tests {
         assert_eq!(*rx.borrow(), None);
     }
 
+    // The guard is held across the await on purpose. `#[tokio::test]` runs
+    // a current-thread runtime, so there is no other task on this thread to
+    // starve, and the lock exists precisely to stop these tests
+    // interleaving on the process-global channel -- the same pattern as
+    // control's outbound_install_tests.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_subscriber_is_woken_by_a_report() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

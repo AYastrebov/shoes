@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### The AmneziaWG receive path survives errors, and its death stops the engine
+
+One `EMSGSIZE` on the tunnel's UDP socket used to kill inbound for the
+rest of the session while the engine kept reporting healthy. On a
+connected UDP socket that error is a deferred echo of our own send
+exceeding the path MTU -- with 3.1 random trailers, the trailer window
+grows past what the path carries when the peer runs a higher MTU -- and
+the socket is fine afterwards. The receive loop now classifies recv
+errors and continues: routine ICMP echoes are logged and dropped,
+`EMSGSIZE` additionally shrinks the trailer window, and unknown errors
+are tolerated too. Only a socket producing nothing but errors for ~5
+seconds straight ends the loop -- and that now stops the engine with the
+reason (the stopped callback on iOS/macOS, `shoes_get_last_error` on
+Android) instead of leaving `shoes_is_running()` true over a deaf tunnel.
+The standalone binary instead rebuilds the tunnel on the next connection.
+
+The trailer-probe hint no longer says "set random_trailers to match the
+peer" when nothing was received from the peer at all -- silence cannot
+falsify the trailer setting, and the old wording sent a real debugging
+session down a false path.
+
 ## v0.2.16
 
 ### `ShoesTunnelHost`
