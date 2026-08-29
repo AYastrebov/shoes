@@ -542,7 +542,7 @@ async fn prepare_configs(
 /// channels instead of the process-global.
 async fn shutdown_or_fatal(
     shutdown_rx: oneshot::Receiver<()>,
-    mut fatal_rx: watch::Receiver<Option<String>>,
+    mut fatal_rx: watch::Receiver<(u64, Option<String>)>,
     forward_tx: oneshot::Sender<()>,
 ) -> Option<String> {
     let reason = tokio::select! {
@@ -551,10 +551,10 @@ async fn shutdown_or_fatal(
             // Cloned out in one expression so the watch's read guard --
             // which is not Send -- is gone before any await point.
             let reported = fatal_rx
-                .wait_for(|slot| slot.is_some())
+                .wait_for(|slot| slot.1.is_some())
                 .await
                 .ok()
-                .and_then(|slot| slot.clone());
+                .and_then(|slot| slot.1.clone());
             match reported {
                 Some(reason) => reason,
                 // The production sender is a static and cannot drop; a
@@ -632,7 +632,15 @@ pub async fn run_prepared(
     // ExitGuard then reports it through on_exit like any other failure.
     stop_watcher.abort();
     match stop_watcher.await {
-        Ok(Some(reason)) => Err(std::io::Error::other(reason)),
+        Ok(Some(reason)) => {
+            // The fatal is what the host must hear, but a teardown that
+            // also failed -- a descriptor not released, say -- must not
+            // vanish with it; the next start may fail because of it.
+            if let Err(e) = &result {
+                error!("TUN teardown also failed after the fatal: {e}");
+            }
+            Err(std::io::Error::other(reason))
+        }
         _ => result,
     }
 }
@@ -768,12 +776,12 @@ mod tests {
     /// tests can build their own channels and never touch the global.
     #[tokio::test]
     async fn a_fatal_report_forwards_shutdown_and_carries_its_reason() {
-        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel((0u64, None));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (forward_tx, forward_rx) = oneshot::channel::<()>();
         let watcher = tokio::spawn(shutdown_or_fatal(shutdown_rx, fatal_rx, forward_tx));
 
-        fatal_tx.send_replace(Some("receive path died".to_string()));
+        fatal_tx.send_replace((0, Some("receive path died".to_string())));
 
         forward_rx.await.expect("the merged shutdown must fire");
         assert_eq!(watcher.await.unwrap().as_deref(), Some("receive path died"));
@@ -782,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_stop_forwards_shutdown_without_a_reason() {
-        let (_fatal_tx, fatal_rx) = tokio::sync::watch::channel(None::<String>);
+        let (_fatal_tx, fatal_rx) = tokio::sync::watch::channel((0u64, None::<String>));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (forward_tx, forward_rx) = oneshot::channel::<()>();
         let watcher = tokio::spawn(shutdown_or_fatal(shutdown_rx, fatal_rx, forward_tx));

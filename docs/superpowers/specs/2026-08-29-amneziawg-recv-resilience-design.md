@@ -238,6 +238,52 @@ persists at all.
   received at all.
 - No FFI surface change: both platforms already consume `on_exit`.
 
+## Amendments after review (same day)
+
+A `/code-review high` pass over the first implementation surfaced ten
+findings; all were applied, and where they contradict the text above,
+this section wins:
+
+- **Only `Suspect` errors feed the fatal streak.** The original "every
+  error of any class" rule turned a routine peer restart -- Ignore-class
+  ICMP echoes arriving back-to-back under active traffic -- into an
+  engine death in ~5 seconds. An outage is ridden out; only errors nobody
+  can explain count toward `GiveUp`.
+- **Fatal reports carry a session generation.** A stopped session's
+  tunnel tasks outlive it on the background shutdown thread, and both FFI
+  restart paths start the new session first. `fatal::reset()` bumps a
+  generation; a reporter captures `fatal::generation()` at tunnel
+  creation, and a report from any other generation is dropped, so a stale
+  death cannot kill the next session.
+- **EMSGSIZE is handled on the send path too.** Once the kernel caches
+  the lower path MTU it rejects oversized sends synchronously, and the
+  recv side may never see the error. `send_to_network` routes every send
+  error through the same handler as recv.
+- **The EMSGSIZE message respects the config.** Plain WireGuard has no
+  trailer window; blaming one would be the same false-path hint issue 3
+  removed. The live setting is an `AtomicBool` the trailer probe keeps
+  current, and without trailers the message points at the path MTU.
+- **The errno is per-platform.** `libc::EMSGSIZE` on Windows is the CRT
+  errno a socket never produces; WinSock's `WSAEMSGSIZE` (10040) is
+  matched there instead.
+- **Route-gone evidence on recv triggers a rebind.** The recv side
+  consults `endpoint::is_route_gone` -- the same table the send path
+  uses -- because on an idle tunnel it sees the dead route first.
+- **A panic in the receive loop still marks the tunnel dead.** The loop
+  runs under `catch_unwind` on unwinding profiles; release-mobile builds
+  with `panic = "abort"`, where the process's death is its own
+  announcement.
+- **A rebuild aborts the old netstack task.** Its `request_rx` and the
+  pending reply senders drop with it, unblocking callers parked on a
+  stack nobody feeds; the rebuild condition also checks
+  `request_tx.is_closed()` so a netstack that died on its own is caught
+  too. Residual gap, accepted: a request that races the `is_dead` check
+  through a slow DNS resolution parks its caller until the next
+  connection triggers that rebuild.
+- **A fatal does not swallow the TUN's own teardown error.** It is
+  logged before the fatal reason overrides the result, because the next
+  start may fail on whatever the teardown failed to release.
+
 ## Out of scope
 
 - KVN-side follow-ups from the report (degraded-state UI, stale ping

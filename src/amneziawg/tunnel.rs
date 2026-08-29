@@ -11,11 +11,12 @@ use std::time::Duration;
 use awgtun::amnezia::Amnezia3Config;
 use awgtun::noise::{Tunn, TunnResult};
 use awgtun::x25519;
+use futures::FutureExt;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::mpsc;
 
-use super::endpoint::EndpointSocket;
+use super::endpoint::{EndpointSocket, is_route_gone};
 
 /// Maximum UDP datagram size (outer AmneziaWG packets).
 const MAX_UDP_SIZE: usize = 65536;
@@ -28,6 +29,16 @@ const MAX_UDP_SIZE: usize = 65536;
 /// for a peer that disagrees about trailers.
 const TRAILER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// The errno that says a sent datagram exceeded the path MTU. Unix
+/// reports EMSGSIZE; WinSock has its own number for the same fact, and
+/// `libc::EMSGSIZE` on Windows is the CRT errno, which a socket never
+/// produces -- matching it there would leave this branch dead code on a
+/// shipping target.
+#[cfg(windows)]
+const EMSGSIZE_RAW: i32 = 10040; // WSAEMSGSIZE
+#[cfg(not(windows))]
+const EMSGSIZE_RAW: i32 = libc::EMSGSIZE;
+
 /// What a recv error on the connected endpoint socket means.
 ///
 /// On a connected UDP socket nearly every recv error is an asynchronous
@@ -39,25 +50,25 @@ const TRAILER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// until the user reconnects.
 #[derive(Debug, PartialEq, Eq)]
 enum RecvErrorAction {
-    /// Routine. Log at debug and keep receiving.
+    /// Routine. Log at debug and keep receiving. Never counts toward the
+    /// fatal streak: a restarting peer produces these back-to-back for as
+    /// long as the outage lasts, and an outage is not a dead socket.
     Ignore,
-    /// EMSGSIZE: a datagram *we* sent exceeded the path MTU. With
-    /// AmneziaWG 3.1 random trailers that means the trailer window has
-    /// outgrown the path -- it is sized from a high-water mark of
-    /// datagrams seen, which a higher-MTU peer pushes past what this
-    /// path carries. Warn, shrink the window, keep receiving.
-    ResetTrailerWindow,
-    /// Unrecognised. Warn and keep receiving -- but a socket producing
-    /// nothing but errors is dead, which is RecvErrorStreak's call.
+    /// EMSGSIZE: a datagram *we* sent exceeded the path MTU -- see
+    /// handle_path_mtu_exceeded. Keep receiving; never counts toward the
+    /// fatal streak either.
+    PathMtuExceeded,
+    /// Unrecognised. Warn and keep receiving -- but count it, because a
+    /// socket producing nothing but errors nobody can explain is dead,
+    /// which is RecvErrorStreak's call.
     Suspect,
 }
 
 fn classify_recv_error(e: &std::io::Error) -> RecvErrorAction {
     use std::io::ErrorKind;
-    // No stable ErrorKind exists for EMSGSIZE; endpoint.rs matches raw
-    // errno the same way for EINVAL.
-    if e.raw_os_error() == Some(libc::EMSGSIZE) {
-        return RecvErrorAction::ResetTrailerWindow;
+    // No stable ErrorKind exists for EMSGSIZE, so the raw errno it is.
+    if e.raw_os_error() == Some(EMSGSIZE_RAW) {
+        return RecvErrorAction::PathMtuExceeded;
     }
     match e.kind() {
         ErrorKind::ConnectionRefused
@@ -67,6 +78,30 @@ fn classify_recv_error(e: &std::io::Error) -> RecvErrorAction {
         | ErrorKind::NetworkDown
         | ErrorKind::Interrupted => RecvErrorAction::Ignore,
         _ => RecvErrorAction::Suspect,
+    }
+}
+
+/// The response to EMSGSIZE wherever it is seen -- latched on a recv or
+/// synchronous at a send once the kernel has cached the lower path MTU.
+///
+/// With random trailers on, the trailer window is the state whose growth
+/// produces the oversized sends: it is sized from a high-water mark of
+/// datagrams seen, which a higher-MTU peer pushes past what the path
+/// carries. Shrinking it is the repair. Without them there is no window
+/// to shrink -- the reset would be a no-op -- and the message must not
+/// send an operator hunting for a feature they never enabled.
+fn handle_path_mtu_exceeded(tunn: &ParkingMutex<Tunn>, trailers_on: &AtomicBool, context: &str) {
+    if trailers_on.load(Ordering::Relaxed) {
+        warn!(
+            "AmneziaWG: a sent datagram exceeded the path MTU (EMSGSIZE, {context}); \
+             resetting the trailer window and continuing"
+        );
+        tunn.lock().reset_udp_window();
+    } else {
+        warn!(
+            "AmneziaWG: a sent datagram exceeded the path MTU (EMSGSIZE, {context}); \
+             the path carries less than the configured mtu expects"
+        );
     }
 }
 
@@ -205,6 +240,16 @@ impl TunnelRuntime {
         let datagrams_received = Arc::new(AtomicUsize::new(0));
         let dead = Arc::new(AtomicBool::new(false));
 
+        // The live trailer setting, for EMSGSIZE handling. An atomic
+        // rather than a copy of the config because the trailer probe
+        // flips it at runtime, and awgtun exposes no getter on Tunn.
+        let trailers_on = Arc::new(AtomicBool::new(rebuild.amnezia.random_trailers));
+
+        // Captured at creation: this tunnel belongs to the session that
+        // is current now, and a death it reports after that session is
+        // over must not kill the next one (see crate::fatal).
+        let fatal_generation = crate::fatal::generation();
+
         // Rebindable rather than a plain UdpSocket: on mobile the address this
         // is bound to stops existing every time the device changes network.
         // See src/amneziawg/endpoint.rs.
@@ -222,9 +267,22 @@ impl TunnelRuntime {
             let udp = udp_socket.clone();
             let tx = ip_from_tunnel_tx;
             let received = datagrams_received.clone();
+            let trailers = trailers_on.clone();
             let dead = dead.clone();
             tokio::spawn(async move {
-                let reason = decapsulate_loop(tunn, udp, tx, received).await;
+                // catch_unwind so a panic inside the loop still marks the
+                // tunnel dead on the unwinding profiles; release-mobile
+                // builds with panic = "abort", where the process's death
+                // is its own announcement. An abort of this task merely
+                // drops the future -- no catch, no false report.
+                let loop_future = decapsulate_loop(tunn, udp, tx, received, trailers);
+                let reason = match std::panic::AssertUnwindSafe(loop_future)
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(reason) => reason,
+                    Err(_) => "receive task panicked".to_string(),
+                };
                 // The loop only returns when the receive path is
                 // unrecoverable. Say so loudly: an engine that keeps
                 // reporting healthy over a tunnel that cannot hear its
@@ -232,7 +290,10 @@ impl TunnelRuntime {
                 // react to a stop and cannot detect deafness.
                 dead.store(true, Ordering::SeqCst);
                 error!("AmneziaWG receive path failed: {reason}");
-                crate::fatal::report(format!("AmneziaWG receive path failed: {reason}"));
+                crate::fatal::report(
+                    fatal_generation,
+                    format!("AmneziaWG receive path failed: {reason}"),
+                );
             })
         };
 
@@ -241,8 +302,9 @@ impl TunnelRuntime {
             let tunn = tunn.clone();
             let udp = udp_socket.clone();
             let offered = packets_offered.clone();
+            let trailers = trailers_on.clone();
             tokio::spawn(async move {
-                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered).await;
+                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered, trailers).await;
             })
         };
 
@@ -250,8 +312,9 @@ impl TunnelRuntime {
         let timer_task = {
             let tunn = tunn.clone();
             let udp = udp_socket.clone();
+            let trailers = trailers_on.clone();
             tokio::spawn(async move {
-                timer_loop(tunn, udp).await;
+                timer_loop(tunn, udp, trailers).await;
             })
         };
 
@@ -289,6 +352,7 @@ impl TunnelRuntime {
                 rebuild,
                 packets_offered.clone(),
                 datagrams_received.clone(),
+                trailers_on.clone(),
                 TRAILER_PROBE_INTERVAL,
             ));
             abort_handles.push(probe_task.abort_handle());
@@ -314,6 +378,7 @@ async fn decapsulate_loop(
     udp: Arc<EndpointSocket>,
     tx: mpsc::Sender<Vec<u8>>,
     datagrams_received: Arc<AtomicUsize>,
+    trailers_on: Arc<AtomicBool>,
 ) -> String {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
     let mut out = vec![0u8; MAX_UDP_SIZE];
@@ -336,26 +401,31 @@ async fn decapsulate_loop(
                     RecvErrorAction::Ignore => {
                         debug!("AmneziaWG UDP recv transient error, continuing: {}", e);
                     }
-                    RecvErrorAction::ResetTrailerWindow => {
-                        warn!(
-                            "AmneziaWG: a sent datagram exceeded the path MTU \
-                             (EMSGSIZE on the socket); resetting the trailer window \
-                             and continuing"
-                        );
-                        tunn.lock().reset_udp_window();
+                    RecvErrorAction::PathMtuExceeded => {
+                        handle_path_mtu_exceeded(&tunn, &trailers_on, "reported on recv");
                     }
+                    // Only the unexplained count toward death. A peer
+                    // that is down produces Ignore-class echoes back to
+                    // back for the whole outage, and an outage must be
+                    // ridden out, not converted into an engine stop.
                     RecvErrorAction::Suspect => {
                         warn!("AmneziaWG UDP recv error, continuing: {}", e);
+                        match streak.on_error(std::time::Instant::now()) {
+                            StreakVerdict::KeepGoing => {}
+                            StreakVerdict::Backoff => tokio::time::sleep(RECV_ERROR_BACKOFF).await,
+                            StreakVerdict::GiveUp => {
+                                return format!(
+                                    "{RECV_ERROR_FATAL_STREAK} consecutive unexplained recv errors, last: {e}"
+                                );
+                            }
+                        }
                     }
                 }
-                match streak.on_error(std::time::Instant::now()) {
-                    StreakVerdict::KeepGoing => {}
-                    StreakVerdict::Backoff => tokio::time::sleep(RECV_ERROR_BACKOFF).await,
-                    StreakVerdict::GiveUp => {
-                        return format!(
-                            "{RECV_ERROR_FATAL_STREAK} consecutive recv errors, last: {e}"
-                        );
-                    }
+                // Route-gone evidence is acted on whatever the class: the
+                // send path schedules a rebind on these already, and on
+                // an idle tunnel the recv side sees the dead route first.
+                if is_route_gone(&e) {
+                    udp.request_rebind();
                 }
                 continue;
             }
@@ -375,8 +445,8 @@ async fn decapsulate_loop(
             TunnResult::WriteToNetwork(data) => {
                 packet.clear();
                 packet.extend_from_slice(data);
-                send_to_network(&tunn, &udp, &packet, "handshake").await;
-                drain_queued_packets(&tunn, &udp, &mut out, &mut packet).await;
+                send_to_network(&tunn, &udp, &packet, "handshake", &trailers_on).await;
+                drain_queued_packets(&tunn, &udp, &mut out, &mut packet, &trailers_on).await;
             }
             TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
                 if tx.try_send(data.to_vec()).is_err() {
@@ -385,7 +455,7 @@ async fn decapsulate_loop(
                     // it is worth seeing when throughput is being lost.
                     debug!("AmneziaWG: virtual stack queue full, dropping inbound packet");
                 }
-                drain_queued_packets(&tunn, &udp, &mut out, &mut packet).await;
+                drain_queued_packets(&tunn, &udp, &mut out, &mut packet, &trailers_on).await;
             }
         }
     }
@@ -424,22 +494,40 @@ fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
     datagrams
 }
 
+/// One send error, wherever the send happened. EMSGSIZE gets the same
+/// remediation as on recv -- once the kernel caches the lower path MTU
+/// it rejects oversized sends synchronously, and the recv side may never
+/// see the error at all.
+fn report_send_error(
+    tunn: &ParkingMutex<Tunn>,
+    trailers_on: &AtomicBool,
+    context: &str,
+    e: &std::io::Error,
+) {
+    if e.raw_os_error() == Some(EMSGSIZE_RAW) {
+        handle_path_mtu_exceeded(tunn, trailers_on, context);
+    } else {
+        warn!("AmneziaWG UDP send ({}) error: {}", context, e);
+    }
+}
+
 /// Send the datagrams for a `WriteToNetwork` result, decoys first.
 async fn send_to_network(
     tunn: &Arc<ParkingMutex<Tunn>>,
     udp: &Arc<EndpointSocket>,
     packet: &[u8],
     context: &str,
+    trailers_on: &AtomicBool,
 ) {
     let decoys = take_queued_decoys(&mut tunn.lock());
     for datagram in &decoys {
         if let Err(e) = udp.send(datagram).await {
-            warn!("AmneziaWG UDP send ({}) error: {}", context, e);
+            report_send_error(tunn, trailers_on, context, &e);
         }
     }
 
     if let Err(e) = udp.send(packet).await {
-        warn!("AmneziaWG UDP send ({}) error: {}", context, e);
+        report_send_error(tunn, trailers_on, context, &e);
     }
 }
 
@@ -450,6 +538,7 @@ async fn drain_queued_packets(
     udp: &Arc<EndpointSocket>,
     out: &mut [u8],
     packet: &mut Vec<u8>,
+    trailers_on: &AtomicBool,
 ) {
     loop {
         {
@@ -466,7 +555,7 @@ async fn drain_queued_packets(
                 _ => break,
             }
         }
-        send_to_network(tunn, udp, packet, "drain").await;
+        send_to_network(tunn, udp, packet, "drain", trailers_on).await;
     }
 }
 
@@ -475,6 +564,7 @@ async fn encapsulate_loop(
     udp: Arc<EndpointSocket>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     packets_offered: Arc<AtomicUsize>,
+    trailers_on: Arc<AtomicBool>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
@@ -507,7 +597,7 @@ async fn encapsulate_loop(
         };
 
         if has_packet {
-            send_to_network(&tunn, &udp, &packet, "encap").await;
+            send_to_network(&tunn, &udp, &packet, "encap", &trailers_on).await;
         }
     }
 }
@@ -570,6 +660,7 @@ async fn trailer_probe_loop(
     keys: TunnelKeys,
     packets_offered: Arc<AtomicUsize>,
     datagrams_received: Arc<AtomicUsize>,
+    trailers_on: Arc<AtomicBool>,
     interval: Duration,
 ) {
     let mut random_trailers = keys.amnezia.random_trailers;
@@ -609,6 +700,9 @@ async fn trailer_probe_loop(
         ) {
             Ok(replacement) => {
                 *tunn.lock() = replacement;
+                // The EMSGSIZE handling reads this to know whether a
+                // trailer window exists to blame; keep it current.
+                trailers_on.store(random_trailers, Ordering::Relaxed);
                 let state = if random_trailers { "on" } else { "off" };
                 warn!("{}", probe_message(offered, state, arrived));
             }
@@ -622,7 +716,11 @@ async fn trailer_probe_loop(
     }
 }
 
-async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<EndpointSocket>) {
+async fn timer_loop(
+    tunn: Arc<ParkingMutex<Tunn>>,
+    udp: Arc<EndpointSocket>,
+    trailers_on: Arc<AtomicBool>,
+) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
 
@@ -642,7 +740,7 @@ async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<EndpointSocket>) {
             TunnResult::WriteToNetwork(data) => {
                 packet.clear();
                 packet.extend_from_slice(data);
-                send_to_network(&tunn, &udp, &packet, "timer").await;
+                send_to_network(&tunn, &udp, &packet, "timer", &trailers_on).await;
             }
             _ => {}
         }
@@ -970,8 +1068,8 @@ mod tests {
     /// produces the oversized sends.
     #[test]
     fn emsgsize_is_survivable_and_resets_the_trailer_window() {
-        let e = std::io::Error::from_raw_os_error(libc::EMSGSIZE);
-        assert_eq!(classify_recv_error(&e), RecvErrorAction::ResetTrailerWindow);
+        let e = std::io::Error::from_raw_os_error(EMSGSIZE_RAW);
+        assert_eq!(classify_recv_error(&e), RecvErrorAction::PathMtuExceeded);
     }
 
     #[test]
@@ -1115,6 +1213,7 @@ mod tests {
             keys,
             offered,
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(true)),
             interval,
         ));
 
