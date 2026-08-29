@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{error, info, warn};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 mod device;
@@ -533,10 +533,45 @@ async fn prepare_configs(
     })
 }
 
+/// Merge the two ways a service can be told to stop into the one oneshot
+/// the TUN honours: the host's shutdown signal, or a fatal report from a
+/// component with no handle to the service task (see `crate::fatal`).
+///
+/// Returns the fatal reason when that is what fired, `None` for a host
+/// stop. Takes its receivers as parameters so tests can supply their own
+/// channels instead of the process-global.
+async fn shutdown_or_fatal(
+    shutdown_rx: oneshot::Receiver<()>,
+    mut fatal_rx: watch::Receiver<Option<String>>,
+    forward_tx: oneshot::Sender<()>,
+) -> Option<String> {
+    let reason = tokio::select! {
+        _ = shutdown_rx => None,
+        reason = async {
+            // Cloned out in one expression so the watch's read guard --
+            // which is not Send -- is gone before any await point.
+            let reported = fatal_rx
+                .wait_for(|slot| slot.is_some())
+                .await
+                .ok()
+                .and_then(|slot| slot.clone());
+            match reported {
+                Some(reason) => reason,
+                // The production sender is a static and cannot drop; a
+                // closed channel means no fatal is ever coming.
+                None => std::future::pending().await,
+            }
+        } => Some(reason),
+    };
+    let _ = forward_tx.send(());
+    reason
+}
+
 /// Run a service that [`prepare_from_config`] has already validated.
 ///
-/// Returns when the TUN stops, either because `shutdown_rx` fired or because
-/// the stack died.
+/// Returns when the TUN stops, either because `shutdown_rx` fired, because
+/// the stack died, or because a component reported a fatal condition
+/// through [`crate::fatal`] -- which comes back as `Err` with its reason.
 pub async fn run_prepared(
     prepared: PreparedService,
     shutdown_rx: oneshot::Receiver<()>,
@@ -548,6 +583,9 @@ pub async fn run_prepared(
         policy,
     } = prepared;
 
+    // A fatal from a previous session must not stop this one.
+    crate::fatal::reset();
+
     // Start TCP servers (like mixed)
     let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -556,14 +594,26 @@ pub async fn run_prepared(
         join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
     }
 
+    // The TUN honours one oneshot. Merge the host's shutdown and the
+    // process-wide fatal signal into it, rather than selecting over the
+    // TUN future itself -- dropping that future mid-poll would skip the
+    // graceful teardown that releases the descriptor.
+    let (tun_shutdown_tx, tun_shutdown_rx) = oneshot::channel();
+    let stop_watcher = tokio::spawn(shutdown_or_fatal(
+        shutdown_rx,
+        crate::fatal::subscribe(),
+        tun_shutdown_tx,
+    ));
+
     // Runs until shutdown. Who closes the descriptor follows from the policy:
     // whoever created the device closes it, and nobody else.
     #[cfg(any(unix, windows))]
-    let result = run_tun_from_config(tun_config, shutdown_rx, policy.close_fd_on_drop()).await;
+    let result = run_tun_from_config(tun_config, tun_shutdown_rx, policy.close_fd_on_drop()).await;
     #[cfg(not(any(unix, windows)))]
     let result = {
         // Consumed only by the TUN branch, which this platform does not have.
         let _ = policy;
+        let _ = tun_shutdown_rx;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN is not supported on this platform",
@@ -575,7 +625,16 @@ pub async fn run_prepared(
         handle.abort();
     }
 
-    result
+    // The watcher either fired (and is finished -- a finished task
+    // survives the abort and still yields its value) or the TUN ended on
+    // its own (and the watcher is moot). A fatal reason overrides the
+    // Ok(()) the TUN returns for what it saw as a requested shutdown; the
+    // ExitGuard then reports it through on_exit like any other failure.
+    stop_watcher.abort();
+    match stop_watcher.await {
+        Ok(Some(reason)) => Err(std::io::Error::other(reason)),
+        _ => result,
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +762,35 @@ mod tests {
             .worker_threads(1)
             .build()
             .unwrap()
+    }
+
+    /// The watcher takes its receivers as parameters precisely so these
+    /// tests can build their own channels and never touch the global.
+    #[tokio::test]
+    async fn a_fatal_report_forwards_shutdown_and_carries_its_reason() {
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (forward_tx, forward_rx) = oneshot::channel::<()>();
+        let watcher = tokio::spawn(shutdown_or_fatal(shutdown_rx, fatal_rx, forward_tx));
+
+        fatal_tx.send_replace(Some("receive path died".to_string()));
+
+        forward_rx.await.expect("the merged shutdown must fire");
+        assert_eq!(watcher.await.unwrap().as_deref(), Some("receive path died"));
+        drop(shutdown_tx);
+    }
+
+    #[tokio::test]
+    async fn a_host_stop_forwards_shutdown_without_a_reason() {
+        let (_fatal_tx, fatal_rx) = tokio::sync::watch::channel(None::<String>);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (forward_tx, forward_rx) = oneshot::channel::<()>();
+        let watcher = tokio::spawn(shutdown_or_fatal(shutdown_rx, fatal_rx, forward_tx));
+
+        shutdown_tx.send(()).unwrap();
+
+        forward_rx.await.expect("the merged shutdown must fire");
+        assert_eq!(watcher.await.unwrap(), None);
     }
 
     /// A failing service reports its message, and by then `running` is
