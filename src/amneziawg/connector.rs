@@ -21,6 +21,11 @@ use super::tunnel::TunnelRuntime;
 struct TunnelState {
     runtime: Arc<TunnelRuntime>,
     request_tx: mpsc::Sender<NetStackRequest>,
+    /// The netstack task, so a rebuild can kill it. Aborting drops its
+    /// `request_rx` and every pending reply sender with it, which is what
+    /// unblocks callers parked on a reply from a stack nobody feeds --
+    /// their own `request_tx` clones would otherwise keep it alive.
+    netstack_abort: tokio::task::AbortHandle,
 }
 
 /// Tunnel protocol variant for display purposes.
@@ -127,7 +132,12 @@ impl AmneziaWgConnector {
     ) -> std::io::Result<mpsc::Sender<NetStackRequest>> {
         let mut state = self.state.lock().await;
         if let Some(ref s) = *state {
-            if s.runtime.is_dead() {
+            // is_dead covers the receive path; is_closed covers a netstack
+            // task that ended on its own (its request_rx is gone). A
+            // request that slipped through after the death -- the is_dead
+            // check races the caller's DNS resolution -- parks its caller
+            // until this rebuild aborts the old stack and fails it.
+            if s.runtime.is_dead() || s.request_tx.is_closed() {
                 // The receive path died and reported fatal. Under the
                 // mobile engine that has already stopped the service; in
                 // the standalone binary nobody listens, so recovery is
@@ -135,6 +145,7 @@ impl AmneziaWgConnector {
                 // connection. Streams on the old netstack are lost, which
                 // they already were.
                 info!("AmneziaWG: tunnel receive path died; rebuilding the tunnel");
+                s.netstack_abort.abort();
                 *state = None;
             } else {
                 return Ok(s.request_tx.clone());
@@ -177,13 +188,14 @@ impl AmneziaWgConnector {
 
         let (request_tx, request_rx) = mpsc::channel::<NetStackRequest>(64);
 
-        tokio::spawn(async move {
+        let netstack_task = tokio::spawn(async move {
             netstack.run(request_rx).await;
         });
 
         *state = Some(TunnelState {
             runtime: tunnel_runtime,
             request_tx: request_tx.clone(),
+            netstack_abort: netstack_task.abort_handle(),
         });
 
         Ok(request_tx)

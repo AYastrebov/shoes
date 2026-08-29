@@ -206,7 +206,11 @@ impl EndpointSocket {
 /// `ECONNREFUSED` and `ECONNRESET` are deliberately absent: on a connected UDP
 /// socket they are the peer's ICMP replies, which say nothing about our own
 /// address and arrive routinely when a peer restarts.
-fn is_route_gone(e: &std::io::Error) -> bool {
+///
+/// pub(crate): the receive loop consults the same table, because on an
+/// idle tunnel the recv side sees the dead route first -- the send path
+/// only notices when something makes it transmit.
+pub(crate) fn is_route_gone(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         e.kind(),
