@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use awgtun::amnezia::Amnezia3Config;
@@ -137,6 +137,14 @@ pub struct TunnelRuntime {
     pub ip_to_tunnel_tx: mpsc::Sender<Vec<u8>>,
     /// Channel to receive decapsulated IP packets for the virtual stack.
     pub ip_from_tunnel_rx: ParkingMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Outer datagrams successfully received, ever. The trailer probe
+    /// reads this to tell "the peer answers but nothing parses" from
+    /// "nothing arrives at all" -- see probe_message.
+    datagrams_received: Arc<AtomicUsize>,
+    /// Set when the receive loop has terminated. The engine hears about
+    /// that through crate::fatal; the standalone binary has no engine, so
+    /// the connector polls this instead and rebuilds the tunnel.
+    dead: Arc<AtomicBool>,
     /// Abort handles for background tasks.
     abort_handles: Vec<tokio::task::AbortHandle>,
 }
@@ -195,6 +203,9 @@ impl TunnelRuntime {
         // which is fine — from "no handshake although we kept trying".
         let packets_offered = Arc::new(AtomicUsize::new(0));
 
+        let datagrams_received = Arc::new(AtomicUsize::new(0));
+        let dead = Arc::new(AtomicBool::new(false));
+
         // Rebindable rather than a plain UdpSocket: on mobile the address this
         // is bound to stops existing every time the device changes network.
         // See src/amneziawg/endpoint.rs.
@@ -211,8 +222,18 @@ impl TunnelRuntime {
             let tunn = tunn.clone();
             let udp = udp_socket.clone();
             let tx = ip_from_tunnel_tx;
+            let received = datagrams_received.clone();
+            let dead = dead.clone();
             tokio::spawn(async move {
-                decapsulate_loop(tunn, udp, tx).await;
+                let reason = decapsulate_loop(tunn, udp, tx, received).await;
+                // The loop only returns when the receive path is
+                // unrecoverable. Say so loudly: an engine that keeps
+                // reporting healthy over a tunnel that cannot hear its
+                // peer is worse than a stopped one, because the host can
+                // react to a stop and cannot detect deafness.
+                dead.store(true, Ordering::SeqCst);
+                error!("AmneziaWG receive path failed: {reason}");
+                crate::fatal::report(format!("AmneziaWG receive path failed: {reason}"));
             })
         };
 
@@ -276,8 +297,16 @@ impl TunnelRuntime {
         Ok(Arc::new(Self {
             ip_to_tunnel_tx,
             ip_from_tunnel_rx: ParkingMutex::new(Some(ip_from_tunnel_rx)),
+            datagrams_received,
+            dead,
             abort_handles,
         }))
+    }
+
+    /// Whether the receive loop has terminated. A dead runtime never
+    /// recovers; the caller's move is to drop it and build a new one.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 }
 
@@ -285,30 +314,51 @@ async fn decapsulate_loop(
     tunn: Arc<ParkingMutex<Tunn>>,
     udp: Arc<EndpointSocket>,
     tx: mpsc::Sender<Vec<u8>>,
-) {
+    datagrams_received: Arc<AtomicUsize>,
+) -> String {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
     let mut out = vec![0u8; MAX_UDP_SIZE];
     // Reused for every packet this loop sends. See the comment in
     // drain_queued_packets for why the copy is needed at all.
     let mut packet = Vec::new();
+    let mut streak = RecvErrorStreak::new();
 
     loop {
         let n = match udp.recv(&mut buf).await {
-            Ok(n) => n,
+            Ok(n) => {
+                streak.on_success();
+                // Counted before decapsulation: arrival is the fact the
+                // trailer probe needs, parseability is a separate one.
+                datagrams_received.fetch_add(1, Ordering::Relaxed);
+                n
+            }
             Err(e) => {
-                // A connected UDP socket reports ICMP port-unreachable (e.g. the
-                // peer restarting) as ECONNREFUSED, and a stale mapping as
-                // ECONNRESET. The socket is still usable, so keep listening rather
-                // than killing inbound for the rest of the process's life.
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
-                ) {
-                    debug!("AmneziaWG UDP recv transient error, continuing: {}", e);
-                    continue;
+                match classify_recv_error(&e) {
+                    RecvErrorAction::Ignore => {
+                        debug!("AmneziaWG UDP recv transient error, continuing: {}", e);
+                    }
+                    RecvErrorAction::ResetTrailerWindow => {
+                        warn!(
+                            "AmneziaWG: a sent datagram exceeded the path MTU \
+                             (EMSGSIZE on the socket); resetting the trailer window \
+                             and continuing"
+                        );
+                        tunn.lock().reset_udp_window();
+                    }
+                    RecvErrorAction::Suspect => {
+                        warn!("AmneziaWG UDP recv error, continuing: {}", e);
+                    }
                 }
-                error!("AmneziaWG UDP recv error, stopping decapsulate loop: {}", e);
-                break;
+                match streak.on_error(std::time::Instant::now()) {
+                    StreakVerdict::KeepGoing => {}
+                    StreakVerdict::Backoff => tokio::time::sleep(RECV_ERROR_BACKOFF).await,
+                    StreakVerdict::GiveUp => {
+                        return format!(
+                            "{RECV_ERROR_FATAL_STREAK} consecutive recv errors, last: {e}"
+                        );
+                    }
+                }
+                continue;
             }
         };
 
@@ -863,6 +913,28 @@ mod tests {
                 .is_none(),
             "a peer with the wrong header protection key must not recognise it"
         );
+    }
+
+    /// The dead flag is what the connector polls to rebuild a tunnel in
+    /// the standalone binary; a fresh runtime must start alive.
+    #[tokio::test]
+    async fn a_fresh_tunnel_runtime_is_not_dead() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let config = convert_amnezia_config(&real_world_params(), 1420).unwrap();
+        let (secret, _) = keypair(1);
+        let (_, server_public) = keypair(2);
+        let runtime = TunnelRuntime::start(
+            secret,
+            server_public,
+            Some([0x33u8; 32]),
+            Some(25),
+            config,
+            addr,
+        )
+        .await
+        .unwrap();
+        assert!(!runtime.is_dead());
     }
 
     /// EMSGSIZE on a connected UDP socket is a deferred send-path error --
