@@ -137,10 +137,6 @@ pub struct TunnelRuntime {
     pub ip_to_tunnel_tx: mpsc::Sender<Vec<u8>>,
     /// Channel to receive decapsulated IP packets for the virtual stack.
     pub ip_from_tunnel_rx: ParkingMutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    /// Outer datagrams successfully received, ever. The trailer probe
-    /// reads this to tell "the peer answers but nothing parses" from
-    /// "nothing arrives at all" -- see probe_message.
-    datagrams_received: Arc<AtomicUsize>,
     /// Set when the receive loop has terminated. The engine hears about
     /// that through crate::fatal; the standalone binary has no engine, so
     /// the connector polls this instead and rebuilds the tunnel.
@@ -203,6 +199,9 @@ impl TunnelRuntime {
         // which is fine — from "no handshake although we kept trying".
         let packets_offered = Arc::new(AtomicUsize::new(0));
 
+        // Outer datagrams successfully received, ever. The receive loop
+        // counts, the trailer probe reads -- to tell "the peer answers but
+        // nothing parses" from "nothing arrives at all" (probe_message).
         let datagrams_received = Arc::new(AtomicUsize::new(0));
         let dead = Arc::new(AtomicBool::new(false));
 
@@ -289,6 +288,7 @@ impl TunnelRuntime {
                 tunn.clone(),
                 rebuild,
                 packets_offered.clone(),
+                datagrams_received.clone(),
                 TRAILER_PROBE_INTERVAL,
             ));
             abort_handles.push(probe_task.abort_handle());
@@ -297,7 +297,6 @@ impl TunnelRuntime {
         Ok(Arc::new(Self {
             ip_to_tunnel_tx,
             ip_from_tunnel_rx: ParkingMutex::new(Some(ip_from_tunnel_rx)),
-            datagrams_received,
             dead,
             abort_handles,
         }))
@@ -532,6 +531,28 @@ fn trailers_look_wrong(last_handshake: Option<Duration>, packets_offered: usize)
     last_handshake.is_none() && packets_offered > 0
 }
 
+/// The flip announcement, worded by what actually arrived.
+///
+/// Datagrams arrived but no handshake completed: the peer answers and
+/// nothing parses, which genuinely smells like a framing mismatch.
+/// Nothing arrived in the whole probe interval: the trailer setting is
+/// unfalsifiable, so the message must not single it out.
+fn probe_message(offered: usize, new_state: &str, arrived_since_last_probe: usize) -> String {
+    if arrived_since_last_probe == 0 {
+        format!(
+            "AmneziaWG: no handshake after {offered} packets and nothing received from \
+             the peer; the endpoint may be unreachable or blocked, or the obfuscation \
+             parameters may not match -- retrying with random trailers {new_state} anyway."
+        )
+    } else {
+        format!(
+            "AmneziaWG: no handshake after {offered} packets; retrying with random \
+             trailers {new_state}. If this is what fixes the tunnel, set random_trailers \
+             to match the peer."
+        )
+    }
+}
+
 /// Try random trailers the other way round when the handshake never completes.
 ///
 /// A random-trailer mismatch cannot be detected by asking: the peer's setting
@@ -548,12 +569,18 @@ async fn trailer_probe_loop(
     tunn: Arc<ParkingMutex<Tunn>>,
     keys: TunnelKeys,
     packets_offered: Arc<AtomicUsize>,
+    datagrams_received: Arc<AtomicUsize>,
     interval: Duration,
 ) {
     let mut random_trailers = keys.amnezia.random_trailers;
+    let mut received_at_last_probe = datagrams_received.load(Ordering::Relaxed);
 
     loop {
         tokio::time::sleep(interval).await;
+
+        let received_now = datagrams_received.load(Ordering::Relaxed);
+        let arrived = received_now - received_at_last_probe;
+        received_at_last_probe = received_now;
 
         let offered = packets_offered.load(Ordering::Relaxed);
         {
@@ -583,9 +610,7 @@ async fn trailer_probe_loop(
             Ok(replacement) => {
                 *tunn.lock() = replacement;
                 let state = if random_trailers { "on" } else { "off" };
-                warn!(
-                    "AmneziaWG: no handshake after {offered} packets; retrying with random trailers {state}. If this is what fixes the tunnel, set random_trailers to match the peer."
-                );
+                warn!("{}", probe_message(offered, state, arrived));
             }
             Err(e) => {
                 // The same configuration validated at startup, so this is not
@@ -1028,6 +1053,26 @@ mod tests {
         ));
     }
 
+    /// When nothing has arrived at all, the trailer setting is
+    /// unfalsifiable -- the message must not point at it. That hint sent
+    /// a real debugging session down a false path (KVN, 2026-08-29) while
+    /// the actual fault was a dead receive loop.
+    #[test]
+    fn the_probe_does_not_blame_trailers_when_nothing_arrived() {
+        let silent = probe_message(221, "off", 0);
+        assert!(silent.contains("nothing received"), "got: {silent}");
+        assert!(
+            !silent.contains("set random_trailers to match the peer"),
+            "got: {silent}"
+        );
+
+        let chatty = probe_message(221, "off", 7);
+        assert!(
+            chatty.contains("set random_trailers to match the peer"),
+            "got: {chatty}"
+        );
+    }
+
     /// The probe fires only for the shape a trailer mismatch actually has.
     #[test]
     fn only_a_tunnel_that_tried_and_never_handshaked_looks_wrong() {
@@ -1068,7 +1113,13 @@ mod tests {
         // TRAILER_PROBE_INTERVAL, which the loop takes as a parameter for
         // exactly this reason.
         let interval = Duration::from_millis(50);
-        tokio::spawn(trailer_probe_loop(tunn.clone(), keys, offered, interval));
+        tokio::spawn(trailer_probe_loop(
+            tunn.clone(),
+            keys,
+            offered,
+            Arc::new(AtomicUsize::new(0)),
+            interval,
+        ));
 
         // Past the first probe but short of the second, which would flip back.
         tokio::time::sleep(interval + interval / 2).await;
