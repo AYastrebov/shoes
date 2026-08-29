@@ -19,7 +19,7 @@ use super::netstack::{NetStackRequest, VirtualNetStack};
 use super::tunnel::TunnelRuntime;
 
 struct TunnelState {
-    _runtime: Arc<TunnelRuntime>,
+    runtime: Arc<TunnelRuntime>,
     request_tx: mpsc::Sender<NetStackRequest>,
 }
 
@@ -127,7 +127,18 @@ impl AmneziaWgConnector {
     ) -> std::io::Result<mpsc::Sender<NetStackRequest>> {
         let mut state = self.state.lock().await;
         if let Some(ref s) = *state {
-            return Ok(s.request_tx.clone());
+            if s.runtime.is_dead() {
+                // The receive path died and reported fatal. Under the
+                // mobile engine that has already stopped the service; in
+                // the standalone binary nobody listens, so recovery is
+                // here -- drop the dead runtime and rebuild on this
+                // connection. Streams on the old netstack are lost, which
+                // they already were.
+                info!("AmneziaWG: tunnel receive path died; rebuilding the tunnel");
+                *state = None;
+            } else {
+                return Ok(s.request_tx.clone());
+            }
         }
 
         let variant = match self.protocol {
@@ -171,7 +182,7 @@ impl AmneziaWgConnector {
         });
 
         *state = Some(TunnelState {
-            _runtime: tunnel_runtime,
+            runtime: tunnel_runtime,
             request_tx: request_tx.clone(),
         });
 
