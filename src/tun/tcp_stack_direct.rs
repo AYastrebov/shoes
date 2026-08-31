@@ -724,7 +724,7 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
 
         let start = std::time::Instant::now();
-        tx.send(vec![0xAB; 32]).unwrap();
+        tx.try_send(vec![0xAB; 32]).unwrap();
         waker();
 
         // Well under the loop's 1-second idle wait: if the wake is broken,
