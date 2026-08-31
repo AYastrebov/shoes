@@ -252,7 +252,7 @@ impl VirtualNetStack {
 
         let mut config = InterfaceConfig::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
-        let mut iface = Interface::new(config, &mut device, SmolInstant::now());
+        let mut iface = Interface::new(config, &mut device, crate::tun::stack_common::smol_now());
 
         let cidrs: Vec<IpCidr> = local_addresses
             .iter()
@@ -313,7 +313,7 @@ impl VirtualNetStack {
             // the existing TUN stack in tcp_stack_direct.rs).
             let delay = self
                 .iface
-                .poll_delay(SmolInstant::now(), &self.sockets)
+                .poll_delay(crate::tun::stack_common::smol_now(), &self.sockets)
                 .map(|d| std::time::Duration::from_millis(d.total_millis().min(10)))
                 .unwrap_or(std::time::Duration::from_millis(10));
             let sleep = tokio::time::sleep(delay);
@@ -340,7 +340,7 @@ impl VirtualNetStack {
             }
 
             // Poll smoltcp
-            let now = SmolInstant::now();
+            let now = crate::tun::stack_common::smol_now();
             self.iface.poll(now, &mut self.device, &mut self.sockets);
 
             // Flush outbound IP packets to tunnel

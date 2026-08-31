@@ -38,6 +38,23 @@ use smoltcp::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+/// smoltcp time from the monotonic clock.
+///
+/// `SmolInstant::now()` reads the wall clock, and both virtual stacks
+/// used it for every poll and timer decision. A backward NTP step --
+/// routine on the wake after a long sleep -- then stalls every
+/// retransmit and keepalive timer for the size of the correction, and a
+/// forward step fires them all at once. Anchored to the wall clock once,
+/// at first use, so the absolute values stay legible in diagnostics;
+/// after that only the monotonic clock moves it. Shared with the
+/// AmneziaWG netstack, which had the same exposure.
+pub(crate) fn smol_now() -> SmolInstant {
+    static BASE: std::sync::OnceLock<(std::time::Instant, SmolInstant)> =
+        std::sync::OnceLock::new();
+    let (mono, smol) = *BASE.get_or_init(|| (std::time::Instant::now(), SmolInstant::now()));
+    smol + SmolDuration::from_micros(mono.elapsed().as_micros() as u64)
+}
+
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 
 pub type PacketBuffer = Vec<u8>;
@@ -386,7 +403,7 @@ pub fn run_stack_loop<D: StackDevice>(
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
 
-    let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+    let mut iface = Interface::new(iface_config, &mut device, smol_now());
 
     iface.update_ip_addrs(|addrs| {
         if let Err(e) = addrs.push(IpCidr::new(IpAddress::v4(0, 0, 0, 1), 0)) {
@@ -552,11 +569,11 @@ pub fn run_stack_loop<D: StackDevice>(
         let has_tcp_packet = !tcp_packets.is_empty();
         for pkt in tcp_packets {
             device.store_packet(pkt);
-            let now = SmolInstant::now();
+            let now = smol_now();
             iface.poll(now, &mut device, &mut socket_set);
         }
 
-        let now = SmolInstant::now();
+        let now = smol_now();
         iface.poll(now, &mut device, &mut socket_set);
 
         let mut sockets_to_remove = Vec::new();
@@ -700,7 +717,7 @@ pub fn run_stack_loop<D: StackDevice>(
         }
 
         // Polls again after data transfer (critical for performance).
-        let after_transfer = SmolInstant::now();
+        let after_transfer = smol_now();
         iface.poll(after_transfer, &mut device, &mut socket_set);
 
         // Wait for data using the platform's readiness primitive - this is
