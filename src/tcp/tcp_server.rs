@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 // Only the unix-socket server takes a filesystem path.
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -56,16 +56,18 @@ fn accept_exhausted_a_resource(e: &std::io::Error) -> bool {
     }
 }
 
+/// The accept loop. The listener is bound by the caller, before the task
+/// spawns: a bind failure must surface from `start_servers` as an error
+/// the launch path can act on, not panic silently inside a task nobody
+/// joins while the port goes unserved.
 async fn run_tcp_server(
-    bind_address: SocketAddr,
+    listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
-) -> std::io::Result<()> {
+) {
     let TcpConfig { no_delay } = tcp_config;
-
-    let listener = new_tcp_listener(bind_address, 4096, None)?;
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -106,13 +108,10 @@ async fn run_tcp_server(
     }
 }
 
+/// Clear anything squatting on the socket path and bind. Runs before the
+/// accept task spawns, for the same reason as the TCP listener above.
 #[cfg(target_family = "unix")]
-async fn run_unix_server(
-    path_buf: PathBuf,
-    resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
-    sniff: Option<SniffSettings>,
-) -> std::io::Result<()> {
+async fn bind_unix_listener(path_buf: PathBuf) -> std::io::Result<tokio::net::UnixListener> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
             "WARNING: replacing file at socket path {}",
@@ -121,8 +120,16 @@ async fn run_unix_server(
         let _ = tokio::fs::remove_file(&path_buf).await;
     }
 
-    let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
+    crate::socket_util::new_unix_listener(path_buf, 4096)
+}
 
+#[cfg(target_family = "unix")]
+async fn run_unix_server(
+    listener: tokio::net::UnixListener,
+    resolver: Arc<dyn Resolver>,
+    server_handler: Arc<dyn TcpServerHandler>,
+    sniff: Option<SniffSettings>,
+) {
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
@@ -424,11 +431,14 @@ async fn start_tcp_servers(
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
                     let sniff = sniff.clone();
-                    let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler, sniff)
-                            .await
-                            .unwrap();
-                    });
+                    let listener = new_tcp_listener(socket_addr, 4096, None)?;
+                    let handle = tokio::spawn(run_tcp_server(
+                        listener,
+                        tcp_config,
+                        resolver,
+                        tcp_handler,
+                        sniff,
+                    ));
                     handles.push(handle);
                 }
             }
@@ -442,11 +452,8 @@ async fn start_tcp_servers(
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
                 debug!("TCP handler: {tcp_handler:?}");
-                let handle = tokio::spawn(async move {
-                    run_unix_server(_path_buf, resolver, tcp_handler, sniff)
-                        .await
-                        .unwrap();
-                });
+                let listener = bind_unix_listener(_path_buf).await?;
+                let handle = tokio::spawn(run_unix_server(listener, resolver, tcp_handler, sniff));
                 handles.push(handle);
             }
             #[cfg(not(target_family = "unix"))]

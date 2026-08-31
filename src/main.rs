@@ -399,8 +399,24 @@ fn main() {
             }
         };
 
+        let mut first_launch = true;
         loop {
-            let join_handles = launch_servers(prepared).await;
+            let join_handles = match launch_servers(prepared).await {
+                Ok(handles) => handles,
+                Err(e) if first_launch => {
+                    eprintln!("{e}\n");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    // A reload that validated but failed to launch -- a bind
+                    // conflict, fd exhaustion. The old servers are already
+                    // gone, so there is nothing to keep; but the process
+                    // survives and the next edit retries.
+                    eprintln!("{e}\nNo servers are running; fix the config to retry.");
+                    Vec::new()
+                }
+            };
+            first_launch = false;
 
             if reload_state.is_none() {
                 // No reload mode - wait forever
@@ -433,12 +449,14 @@ fn main() {
             };
 
             println!("Restarting servers..");
-            for join_handle in join_handles {
+            for join_handle in &join_handles {
                 join_handle.abort();
             }
-            // A beat for the aborted listeners to release their ports
-            // before the replacements bind the same addresses.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Awaited, not slept over: abort only schedules cancellation,
+            // and the replacements bind these same addresses next.
+            for join_handle in join_handles {
+                let _ = join_handle.await;
+            }
         }
     });
 }
@@ -504,7 +522,12 @@ async fn prepare_servers(
 
 /// Commit a prepared configuration: install its outbounds and spawn its
 /// servers. Only called with a `PreparedServers` that validated whole.
-async fn launch_servers(prepared: PreparedServers) -> Vec<tokio::task::JoinHandle<()>> {
+/// A launch failure -- a bind conflict, fd exhaustion -- aborts whatever
+/// did start and returns the message to print, so the serve loop decides
+/// what happens next instead of a panic deciding for it.
+async fn launch_servers(
+    prepared: PreparedServers,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
     let PreparedServers {
         server_configs,
         mut dns_registry,
@@ -520,7 +543,7 @@ async fn launch_servers(prepared: PreparedServers) -> Vec<tokio::task::JoinHandl
 
     println!("\nStarting {} server(s)..", server_configs.len());
 
-    let mut join_handles = vec![];
+    let mut join_handles: Vec<tokio::task::JoinHandle<()>> = vec![];
     for server_config in server_configs {
         // Get the resolver for this server from the registry
         let dns_ref = match &server_config {
@@ -529,7 +552,19 @@ async fn launch_servers(prepared: PreparedServers) -> Vec<tokio::task::JoinHandl
             _ => None,
         };
         let resolver = dns_registry.get_for_server(dns_ref);
-        join_handles.extend(start_servers(server_config, resolver).await.unwrap());
+        match start_servers(server_config, resolver).await {
+            Ok(handles) => join_handles.extend(handles),
+            Err(e) => {
+                // Half a configuration must not keep serving as if whole.
+                for handle in &join_handles {
+                    handle.abort();
+                }
+                for handle in join_handles {
+                    let _ = handle.await;
+                }
+                return Err(format!("Failed to start servers: {e}"));
+            }
+        }
     }
-    join_handles
+    Ok(join_handles)
 }
