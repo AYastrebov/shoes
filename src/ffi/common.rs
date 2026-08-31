@@ -165,9 +165,24 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
         return true;
     };
 
+    // A stop the host asked for must not manufacture an error: the exit
+    // guard reads stop_requested in a race with our store of it, and the
+    // losing interleaving fires a report -- with a reason -- for this
+    // very stop during the wait below. Whatever LAST_ERROR held before
+    // the stop is what it holds after; anything written mid-stop is the
+    // race's, not a fact the host needs. A reason from an engine that
+    // died before the host called stop was written before this snapshot
+    // and survives it.
+    let before = get_last_error();
+
     // The C and JNI surfaces answer with an int, so the obligation the type
     // carries is flattened here rather than at the call sites.
     let stopped = crate::control::stop_handle(handle).device_released();
+
+    match before {
+        Some(msg) => set_last_error(msg),
+        None => clear_last_error(),
+    }
 
     // The protector holds a reference to the platform's VPN service object.
     // Released here rather than in the platform modules so that neither one can

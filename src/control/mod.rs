@@ -377,12 +377,17 @@ impl Drop for ExitGuard {
         if self.stop_requested.load(Ordering::SeqCst) {
             return;
         }
-        let error = self.failure.lock().clone();
-        if error.is_none() {
-            // The callback says None -- no error -- but status must not say
-            // Requested for a stop nobody requested.
-            *self.failure.lock() = Some(ENDED_UNREQUESTED.to_string());
-        }
+        // An unrequested Ok gets the same sentence status() records: the
+        // FFI hosts read only what on_exit carries, and a None here left
+        // the iOS callback announcing a reasonless stop while
+        // shoes_get_last_error answered with whatever an earlier failure
+        // had written -- a stale message dressed as this stop's reason.
+        let error = self
+            .failure
+            .lock()
+            .clone()
+            .or_else(|| Some(ENDED_UNREQUESTED.to_string()));
+        *self.failure.lock() = error.clone();
         if let Some(on_exit) = self.on_exit.take() {
             on_exit(error);
         }
@@ -840,7 +845,7 @@ mod tests {
     /// An Ok that nobody requested is still an exit the host must hear
     /// about; `None` is what it hears.
     #[test]
-    fn on_exit_reports_an_unrequested_ok_as_none() {
+    fn on_exit_reports_an_unrequested_ok_with_the_recorded_sentence() {
         let (tx, rx) = mpsc::channel();
         let handle = start_with(
             test_runtime(),
@@ -848,7 +853,10 @@ mod tests {
             move |reason| tx.send(reason).unwrap(),
         );
         let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        assert_eq!(reason, None);
+        // The same sentence status() records: the FFI hosts read only what
+        // on_exit carries, and None here meant a reasonless callback plus a
+        // stale shoes_get_last_error.
+        assert_eq!(reason.as_deref(), Some(ENDED_UNREQUESTED));
         assert_eq!(
             handle.failure.lock().as_deref(),
             Some(ENDED_UNREQUESTED),
