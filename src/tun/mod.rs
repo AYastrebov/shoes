@@ -56,7 +56,7 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::selection::ConfigSelection;
 use crate::config::{FakeIpConfig, TunConfig};
 use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpResponder};
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use stack_common::{NewTcpConnection, TcpStackOptions};
@@ -477,15 +477,21 @@ async fn handle_udp_packets(
 }
 
 /// Start TUN server based on the provided configuration.
+///
+/// `resolver` is the one the caller selected for this entry's `dns:`
+/// block (or the default when there is none). It used to be discarded
+/// here, which was the whole bug: the TUN datapath resolved through the
+/// system resolver while the config's DoH block validated, built, and
+/// did nothing.
 pub async fn start_tun_server(
     config: TunConfig,
-    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
+        if let Err(e) = run_tun_from_config(config, resolver, shutdown_rx, true).await {
             warn!("TUN server error: {}", e);
         }
     });
@@ -514,8 +520,17 @@ fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpR
 }
 
 /// Run TUN server from config with external shutdown control.
+///
+/// `resolver` reaches everything in the session that resolves: the
+/// client-chain selector, `connect_tcp`, the UDP manager's destination
+/// connects, and the WireGuard/AmneziaWG endpoint (re-)resolution on
+/// rebinds and rebuilds. Callers pick it from the DnsRegistry, so a TUN
+/// entry's `dns:` block is what answers -- and without one, the
+/// registry's default is the same system resolver this function used to
+/// build in place.
 pub async fn run_tun_from_config(
     config: TunConfig,
+    resolver: Arc<dyn Resolver>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
 ) -> std::io::Result<()> {
@@ -569,7 +584,6 @@ pub async fn run_tun_from_config(
     let sniff = config.sniff.as_ref().and_then(|s| s.to_settings());
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
 
     run_tun_server(
@@ -699,6 +713,152 @@ mod tests {
             ConnectAction::new_allow(None, group),
         );
         Arc::new(ClientProxySelector::new(vec![rule]))
+    }
+
+    /// A minimal UDP DNS upstream: records every queried name and answers
+    /// A queries with 127.0.0.1. Nothing this small existed in the tree.
+    async fn spawn_recording_dns_upstream(names: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if n < 12 {
+                    continue;
+                }
+                // Question name: labels from offset 12 until the root label.
+                let mut pos = 12;
+                let mut labels: Vec<String> = Vec::new();
+                while pos < n {
+                    let len = buf[pos] as usize;
+                    pos += 1;
+                    if len == 0 {
+                        break;
+                    }
+                    labels.push(String::from_utf8_lossy(&buf[pos..pos + len]).to_string());
+                    pos += len;
+                }
+                if pos + 4 > n {
+                    continue;
+                }
+                let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+                let question_end = pos + 4;
+                names.lock().unwrap().push(labels.join("."));
+
+                // Echo the ID and question; answer A queries with 127.0.0.1
+                // and everything else with an empty NOERROR.
+                let answers: u16 = if qtype == 1 { 1 } else { 0 };
+                let mut resp = Vec::with_capacity(question_end + 16);
+                resp.extend_from_slice(&buf[0..2]);
+                resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01]);
+                resp.extend_from_slice(&answers.to_be_bytes());
+                resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                resp.extend_from_slice(&buf[12..question_end]);
+                if qtype == 1 {
+                    resp.extend_from_slice(&[
+                        0xC0, 0x0C, // name: pointer to the question
+                        0x00, 0x01, 0x00, 0x01, // TYPE A, CLASS IN
+                        0x00, 0x00, 0x00, 0x3C, // TTL 60
+                        0x00, 0x04, 127, 0, 0, 1, // RDATA
+                    ]);
+                }
+                let _ = socket.send_to(&resp, from).await;
+            }
+        });
+
+        addr
+    }
+
+    /// The whole point of the change: a TUN config with a `dns:` block
+    /// resolves the client-chain hostname through the CONFIGURED upstream,
+    /// not the system resolver. The resolver is obtained exactly the way
+    /// `run_prepared` and `launch_servers` now obtain it -- config through
+    /// validation, registry, `get_for_server` -- and then drives the same
+    /// datapath the TUN session uses.
+    #[tokio::test]
+    async fn a_tun_dns_block_resolves_through_its_configured_upstream() {
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let dns_addr = spawn_recording_dns_upstream(names.clone()).await;
+
+        let yaml = format!(
+            r#"
+- device_fd: 0
+  dns:
+    servers:
+      - url: "udp://{dns_addr}"
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#
+        );
+        let configs: Vec<crate::config::Config> = serde_yaml::from_str(&yaml).unwrap();
+        let validated = crate::config::create_server_configs(configs).unwrap();
+        let registry = crate::dns::build_dns_registry(validated.dns_groups)
+            .await
+            .unwrap();
+        let mut registry = registry;
+        let tun = validated
+            .configs
+            .iter()
+            .find_map(|c| match c {
+                crate::config::Config::TunServer(t) => Some(t),
+                _ => None,
+            })
+            .expect("the config parses to a TUN entry");
+        let resolver = registry.get_for_server(tun.dns.as_ref());
+
+        // The destination the mock's answer points at.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload_seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = payload_seen.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = Vec::new();
+            let _ = stream.read_to_end(&mut payload).await;
+            *recorded.lock().unwrap() = payload;
+        });
+
+        // A direct chain, as the default TUN rules build one.
+        let group = crate::tcp::chain_builder::build_direct_chain_group(resolver.clone());
+        let rule = ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![],
+            ConnectAction::new_allow(None, group),
+        );
+        let selector = Arc::new(ClientProxySelector::new(vec![rule]));
+
+        let target = NetLocation::new(
+            Address::Hostname("tun-dns-upstream-test.internal".to_string()),
+            port,
+        );
+        let local = HelloThenEof {
+            hello: Some(b"through-the-configured-dns".to_vec()),
+        };
+        handle_tcp_connection(local, target, selector, resolver, None)
+            .await
+            .unwrap();
+
+        assert!(
+            names
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == "tun-dns-upstream-test.internal"),
+            "the configured upstream never saw the query; seen: {:?}",
+            names.lock().unwrap()
+        );
+        // Give the listener task a beat to record.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            payload_seen.lock().unwrap().as_slice(),
+            b"through-the-configured-dns",
+            "the connection did not reach the address the upstream answered"
+        );
     }
 
     #[tokio::test]

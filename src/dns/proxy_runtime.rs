@@ -442,4 +442,54 @@ mod tests {
             elapsed
         );
     }
+
+    /// The TUN-mode constraint made testable: every DNS upstream socket
+    /// must pass through the socket protector, or on Android the query
+    /// routes into the very tunnel it resolves for. Asserted on the fd of
+    /// OUR socket specifically, so concurrent tests protecting their own
+    /// sockets through the shared global cannot confuse the result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_udp_routes_the_dns_socket_through_the_protector() {
+        use std::os::unix::io::AsRawFd;
+
+        let seen: Arc<std::sync::Mutex<Vec<i32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let previous = crate::socket_protector::get_global_socket_protector();
+        crate::socket_protector::set_global_socket_protector(Arc::new(
+            crate::socket_protector::FnSocketProtector::new(move |fd| {
+                recorder.lock().unwrap().push(fd);
+                Ok(())
+            }),
+        ));
+
+        let chain = Arc::new(build_direct_chain_group(Arc::new(
+            crate::resolver::NativeResolver::new(),
+        )));
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            chain,
+            Arc::new(crate::resolver::NativeResolver::new()),
+            Duration::from_secs(5),
+        );
+        let socket = provider
+            .bind_udp(
+                "0.0.0.0:0".parse().unwrap(),
+                "127.0.0.1:53".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let fd = socket.as_raw_fd();
+
+        // Restore before asserting, so a failure does not leave the
+        // counting protector installed for every later test.
+        match previous {
+            Some(p) => crate::socket_protector::set_global_socket_protector(p),
+            None => crate::socket_protector::clear_global_socket_protector(),
+        }
+
+        assert!(
+            seen.lock().unwrap().contains(&fd),
+            "the DNS upstream socket never passed through the protector"
+        );
+    }
 }
