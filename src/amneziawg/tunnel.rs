@@ -415,14 +415,33 @@ impl TunnelRuntime {
             let tunn = tunn.clone();
             let rebinds = rebinds_completed.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
+                rebinds.fetch_add(1, Ordering::Relaxed);
+                let mut out = vec![0u8; MAX_UDP_SIZE];
+                let mut tunn = tunn.lock();
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
                 // mark of datagrams seen on this path. A rebind is a new path,
                 // so the mark it carried no longer describes anything. awgtun
                 // leaves this to the caller because `Tunn` has no endpoint of
                 // its own; upstream's `Device` does the same on a peer roam.
                 // A no-op when random trailers are off.
-                tunn.lock().reset_udp_window();
-                rebinds.fetch_add(1, Ordering::Relaxed);
+                tunn.reset_udp_window();
+                // Announce the new address. The server learns a roamed peer's
+                // endpoint from the first authenticated packet, so until one
+                // goes out it keeps sending to the old address and inbound
+                // stays dead on an idle tunnel. An empty payload is awgtun's
+                // explicit keepalive when a session exists; without one it
+                // starts a handshake, which announces just as well.
+                match tunn.encapsulate(&[], &mut out) {
+                    TunnResult::WriteToNetwork(data) => {
+                        let packet = data.to_vec();
+                        let mut datagrams = take_queued_decoys(&mut tunn);
+                        datagrams.push(packet);
+                        datagrams
+                    }
+                    // Done: a handshake initiation is already in flight and
+                    // the timer loop is retrying it; nothing extra to send.
+                    _ => Vec::new(),
+                }
             }))
         };
 
