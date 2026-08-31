@@ -346,6 +346,10 @@ impl TunnelRuntime {
         // see a black hole -- the exact deafness the watchdog exists to
         // catch, hidden by sampling one layer too low.
         let datagrams_decapsulated = Arc::new(AtomicUsize::new(0));
+
+        // Consecutive failed sends, for log throttling. Per-tunnel by
+        // construction: see SEND_FAILURE_WARN_EVERY.
+        let send_failures = Arc::new(AtomicUsize::new(0));
         let dead = Arc::new(AtomicBool::new(false));
 
         // The live trailer setting, for EMSGSIZE handling. An atomic
@@ -377,6 +381,7 @@ impl TunnelRuntime {
             let received = datagrams_received.clone();
             let decapsulated = datagrams_decapsulated.clone();
             let trailers = trailers_on.clone();
+            let failures = send_failures.clone();
             let dead = dead.clone();
             tokio::spawn(async move {
                 // catch_unwind so a panic inside the loop still marks the
@@ -384,7 +389,8 @@ impl TunnelRuntime {
                 // builds with panic = "abort", where the process's death
                 // is its own announcement. An abort of this task merely
                 // drops the future -- no catch, no false report.
-                let loop_future = decapsulate_loop(tunn, udp, tx, received, decapsulated, trailers);
+                let loop_future =
+                    decapsulate_loop(tunn, udp, tx, received, decapsulated, trailers, failures);
                 let reason = match std::panic::AssertUnwindSafe(loop_future)
                     .catch_unwind()
                     .await
@@ -412,8 +418,9 @@ impl TunnelRuntime {
             let udp = udp_socket.clone();
             let offered = packets_offered.clone();
             let trailers = trailers_on.clone();
+            let failures = send_failures.clone();
             tokio::spawn(async move {
-                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered, trailers).await;
+                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered, trailers, failures).await;
             })
         };
 
@@ -422,8 +429,9 @@ impl TunnelRuntime {
             let tunn = tunn.clone();
             let udp = udp_socket.clone();
             let trailers = trailers_on.clone();
+            let failures = send_failures.clone();
             tokio::spawn(async move {
-                timer_loop(tunn, udp, trailers).await;
+                timer_loop(tunn, udp, trailers, failures).await;
             })
         };
 
@@ -529,6 +537,7 @@ async fn decapsulate_loop(
     datagrams_received: Arc<AtomicUsize>,
     datagrams_decapsulated: Arc<AtomicUsize>,
     trailers_on: Arc<AtomicBool>,
+    send_failures: Arc<AtomicUsize>,
 ) -> String {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
     let mut out = vec![0u8; MAX_UDP_SIZE];
@@ -616,8 +625,24 @@ async fn decapsulate_loop(
             TunnResult::WriteToNetwork(data) => {
                 packet.clear();
                 packet.extend_from_slice(data);
-                send_to_network(&tunn, &udp, &packet, "handshake", &trailers_on).await;
-                drain_queued_packets(&tunn, &udp, &mut out, &mut packet, &trailers_on).await;
+                send_to_network(
+                    &tunn,
+                    &udp,
+                    &packet,
+                    "handshake",
+                    &trailers_on,
+                    &send_failures,
+                )
+                .await;
+                drain_queued_packets(
+                    &tunn,
+                    &udp,
+                    &mut out,
+                    &mut packet,
+                    &trailers_on,
+                    &send_failures,
+                )
+                .await;
             }
             TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
                 if tx.try_send(data.to_vec()).is_err() {
@@ -626,7 +651,15 @@ async fn decapsulate_loop(
                     // it is worth seeing when throughput is being lost.
                     debug!("AmneziaWG: virtual stack queue full, dropping inbound packet");
                 }
-                drain_queued_packets(&tunn, &udp, &mut out, &mut packet, &trailers_on).await;
+                drain_queued_packets(
+                    &tunn,
+                    &udp,
+                    &mut out,
+                    &mut packet,
+                    &trailers_on,
+                    &send_failures,
+                )
+                .await;
             }
         }
     }
@@ -665,15 +698,14 @@ fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
     datagrams
 }
 
-/// Consecutive failed sends, across all of the tunnel's send contexts.
-/// Log throttling only -- detection belongs to the liveness watchdog,
-/// which sees the silence these failures produce. Process-global because
-/// the log it protects is.
-static SEND_FAILURE_STREAK: AtomicUsize = AtomicUsize::new(0);
-
 /// Warn on the first failure of a streak and every 1000th after, so a
 /// send path that fails permanently -- a dead interface a phone carries
-/// for hours -- does not write a warning per attempted packet.
+/// for hours -- does not write a warning per attempted packet. The
+/// streak is per-tunnel (owned by TunnelRuntime::start, threaded to the
+/// send paths): a process-global one let a healthy tunnel's per-packet
+/// reset defeat a coexisting dead tunnel's throttle entirely -- nth was
+/// 1 for every failure, a warn per packet -- while the healthy tunnel's
+/// leftovers could equally suppress a fresh outage's onset warning.
 const SEND_FAILURE_WARN_EVERY: usize = 1000;
 
 /// One send error, wherever the send happened. EMSGSIZE gets the same
@@ -683,13 +715,14 @@ const SEND_FAILURE_WARN_EVERY: usize = 1000;
 fn report_send_error(
     tunn: &ParkingMutex<Tunn>,
     trailers_on: &AtomicBool,
+    send_failures: &AtomicUsize,
     context: &str,
     e: &std::io::Error,
 ) {
     if e.raw_os_error() == Some(EMSGSIZE_RAW) {
         handle_path_mtu_exceeded(tunn, trailers_on, context);
     } else {
-        let nth = SEND_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+        let nth = send_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if nth == 1 || nth.is_multiple_of(SEND_FAILURE_WARN_EVERY) {
             warn!("AmneziaWG UDP send ({context}) error ({nth} consecutive): {e}");
         } else {
@@ -705,17 +738,25 @@ async fn send_to_network(
     packet: &[u8],
     context: &str,
     trailers_on: &AtomicBool,
+    send_failures: &AtomicUsize,
 ) {
     let decoys = take_queued_decoys(&mut tunn.lock());
     for datagram in &decoys {
         if let Err(e) = udp.send(datagram).await {
-            report_send_error(tunn, trailers_on, context, &e);
+            report_send_error(tunn, trailers_on, send_failures, context, &e);
         }
     }
 
     match udp.send(packet).await {
-        Ok(_) => SEND_FAILURE_STREAK.store(0, Ordering::Relaxed),
-        Err(e) => report_send_error(tunn, trailers_on, context, &e),
+        // Guarded, not stored unconditionally: this sits on the path every
+        // packet takes, and an always-store is cross-core cacheline
+        // traffic for nothing in the steady state.
+        Ok(_) => {
+            if send_failures.load(Ordering::Relaxed) != 0 {
+                send_failures.store(0, Ordering::Relaxed);
+            }
+        }
+        Err(e) => report_send_error(tunn, trailers_on, send_failures, context, &e),
     }
 }
 
@@ -727,6 +768,7 @@ async fn drain_queued_packets(
     out: &mut [u8],
     packet: &mut Vec<u8>,
     trailers_on: &AtomicBool,
+    send_failures: &AtomicUsize,
 ) {
     loop {
         {
@@ -743,7 +785,7 @@ async fn drain_queued_packets(
                 _ => break,
             }
         }
-        send_to_network(tunn, udp, packet, "drain", trailers_on).await;
+        send_to_network(tunn, udp, packet, "drain", trailers_on, send_failures).await;
     }
 }
 
@@ -753,6 +795,7 @@ async fn encapsulate_loop(
     mut rx: mpsc::Receiver<Vec<u8>>,
     packets_offered: Arc<AtomicUsize>,
     trailers_on: Arc<AtomicBool>,
+    send_failures: Arc<AtomicUsize>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
@@ -785,7 +828,7 @@ async fn encapsulate_loop(
         };
 
         if has_packet {
-            send_to_network(&tunn, &udp, &packet, "encap", &trailers_on).await;
+            send_to_network(&tunn, &udp, &packet, "encap", &trailers_on, &send_failures).await;
         }
     }
 }
@@ -971,6 +1014,7 @@ async fn timer_loop(
     tunn: Arc<ParkingMutex<Tunn>>,
     udp: Arc<EndpointSocket>,
     trailers_on: Arc<AtomicBool>,
+    send_failures: Arc<AtomicUsize>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
@@ -1012,7 +1056,7 @@ async fn timer_loop(
             TunnResult::WriteToNetwork(data) => {
                 packet.clear();
                 packet.extend_from_slice(data);
-                send_to_network(&tunn, &udp, &packet, "timer", &trailers_on).await;
+                send_to_network(&tunn, &udp, &packet, "timer", &trailers_on, &send_failures).await;
             }
             _ => {}
         }
