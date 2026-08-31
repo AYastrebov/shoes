@@ -92,12 +92,34 @@ impl TcpStackDirect {
             }
         };
 
-        let handle = StackHandle::spawn("shoes-smoltcp-direct", options, move || {
+        let handle = match StackHandle::spawn("shoes-smoltcp-direct", options, move || {
             // Sets fd to non-blocking mode once at startup for performance.
             set_nonblocking(fd)
                 .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
             Ok(FdDevice::new(fd, wake_rx, options.mtu))
-        })?;
+        }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Self was never built, so Drop -- the only other closer of
+                // these descriptors -- will not run. Without this, a host
+                // retrying a start after thread-spawn EAGAIN leaked the wake
+                // pipe every attempt, plus the TUN device itself on the
+                // desktop path, where the interface then stays up and the
+                // named device can refuse the retry with EBUSY.
+                unsafe {
+                    if wake_rx >= 0 {
+                        libc::close(wake_rx);
+                    }
+                    if wake_tx >= 0 {
+                        libc::close(wake_tx);
+                    }
+                    if options.close_fd_on_drop {
+                        libc::close(fd);
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             handle,
