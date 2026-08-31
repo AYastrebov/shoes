@@ -57,6 +57,11 @@ pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes:
 /// `shoes_is_running()` is already false when it runs, and calling
 /// `shoes_stop` from inside it is allowed. Do not block in it.
 ///
+/// Do not call `shoes_start` from inside it: the callback runs on a
+/// worker of the dying session's runtime, and a start there is refused
+/// with an error (it would otherwise abort the process). Dispatch the
+/// reconnect to another thread or queue instead.
+///
 /// May be NULL, in which case nothing is called.
 pub type ShoesStoppedCallback = Option<extern "C" fn(reason: *const c_char)>;
 
@@ -285,6 +290,21 @@ unsafe fn start_service(
     traffic_callback: ShoesTrafficCallback,
     stopped_callback: ShoesStoppedCallback,
 ) -> c_long {
+    // The natural auto-reconnect mistake: shoes_start from inside the
+    // stopped callback, which runs on a worker of the dying session's
+    // runtime. block_on below then panics ("Cannot start a runtime from
+    // within a runtime"), and panic = "abort" turns that into process
+    // death. Refused with a reason instead.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        error!("{who}: called from a shoes runtime thread (the stopped callback?)");
+        common::set_last_error(
+            "shoes_start called from a shoes callback thread; \
+             dispatch the restart to another thread"
+                .to_string(),
+        );
+        return -1;
+    }
+
     // Serialized against shoes_stop (and any concurrent start): a stop in
     // flight empties the service slot before its five-second wait, and a
     // start that slipped into that window used to pass the guard below
@@ -694,6 +714,26 @@ mod tests {
         assert_eq!(handle, -1);
         let err = common::get_last_error().unwrap_or_default();
         assert!(err.contains("No TUN config found"), "got: {err}");
+        assert!(!shoes_is_running());
+    }
+
+    /// The natural auto-reconnect mistake: shoes_start from the stopped
+    /// callback, which runs on a shoes runtime worker. block_on there
+    /// panics, and the mobile profile's panic=abort made that process
+    /// death. It must be a refusal with a reason instead.
+    #[test]
+    fn a_start_from_a_runtime_thread_is_refused_not_aborted() {
+        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = rt.block_on(async {
+            let yaml = CString::new("tun:\n  device_fd: 7\n").unwrap();
+            unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, None) }
+        });
+        assert_eq!(handle, -1);
+        let err = common::get_last_error().unwrap_or_default();
+        assert!(err.contains("callback thread"), "got: {err}");
         assert!(!shoes_is_running());
     }
 
