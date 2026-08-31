@@ -377,38 +377,54 @@ async fn session_task(
                     destinations.remove(&dest);
                 }
 
-                // Create destination task if absent
+                // Create destination task if absent. The connect happens
+                // inside the spawned task, not here: create_connection can
+                // take a DNS lookup plus a full proxy handshake, and
+                // awaiting it in this select arm stalled every other
+                // destination of this peer for the duration while their
+                // queues filled and dropped. Packets that arrive meanwhile
+                // buffer in the entry's channel and flow once the connect
+                // lands; if it fails, the task ends and the dead-entry
+                // check above recreates it on the next packet.
                 if !destinations.contains_key(&dest) {
-                    match create_connection(&dest, &proxy_selector, &resolver).await {
-                        Ok(stream) => {
-                            let source_addr = match dest.to_socket_addr_nonblocking() {
-                                Some(addr) => addr,
-                                None => continue,
-                            };
+                    let source_addr = match dest.to_socket_addr_nonblocking() {
+                        Some(addr) => addr,
+                        None => continue,
+                    };
 
-                            let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
-                            let handle = tokio::spawn(destination_task(
-                                peer_addr,
-                                source_addr,
-                                stream,
-                                write_rx,
-                                response_tx.clone(),
-                            ));
+                    let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
+                    let handle = {
+                        let dest = dest.clone();
+                        let proxy_selector = proxy_selector.clone();
+                        let resolver = resolver.clone();
+                        let response_tx = response_tx.clone();
+                        tokio::spawn(async move {
+                            match create_connection(&dest, &proxy_selector, &resolver).await {
+                                Ok(stream) => {
+                                    destination_task(
+                                        peer_addr,
+                                        source_addr,
+                                        stream,
+                                        write_rx,
+                                        response_tx,
+                                    )
+                                    .await
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "[TunUdpSession {}] Failed to connect to {}: {}",
+                                        peer_addr, dest, e
+                                    );
+                                }
+                            }
+                        })
+                    };
 
-                            debug!(
-                                "[TunUdpSession {}] Created destination task for {}",
-                                peer_addr, dest
-                            );
-                            destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
-                        }
-                        Err(e) => {
-                            debug!(
-                                "[TunUdpSession {}] Failed to connect to {}: {}",
-                                peer_addr, dest, e
-                            );
-                            continue;
-                        }
-                    }
+                    debug!(
+                        "[TunUdpSession {}] Created destination task for {}",
+                        peer_addr, dest
+                    );
+                    destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
                 }
 
                 // Forward payload to destination task. Uses try_send to avoid
