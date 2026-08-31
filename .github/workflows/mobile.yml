@@ -205,8 +205,14 @@ jobs:
       # linked here rather than only on a tag build. The symbol itself is
       # unconditional, which is what keeps the check below counting the same
       # list whichever features are on.
+      # release-mobile, not --release: it is the profile every shipping FFI
+      # artifact uses, and the panic = "abort" it carries is now enforced by
+      # a compile guard in src/ffi/mod.rs -- an unwinding FFI build would
+      # unwind across extern "C" (UB) and report a panicking engine as a
+      # clean stop. Checking the surface of the profile that ships also
+      # makes this job verify the right artifact.
       - name: Build staticlib
-        run: cargo build --locked --release --features ffi,control-stats --target aarch64-apple-darwin
+        run: cargo build --locked --profile release-mobile --features ffi,control-stats --target aarch64-apple-darwin
 
       - name: Verify the C surface matches include/shoes.h
         run: |
@@ -217,10 +223,10 @@ jobs:
           # from an archive that was otherwise 28MB larger. A dynamic library
           # has to keep its exported symbols to be linkable at all, and that
           # export list is the ABI a Swift provider actually binds to.
-          lib=target/aarch64-apple-darwin/release/libshoes.dylib
+          lib=target/aarch64-apple-darwin/release-mobile/libshoes.dylib
           if [ ! -f "$lib" ]; then
             echo "$lib not found"
-            ls -la target/aarch64-apple-darwin/release/ | head -20
+            ls -la target/aarch64-apple-darwin/release-mobile/ | head -20
             exit 1
           fi
 
@@ -245,7 +251,7 @@ jobs:
       # is cfg'd out entirely. It guards the promise that a build without the
       # feature still compiles and keeps the same symbols.
       - name: Check the FFI surface with stats off
-        run: cargo check --locked --release --lib --features ffi --target aarch64-apple-darwin
+        run: cargo check --locked --profile release-mobile --lib --features ffi --target aarch64-apple-darwin
 
       # src/ffi/ios.rs carries tests that only compile where the module does;
       # test.yml runs on ubuntu and never sees them.
