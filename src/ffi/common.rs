@@ -126,7 +126,16 @@ pub fn stop_service() -> bool {
     // Held to the end: a start that arrives mid-stop must wait until the
     // engine is gone, and a second stop must not clear the protector out
     // from under a teardown still in flight.
-    let _transition = transition_guard();
+    let transition = transition_guard();
+    stop_service_locked(&transition)
+}
+
+/// The body of [`stop_service`], for a caller that already holds the
+/// transition lock -- the platform stop functions, which must clear their
+/// callback slots inside the same locked scope. Clearing them after the
+/// lock is released wiped the callbacks a queued start had just
+/// installed, leaving its fresh engine with no socket protector.
+pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -> bool {
     info!("Stopping TUN service");
 
     let handle = if let Some(service) = TUN_SERVICE.get() {

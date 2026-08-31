@@ -331,7 +331,11 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     _class: JClass,
     _handle: jlong,
 ) {
-    common::stop_service();
+    // One transition guard over the stop and the callback clear, so a
+    // start queued behind the lock cannot have its just-installed
+    // traffic callback wiped by this stop's tail.
+    let transition = common::transition_guard();
+    common::stop_service_locked(&transition);
     crate::tun::traffic::clear_traffic_callback();
 }
 

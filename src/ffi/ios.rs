@@ -414,11 +414,17 @@ unsafe fn start_service(
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_stop(_handle: c_long) {
+    // The whole teardown under one transition guard: a start queued
+    // behind it installs its own callbacks the moment the lock frees, so
+    // a clear outside the lock wiped the slots that start had just
+    // filled -- its engine then ran with no socket protector.
+    let transition = common::transition_guard();
+
     // Before stop_service, not after like the traffic callback: the service
     // task exits during the stop, and that exit is one the host asked for.
     // A late traffic tick is harmless; a stop event here is a lie.
     clear_stopped_callback();
-    common::stop_service();
+    common::stop_service_locked(&transition);
     crate::tun::traffic::clear_traffic_callback();
 
     if let Some(callback) = PROTECT_CALLBACK.get() {
