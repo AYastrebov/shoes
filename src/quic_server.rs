@@ -85,11 +85,26 @@ async fn start_quic_server(
         let server_handler = server_handler.clone();
         let sniff = sniff.clone();
         let join_handle = tokio::spawn(async move {
-            while let Some(conn) = endpoint.accept().await {
+            // The same per-listener cap as the TCP accept loops; the
+            // permit lives in the per-connection task, which owns the
+            // connection for its whole life here.
+            let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::util::MAX_INFLIGHT_PER_LISTENER,
+            ));
+            loop {
+                let permit = limiter
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("the limiter is never closed");
+                let Some(conn) = endpoint.accept().await else {
+                    break;
+                };
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 let sniff = sniff.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
                     {
                         // Same triage as the TCP accept loops: scanner

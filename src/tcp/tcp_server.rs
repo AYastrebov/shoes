@@ -60,13 +60,6 @@ fn accept_exhausted_a_resource(e: &std::io::Error) -> bool {
 /// spawns: a bind failure must surface from `start_servers` as an error
 /// the launch path can act on, not panic silently inside a task nobody
 /// joins while the port goes unserved.
-/// Concurrent proxied connections one listener will hold. Acquired before
-/// accept, so past the cap the kernel backlog queues instead of the
-/// process's fd table filling -- an unbounded spawn-per-connection is how
-/// a connection flood turns into the EMFILE spin the backoff above then
-/// has to ride out.
-const MAX_INFLIGHT_PER_LISTENER: usize = 4096;
-
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
@@ -75,7 +68,9 @@ async fn run_tcp_server(
     sniff: Option<SniffSettings>,
 ) {
     let TcpConfig { no_delay } = tcp_config;
-    let limiter = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_LISTENER));
+    let limiter = Arc::new(tokio::sync::Semaphore::new(
+        crate::util::MAX_INFLIGHT_PER_LISTENER,
+    ));
 
     loop {
         let permit = limiter
@@ -106,11 +101,17 @@ async fn run_tcp_server(
             error!("Failed to set TCP nodelay: {e}");
         }
 
+        // The permit rides inside the stream: handlers that answer
+        // AlreadyHandled hand the connection to a detached task and
+        // return, and a permit scoped to this task freed while their
+        // sockets lived on -- the cap was a no-op for exactly those
+        // paths. See PermitStream.
+        let stream = crate::async_stream::PermitStream::new(stream, permit);
+
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
                 Err(e) => log::log!(
@@ -147,7 +148,9 @@ async fn run_unix_server(
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
 ) {
-    let limiter = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_LISTENER));
+    let limiter = Arc::new(tokio::sync::Semaphore::new(
+        crate::util::MAX_INFLIGHT_PER_LISTENER,
+    ));
     loop {
         let permit = limiter
             .clone()
@@ -165,11 +168,12 @@ async fn run_unix_server(
             }
         };
 
+        // Same permit-in-stream reasoning as the TCP loop above.
+        let stream = crate::async_stream::PermitStream::new(stream, permit);
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{addr:?} finished successfully"),
                 Err(e) => log::log!(

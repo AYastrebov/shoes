@@ -131,3 +131,16 @@ pub fn connection_end_level(e: &std::io::Error) -> log::Level {
         _ => log::Level::Error,
     }
 }
+
+/// Concurrent proxied connections one listener will hold. Acquired
+/// before accept, so past the cap the kernel backlog queues instead of
+/// the process's fd table filling -- an unbounded spawn-per-connection
+/// is how a connection flood turns into an EMFILE spin. Applied by the
+/// TCP, unix-socket, and QUIC accept loops alike; the permit rides
+/// inside the connection (PermitStream, or the QUIC connection task) so
+/// it tracks the socket's lifetime, not the setup future's.
+///
+/// Per LISTENER: a config with many listeners can still out-provision
+/// RLIMIT_NOFILE in aggregate. A process-wide budget derived from the
+/// rlimit is the recorded follow-up in the roadmap.
+pub const MAX_INFLIGHT_PER_LISTENER: usize = 4096;
