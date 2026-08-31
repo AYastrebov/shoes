@@ -198,6 +198,43 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
     stopped
 }
 
+/// A C string from an arbitrary message. An interior NUL is replaced
+/// rather than allowed to fail the conversion: the messages are io::Error
+/// text derived from config values and peer data, and a failure whose
+/// message could not cross the boundary used to be delivered as a clean
+/// stop -- NULL to the callback AND NULL from shoes_get_last_error, the
+/// one state the contract reserves for "no reason". Shared here so every
+/// C-string-producing sink uses the same rule; a file-private copy is how
+/// the next symbol reintroduces the bug.
+pub fn c_string_lossy(s: String) -> std::ffi::CString {
+    std::ffi::CString::new(s.replace('\0', "\u{fffd}")).expect("NULs were just replaced")
+}
+
+/// Refuse a start called from a thread inside a tokio runtime context.
+///
+/// The start paths run `block_on`, which panics there -- process death
+/// under panic = "abort". The common way in is the stopped callback (it
+/// runs on a worker of the dying session's runtime), but the check is by
+/// context, not by caller, and it is broader than the panic it prevents:
+/// a blocking-pool thread of an embedding host's runtime would be legal
+/// ground for block_on, yet is refused too, because tokio exposes no way
+/// to tell the two apart. The message names the context and the way out.
+///
+/// Returns true when the start must be refused; the reason is already in
+/// last_error.
+pub fn refuse_start_from_runtime_thread(who: &str) -> bool {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return false;
+    }
+    log::error!("{who}: called on a thread with a tokio runtime context");
+    set_last_error(
+        "start called on a thread with a tokio runtime context (a shoes callback, or an \
+         embedding runtime); call it from a plain thread instead"
+            .to_string(),
+    );
+    true
+}
+
 /// Store an error message.
 pub fn set_last_error(error: String) {
     let err = LAST_ERROR.get_or_init(|| parking_lot::Mutex::new(None));

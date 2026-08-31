@@ -16,6 +16,13 @@
  * Socket protector callback type.
  * Called from Rust to protect sockets from VPN routing.
  * The callback receives a file descriptor and should return true if protected successfully.
+ *
+ * Like the stopped callback, a call already in flight when `shoes_stop`
+ * begins may still complete after `shoes_stop` returns -- the pointer
+ * must stay valid until then (a non-capturing function, not a freed
+ * trampoline). A protect that runs after the slot is cleared reports
+ * success without protecting; the socket it was for belongs to a
+ * session that is already gone.
  */
 typedef bool (*ProtectSocketCallback)(int fd);
 
@@ -35,7 +42,10 @@ typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_by
  *
  * Called once, from a shoes worker thread, when the engine stops without
  * `shoes_stop` having been called: a failure, or a task that ended on its
- * own. `reason` is the failure message, or NULL when there is none; it is
+ * own. `reason` is the failure message -- currently always non-NULL: an
+ * unrequested clean end carries "service ended without being asked".
+ * NULL stays reserved for "no reason", so treat it as such if it ever
+ * appears; the pointer is
  * valid for the duration of the call only, and `shoes_get_last_error`
  * returns the same text afterwards. Never called for a stop the host
  * requested and never for a start that failed; a call already in flight
