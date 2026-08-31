@@ -5,9 +5,15 @@ import Foundation
 /// The provider's docs tell every host to persist a fatal reason from
 /// `report(error:)` -- the extension exits right after it, so nothing
 /// asynchronous is guaranteed to run, and `.lastError` cannot answer once
-/// the process is gone. This is the ready-made way to do it: an App Group
-/// `UserDefaults` write, synchronous by nature, readable from the app
-/// through the same suite.
+/// the process is gone.
+///
+/// Atomic file writes into the App Group container, not `UserDefaults`:
+/// `set(_:forKey:)` only updates the in-process cache and pushes to
+/// `cfprefsd` on a deferred, coalesced schedule -- an extension SIGKILLed
+/// right after `stopTunnel` completes runs no exit flush, and the one
+/// error this store exists to preserve was the write most likely to be
+/// lost. `Data.write(to:options:.atomic)` has the durability the job
+/// needs and the same synchronous shape.
 ///
 /// ```swift
 /// // In the provider subclass:
@@ -21,60 +27,74 @@ import Foundation
 /// let why = store?.load()
 /// ```
 ///
-/// `@unchecked Sendable`: `UserDefaults` is documented thread-safe; the
-/// stored reference is immutable.
+/// `@unchecked Sendable`: the stored URLs are immutable, and the file
+/// system serializes the atomic replace.
 public final class ShoesErrorStore: @unchecked Sendable {
-    private let defaults: UserDefaults
-    private let errorKey: String
-    private let stopReasonKey: String
+    private let errorURL: URL
+    private let stopReasonURL: URL
 
-    /// `nil` when the App Group suite cannot be opened -- a misspelled
-    /// group, or an entitlement the target does not carry.
-    public init?(
+    /// Store into the App Group container. `nil` when the container cannot
+    /// be resolved -- a misspelled group, or an entitlement the target does
+    /// not carry.
+    public convenience init?(
         appGroup: String,
         errorKey: String = "shoes.lastFatalError",
         stopReasonKey: String = "shoes.lastStopReason"
     ) {
-        guard let defaults = UserDefaults(suiteName: appGroup) else { return nil }
-        self.defaults = defaults
-        self.errorKey = errorKey
-        self.stopReasonKey = stopReasonKey
+        guard
+            let container = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: appGroup)
+        else { return nil }
+        self.init(directory: container, errorKey: errorKey, stopReasonKey: stopReasonKey)
     }
 
-    /// Persist a fatal error. Synchronous; safe to call from
-    /// `report(error:)` right before the process exits.
+    /// Store into an explicit directory. The App Group initializer routes
+    /// here; tests use it directly with a temporary directory.
+    public init(
+        directory: URL,
+        errorKey: String = "shoes.lastFatalError",
+        stopReasonKey: String = "shoes.lastStopReason"
+    ) {
+        errorURL = directory.appendingPathComponent(errorKey).appendingPathExtension("json")
+        stopReasonURL = directory.appendingPathComponent(stopReasonKey).appendingPathExtension("json")
+    }
+
+    /// Persist a fatal error. Synchronous and durable on return; safe to
+    /// call from `report(error:)` right before the process exits.
     public func save(_ error: ShoesError) {
         guard let data = try? JSONEncoder().encode(error) else { return }
-        defaults.set(data, forKey: errorKey)
+        try? data.write(to: errorURL, options: .atomic)
     }
 
     /// The last persisted error, if any. Typically read by the app when the
     /// session goes `.disconnected` without the user asking.
     public func load() -> ShoesError? {
-        guard let data = defaults.data(forKey: errorKey) else { return nil }
+        guard let data = try? Data(contentsOf: errorURL) else { return nil }
         return try? JSONDecoder().decode(ShoesError.self, from: data)
     }
 
     /// Forget the persisted error -- call once the app has shown it.
     public func clear() {
-        defaults.removeObject(forKey: errorKey)
+        try? FileManager.default.removeItem(at: errorURL)
     }
 
     /// Persist why the system stopped the tunnel, as
     /// `NEProviderStopReason.rawValue`. An `Int` rather than the enum so
     /// this target needs no NetworkExtension dependency.
     public func saveStopReason(_ rawValue: Int) {
-        defaults.set(rawValue, forKey: stopReasonKey)
+        guard let data = try? JSONEncoder().encode(rawValue) else { return }
+        try? data.write(to: stopReasonURL, options: .atomic)
     }
 
     /// The last persisted stop reason's `rawValue`, or `nil` when none was
     /// saved. Rebuild with `NEProviderStopReason(rawValue:)` on the app side.
     public func loadStopReason() -> Int? {
-        defaults.object(forKey: stopReasonKey) as? Int
+        guard let data = try? Data(contentsOf: stopReasonURL) else { return nil }
+        return try? JSONDecoder().decode(Int.self, from: data)
     }
 
     /// Forget the persisted stop reason.
     public func clearStopReason() {
-        defaults.removeObject(forKey: stopReasonKey)
+        try? FileManager.default.removeItem(at: stopReasonURL)
     }
 }
