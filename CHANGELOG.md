@@ -4,13 +4,18 @@
 
 ### The desktop binary behaves like a daemon
 
-SIGINT and SIGTERM stop the accept loops, flush the logs, and exit 0
-instead of the OS default death; each listener caps its concurrent
-connections at 4096 so a flood queues in the kernel backlog instead of
-filling the fd table; routine client disconnects log at debug instead
-of flooding error level; a QUIC endpoint that closes says so instead of
-silently ending its accept task; and the `-l` log file rotates at
-32 MiB to `<path>.old` instead of growing forever.
+SIGINT and SIGTERM stop the accept loops, flush the logs, and exit
+with the conventional signal codes (130/143) instead of the OS default
+death -- and they reach through the reload debounce and prepare, where
+they used to buffer until systemd's escalation. Every listener -- TCP,
+unix socket, and QUIC alike -- caps its concurrent connections at 4096,
+with the permit riding inside the connection so protocol-session paths
+cannot escape it. Routine client disconnects log at debug and timeouts
+at info (visible in release builds, which compile debug out); a QUIC
+endpoint that closes says so instead of silently ending its accept
+task; and the `-l` log file rotates at 32 MiB to `<path>.old`,
+refusing -- audibly -- the cases it cannot rotate safely (symlinked
+paths, directories that refuse the rename).
 
 ### The Swift package grows up around its lifecycle
 
