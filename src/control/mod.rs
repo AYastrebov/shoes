@@ -612,8 +612,22 @@ pub async fn run_prepared(
 
     // Runs until shutdown. Who closes the descriptor follows from the policy:
     // whoever created the device closes it, and nobody else.
+    //
+    // The resolver comes from the registry the config built: this is the
+    // line that makes a TUN entry's `dns:` block real. Without the block,
+    // get_for_server(None) answers the default system resolver, so
+    // behaviour is unchanged for configs that never carried one.
     #[cfg(any(unix, windows))]
-    let result = run_tun_from_config(tun_config, tun_shutdown_rx, policy.close_fd_on_drop()).await;
+    let result = {
+        let tun_resolver = dns_registry.get_for_server(tun_config.dns.as_ref());
+        run_tun_from_config(
+            tun_config,
+            tun_resolver,
+            tun_shutdown_rx,
+            policy.close_fd_on_drop(),
+        )
+        .await
+    };
     #[cfg(not(any(unix, windows)))]
     let result = {
         // Consumed only by the TUN branch, which this platform does not have.
