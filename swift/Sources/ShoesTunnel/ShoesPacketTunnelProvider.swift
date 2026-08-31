@@ -94,6 +94,12 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// A path change arrived while a rebind was executing; run another when
     /// it finishes rather than dropping the newer path on the floor.
     private var rebindAgain = false
+    /// The highest session number a scheduled rebind will replace. A death
+    /// is only swallowed for sessions a rebind is guaranteed to restart;
+    /// the session the rebind itself starts is numbered past this, so its
+    /// death -- milliseconds after a "successful" rebind into a blocked
+    /// network -- is a real death and cancels the tunnel.
+    private var rebindTargets = 0
     /// Which engine start the stopped callback belongs to. The callback's
     /// delivery hops through a Task, so an old session's death can land after
     /// the next session started; the stamp is what makes "cleared before the
@@ -168,6 +174,12 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         rebind = nil
         pendingRebind?.cancel()
         await pendingRebind?.value
+        // Re-cleared after the await: the drained rebind's own defer can
+        // schedule a successor DURING the await, and clearing only the
+        // flags left that orphan to run a full stop/settings/start cycle
+        // into the fresh session 500 ms later.
+        rebind?.cancel()
+        rebind = nil
         // A previous session, if the system is reasserting after sleep.
         // Awaited, not blocked on: shoes_stop can take up to five seconds.
         if engine.isRunning { await engine.stop() }
@@ -177,53 +189,64 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         rebindPending = false
         rebindAgain = false
 
+        // Raced against the timeout, first-wins: a task group would
+        // await its children on exit, and the engine call cannot be
+        // cancelled mid-C, so the race is by continuation instead --
+        // the timeout genuinely bounds startTunnel. Work that finishes
+        // after losing the race is cleaned up in the catch, so a tunnel
+        // that came up late does not linger behind a failed start.
+        //
+        // loadConfiguration is inside the raced work: it is an open
+        // hook whose doc invites a slow source, and outside the race a
+        // hung keychain or network read kept startTunnel past this
+        // timeout's whole point, until the system's own ~60 s kill.
+        let limit = startTimeout
+        let work = Task { @MainActor in
+            let config = try await self.loadConfiguration()
+            self.configuration = config
+            try self.engine.initialize(logLevel: config.logLevel)
+            try await self.applySettingsAndStartEngine(config)
+        }
         do {
-            // Raced against the timeout, first-wins: a task group would
-            // await its children on exit, and the engine call cannot be
-            // cancelled mid-C, so the race is by continuation instead --
-            // the timeout genuinely bounds startTunnel. Work that finishes
-            // after losing the race is cleaned up below, so a tunnel that
-            // came up late does not linger behind a failed start.
-            //
-            // loadConfiguration is inside the raced work: it is an open
-            // hook whose doc invites a slow source, and outside the race a
-            // hung keychain or network read kept startTunnel past this
-            // timeout's whole point, until the system's own ~60 s kill.
-            let limit = startTimeout
-            let work = Task { @MainActor in
-                let config = try await self.loadConfiguration()
-                self.configuration = config
-                try self.engine.initialize(logLevel: config.logLevel)
-                try await self.applySettingsAndStartEngine(config)
-            }
             let claim = ClaimFlag()
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                let deadline = Task {
+                    try? await Task.sleep(for: limit)
+                    if await claim.claim() {
+                        cont.resume(throwing: ShoesError.timedOut(seconds: wholeSeconds(limit)))
+                    }
+                }
                 Task { @MainActor in
                     do {
                         try await work.value
-                        if await claim.claim() { cont.resume() }
+                        if await claim.claim() {
+                            deadline.cancel()
+                            cont.resume()
+                        }
                     } catch {
-                        if await claim.claim() { cont.resume(throwing: error) }
-                    }
-                }
-                Task {
-                    try? await Task.sleep(for: limit)
-                    if await claim.claim() {
-                        cont.resume(throwing: ShoesError.timedOut(seconds: Int(limit.components.seconds)))
+                        if await claim.claim() {
+                            deadline.cancel()
+                            cont.resume(throwing: error)
+                        }
                     }
                 }
             }
         } catch {
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             fail(shoesError, prefix: "startTunnel failed")
+            configuration = nil
             if case .timedOut = shoesError {
-                // The engine call may still be running and may yet succeed;
-                // stop whatever it produces once it lands. The session is
-                // abandoned either way, so a death it reports before that
-                // stop is not a second error.
+                // The work is abandoned: cancel it (loadConfiguration may
+                // honor that) and then AWAIT its outcome before probing --
+                // a one-shot isRunning sample here ran before a hung load
+                // ever started the engine, and a late resume then brought
+                // the engine up on a descriptor the system had reclaimed.
                 isStopping = true
+                work.cancel()
                 Task { @MainActor in
+                    try? await work.value
                     if self.engine.isRunning { await self.engine.stop() }
+                    self.configuration = nil
                 }
             }
             throw shoesError
@@ -238,6 +261,9 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // the app cannot reconstruct this reason later.
         report(stopReason: reason)
         isStopping = true
+        // The session is over: wake() and rebindTunnel key on this, so a
+        // reused provider object cannot rebind a stale config later.
+        configuration = nil
         rebindPending = false
         rebindAgain = false
         let pendingRebind = rebind
@@ -253,6 +279,10 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // before this suspension) at its next checkpoint and stops any
         // engine it started, so by the time this returns nothing runs.
         await pendingRebind?.value
+        // Belt: nothing re-arms under isStopping, but an orphan here would
+        // outlive the session.
+        rebind?.cancel()
+        rebind = nil
         // The system may release packetFlow's descriptor once stopTunnel's
         // completion handler runs, and the engine reads it until
         // shoes_stop comes back. The five-second bound in the library is
@@ -363,7 +393,20 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     /// Debounced: rapid path changes coalesce into one rebind.
     private func scheduleRebind() {
+        // Every session up to the current one is now a rebind's to
+        // replace; deaths of those sessions are recovery in progress, not
+        // the tunnel's end.
+        rebindTargets = session
         rebindPending = true
+        // While a rebind executes, do not replace the task handle: stop()
+        // and start() drain `rebind`, and overwriting it mid-execution
+        // left the executing one undrained -- an engine start completing
+        // after stopTunnel returned. The executing rebind's defer re-arms
+        // through rebindAgain instead.
+        if isRebinding {
+            rebindAgain = true
+            return
+        }
         rebind?.cancel()
         rebind = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
@@ -425,6 +468,10 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             guard !isStopping else { return }
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             fail(shoesError, prefix: "rebind failed")
+            // Before the cancel, so the defer above cannot see rebindAgain
+            // and schedule a fresh rebind into the tunnel this call just
+            // ended -- stopTunnel's own isStopping arrives a hop too late.
+            isStopping = true
             cancelTunnelWithError(shoesError)
         }
     }
@@ -444,13 +491,22 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private func engineStopped(reason: String?, session: Int) {
         guard session == self.session else { return }
         if isStopping { return }
-        if rebindPending {
+        // Swallowed only when a rebind is guaranteed to replace this very
+        // session. The session a rebind itself started is numbered past
+        // rebindTargets, so its death -- a "successful" rebind into a
+        // blocked network, dead milliseconds later -- falls through and
+        // cancels the tunnel instead of leaving it connected over a dead
+        // engine with the one-shot callback slot already spent.
+        if rebindPending && session <= rebindTargets {
             record(.engineStopped(reason))
             log.info("engine died with a rebind underway; letting the rebind recover")
             return
         }
         let error = ShoesError.engineStopped(reason)
         fail(error, prefix: "engine stopped")
+        // Same reasoning as the rebind's failure path: nothing may re-arm
+        // into a tunnel this call just cancelled.
+        isStopping = true
         cancelTunnelWithError(error)
     }
 
@@ -470,14 +526,5 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     }
 }
 
-/// First-wins for the start race: exactly one of the two racers resumes the
-/// continuation. An actor rather than a lock, so it needs no unchecked
-/// Sendable of its own.
-private actor ClaimFlag {
-    private var claimed = false
-    func claim() -> Bool {
-        if claimed { return false }
-        claimed = true
-        return true
-    }
-}
+// ClaimFlag and wholeSeconds live in ShoesTunnelCore: the host's send()
+// deadline runs the same race and duplicating them had already begun.
