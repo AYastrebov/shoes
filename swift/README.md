@@ -6,7 +6,7 @@ and macOS, from the repository that owns the C API it wraps.
 ## Add it
 
 ```swift
-.package(url: "https://github.com/AYastrebov/shoes.git", from: "0.2.16")
+.package(url: "https://github.com/AYastrebov/shoes.git", from: "0.2.17")
 ```
 
 Two products: the extension target depends on `ShoesTunnel`, the app target

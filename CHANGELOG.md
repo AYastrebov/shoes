@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.17
 
 ### The AmneziaWG receive path survives errors, and its death stops the engine
 
