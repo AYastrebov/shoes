@@ -189,7 +189,8 @@ artifacts are built with the feature on.
    failure.
 4. `stop(...)`. Signals shutdown, then blocks until the engine has released the
    TUN descriptor — milliseconds in practice, bounded at 5 s. Not from the main
-   thread. Close your descriptor after it returns.
+   thread. Close your descriptor after it returns **true**; on false the wait
+   timed out and the engine may still be reading it — prefer leaking it.
 5. Forward network changes while the tunnel runs: `networkChanged()` /
    `shoes_network_changed()`. See finding 3.
 
@@ -199,7 +200,8 @@ device, so on the raw-fd path — every mobile start — the stack closed the ap
 descriptor on shutdown regardless. An app that also closed its own, as this
 document told it to, was double-closing, which in a process that is opening
 sockets constantly means closing whichever socket has since taken the number.
-Close it yourself after `stop` returns.
+Close it yourself after `stop` returns true; a false return means the engine
+may still hold it, and leaking one descriptor beats racing a reader.
 
 There is one tunnel per process. All state lives in the `TUN_SERVICE` global in
 `common.rs`, and starting over a running service is refused rather than
