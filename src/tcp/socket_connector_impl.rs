@@ -300,8 +300,7 @@ impl SocketConnector for SocketConnectorImpl {
                         // its handshake until the idle timeout otherwise.
                         Ok(connecting) => match tokio::time::timeout(CONNECT_TIMEOUT, connecting)
                             .await
-                            .map_err(|_| quinn::ConnectionError::TimedOut)
-                            .and_then(|r| r.map_err(Into::into))
+                            .unwrap_or(Err(quinn::ConnectionError::TimedOut))
                         {
                             Ok(conn) => match conn.open_bi().await {
                                 Ok((send, recv)) => {
