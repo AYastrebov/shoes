@@ -46,7 +46,7 @@ pub struct AmneziaWgConnector {
 #[derive(Default)]
 struct ConnectorState {
     tunnel: Option<TunnelState>,
-    /// When the last failed build attempt started. A busy proxy with an
+    /// When the last build attempt failed. A busy proxy with an
     /// unreachable peer otherwise repeats DNS resolution and a socket
     /// bind for every inbound connection, serialized behind this mutex
     /// with every other connection queued on it.
@@ -176,10 +176,34 @@ impl AmneziaWgConnector {
                 "AmneziaWG tunnel build failed moments ago; next attempt after the cooldown",
             ));
         }
-        // Pessimistic: every early return below is a failed build, and the
-        // arms are too many to mark one by one. Cleared on success.
-        state.last_attempt_failed_at = Some(std::time::Instant::now());
 
+        // The bookkeeping happens in one match on the helper's result, so
+        // failure is stamped when it HAPPENS -- a stamp at attempt start
+        // was already expired by the time a 10-second DNS timeout failed,
+        // which is the motivating slow-failure case -- and a caller future
+        // dropped mid-build stamps nothing: a cancellation is not evidence
+        // the peer is down, and there is no Drop guard to clean a
+        // pessimistic stamp up.
+        match self.build_tunnel(resolver).await {
+            Ok((tunnel, request_tx)) => {
+                state.last_attempt_failed_at = None;
+                state.tunnel = Some(tunnel);
+                Ok(request_tx)
+            }
+            Err(e) => {
+                state.last_attempt_failed_at = Some(std::time::Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    /// Resolve, start the tunnel runtime, and spawn its netstack. Pure
+    /// build: no connector state is touched, so `ensure_initialized` owns
+    /// the outcome bookkeeping in one place.
+    async fn build_tunnel(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(TunnelState, mpsc::Sender<NetStackRequest>)> {
         let variant = match self.protocol {
             TunnelProtocol::WireGuard => "WireGuard",
             TunnelProtocol::AmneziaWg if self.config.awg.uses_awg31() => "AmneziaWG 3.1",
@@ -220,14 +244,14 @@ impl AmneziaWgConnector {
             netstack.run(request_rx).await;
         });
 
-        state.last_attempt_failed_at = None;
-        state.tunnel = Some(TunnelState {
-            runtime: tunnel_runtime,
-            request_tx: request_tx.clone(),
-            netstack_abort: netstack_task.abort_handle(),
-        });
-
-        Ok(request_tx)
+        Ok((
+            TunnelState {
+                runtime: tunnel_runtime,
+                request_tx: request_tx.clone(),
+                netstack_abort: netstack_task.abort_handle(),
+            },
+            request_tx,
+        ))
     }
 }
 
