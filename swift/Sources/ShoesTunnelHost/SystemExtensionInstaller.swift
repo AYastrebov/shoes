@@ -12,28 +12,25 @@
     /// is something this code can check for you; both surface as the request
     /// failing.
     public enum SystemExtensionInstaller {
-        /// A first install waits in `.needsApproval` until the user acts in
-        /// System Settings -- potentially forever. `activate` reports it so
-        /// the app can say so instead of hanging silently; it still waits,
-        /// because the request genuinely completes once approval lands.
-        public enum ActivationEvent: Sendable {
-            /// The user must approve the extension in System Settings >
-            /// General > Login Items & Extensions. Show them the way.
-            case needsUserApproval
-        }
-
-        /// Thrown when activation reported `.willCompleteAfterReboot`: the
-        /// extension is NOT active yet, and `startVPNTunnel` on top of it
+        /// Thrown when a FIRST install reported `.willCompleteAfterReboot`:
+        /// no extension is active yet, and `startVPNTunnel` on top of it
         /// fails with an opaque error. Treating it as success was how the
-        /// old code turned "reboot required" into a mystery.
+        /// old code turned "reboot required" into a mystery. An UPGRADE
+        /// deferred to reboot is different -- the already-approved older
+        /// extension keeps serving -- and is treated as success.
         public struct RebootRequired: Error, Sendable {}
 
+        /// Thrown for an `OSSystemExtensionRequest.Result` this code does
+        /// not know. Unknown is not "completed": surfacing it beats
+        /// starting a tunnel on an extension in an unmodeled state.
+        public struct UnexpectedActivationResult: Error, Sendable {}
+
         /// Activate, reporting progress through `onEvent` (delivered on the
-        /// main queue). Throws [`RebootRequired`] when the system defers the
-        /// activation to the next boot.
+        /// main queue). Throws [`RebootRequired`] when a first install is
+        /// deferred to the next boot.
         public static func activate(
             bundleIdentifier: String,
-            onEvent: (@Sendable (ActivationEvent) -> Void)? = nil
+            onEvent: (@Sendable (TunnelActivationEvent) -> Void)? = nil
         ) async throws {
             let request = OSSystemExtensionRequest.activationRequest(
                 forExtensionWithIdentifier: bundleIdentifier, queue: .main)
@@ -51,9 +48,13 @@
 
         private final class Delegate: NSObject, OSSystemExtensionRequestDelegate {
             var continuation: CheckedContinuation<Void, any Error>?
-            let onEvent: (@Sendable (ActivationEvent) -> Void)?
+            let onEvent: (@Sendable (TunnelActivationEvent) -> Void)?
+            /// Whether this activation replaces an installed extension --
+            /// what makes `.willCompleteAfterReboot` survivable: the old,
+            /// already-approved extension keeps serving until the reboot.
+            var replacesExisting = false
 
-            init(onEvent: (@Sendable (ActivationEvent) -> Void)?) {
+            init(onEvent: (@Sendable (TunnelActivationEvent) -> Void)?) {
                 self.onEvent = onEvent
             }
 
@@ -61,7 +62,8 @@
                 _ request: OSSystemExtensionRequest, actionForReplacingExtension existing: OSSystemExtensionProperties,
                 withExtension ext: OSSystemExtensionProperties
             ) -> OSSystemExtensionRequest.ReplacementAction {
-                .replace
+                replacesExisting = true
+                return .replace
             }
 
             func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
@@ -78,11 +80,17 @@
                 case .completed:
                     continuation?.resume()
                 case .willCompleteAfterReboot:
-                    // Not active yet: proceeding to startVPNTunnel fails
-                    // with an opaque error. Surface the actionable fact.
-                    continuation?.resume(throwing: RebootRequired())
+                    if replacesExisting {
+                        // The older approved extension keeps serving; the
+                        // reboot only upgrades it. Failing start() here
+                        // would break a working tunnel over a pending
+                        // version bump.
+                        continuation?.resume()
+                    } else {
+                        continuation?.resume(throwing: RebootRequired())
+                    }
                 @unknown default:
-                    continuation?.resume()
+                    continuation?.resume(throwing: UnexpectedActivationResult())
                 }
                 continuation = nil
             }

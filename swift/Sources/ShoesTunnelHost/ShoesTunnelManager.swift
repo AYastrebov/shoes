@@ -5,6 +5,17 @@ import Foundation
 // ShoesError and the other wire types.
 @_exported import ShoesTunnelCore
 
+/// Progress of a macOS system-extension activation that the app should
+/// show rather than wait out. Defined outside the macOS-only installer so
+/// `start(onActivationEvent:configure:)` has one signature on every
+/// platform; on iOS the handler is simply never called.
+public enum TunnelActivationEvent: Sendable {
+    /// The user must approve the extension in System Settings > General >
+    /// Login Items & Extensions. The activation -- and `start()` -- waits
+    /// until they do, potentially forever: point them at the setting.
+    case needsUserApproval
+}
+
 /// The app-process half: Apple's TN3120 sequence, status as a stream, and
 /// typed messages to the provider.
 ///
@@ -45,16 +56,32 @@ public final class ShoesTunnelManager {
         try await start { _, proto in configure(proto) }
     }
 
+    /// The two-parameter form without activation events.
+    public func start(
+        configure: (NETunnelProviderManager, NETunnelProviderProtocol) -> Void
+    ) async throws {
+        try await start(onActivationEvent: nil, configure: configure)
+    }
+
     /// The two-parameter form, for policy that lives on the manager rather
     /// than the protocol object: on-demand rules (`onDemandRules`,
     /// `isOnDemandEnabled` -- always-on VPN), `localizedDescription`. The
     /// one-parameter form could not express these at all, which forced any
     /// app wanting always-on to bypass `start()` entirely.
+    ///
+    /// `onActivationEvent` is the macOS first-install story: without it the
+    /// await sits silent for as long as the user takes to find System
+    /// Settings, and the app has nothing to show. Delivered on the main
+    /// queue; never called on iOS.
     public func start(
+        onActivationEvent: (@Sendable (TunnelActivationEvent) -> Void)?,
         configure: (NETunnelProviderManager, NETunnelProviderProtocol) -> Void
     ) async throws {
         #if os(macOS)
-            try await SystemExtensionInstaller.activate(bundleIdentifier: providerBundleIdentifier)
+            try await SystemExtensionInstaller.activate(
+                bundleIdentifier: providerBundleIdentifier, onEvent: onActivationEvent)
+        #else
+            _ = onActivationEvent
         #endif
         // load() always yields a manager; the binding makes that a
         // compile-time fact rather than a guard that silently returns.
@@ -73,14 +100,25 @@ public final class ShoesTunnelManager {
 
         do {
             try await manager.saveToPreferences()
-        } catch {
+        } catch let error as NEVPNError
+            where error.code == .configurationStale || error.code == .configurationInvalid
+        {
             // The cached manager can be stale: the user deleting the VPN
             // profile in Settings is routine, and saving the stale object
             // then fails. One reload-and-retry recreates the profile
             // instead of surfacing a configuration error for a state the
-            // user considers clean.
+            // user considers clean. Scoped to the stale/invalid codes: any
+            // other failure (a permission denial, say) must surface, not
+            // be retried into a second identical failure.
             let fresh = try await load()
-            fresh.protocolConfiguration = proto
+            let retryProto = NETunnelProviderProtocol()
+            retryProto.providerBundleIdentifier = providerBundleIdentifier
+            // configure runs again with the FRESH manager: the first run
+            // put on-demand rules and descriptions on the stale object,
+            // and carrying only the protocol forward silently shipped an
+            // always-on app without always-on.
+            configure(fresh, retryProto)
+            fresh.protocolConfiguration = retryProto
             fresh.isEnabled = true
             try await fresh.saveToPreferences()
             try await fresh.loadFromPreferences()
@@ -140,35 +178,36 @@ public final class ShoesTunnelManager {
         let request = try message.encoded()
         let response: Data? = try await withCheckedThrowingContinuation { continuation in
             let claim = ClaimFlag()
-            do {
-                try session.sendProviderMessage(request) { data in
-                    Task { if await claim.claim() { continuation.resume(returning: data) } }
-                }
-            } catch {
-                Task { if await claim.claim() { continuation.resume(throwing: error) } }
-            }
-            Task {
+            // Held so the winner can cancel it: an unstructured deadline
+            // task otherwise sleeps out its full timeout retaining the
+            // claim and continuation after every reply -- a 1 Hz stats
+            // poll kept a rolling handful of dead racers alive for good.
+            let deadline = Task {
                 try? await Task.sleep(for: timeout)
                 if await claim.claim() {
                     continuation.resume(
-                        throwing: ShoesError.timedOut(seconds: Int(timeout.components.seconds)))
+                        throwing: ShoesError.timedOut(seconds: wholeSeconds(timeout)))
+                }
+            }
+            do {
+                try session.sendProviderMessage(request) { data in
+                    Task {
+                        if await claim.claim() {
+                            deadline.cancel()
+                            continuation.resume(returning: data)
+                        }
+                    }
+                }
+            } catch {
+                Task {
+                    if await claim.claim() {
+                        deadline.cancel()
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
         }
         guard let response else { throw ShoesError.providerNoReply }
         return try ShoesAppReply.decode(response)
-    }
-}
-
-/// First-wins between the reply and the deadline: exactly one racer
-/// resumes the continuation. The provider's start race uses the same
-/// shape; a `CheckedContinuation` diagnoses a double resume, not a
-/// never-resume, which is the failure this exists to close.
-private actor ClaimFlag {
-    private var claimed = false
-    func claim() -> Bool {
-        if claimed { return false }
-        claimed = true
-        return true
     }
 }

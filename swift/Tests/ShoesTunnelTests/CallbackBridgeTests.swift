@@ -5,14 +5,16 @@ import Testing
 
 /// The bridge is the crux of the stopped-callback design: the C side may
 /// misbehave, the take-slot is what guarantees the host sees at most one
-/// stop per session. A fresh instance per test would be nicer, but the
-/// bridge is deliberately a singleton (one engine per process), so the
-/// suite is serialized and every test leaves the slots clear.
-@Suite(.serialized) struct CallbackBridgeTests {
+/// stop per session. Each test builds its OWN bridge: the semantics under
+/// test are per-instance, and `.shared` is process-global state that
+/// ShoesEngineTests drives concurrently -- `.serialized` only orders a
+/// suite internally, so touching the singleton here raced their
+/// install/clear cycles and failed at random (AGENTS.md: scope the
+/// effect, do not serialize around global state).
+@Suite struct CallbackBridgeTests {
 
     @Test func aStopDeliversAtMostOncePerInstall() {
-        let bridge = CallbackBridge.shared
-        defer { bridge.clear() }
+        let bridge = CallbackBridge()
 
         let deliveries = Counter()
         bridge.install(traffic: { _, _ in }, stopped: { _ in deliveries.increment() })
@@ -23,8 +25,7 @@ import Testing
     }
 
     @Test func aClearedBridgeDeliversNothing() {
-        let bridge = CallbackBridge.shared
-        defer { bridge.clear() }
+        let bridge = CallbackBridge()
 
         let deliveries = Counter()
         bridge.install(traffic: { _, _ in deliveries.increment() }, stopped: { _ in deliveries.increment() })
@@ -36,8 +37,7 @@ import Testing
     }
 
     @Test func aReinstallRearmsTheStoppedSlot() {
-        let bridge = CallbackBridge.shared
-        defer { bridge.clear() }
+        let bridge = CallbackBridge()
 
         let reasons = Reasons()
         bridge.install(traffic: { _, _ in }, stopped: { reasons.append($0) })
@@ -51,8 +51,7 @@ import Testing
     }
 
     @Test func trafficDeliversRepeatedlyAndInOrder() {
-        let bridge = CallbackBridge.shared
-        defer { bridge.clear() }
+        let bridge = CallbackBridge()
 
         let totals = Counter()
         bridge.install(traffic: { up, down in totals.add(Int(up + down)) }, stopped: { _ in })
