@@ -57,6 +57,28 @@ pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// or the service stops with an error. Read via `shoes_get_last_error()`.
 pub static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
 
+/// Serializes start/stop transitions across the FFI surface.
+///
+/// `stop_service` takes the handle out of `TUN_SERVICE` and then waits up
+/// to five seconds for the engine to wind down. For that whole window the
+/// slot is empty and `is_service_running()` answers false -- so a start
+/// arriving on another thread would pass its already-running guard and put
+/// a second engine on the same device descriptor. Every transition holds
+/// this lock for its whole duration: the concurrent caller waits its turn
+/// and sees the truth when it gets in.
+///
+/// A stopped callback that calls `shoes_stop` while a host-initiated stop
+/// holds the lock waits here for at most that stop's five-second bound --
+/// the holder never waits on the callback's thread past its timeout, so
+/// this cannot deadlock, only queue.
+static TRANSITION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Take the transition lock. Held across all of `stop_service` and all of
+/// each platform's start path.
+pub fn transition_guard() -> parking_lot::MutexGuard<'static, ()> {
+    TRANSITION.lock()
+}
+
 /// Set up log file for file-based logging.
 ///
 /// Returns 0 on success, -1 on error.
@@ -101,6 +123,10 @@ pub fn flush_log_file() {
 /// timed out. See [`crate::control::stop_handle`] for what that distinction
 /// costs the caller.
 pub fn stop_service() -> bool {
+    // Held to the end: a start that arrives mid-stop must wait until the
+    // engine is gone, and a second stop must not clear the protector out
+    // from under a teardown still in flight.
+    let _transition = transition_guard();
     info!("Stopping TUN service");
 
     let handle = if let Some(service) = TUN_SERVICE.get() {
@@ -198,5 +224,26 @@ mod tests {
         set_last_error("first error".to_string());
         set_last_error("second error".to_string());
         assert_eq!(get_last_error().as_deref(), Some("second error"));
+    }
+
+    /// The property the transition lock buys: a stop queues behind a
+    /// transition already in flight instead of interleaving with it.
+    /// (The start paths take the same lock first thing, so this covers
+    /// start-during-stop and stop-during-start alike.)
+    #[test]
+    fn a_stop_waits_for_the_transition_in_flight() {
+        let held = transition_guard();
+
+        let stopper = std::thread::spawn(stop_service);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !stopper.is_finished(),
+            "stop_service must wait for the transition lock"
+        );
+
+        drop(held);
+        // With no service installed, a stop that gets the lock reports
+        // "was not running": device released.
+        assert!(stopper.join().unwrap());
     }
 }

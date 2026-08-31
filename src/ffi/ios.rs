@@ -275,6 +275,12 @@ unsafe fn start_service(
     traffic_callback: ShoesTrafficCallback,
     stopped_callback: ShoesStoppedCallback,
 ) -> c_long {
+    // Serialized against shoes_stop (and any concurrent start): a stop in
+    // flight empties the service slot before its five-second wait, and a
+    // start that slipped into that window used to pass the guard below
+    // and run a second engine on the same descriptor.
+    let _transition = common::transition_guard();
+
     // Every -1 below leaves a reason in shoes_get_last_error, so a caller
     // that reads it never sees the previous failure's message instead.
     if config_yaml.is_null() {
