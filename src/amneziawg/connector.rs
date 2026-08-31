@@ -39,8 +39,24 @@ pub struct AmneziaWgConnector {
     config: AmneziaWgClientConfig,
     protocol: TunnelProtocol,
     endpoint: NetLocation,
-    state: Mutex<Option<TunnelState>>,
+    state: Mutex<ConnectorState>,
 }
+
+/// The connector's tunnel, plus the memory of a build that failed.
+#[derive(Default)]
+struct ConnectorState {
+    tunnel: Option<TunnelState>,
+    /// When the last failed build attempt started. A busy proxy with an
+    /// unreachable peer otherwise repeats DNS resolution and a socket
+    /// bind for every inbound connection, serialized behind this mutex
+    /// with every other connection queued on it.
+    last_attempt_failed_at: Option<std::time::Instant>,
+}
+
+/// How long after a failed build the next inbound connection fails fast
+/// instead of retrying the build. Long enough to stop the per-connection
+/// churn, short enough that a recovered peer is noticed promptly.
+const REBUILD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl std::fmt::Debug for AmneziaWgConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,7 +91,7 @@ impl AmneziaWgConnector {
             config,
             protocol: TunnelProtocol::AmneziaWg,
             endpoint,
-            state: Mutex::new(None),
+            state: Mutex::new(ConnectorState::default()),
         }
     }
 
@@ -122,7 +138,7 @@ impl AmneziaWgConnector {
             config,
             protocol: TunnelProtocol::WireGuard,
             endpoint,
-            state: Mutex::new(None),
+            state: Mutex::new(ConnectorState::default()),
         }
     }
 
@@ -131,7 +147,7 @@ impl AmneziaWgConnector {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<mpsc::Sender<NetStackRequest>> {
         let mut state = self.state.lock().await;
-        if let Some(ref s) = *state {
+        if let Some(ref s) = state.tunnel {
             // is_dead covers the receive path; is_closed covers a netstack
             // task that ended on its own (its request_rx is gone). A
             // request that slipped through after the death -- the is_dead
@@ -146,11 +162,23 @@ impl AmneziaWgConnector {
                 // they already were.
                 info!("AmneziaWG: tunnel receive path died; rebuilding the tunnel");
                 s.netstack_abort.abort();
-                *state = None;
+                state.tunnel = None;
             } else {
                 return Ok(s.request_tx.clone());
             }
         }
+
+        if let Some(failed_at) = state.last_attempt_failed_at
+            && failed_at.elapsed() < REBUILD_COOLDOWN
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "AmneziaWG tunnel build failed moments ago; next attempt after the cooldown",
+            ));
+        }
+        // Pessimistic: every early return below is a failed build, and the
+        // arms are too many to mark one by one. Cleared on success.
+        state.last_attempt_failed_at = Some(std::time::Instant::now());
 
         let variant = match self.protocol {
             TunnelProtocol::WireGuard => "WireGuard",
@@ -192,7 +220,8 @@ impl AmneziaWgConnector {
             netstack.run(request_rx).await;
         });
 
-        *state = Some(TunnelState {
+        state.last_attempt_failed_at = None;
+        state.tunnel = Some(TunnelState {
             runtime: tunnel_runtime,
             request_tx: request_tx.clone(),
             netstack_abort: netstack_task.abort_handle(),
