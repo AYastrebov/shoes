@@ -63,3 +63,42 @@ mod tests {
         );
     }
 }
+
+/// smoltcp time from the monotonic clock.
+///
+/// `smoltcp::time::Instant::now()` reads the wall clock, and both virtual
+/// stacks used it for every poll and timer decision. A backward NTP step
+/// -- routine on the wake after a long sleep -- then stalls every
+/// retransmit and keepalive timer for the size of the correction, and a
+/// forward step fires them all at once. Anchored to the wall clock once,
+/// at first use, so the absolute values stay legible in diagnostics;
+/// after that only the monotonic clock moves it.
+///
+/// Lives here rather than in either stack: the AmneziaWG netstack is not
+/// gated on the TUN module, and a clock is nobody's device concern.
+pub fn smol_now() -> smoltcp::time::Instant {
+    static BASE: std::sync::OnceLock<(std::time::Instant, smoltcp::time::Instant)> =
+        std::sync::OnceLock::new();
+    let (mono, smol) =
+        *BASE.get_or_init(|| (std::time::Instant::now(), smoltcp::time::Instant::now()));
+    smol + smoltcp::time::Duration::from_micros(mono.elapsed().as_micros() as u64)
+}
+
+/// Raw errnos whose numbers differ between libc and WinSock.
+///
+/// `libc::EMSGSIZE`/`libc::EINVAL` on Windows are the CRT errnos, which a
+/// socket never produces -- matching them there leaves the branch dead
+/// code on a shipping target. The trap is documented once, here; a new
+/// errno comparison should add its constant here rather than rediscover
+/// it (the accept-exhaustion set in tcp_server.rs carries its own cfg for
+/// the same reason).
+#[cfg(windows)]
+pub const EMSGSIZE_RAW: i32 = 10040; // WSAEMSGSIZE
+#[cfg(not(windows))]
+pub const EMSGSIZE_RAW: i32 = libc::EMSGSIZE;
+
+/// See [`EMSGSIZE_RAW`].
+#[cfg(windows)]
+pub const EINVAL_RAW: i32 = 10022; // WSAEINVAL
+#[cfg(not(windows))]
+pub const EINVAL_RAW: i32 = libc::EINVAL;

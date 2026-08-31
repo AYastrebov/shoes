@@ -30,7 +30,7 @@ use smoltcp::{
     socket::tcp::{
         CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     },
-    time::{Duration as SmolDuration, Instant as SmolInstant},
+    time::Duration as SmolDuration,
     wire::{
         HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address,
         Ipv6Packet, TcpPacket,
@@ -38,22 +38,7 @@ use smoltcp::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-/// smoltcp time from the monotonic clock.
-///
-/// `SmolInstant::now()` reads the wall clock, and both virtual stacks
-/// used it for every poll and timer decision. A backward NTP step --
-/// routine on the wake after a long sleep -- then stalls every
-/// retransmit and keepalive timer for the size of the correction, and a
-/// forward step fires them all at once. Anchored to the wall clock once,
-/// at first use, so the absolute values stay legible in diagnostics;
-/// after that only the monotonic clock moves it. Shared with the
-/// AmneziaWG netstack, which had the same exposure.
-pub(crate) fn smol_now() -> SmolInstant {
-    static BASE: std::sync::OnceLock<(std::time::Instant, SmolInstant)> =
-        std::sync::OnceLock::new();
-    let (mono, smol) = *BASE.get_or_init(|| (std::time::Instant::now(), SmolInstant::now()));
-    smol + SmolDuration::from_micros(mono.elapsed().as_micros() as u64)
-}
+use crate::util::smol_now;
 
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 
@@ -1023,6 +1008,8 @@ pub mod test_util {
 // needs a driver and Administrator to exist.
 #[cfg(test)]
 mod tests {
+    use smoltcp::time::Instant as SmolInstant;
+
     use std::collections::VecDeque;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration as StdDuration;

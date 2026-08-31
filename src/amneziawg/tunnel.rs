@@ -29,15 +29,9 @@ const MAX_UDP_SIZE: usize = 65536;
 /// for a peer that disagrees about trailers.
 const TRAILER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// The errno that says a sent datagram exceeded the path MTU. Unix
-/// reports EMSGSIZE; WinSock has its own number for the same fact, and
-/// `libc::EMSGSIZE` on Windows is the CRT errno, which a socket never
-/// produces -- matching it there would leave this branch dead code on a
-/// shipping target.
-#[cfg(windows)]
-const EMSGSIZE_RAW: i32 = 10040; // WSAEMSGSIZE
-#[cfg(not(windows))]
-const EMSGSIZE_RAW: i32 = libc::EMSGSIZE;
+/// The errno that says a sent datagram exceeded the path MTU. The
+/// libc-vs-WinSock trap is documented at the constant's definition.
+use crate::util::EMSGSIZE_RAW;
 
 /// What a recv error on the connected endpoint socket means.
 ///
