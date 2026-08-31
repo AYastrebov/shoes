@@ -895,6 +895,14 @@ async fn liveness_loop(
     let mut watch = LivenessWatch::new();
     loop {
         tokio::time::sleep(LIVENESS_TICK).await;
+        // The recv task's error streak can declare the runtime dead first.
+        // A dead runtime is waiting to be torn down or rebuilt -- on the
+        // desktop connector that wait lasts until the next connection --
+        // and this task must not keep rebinding its socket or reach a
+        // second death verdict for a death already reported.
+        if dead.load(Ordering::SeqCst) {
+            return;
+        }
         match watch.on_tick(
             packets_offered.load(Ordering::Relaxed),
             datagrams_decapsulated.load(Ordering::Relaxed),
