@@ -20,7 +20,7 @@ import Testing
         let store = try freshStore()
         #expect(store.load() == nil)
 
-        store.save(.engineStopped("the peer vanished"))
+        #expect(store.save(.engineStopped("the peer vanished")))
         #expect(store.load() == .engineStopped("the peer vanished"))
 
         store.clear()

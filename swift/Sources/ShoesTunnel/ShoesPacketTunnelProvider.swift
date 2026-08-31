@@ -141,11 +141,12 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// sleep itself -- the engine's timers run on clocks that stop with
     /// the machine.
     nonisolated open override func sleep(completionHandler: @escaping () -> Void) {
-        nonisolated(unsafe) let done = completionHandler
-        Task { @MainActor in
-            self.log.info("sleep")
-            done()
-        }
+        // Answered synchronously on the system's own thread: the override
+        // exists to mark the provider sleep-aware and to answer promptly,
+        // and routing the completion through the actor made "immediate"
+        // depend on how busy the actor happened to be. Only the log hops.
+        Task { @MainActor in self.log.info("sleep") }
+        completionHandler()
     }
 
     nonisolated open override func wake() {
