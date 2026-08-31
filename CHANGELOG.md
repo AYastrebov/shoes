@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### The reconnection paths sand off their remaining edges
+
+From the resilience audit's should-fix list, the Rust-core cluster. A
+failed endpoint rebind retries by itself (1 s doubling to 30 s) instead
+of waiting for a trigger that may never come; the route-gone table
+covers WinSock's EINVAL and the EPERM/EACCES Android returns when a
+socket loses its VPN exemption. Ignore-class recv errors join the
+backoff ladder -- a persistent ENETDOWN no longer spins the receive
+loop at full CPU -- and a permanently failing send path warns once per
+streak instead of once per packet. Both virtual TCP stacks run on the
+monotonic clock, so an NTP step on wake no longer stalls or mass-fires
+their timers. Outbound TCP connects get a 10-second deadline, the UDP
+response queue to the stack thread is bounded with drop-on-full, a
+failed AmneziaWG tunnel build fails fast for three seconds instead of
+re-resolving per inbound connection, and a new UDP destination connects
+in its own task instead of stalling every sibling flow behind its DNS
+lookup and proxy handshake.
+
 ### The resilience audit's critical findings, fixed
 
 Silent failures are now detected. A liveness watchdog watches the traffic
