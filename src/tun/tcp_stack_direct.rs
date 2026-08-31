@@ -77,7 +77,7 @@ impl TcpStackDirect {
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
     /// The thread uses `poll()` on the fd for efficient event-driven I/O.
-    pub fn new(fd: RawFd, options: TcpStackOptions) -> Self {
+    pub fn new(fd: RawFd, options: TcpStackOptions) -> io::Result<Self> {
         // A shutdown that the stack thread can see while it is asleep. Both
         // ends stay open for the life of the stack; the thread only ever reads,
         // and Drop only ever writes.
@@ -97,15 +97,15 @@ impl TcpStackDirect {
             set_nonblocking(fd)
                 .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
             Ok(FdDevice::new(fd, wake_rx, options.mtu))
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             handle,
             tun_fd: fd,
             close_fd_on_drop: options.close_fd_on_drop,
             wake_tx,
             wake_rx,
-        }
+        })
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
@@ -459,7 +459,7 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options());
+        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -491,7 +491,8 @@ mod tests {
                 close_fd_on_drop: false,
                 ..owning_options()
             },
-        );
+        )
+        .unwrap();
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -560,7 +561,8 @@ mod tests {
                 max_connections: CONNECTIONS * 2,
                 close_fd_on_drop: true,
             },
-        );
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
 
         for i in 0..CONNECTIONS {
@@ -622,7 +624,8 @@ mod tests {
                 close_fd_on_drop: false,
                 ..owning_options()
             },
-        );
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
         drop(stack);
 
@@ -641,7 +644,7 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options());
+        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running());
@@ -675,7 +678,7 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options());
+        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running());
 
@@ -714,7 +717,7 @@ mod tests {
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         let client_fd = client.into_raw_fd();
 
-        let mut stack = TcpStackDirect::new(client_fd, owning_options());
+        let mut stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         stack.set_udp_response_tx(rx);
         let waker = stack.udp_waker();

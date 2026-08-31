@@ -110,7 +110,7 @@ impl TcpStackWintun {
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface,
     /// waiting on the session's read event for event-driven I/O.
-    pub fn new(tun: OpenedWintun, options: TcpStackOptions) -> Self {
+    pub fn new(tun: OpenedWintun, options: TcpStackOptions) -> std::io::Result<Self> {
         let tun = Arc::new(tun);
         let wake_event = WakeEvent::new();
 
@@ -122,13 +122,13 @@ impl TcpStackWintun {
         // Send is the deliberate exception WakeEvent exists to declare.
         let handle = StackHandle::spawn("shoes-smoltcp-wintun", options, move || {
             WintunDevice::new(session, device_wake, options.mtu)
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             handle,
             tun,
             wake_event,
-        }
+        })
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
@@ -420,7 +420,8 @@ mod tests {
                 max_connections: 16,
                 close_fd_on_drop: false,
             },
-        );
+        )
+        .unwrap();
         let _udp_rx = stack.take_udp_rx();
 
         std::thread::sleep(std::time::Duration::from_millis(300));
