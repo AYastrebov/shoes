@@ -433,34 +433,28 @@ impl TunnelRuntime {
         let rebind_task = {
             let tunn = tunn.clone();
             let rebinds = rebinds_completed.clone();
+            let announce = ip_to_tunnel_tx.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
                 rebinds.fetch_add(1, Ordering::Relaxed);
-                let mut out = vec![0u8; MAX_UDP_SIZE];
-                let mut tunn = tunn.lock();
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
                 // mark of datagrams seen on this path. A rebind is a new path,
                 // so the mark it carried no longer describes anything. awgtun
                 // leaves this to the caller because `Tunn` has no endpoint of
                 // its own; upstream's `Device` does the same on a peer roam.
                 // A no-op when random trailers are off.
-                tunn.reset_udp_window();
-                // Announce the new address. The server learns a roamed peer's
+                tunn.lock().reset_udp_window();
+                // Announce the new address: the server learns a roamed peer's
                 // endpoint from the first authenticated packet, so until one
-                // goes out it keeps sending to the old address and inbound
-                // stays dead on an idle tunnel. An empty payload is awgtun's
-                // explicit keepalive when a session exists; without one it
-                // starts a handshake, which announces just as well.
-                match tunn.encapsulate(&[], &mut out) {
-                    TunnResult::WriteToNetwork(data) => {
-                        let packet = data.to_vec();
-                        let mut datagrams = take_queued_decoys(&mut tunn);
-                        datagrams.push(packet);
-                        datagrams
-                    }
-                    // Done: a handshake initiation is already in flight and
-                    // the timer loop is retrying it; nothing extra to send.
-                    _ => Vec::new(),
-                }
+                // goes out it keeps sending to the old address and an idle
+                // tunnel stays deaf. The announcement is an empty payload
+                // through the encapsulate loop -- awgtun's explicit keepalive
+                // when a session exists, a handshake starter when none does --
+                // rather than sent from here: the loop owns the send path, so
+                // the decoys stay ordered ahead of a handshake (this task
+                // sending its own datagrams raced the timer task's rekey) and
+                // a send failure gets the loop's EMSGSIZE remediation. If the
+                // queue is full, the traffic filling it announces instead.
+                let _ = announce.try_send(Vec::new());
             }))
         };
 
@@ -1050,6 +1044,42 @@ mod tests {
         let secret = x25519::StaticSecret::from([seed; 32]);
         let public = x25519::PublicKey::from(&secret);
         (secret, public)
+    }
+
+    /// A rebound tunnel must speak first: the server learns a roamed
+    /// peer's endpoint from the first authenticated packet, so a rebind
+    /// that swapped the socket and sent nothing leaves an idle tunnel
+    /// deaf until the app happens to transmit. The announcement goes
+    /// through the encapsulate loop (which keeps decoys ordered ahead of
+    /// the handshake), so it is asserted here, over a whole runtime.
+    #[tokio::test]
+    async fn a_rebind_announces_itself_to_the_peer() {
+        let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+        let (client_secret, _) = keypair(1);
+        let (_, server_public) = keypair(2);
+        let config = convert_amnezia_config(&real_world_params(), 1420).unwrap();
+
+        let runtime =
+            TunnelRuntime::start(client_secret, server_public, None, None, config, peer_addr)
+                .await
+                .unwrap();
+
+        // Idle until the rebind: nothing has asked the tunnel to send, so
+        // anything the peer receives after this is the announcement.
+        super::super::endpoint::notify_network_change();
+
+        let mut buf = [0u8; 65536];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("the rebound tunnel never announced itself")
+        .map(|(n, _)| n)
+        .unwrap();
+        assert!(n > 0);
+        drop(runtime);
     }
 
     /// Build a client/server pair that share one AmneziaWG configuration, the
