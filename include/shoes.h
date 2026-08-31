@@ -43,6 +43,11 @@ typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_by
  * `shoes_is_running()` is already false when it runs, and calling
  * `shoes_stop` from inside it is allowed. Do not block in it.
  *
+ * Do not call `shoes_start` from inside it: the callback runs on a
+ * worker of the dying session's runtime, and a start there is refused
+ * with an error (it would otherwise abort the process). Dispatch the
+ * reconnect to another thread or queue instead.
+ *
  * May be NULL, in which case nothing is called.
  */
 typedef void (*ShoesStoppedCallback)(const char *reason);
