@@ -121,6 +121,13 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     private func start() async throws {
         log.info("startTunnel")
+        // A rebind left over from a previous session must not survive into
+        // this one: drained before the engine check below, so an engine it
+        // was in the middle of starting is the one that check stops.
+        let pendingRebind = rebind
+        rebind = nil
+        pendingRebind?.cancel()
+        await pendingRebind?.value
         // A previous session, if the system is reasserting after sleep.
         // Awaited, not blocked on: shoes_stop can take up to five seconds.
         if engine.isRunning { await engine.stop() }
@@ -181,14 +188,23 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private func stop(reason: NEProviderStopReason) async {
         log.info("stopTunnel: \(reason.rawValue)")
         isStopping = true
-        rebind?.cancel()
+        let pendingRebind = rebind
         rebind = nil
+        pendingRebind?.cancel()
         pathObservation?.cancel()
         pathObservation = nil
-        // Awaited before the completion handler runs: the system may release
-        // packetFlow's descriptor once it does, and the engine is reading it
-        // until shoes_stop comes back. The five-second bound in the library
-        // is what makes waiting here fit the platform's deadline.
+        // Awaited, not just cancelled: cancellation is cooperative, and a
+        // rebind suspended inside the engine start observes nothing until
+        // that call returns -- returning from here before it does would
+        // let the engine come up on packetFlow's descriptor after the
+        // system reclaimed it. rebindTunnel sees isStopping (set above,
+        // before this suspension) at its next checkpoint and stops any
+        // engine it started, so by the time this returns nothing runs.
+        await pendingRebind?.value
+        // The system may release packetFlow's descriptor once stopTunnel's
+        // completion handler runs, and the engine reads it until
+        // shoes_stop comes back. The five-second bound in the library is
+        // what makes waiting here fit the platform's deadline.
         await engine.stop()
     }
 
