@@ -162,30 +162,57 @@ impl EndpointSocket {
     /// path does the sending, so ordering and error handling stay in one
     /// place.
     pub async fn run_rebind_task(self: Arc<Self>, on_rebound: impl Fn() + Send + 'static) {
+        /// First retry delay after a failed rebind, doubling to the cap.
+        /// Failing is normal while the device is between networks -- but
+        /// the request's Notify permit is consumed by then, so without a
+        /// retry timer a tunnel whose app never re-notifies (and whose
+        /// sends all vanish rather than error) stayed on the dead socket
+        /// for good.
+        const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+        const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
         loop {
             self.rebind_requested.notified().await;
 
-            match Self::bind(self.endpoint).await {
-                Ok(socket) => {
-                    let local = socket
-                        .local_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    // send_replace, not send: `send` fails and leaves the
-                    // value untouched when no receiver happens to be parked,
-                    // which is most of the time — the tunnel tasks subscribe
-                    // only for the duration of a recv.
-                    self.socket.send_replace(Arc::new(socket));
-                    on_rebound();
-                    info!(
-                        "AmneziaWG endpoint rebound to {} -> {}",
-                        local, self.endpoint
-                    );
-                }
-                Err(e) => {
-                    // Normal while the device is between networks. The next
-                    // failed send, or the app's next notification, tries again.
-                    warn!("AmneziaWG endpoint rebind failed: {e}");
+            let mut backoff = RETRY_INITIAL;
+            let mut attempt = 1u32;
+            loop {
+                match Self::bind(self.endpoint).await {
+                    Ok(socket) => {
+                        let local = socket
+                            .local_addr()
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        // send_replace, not send: `send` fails and leaves the
+                        // value untouched when no receiver happens to be parked,
+                        // which is most of the time — the tunnel tasks subscribe
+                        // only for the duration of a recv.
+                        self.socket.send_replace(Arc::new(socket));
+                        on_rebound();
+                        info!(
+                            "AmneziaWG endpoint rebound to {} -> {}",
+                            local, self.endpoint
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        // Warn once per episode; the retries are routine and
+                        // would otherwise write a line every backoff step for
+                        // as long as the device is between networks.
+                        if attempt == 1 {
+                            warn!("AmneziaWG endpoint rebind failed, will retry: {e}");
+                        } else {
+                            debug!("AmneziaWG endpoint rebind retry {attempt} failed: {e}");
+                        }
+                        attempt += 1;
+                        // A fresh request short-circuits the wait: the app's
+                        // network-change callback knows before the timer does.
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = self.rebind_requested.notified() => {}
+                        }
+                        backoff = (backoff * 2).min(RETRY_MAX);
+                    }
                 }
             }
         }
