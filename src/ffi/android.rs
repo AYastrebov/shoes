@@ -179,6 +179,18 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     protect_callback: JObject<'local>,
     traffic_callback: JObject<'local>,
 ) -> jlong {
+    // A start from inside the traffic callback runs on a worker of the
+    // running session's runtime, and block_on below then panics ("Cannot
+    // start a runtime from within a runtime") -- process death under
+    // panic = "abort". Refused with a reason instead.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        error!("start: called from a shoes runtime thread (a callback?)");
+        common::set_last_error(
+            "start called from a shoes callback thread; dispatch it to another thread".to_string(),
+        );
+        return -1;
+    }
+
     // Serialized against stop (and any concurrent start): a stop in
     // flight empties the service slot before its five-second wait, and a
     // start that slipped into that window used to pass the guard below
