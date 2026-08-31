@@ -1,5 +1,16 @@
 # Resilience audit — 2026-08-31, at v0.2.17 (4882547)
 
+> **Resolution (2026-08-31).** Everything below describes the tree *before*
+> the fixes. The criticals (C1–C8) landed in PR #12; the should-fix lists
+> landed as the stacked chain PR #13 (Rust core) → #14 (FFI/control) →
+> #15 (Swift) → #16 (desktop); the TUN `dns:` gap found alongside this work
+> landed in PR #17. All are merged into `mobile`. Still deferred, recorded
+> here so they are not lost: a process-wide connection budget derived from
+> RLIMIT_NOFILE (per-listener 4096 today), a desktop network-path monitor,
+> an FFI log-rotation policy (needs the consumer's input), extraction of the
+> provider state machine for testing, a control-API status stream, and
+> config-owned connection draining on shutdown.
+
 Scope: code quality, error handling, and connection recovery across the four
 layers a real deployment exercises — the AWG/TUN Rust core, the FFI + control
 surface, the Swift package, and the standalone desktop binary. Four parallel

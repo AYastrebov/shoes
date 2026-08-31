@@ -385,8 +385,10 @@ Two TUN-specific rules:
   resolution before use. A hostname URL without a `bootstrap_url` is
   rejected at validation in TUN configs — resolving it would silently use
   the system resolver, which is the plaintext leak the block exists to
-  prevent. (`url: system` stays allowed: it asks for the system resolver
-  explicitly.)
+  prevent. The same rule covers the indirect shapes: a `bootstrap_url`
+  group that itself resolves through `url: system`, and a `client_chain`
+  hop addressed by hostname. (`url: system` directly in the TUN's own
+  group stays allowed: it asks for the system resolver explicitly.)
 - **Upstream sockets are excluded from the tunnel.** Every DNS upstream
   socket — UDP, TCP, DoT, DoH, DoQ — goes through the same socket-protector
   path as the proxy connection itself, so on Android/iOS a query cannot
