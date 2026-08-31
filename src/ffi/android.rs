@@ -212,13 +212,20 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
         )
         .into_outcome();
 
+    // Every -1 below leaves a reason in getLastError: the host's only
+    // failure channel is polling it, and a start that fails without
+    // writing it hands the host the previous session's message instead.
     let (config_str, protect_ref, traffic_ref, jvm) = match result {
         Outcome::Ok(v) => v,
         Outcome::Err(e) => {
             error!("Failed to extract JNI values for start: {}", e);
+            common::set_last_error(format!("failed to extract JNI values for start: {e}"));
             return -1;
         }
-        Outcome::Panic(_) => return -1,
+        Outcome::Panic(_) => {
+            common::set_last_error("panic while extracting JNI values for start".to_string());
+            return -1;
+        }
     };
     let jvm: Arc<jni::JavaVM> = Arc::new(jvm);
 
@@ -266,12 +273,21 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
             });
     }));
 
+    // Everything installed above -- the protector and the traffic
+    // callback, both holding JNI global refs to the host's objects -- is
+    // undone by this on any failure below, mirroring ios.rs's fail
+    // closure, so no arm can leak one or leave a stale error.
+    let fail = |msg: String| -> jlong {
+        error!("start: {msg}");
+        common::set_last_error(msg);
+        crate::tun::traffic::clear_traffic_callback();
+        crate::socket_protector::clear_global_socket_protector();
+        -1
+    };
+
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
-        Err(e) => {
-            error!("Failed to create tokio runtime: {}", e);
-            return -1;
-        }
+        Err(e) => return fail(format!("failed to create tokio runtime: {e}")),
     };
 
     common::clear_last_error();
@@ -282,14 +298,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // failure by noticing isRunning() had gone false on its own.
     let prepared = match runtime.block_on(common::prepare_from_config(&config_str, None)) {
         Ok(prepared) => prepared,
-        Err(e) => {
-            let msg = e.to_string();
-            error!("start: invalid config: {}", msg);
-            common::set_last_error(msg);
-            crate::tun::traffic::clear_traffic_callback();
-            crate::socket_protector::clear_global_socket_protector();
-            return -1;
-        }
+        Err(e) => return fail(format!("invalid config: {e}")),
     };
 
     // Runtime::new() above, not a pinned worker count: Android has no Network
