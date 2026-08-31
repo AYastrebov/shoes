@@ -210,14 +210,33 @@ where
         let handle_connection = handle_connection.clone();
 
         join_handles.push(tokio::spawn(async move {
-            while let Some(conn) = endpoint.accept().await {
+            // The same per-listener cap and end-of-connection triage as
+            // the TCP accept loops; the permit lives in the task that
+            // owns the connection.
+            let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::util::MAX_INFLIGHT_PER_LISTENER,
+            ));
+            loop {
+                let permit = limiter
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("the limiter is never closed");
+                let Some(conn) = endpoint.accept().await else {
+                    break;
+                };
                 let handle_connection = handle_connection.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_connection(conn).await {
-                        error!("Connection ended with error: {e}");
+                        log::log!(
+                            crate::util::connection_end_level(&e),
+                            "Connection ended with error: {e}"
+                        );
                     }
                 });
             }
+            error!("QUIC endpoint closed; this listener is no longer accepting connections");
         }));
     }
 

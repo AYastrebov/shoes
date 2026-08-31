@@ -234,6 +234,84 @@ impl AsyncPing for TcpStream {
 
 impl AsyncStream for TcpStream {}
 
+/// A stream that carries its accept-side inflight permit with it.
+///
+/// The per-listener connection cap must track the SOCKET's lifetime, not
+/// the setup future's: handlers that answer `AlreadyHandled` hand the
+/// connection to a detached task and return immediately, and a permit
+/// dropped at that return made the cap a no-op for exactly those paths --
+/// the fd table filled while the semaphore read nearly free. Owning the
+/// permit inside the stream means it travels wherever the stream is
+/// moved, detached tasks included, and frees when the socket closes.
+pub struct PermitStream<S> {
+    inner: S,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<S> PermitStream<S> {
+    pub fn new(inner: S, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            _permit: permit,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PermitStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PermitStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl<S: AsyncPing + Unpin> AsyncPing for PermitStream<S> {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl<S: AsyncStream> AsyncStream for PermitStream<S> {}
+
 #[cfg(target_family = "unix")]
 impl AsyncPing for UnixStream {
     fn supports_ping(&self) -> bool {
