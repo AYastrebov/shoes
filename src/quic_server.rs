@@ -64,13 +64,15 @@ async fn start_quic_server(
     for _ in 0..num_endpoints {
         let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
 
+        // `?`, not unwrap: a bind conflict here reaches the launch path as
+        // an error it can keep the previous configuration over, instead of
+        // panicking the main task and taking the whole process with it.
         let socket2_socket = new_socket2_udp_socket(
             bind_address.is_ipv6(),
             None,
             Some(bind_address),
             cfg!(not(windows)),
-        )
-        .unwrap();
+        )?;
 
         let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
