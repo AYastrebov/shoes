@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### The Swift package grows up around its lifecycle
+
+The provider is sleep-aware (guaranteeing `wake()` delivery), stamps
+engine sessions so a stale death cannot be mistaken for the current
+one, lets a scheduled rebind recover from the death it was scheduled
+for instead of cancelling the tunnel mid-recovery, re-runs a rebind for
+a path change that landed while one was executing, runs
+`loadConfiguration` inside the start timeout, and reports the system's
+stop reason through a new `report(stopReason:)` hook. `ShoesErrorStore`
+in Core is the synchronous App Group persistence the fatal-error docs
+mandate. On the host side, `start(configure:)` gains a two-parameter
+form that can express on-demand rules, a stale manager is reloaded and
+retried once, `send()` times out instead of hanging on a dead
+extension, and the macOS installer reports approval-pending and throws
+`RebootRequired` instead of calling a deferred activation a success.
+`engine.stop()` returns whether the descriptor was actually released.
+CallbackBridge and the new store are under test.
+
 ### The FFI surface answers honestly and refuses what would kill it
 
 Also from the audit's should-fix list. `shoes_stop` returns whether the
