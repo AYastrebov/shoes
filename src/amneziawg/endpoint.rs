@@ -242,13 +242,28 @@ impl EndpointSocket {
 /// only notices when something makes it transmit.
 pub(crate) fn is_route_gone(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
+
+    // EINVAL from a connected UDP socket: the address it was bound to no
+    // longer exists. WinSock has its own number for that; `libc::EINVAL`
+    // on Windows is the CRT errno, which a socket never produces -- the
+    // same trap the EMSGSIZE constant in tunnel.rs documents.
+    #[cfg(windows)]
+    const EINVAL_RAW: i32 = 10022; // WSAEINVAL
+    #[cfg(not(windows))]
+    const EINVAL_RAW: i32 = libc::EINVAL;
+
+    // PermissionDenied (EPERM/EACCES): what Android returns once a socket
+    // has lost its VpnService.protect() exemption -- the send is refused
+    // so it cannot loop into the tunnel. A rebind re-protects the fresh
+    // socket, so it is the same repair as a vanished route.
     matches!(
         e.kind(),
         ErrorKind::NetworkUnreachable
             | ErrorKind::HostUnreachable
             | ErrorKind::NetworkDown
             | ErrorKind::AddrNotAvailable
-    ) || e.raw_os_error() == Some(libc::EINVAL)
+            | ErrorKind::PermissionDenied
+    ) || e.raw_os_error() == Some(EINVAL_RAW)
 }
 
 #[cfg(test)]
