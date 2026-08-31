@@ -180,9 +180,10 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
     // carries is flattened here rather than at the call sites.
     let stopped = crate::control::stop_handle(handle).device_released();
 
-    if get_last_error() != before
-        && get_last_error().as_deref() == Some(crate::control::ENDED_UNREQUESTED)
-    {
+    // One snapshot, compared and matched: two separate reads could see
+    // two different values if a late writer lands between them.
+    let after = get_last_error();
+    if after != before && after.as_deref() == Some(crate::control::ENDED_UNREQUESTED) {
         match before {
             Some(msg) => set_last_error(msg),
             None => clear_last_error(),
