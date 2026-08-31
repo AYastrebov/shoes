@@ -140,7 +140,7 @@ iOS and macOS — 12 symbols, declared in `include/shoes.h`:
 int   shoes_init(const char *log_level);
 long  shoes_start(const char *config_yaml, /* protect cb */, /* traffic cb */);
 long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb */, /* traffic cb */, /* stopped cb */);
-void  shoes_stop(long _handle);
+int   shoes_stop(long _handle); /* 1: descriptor released; 0: timed out */
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);
 int   shoes_set_log_file(const char *path);
@@ -372,7 +372,12 @@ caller nothing.
 The wait that remains cannot be skipped: it is what guarantees the stack thread
 has released the TUN descriptor, so the app can close its own copy without
 racing a thread still reading from it. `stop` returns `true` when it confirmed
-the stop and `false` on timeout. It must still be called off the main thread,
+the stop and `false` on timeout, and since the resilience round that answer
+reaches the C and JNI callers too: `shoes_stop` returns 1/0 and the Android
+`stop` returns a `Boolean` (the Kotlin declaration is
+`external fun stop(handle: Long): Boolean`). On 0/false, prefer leaking the
+descriptor to closing a number the kernel will hand to the next socket. It
+must still be called off the main thread,
 and the KDoc sample now does that, closes the descriptor afterwards, and checks
 `start`'s return value.
 
