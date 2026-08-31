@@ -28,7 +28,7 @@
 //!   Use `TunServerConfig::packet_information(true)` if using the socket FD
 //!   directly, or `false` if using the readPackets/writePackets API.
 
-pub(crate) mod stack_common;
+mod stack_common;
 mod tcp_conn;
 #[cfg(unix)]
 mod tcp_stack_direct;
