@@ -354,13 +354,20 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     _env: EnvUnowned,
     _class: JClass,
     _handle: jlong,
-) {
+) -> jboolean {
     // One transition guard over the stop and the callback clear, so a
     // start queued behind the lock cannot have its just-installed
     // traffic callback wiped by this stop's tail.
     let transition = common::transition_guard();
-    common::stop_service_locked(&transition);
+    let released = common::stop_service_locked(&transition);
     crate::tun::traffic::clear_traffic_callback();
+
+    // JNI_TRUE: the engine confirmed the stop and the TUN descriptor is
+    // released -- closing the ParcelFileDescriptor is safe. JNI_FALSE:
+    // the wait timed out and the engine may still be reading it; prefer
+    // leaking the descriptor to closing a number the kernel will reuse.
+    // The Kotlin declaration must read `external fun stop(handle: Long): Boolean`.
+    if released { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// Check if the TUN service is running.

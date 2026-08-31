@@ -435,10 +435,20 @@ unsafe fn start_service(
 ///   belongs to a live NetworkExtension object, which tears it down with the
 ///   extension. An app that did not create it has nothing to close.
 ///
+/// # Returns
+/// * 1 - the engine confirmed the stop; the descriptor is released and
+///   yours to close.
+/// * 0 - the wait timed out and the engine may still be reading the
+///   descriptor. Closing it now risks the fd-recycling hazard described
+///   above; prefer leaking it to closing it.
+///
+/// Earlier releases returned nothing and every caller had to assume 1.
+/// Ignoring the result reproduces exactly that behavior.
+///
 /// # Arguments
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
 #[unsafe(no_mangle)]
-pub extern "C" fn shoes_stop(_handle: c_long) {
+pub extern "C" fn shoes_stop(_handle: c_long) -> c_int {
     // The whole teardown under one transition guard: a start queued
     // behind it installs its own callbacks the moment the lock frees, so
     // a clear outside the lock wiped the slots that start had just
@@ -449,13 +459,15 @@ pub extern "C" fn shoes_stop(_handle: c_long) {
     // task exits during the stop, and that exit is one the host asked for.
     // A late traffic tick is harmless; a stop event here is a lie.
     clear_stopped_callback();
-    common::stop_service_locked(&transition);
+    let released = common::stop_service_locked(&transition);
     crate::tun::traffic::clear_traffic_callback();
 
     if let Some(callback) = PROTECT_CALLBACK.get() {
         let mut guard = callback.lock();
         *guard = None;
     }
+
+    if released { 1 } else { 0 }
 }
 
 /// Check if the shoes service is running.
