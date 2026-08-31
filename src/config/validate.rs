@@ -246,6 +246,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut outbounds,
         )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
+        validate_tun_dns_needs_no_system_resolver(&config.dns, &final_dns_groups)?;
     }
 
     // Combine into Config list (only Server and TunServer variants)
@@ -460,6 +461,66 @@ fn expand_dns_groups_composition(
     }
 
     Ok(expanded)
+}
+
+/// A TUN entry's dns group must never silently need the system resolver.
+///
+/// A hostname URL is resolved through the spec's bootstrap resolver, and
+/// without `bootstrap_url` that is the system resolver -- on a TUN whose
+/// whole point is to keep names off plaintext UDP:53, a silent leak
+/// dressed as DoH. IP-address URLs (`https://1.1.1.1/dns-query`) need no
+/// resolution and keep working with no bootstrap; `url: system` stays
+/// allowed because it asks for the system resolver explicitly. Groups a
+/// bootstrap_url names are checked transitively: the leak is the same one
+/// hop down. Plain server configs keep the system-bootstrap convenience.
+fn validate_tun_dns_needs_no_system_resolver(
+    dns: &Option<DnsConfig>,
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    let Some(group_name) = dns.as_ref().and_then(|c| c.resolved_group()) else {
+        return Ok(());
+    };
+    let by_name: HashMap<&str, &ExpandedDnsGroup> =
+        groups.iter().map(|g| (g.name.as_str(), g)).collect();
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut stack = vec![group_name];
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let Some(group) = by_name.get(name) else {
+            continue; // the group ref was validated already
+        };
+        for spec in &group.specs {
+            // Parsed successfully once during expansion; a parse failure
+            // here would already have failed validation.
+            let parsed = ParsedDnsUrl::parse(&spec.url).map_err(|e| {
+                std::io::Error::other(format!("invalid DNS url '{}': {e}", spec.url))
+            })?;
+            match &spec.bootstrap_url {
+                Some(bootstrap) => {
+                    // An IP-only bootstrap URL was validated in expansion;
+                    // a group name recurses, since a hostname there leaks
+                    // the same way one hop down.
+                    if by_name.contains_key(bootstrap.as_str()) {
+                        stack.push(bootstrap.as_str());
+                    }
+                }
+                None => {
+                    if parsed.has_hostname() {
+                        return Err(std::io::Error::other(format!(
+                            "TUN dns server '{}' has a hostname URL and no bootstrap_url: \
+                             resolving it would silently use the system resolver, which is \
+                             the leak the dns block exists to prevent. Use an IP-address URL \
+                             (e.g. https://1.1.1.1/dns-query) or add a bootstrap_url.",
+                            spec.url
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Phase 2: Topological sort on expanded DNS groups based on bootstrap_url dependencies.
@@ -2578,6 +2639,76 @@ mod tests {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
         let validated = create_server_configs(converted_configs)?;
         Ok(validated.configs)
+    }
+
+    fn tun_yaml_with_dns(server_url: &str, bootstrap: Option<&str>) -> String {
+        let bootstrap_line = match bootstrap {
+            Some(b) => format!("\n        bootstrap_url: \"{b}\""),
+            None => String::new(),
+        };
+        format!(
+            r#"
+- device_fd: 0
+  dns:
+    servers:
+      - url: "{server_url}"{bootstrap_line}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#
+        )
+    }
+
+    /// A hostname DoH URL without a bootstrap resolves through the system
+    /// resolver -- on a TUN, the plaintext leak the dns block exists to
+    /// prevent. Rejected, with the message naming both fixes.
+    #[tokio::test]
+    async fn tun_dns_with_hostname_url_and_no_bootstrap_is_rejected() {
+        let yaml = tun_yaml_with_dns("https://dns.example.com/dns-query", None);
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        let err = validate_configs_test(configs).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bootstrap_url"), "got: {msg}");
+        assert!(msg.contains("IP-address URL"), "got: {msg}");
+    }
+
+    /// The IP-URL shape a client emits to avoid the chicken-and-egg needs
+    /// no bootstrap and must keep validating.
+    #[tokio::test]
+    async fn tun_dns_with_ip_url_needs_no_bootstrap() {
+        let yaml = tun_yaml_with_dns("https://1.1.1.1/dns-query", None);
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        validate_configs_test(configs).await.unwrap();
+    }
+
+    /// A hostname URL WITH an IP bootstrap has no silent fallback and is
+    /// allowed.
+    #[tokio::test]
+    async fn tun_dns_with_hostname_url_and_ip_bootstrap_is_allowed() {
+        let yaml = tun_yaml_with_dns("https://dns.example.com/dns-query", Some("udp://1.1.1.1"));
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        validate_configs_test(configs).await.unwrap();
+    }
+
+    /// The same hostname-without-bootstrap group on a plain server keeps
+    /// today's behaviour: the system-bootstrap default is a documented
+    /// convenience outside TUN mode.
+    #[tokio::test]
+    async fn server_dns_with_hostname_url_and_no_bootstrap_still_validates() {
+        let yaml = r#"
+- address: "127.0.0.1:18599"
+  transport: tcp
+  protocol:
+    type: socks
+  dns:
+    servers:
+      - url: "https://dns.example.com/dns-query"
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        validate_configs_test(configs).await.unwrap();
     }
 
     #[tokio::test]
