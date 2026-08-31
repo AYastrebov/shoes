@@ -165,6 +165,15 @@ struct TcpControl {
     recv_buf: smoltcp::storage::RingBuffer<'static, u8>,
     recv_waker: Option<Waker>,
     recv_closed: bool,
+
+    /// The async side is gone -- VirtualTcpStream was dropped. The poll
+    /// loop aborts the socket (RST, like a real socket dropped with the
+    /// connection up) and frees its slot. Without this, a stream dropped
+    /// without shutdown left the socket Established forever: the peer
+    /// answers keepalive probes, so the idle timeout never fires, and
+    /// each leak pinned ~576 KiB plus one slot of MAX_TCP_SOCKETS until
+    /// the leaks alone had the cap refusing every new connect.
+    dropped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +405,7 @@ impl VirtualNetStack {
             recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_PIPE_BUF]),
             recv_waker: None,
             recv_closed: false,
+            dropped: false,
         }));
         let notify = Arc::new(Notify::new());
 
@@ -483,6 +493,15 @@ impl VirtualNetStack {
         for (handle, active) in &self.active_tcp {
             let socket = self.sockets.get_mut::<SmolTcpSocket>(*handle);
             let mut ctrl = active.control.lock();
+
+            // The async side is gone; nobody will read or write again.
+            // Abort rather than close: no FIN handshake to wait out, so
+            // the slot frees this pass (the Closed check below removes
+            // it). smoltcp's abort sends nothing itself -- the peer's
+            // next segment finds no socket and draws the interface's RST.
+            if ctrl.dropped {
+                socket.abort();
+            }
 
             // smoltcp recv -> ctrl.recv_buf (data for the async reader)
             if socket.can_recv() && !ctrl.recv_buf.is_full() {
@@ -637,6 +656,14 @@ impl VirtualNetStack {
 pub struct VirtualTcpStream {
     control: Arc<Mutex<TcpControl>>,
     notify: Arc<Notify>,
+}
+
+/// See `TcpControl::dropped`: without this, a stream dropped without
+/// shutdown pinned its socket, buffers, and cap slot forever.
+impl Drop for VirtualTcpStream {
+    fn drop(&mut self) {
+        self.control.lock().dropped = true;
+    }
 }
 
 impl AsyncRead for VirtualTcpStream {
@@ -913,6 +940,7 @@ mod tests {
                         recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; 1]),
                         recv_waker: None,
                         recv_closed: false,
+                        dropped: false,
                     })),
                     notify: Arc::new(Notify::new()),
                     reply: {
