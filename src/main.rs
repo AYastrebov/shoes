@@ -399,6 +399,15 @@ fn main() {
             }
         };
 
+        // Registered once, before the serve loop: tokio replaces the OS
+        // default disposition for the process's lifetime, so the streams
+        // must outlive every wait point -- a one-shot future dropped
+        // between waits would leave a window where the signal is neither
+        // handled nor fatal. A signal that lands while the loop is busy
+        // (the reload debounce, a prepare) is buffered by the stream and
+        // handled at the next wait.
+        let mut signals = ShutdownSignals::install();
+
         let mut first_launch = true;
         loop {
             let join_handles = match launch_servers(prepared).await {
@@ -419,10 +428,10 @@ fn main() {
             first_launch = false;
 
             if reload_state.is_none() {
-                // No reload mode - wait forever
-                // TODO: signal handling?
-                futures::future::pending::<()>().await;
-                unreachable!();
+                // No reload mode: nothing to do but serve until the OS
+                // asks the process to exit.
+                let what = signals.recv().await;
+                shut_down(what, join_handles).await;
             }
 
             // Wait for a change, then keep trying until an edit produces a
@@ -431,7 +440,12 @@ fn main() {
             // over a half-saved file punishes the edit before it is done.
             prepared = loop {
                 let (watcher, rx) = reload_state.as_mut().expect("checked above");
-                rx.recv().await.expect("the watcher thread is co-owned");
+                tokio::select! {
+                    changed = rx.recv() => {
+                        changed.expect("the watcher thread is co-owned");
+                    }
+                    what = signals.recv() => shut_down(what, join_handles).await,
+                }
 
                 println!("Configs changed, reloading in 3 seconds..");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -459,6 +473,88 @@ fn main() {
             }
         }
     });
+}
+
+/// Stop accepting, flush the logs, and exit 0.
+///
+/// The default disposition -- die mid-instruction with a signal exit code,
+/// log writers unflushed -- was the entire shutdown story. In-flight
+/// connections still end with the process (draining them is a policy the
+/// config should own someday); what this buys is an orderly stop: no new
+/// accepts, buffered log lines on disk, and an exit code that says
+/// "asked to stop" rather than "killed".
+async fn shut_down(what: &'static str, join_handles: Vec<tokio::task::JoinHandle<()>>) -> ! {
+    println!("\nReceived {what}, shutting down..");
+    for join_handle in &join_handles {
+        join_handle.abort();
+    }
+    for join_handle in join_handles {
+        let _ = join_handle.await;
+    }
+    log::logger().flush();
+    std::process::exit(0);
+}
+
+/// The OS's stop requests, as resumable streams.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            // A handler that cannot install is reported and skipped; the
+            // OS default (immediate death) then applies, which is the
+            // pre-existing behavior rather than a new failure mode.
+            let try_install = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Could not install the {name} handler: {e}");
+                    None
+                }
+            };
+            Self {
+                interrupt: try_install(SignalKind::interrupt(), "SIGINT"),
+                terminate: try_install(SignalKind::terminate(), "SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Resolves when the OS asks the process to exit; pends forever if no
+    /// handler could be installed.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            async fn wait(s: &mut Option<tokio::signal::unix::Signal>) {
+                match s {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => futures::future::pending::<()>().await,
+                }
+            }
+            tokio::select! {
+                _ = wait(&mut self.interrupt) => "SIGINT",
+                _ = wait(&mut self.terminate) => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => "Ctrl-C",
+                Err(_) => futures::future::pending().await,
+            }
+        }
+    }
 }
 
 /// Everything a validated configuration needs to start serving.
