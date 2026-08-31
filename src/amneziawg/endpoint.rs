@@ -171,12 +171,33 @@ impl EndpointSocket {
         const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
         const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+        /// The floor between bind attempts, whatever woke the task. The
+        /// receive loop requests a rebind per route-gone error -- every
+        /// ~50 ms during a persistent ENETDOWN -- and each request stores
+        /// a Notify permit that completes the retry select's notified()
+        /// arm instantly, so without this floor the exponential backoff
+        /// above gated nothing: bind+protect+connect ran at request rate
+        /// (on Android, protect is a VpnService IPC per attempt).
+        const MIN_ATTEMPT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+        let mut last_attempt: Option<std::time::Instant> = None;
+        let pace = async |last: &mut Option<std::time::Instant>| {
+            if let Some(prev) = *last {
+                let since = prev.elapsed();
+                if since < MIN_ATTEMPT_INTERVAL {
+                    tokio::time::sleep(MIN_ATTEMPT_INTERVAL - since).await;
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        };
+
         loop {
             self.rebind_requested.notified().await;
 
             let mut backoff = RETRY_INITIAL;
             let mut attempt = 1u32;
             loop {
+                pace(&mut last_attempt).await;
                 match Self::bind(self.endpoint).await {
                     Ok(socket) => {
                         let local = socket
@@ -255,14 +276,22 @@ pub(crate) fn is_route_gone(e: &std::io::Error) -> bool {
     // PermissionDenied (EPERM/EACCES): what Android returns once a socket
     // has lost its VpnService.protect() exemption -- the send is refused
     // so it cannot loop into the tunnel. A rebind re-protects the fresh
-    // socket, so it is the same repair as a vanished route.
+    // socket, so there it is the same repair as a vanished route. Android
+    // ONLY: on a desktop, EPERM is a firewall rejecting the tunnel's UDP,
+    // which a rebind does not repair -- and since binding is not
+    // firewalled, each rebind *succeeds*, re-sends, fails EPERM again,
+    // and re-requests: a socket-churn hot loop with no error to back off.
+    #[cfg(target_os = "android")]
+    if e.kind() == ErrorKind::PermissionDenied {
+        return true;
+    }
+
     matches!(
         e.kind(),
         ErrorKind::NetworkUnreachable
             | ErrorKind::HostUnreachable
             | ErrorKind::NetworkDown
             | ErrorKind::AddrNotAvailable
-            | ErrorKind::PermissionDenied
     ) || e.raw_os_error() == Some(EINVAL_RAW)
 }
 
