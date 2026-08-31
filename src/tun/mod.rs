@@ -187,9 +187,10 @@ pub async fn run_tun_server(
 
     // Channel for sending UDP responses back (stack thread will write to
     // TUN). Bounded with drop-on-full at the sender: if the stack thread
-    // stalls, datagrams are shed rather than queued without limit. 512
-    // MTU-sized packets is a few megabytes at worst.
-    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(512);
+    // stalls, datagrams are shed rather than queued without limit. Sizing
+    // notes live at the constant.
+    let (udp_to_stack_tx, udp_to_stack_rx) =
+        mpsc::channel::<PacketBuffer>(stack_common::UDP_RESPONSE_QUEUE);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
     let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();

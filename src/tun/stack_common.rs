@@ -163,6 +163,18 @@ pub struct SharedState {
 
 pub const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
 
+/// Datagrams queued on each hop of the UDP response pipeline (destination
+/// task -> session manager -> stack thread). One constant for both hops,
+/// so tuning one cannot silently leave the other as the bottleneck.
+///
+/// Sizing honestly: entries come from a destination task's 64 KiB read
+/// buffer over stream transports, which are not MTU-clamped, so the worst
+/// case per queue is ~32 MiB -- not "a few megabytes". In practice
+/// entries are MTU-sized and a full queue is a few hundred KiB; the
+/// bound exists for the stalled-consumer case, where drop-on-full is the
+/// right answer for datagrams either way.
+pub const UDP_RESPONSE_QUEUE: usize = 512;
+
 /// How the stack thread is sized and who owns its descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct TcpStackOptions {

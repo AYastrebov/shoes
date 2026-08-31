@@ -40,7 +40,9 @@ const CHANNEL_SIZE: usize = 64;
 
 /// Response channel buffer size. Bounds memory growth when destination
 /// tasks produce responses faster than the manager can write to TUN.
-const RESPONSE_CHANNEL_SIZE: usize = 512;
+/// Shared with the stack-thread hop of the same pipeline; see the sizing
+/// notes at its definition.
+use super::stack_common::UDP_RESPONSE_QUEUE as RESPONSE_CHANNEL_SIZE;
 
 /// Per-destination connection timeout (self-enforced by destination tasks)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
