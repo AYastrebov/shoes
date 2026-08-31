@@ -45,6 +45,11 @@ const RESPONSE_CHANNEL_SIZE: usize = 512;
 /// Per-destination connection timeout (self-enforced by destination tasks)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long establishing a destination -- routing decision, DNS, the
+/// transport connect, and the proxy handshake -- may take before the
+/// attempt is failed. The handshakes carry no timeouts of their own.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Maximum time to wait for a single write to complete before treating
 /// the connection as dead. Bounds orphan lifetime if the underlying
 /// stream stalls (e.g. unresponsive remote, full TCP send buffer).
@@ -399,7 +404,28 @@ async fn session_task(
                         let resolver = resolver.clone();
                         let response_tx = response_tx.clone();
                         tokio::spawn(async move {
-                            match create_connection(&dest, &proxy_selector, &resolver).await {
+                            // Bounded: the entry now exists before the connect
+                            // succeeds, and its liveness check is
+                            // handle.is_finished() -- a connect that hangs
+                            // mid-proxy-handshake (the handshakes carry no
+                            // timeouts of their own) would otherwise keep the
+                            // entry "alive" and this destination blackholed
+                            // for as long as the app keeps the session warm.
+                            let connect = tokio::time::timeout(
+                                CONNECT_TIMEOUT,
+                                create_connection(&dest, &proxy_selector, &resolver),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "connect gave no answer in {}s",
+                                        CONNECT_TIMEOUT.as_secs()
+                                    ),
+                                ))
+                            });
+                            match connect {
                                 Ok(stream) => {
                                     destination_task(
                                         peer_addr,
