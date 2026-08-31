@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### The resilience audit's critical findings, fixed
+
+Silent failures are now detected. A liveness watchdog watches the traffic
+counters: sustained outbound traffic with nothing received first rebinds
+the endpoint socket -- the cheap repair for a NAT mapping that expired
+during sleep or a path that moved without an errno -- and, only once a
+rebind succeeded and the peer still says nothing, stops the engine with
+the reason (the standalone binary rebuilds instead). A device that
+cannot rebind is between networks, and that outage is still ridden out.
+A rebind also announces itself: a keepalive (or handshake) goes out on
+the fresh socket immediately, so the server learns the new address
+before app traffic happens to tell it. WireGuard's own session-expiry
+signal is logged at warn instead of swallowed at debug.
+
+The AmneziaWG virtual TCP stack gained what the TUN stack already had:
+a 30-second connect deadline (smoltcp otherwise retransmits a SYN
+forever, parking the caller and its ~576 KiB of buffers for good),
+keepalive and timeout on established flows, and a per-platform socket
+cap instead of unbounded growth into the extension's memory ceiling.
+
+FFI start/stop transitions are serialized. A stop empties the service
+slot before its five-second wait, and a start landing in that window
+used to pass the already-running guard and put a second engine on the
+same device descriptor. On iOS, a rebind past its debounce could
+restart the engine after stopTunnel's completion handler had returned;
+it now stands down at every step once a stop begins.
+
+Desktop: an edit that breaks the config no longer kills the running
+proxy -- the last-good configuration keeps serving and each further
+edit is retried; `--dry-run` failures exit 1 so tooling can tell; and
+fd exhaustion backs the accept loop off instead of spinning it hot.
+
 ## v0.2.17
 
 ### The AmneziaWG receive path survives errors, and its death stops the engine
