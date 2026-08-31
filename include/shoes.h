@@ -161,10 +161,20 @@ long shoes_start_with_fd(const char *config_yaml,
  *   belongs to a live NetworkExtension object, which tears it down with the
  *   extension. An app that did not create it has nothing to close.
  *
+ * # Returns
+ * * 1 - the engine confirmed the stop; the descriptor is released and
+ *   yours to close.
+ * * 0 - the wait timed out and the engine may still be reading the
+ *   descriptor. Closing it now risks the fd-recycling hazard described
+ *   above; prefer leaking it to closing it.
+ *
+ * Earlier releases returned nothing and every caller had to assume 1.
+ * Ignoring the result reproduces exactly that behavior.
+ *
  * # Arguments
  * * `handle` - Handle returned by shoes_start (currently unused, we use global state)
  */
-void shoes_stop(long _handle);
+int shoes_stop(long _handle);
 
 /**
  * Check if the shoes service is running.
