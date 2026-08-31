@@ -247,7 +247,11 @@ impl RecvErrorStreak {
 
     fn on_error(&mut self, now: std::time::Instant) -> StreakVerdict {
         self.count = match self.last {
-            Some(prev) if now.duration_since(prev) <= RECV_ERROR_STREAK_WINDOW => self.count + 1,
+            // saturating: the Ignore-class streak backs off forever without
+            // dying, so its count has no ceiling to reset it.
+            Some(prev) if now.duration_since(prev) <= RECV_ERROR_STREAK_WINDOW => {
+                self.count.saturating_add(1)
+            }
             _ => 1,
         };
         self.last = Some(now);
@@ -532,11 +536,13 @@ async fn decapsulate_loop(
     // drain_queued_packets for why the copy is needed at all.
     let mut packet = Vec::new();
     let mut streak = RecvErrorStreak::new();
+    let mut ignore_streak = RecvErrorStreak::new();
 
     loop {
         let n = match udp.recv(&mut buf).await {
             Ok(n) => {
                 streak.on_success();
+                ignore_streak.on_success();
                 // Counted before decapsulation: arrival is the fact the
                 // trailer probe needs, parseability is a separate one.
                 datagrams_received.fetch_add(1, Ordering::Relaxed);
@@ -546,6 +552,18 @@ async fn decapsulate_loop(
                 match classify_recv_error(&e) {
                     RecvErrorAction::Ignore => {
                         debug!("AmneziaWG UDP recv transient error, continuing: {}", e);
+                        // Usually latched ICMP echoes, one per send -- but
+                        // ENETDOWN can be the socket's persistent state on a
+                        // dead interface, returned back-to-back as fast as
+                        // recv is called. Same backoff ladder as Suspect,
+                        // never the death: an outage is ridden out, just not
+                        // at full CPU with a rebind request per iteration.
+                        match ignore_streak.on_error(std::time::Instant::now()) {
+                            StreakVerdict::KeepGoing => {}
+                            StreakVerdict::Backoff | StreakVerdict::GiveUp => {
+                                tokio::time::sleep(RECV_ERROR_BACKOFF).await
+                            }
+                        }
                     }
                     RecvErrorAction::PathMtuExceeded => {
                         handle_path_mtu_exceeded(&tunn, &trailers_on, "reported on recv");
