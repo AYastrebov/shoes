@@ -362,121 +362,174 @@ fn main() {
             Some((watcher, rx))
         };
 
-        loop {
-            let configs = match config::load_configs(&args).await {
-                Ok(c) => c,
+        if dry_run {
+            // Validation only -- no DNS registry, whose bootstrap resolution
+            // would make an offline dry run fail for a valid config.
+            let checked = async {
+                let configs = config::load_configs(&args)
+                    .await
+                    .map_err(|e| format!("Failed to load server configs: {e}"))?;
+                let (configs, _) = config::convert_cert_paths(configs)
+                    .await
+                    .map_err(|e| format!("Failed to load cert files: {e}"))?;
+                config::create_server_configs(configs)
+                    .map_err(|e| format!("Failed to create server configs: {e}"))?;
+                Ok::<(), String>(())
+            }
+            .await;
+            match checked {
+                Ok(()) => println!("Finishing dry run, config parsed successfully."),
                 Err(e) => {
-                    eprintln!("Failed to load server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
+                    eprintln!("Dry run failed: {e}\n");
+                    // A non-zero exit is the whole point of a dry run:
+                    // tooling validates configs by status, not by prose.
+                    std::process::exit(1);
                 }
-            };
-
-            let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load cert files: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            if load_file_count > 0 {
-                    println!("Loaded {load_file_count} certs/keys from files");
             }
+            return;
+        }
 
-            for config in configs.iter() {
-                debug!("================================================================================");
-                debug!("{config:#?}");
-            }
-            debug!("================================================================================");
-
-            // Rule-set files are only known once the configs are parsed, and
-            // which ones exist can change across a reload, so the watch set is
-            // refreshed here rather than built once at startup. A rule-set edit
-            // then takes the same reload path a config edit does.
-            if let Some((watcher, _)) = reload_state.as_mut() {
-                watch_rule_set_paths(watcher, &configs);
-            }
-
-            if dry_run {
-                if let Err(e) = config::create_server_configs(configs) {
-                    eprintln!("Dry run failed, could not create server configs: {e}\n");
-                } else {
-                    println!("Finishing dry run, config parsed successfully.");
-                }
+        let mut prepared = match prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}\n");
+                print_usage_and_exit(arg0);
                 return;
             }
+        };
 
-            let mut join_handles = vec![];
+        loop {
+            let join_handles = launch_servers(prepared).await;
 
-            let server_configs = match config::create_server_configs(configs) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to create server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            let config::ValidatedConfigs {
-                configs: server_configs,
-                dns_groups,
-                outbounds,
-            } = server_configs;
-
-            // Replace, not add: a reload must not carry the previous config's
-            // servers into the new list.
-            #[cfg(feature = "control-stats")]
-            crate::outbound_stats::install(&outbounds);
-            #[cfg(not(feature = "control-stats"))]
-            let _ = outbounds;
-
-            // Build DNS registry from expanded groups (async - resolves hostnames)
-            let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Failed to build DNS registry: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            println!("\nStarting {} server(s)..", server_configs.len());
-
-            for server_config in server_configs {
-                // Get the resolver for this server from the registry
-                let dns_ref = match &server_config {
-                    config::Config::Server(s) => s.dns.as_ref(),
-                    config::Config::TunServer(t) => t.dns.as_ref(),
-                    _ => None,
-                };
-                let resolver = dns_registry.get_for_server(dns_ref);
-                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
+            if reload_state.is_none() {
+                // No reload mode - wait forever
+                // TODO: signal handling?
+                futures::future::pending::<()>().await;
+                unreachable!();
             }
 
-            match reload_state.as_mut() {
-                Some((_watcher, rx)) => {
-                    rx.recv().await.unwrap();
+            // Wait for a change, then keep trying until an edit produces a
+            // config that loads. The running servers keep serving the
+            // last-good configuration the whole time: killing a live proxy
+            // over a half-saved file punishes the edit before it is done.
+            prepared = loop {
+                let (watcher, rx) = reload_state.as_mut().expect("checked above");
+                rx.recv().await.expect("the watcher thread is co-owned");
 
-                    println!("Configs changed, restarting servers in 3 seconds..");
+                println!("Configs changed, reloading in 3 seconds..");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                // Remove any extra events
+                while rx.try_recv().is_ok() {}
 
-                    for join_handle in join_handles {
-                        join_handle.abort();
+                match prepare_servers(&args, Some(watcher)).await {
+                    Ok(p) => break p,
+                    Err(e) => {
+                        eprintln!(
+                            "{e}\nKeeping the previous configuration; fix the file to retry."
+                        );
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                    // Remove any extra events
-                    while rx.try_recv().is_ok() {}
                 }
-                None => {
-                    // No reload mode - wait forever
-                    // TODO: signal handling?
-                    futures::future::pending::<()>().await;
-                    unreachable!();
-                }
+            };
+
+            println!("Restarting servers..");
+            for join_handle in join_handles {
+                join_handle.abort();
             }
+            // A beat for the aborted listeners to release their ports
+            // before the replacements bind the same addresses.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
+}
+
+/// Everything a validated configuration needs to start serving.
+struct PreparedServers {
+    server_configs: Vec<config::Config>,
+    dns_registry: dns::DnsRegistry,
+    outbounds: outbound_stats::OutboundSet,
+}
+
+/// Load, validate, and resolve a configuration without touching the servers
+/// that may be running -- the reload path decides what to do with the result.
+/// The error is the full message to print.
+async fn prepare_servers(
+    args: &Vec<String>,
+    watcher: Option<&mut RecommendedWatcher>,
+) -> Result<PreparedServers, String> {
+    let configs = config::load_configs(args)
+        .await
+        .map_err(|e| format!("Failed to load server configs: {e}"))?;
+
+    let (configs, load_file_count) = config::convert_cert_paths(configs)
+        .await
+        .map_err(|e| format!("Failed to load cert files: {e}"))?;
+
+    if load_file_count > 0 {
+        println!("Loaded {load_file_count} certs/keys from files");
+    }
+
+    for config in configs.iter() {
+        debug!("================================================================================");
+        debug!("{config:#?}");
+    }
+    debug!("================================================================================");
+
+    // Rule-set files are only known once the configs are parsed, and
+    // which ones exist can change across a reload, so the watch set is
+    // refreshed here rather than built once at startup. A rule-set edit
+    // then takes the same reload path a config edit does.
+    if let Some(watcher) = watcher {
+        watch_rule_set_paths(watcher, &configs);
+    }
+
+    let config::ValidatedConfigs {
+        configs: server_configs,
+        dns_groups,
+        outbounds,
+    } = config::create_server_configs(configs)
+        .map_err(|e| format!("Failed to create server configs: {e}"))?;
+
+    // Build DNS registry from expanded groups (async - resolves hostnames)
+    let dns_registry = dns::build_dns_registry(dns_groups)
+        .await
+        .map_err(|e| format!("Failed to build DNS registry: {e}"))?;
+
+    Ok(PreparedServers {
+        server_configs,
+        dns_registry,
+        outbounds,
+    })
+}
+
+/// Commit a prepared configuration: install its outbounds and spawn its
+/// servers. Only called with a `PreparedServers` that validated whole.
+async fn launch_servers(prepared: PreparedServers) -> Vec<tokio::task::JoinHandle<()>> {
+    let PreparedServers {
+        server_configs,
+        mut dns_registry,
+        outbounds,
+    } = prepared;
+
+    // Replace, not add: a reload must not carry the previous config's
+    // servers into the new list.
+    #[cfg(feature = "control-stats")]
+    crate::outbound_stats::install(&outbounds);
+    #[cfg(not(feature = "control-stats"))]
+    let _ = outbounds;
+
+    println!("\nStarting {} server(s)..", server_configs.len());
+
+    let mut join_handles = vec![];
+    for server_config in server_configs {
+        // Get the resolver for this server from the registry
+        let dns_ref = match &server_config {
+            config::Config::Server(s) => s.dns.as_ref(),
+            config::Config::TunServer(t) => t.dns.as_ref(),
+            _ => None,
+        };
+        let resolver = dns_registry.get_for_server(dns_ref);
+        join_handles.extend(start_servers(server_config, resolver).await.unwrap());
+    }
+    join_handles
 }
