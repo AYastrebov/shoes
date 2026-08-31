@@ -375,8 +375,9 @@ rules: [RuleConfig]
 
 The `dns:` block chooses the resolver for everything this TUN session
 resolves: client-chain hostnames on connect, UDP destinations, and the
-WireGuard/AmneziaWG endpoint's re-resolution on network-change rebinds and
-tunnel rebuilds. Without the block, the system resolver is used, as before.
+WireGuard/AmneziaWG endpoint's re-resolution on tunnel rebuilds. (A
+network-change rebind reuses the already-resolved address; a rebuild
+resolves again.) Without the block, the system resolver is used, as before.
 
 Two TUN-specific rules:
 
