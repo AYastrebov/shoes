@@ -210,6 +210,16 @@ impl EndpointSocket {
                         // only for the duration of a recv.
                         self.socket.send_replace(Arc::new(socket));
                         on_rebound();
+                        // Drain the stored permit: Notify holds at most one,
+                        // but requests that piled up during this rebind --
+                        // route-gone errors fire one per failed send -- were
+                        // asking for the swap that just happened, and honoring
+                        // the leftover would churn a fresh socket for nothing.
+                        // A genuinely new signal re-fires: sends that still
+                        // fail re-request, the app re-notifies, the liveness
+                        // watchdog re-asks every 20 deaf seconds.
+                        use futures::FutureExt;
+                        let _ = self.rebind_requested.notified().now_or_never();
                         info!(
                             "AmneziaWG endpoint rebound to {} -> {}",
                             local, self.endpoint

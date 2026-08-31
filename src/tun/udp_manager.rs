@@ -394,10 +394,13 @@ async fn session_task(
                 // lands; if it fails, the task ends and the dead-entry
                 // check above recreates it on the next packet.
                 if !destinations.contains_key(&dest) {
-                    let source_addr = match dest.to_socket_addr_nonblocking() {
-                        Some(addr) => addr,
-                        None => continue,
-                    };
+                    // The address responses come FROM is the one the app sent
+                    // TO -- dest_addr, straight off the packet. Deriving it
+                    // from the NetLocation instead meant a hostname dest
+                    // (every Fake IP hit maps to one) had no nonblocking
+                    // address and the packet was dropped: UDP through Fake IP
+                    // never flowed at all.
+                    let source_addr = dest_addr;
 
                     let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
                     let handle = {
