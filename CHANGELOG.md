@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### The desktop binary behaves like a daemon
+
+SIGINT and SIGTERM stop the accept loops, flush the logs, and exit 0
+instead of the OS default death; each listener caps its concurrent
+connections at 4096 so a flood queues in the kernel backlog instead of
+filling the fd table; routine client disconnects log at debug instead
+of flooding error level; a QUIC endpoint that closes says so instead of
+silently ending its accept task; and the `-l` log file rotates at
+32 MiB to `<path>.old` instead of growing forever.
+
 ### The Swift package grows up around its lifecycle
 
 The provider is sleep-aware (guaranteeing `wake()` delivery), stamps
