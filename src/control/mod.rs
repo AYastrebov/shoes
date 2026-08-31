@@ -358,7 +358,7 @@ where
 /// What `status` and `on_exit` say about a service that returned `Ok` on its
 /// own. `run_prepared` does that only for the shutdown signal today, so this
 /// is reserved rather than expected.
-const ENDED_UNREQUESTED: &str = "service ended without being asked";
+pub(crate) const ENDED_UNREQUESTED: &str = "service ended without being asked";
 
 /// Runs at the end of the service task, however it ends. Order matters:
 /// `running` goes false first, then the host is told -- so
