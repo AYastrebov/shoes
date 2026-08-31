@@ -670,7 +670,11 @@ async fn trailer_probe_loop(
         tokio::time::sleep(interval).await;
 
         let received_now = datagrams_received.load(Ordering::Relaxed);
-        let arrived = received_now - received_at_last_probe;
+        // wrapping_sub: fetch_add wraps on overflow, which a 32-bit
+        // target can reach in hours of traffic. The modular difference is
+        // still the true count of arrivals since the last tick, since one
+        // interval cannot see usize::MAX datagrams.
+        let arrived = received_now.wrapping_sub(received_at_last_probe);
         received_at_last_probe = received_now;
 
         let offered = packets_offered.load(Ordering::Relaxed);
