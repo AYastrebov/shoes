@@ -727,6 +727,10 @@ async fn timer_loop(
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
+    // ConnectionExpired repeats on every tick until new traffic restarts
+    // the handshake, so only the transition is worth a warning -- at 4 Hz
+    // the repeats would drown the log that the warning exists to inform.
+    let mut expired_announced = false;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -737,7 +741,24 @@ async fn timer_loop(
         };
 
         match result {
-            TunnResult::Done => {}
+            TunnResult::Done => {
+                expired_announced = false;
+            }
+            TunnResult::Err(awgtun::noise::errors::WireGuardError::ConnectionExpired) => {
+                // The peer answered no handshake for the whole rekey attempt
+                // window (or the session aged out unrenewed). Not a death by
+                // itself: the next outbound packet starts a fresh handshake,
+                // and an expiry with traffic behind it is what the liveness
+                // watchdog turns into one. But it must be visible -- this is
+                // WireGuard's own "the peer has stopped answering" signal.
+                if !expired_announced {
+                    expired_announced = true;
+                    warn!(
+                        "AmneziaWG: the session expired without a completed handshake; \
+                         the next outbound packet will retry"
+                    );
+                }
+            }
             TunnResult::Err(e) => {
                 debug!("AmneziaWG timer error: {:?}", e);
             }
