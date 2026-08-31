@@ -47,8 +47,12 @@ package com.shoesproxy
  *         // TUN descriptor, and the system allows onDestroy about 5 seconds
  *         // before it kills the app for not responding.
  *         thread {
- *             ShoesNative.stop(shoesHandle)
- *             tunInterface?.close()
+ *             if (ShoesNative.stop(shoesHandle)) {
+ *                 tunInterface?.close()
+ *             }
+ *             // On false the engine may still be reading the descriptor:
+ *             // leaking it beats closing a number the kernel will hand to
+ *             // the next socket.
  *             tunInterface = null
  *         }
  *         super.onDestroy()
@@ -188,12 +192,15 @@ object ShoesNative {
      * Signals shutdown and blocks until the engine has released the TUN
      * descriptor — usually a few milliseconds, but bounded at 5 seconds if a
      * task will not wind down. **Do not call this on the main thread**: the
-     * system's ANR budget is about the same 5 seconds. Close your
-     * `ParcelFileDescriptor` after it returns, not before.
+     * system's ANR budget is about the same 5 seconds.
      *
      * @param handle The handle returned by [start].
+     * @return true when the engine confirmed the stop — the descriptor is
+     *   released and closing your `ParcelFileDescriptor` is safe. false when
+     *   the wait timed out and the engine may still be reading it: prefer
+     *   leaking the descriptor to closing a number the kernel will reuse.
      */
-    external fun stop(handle: Long)
+    external fun stop(handle: Long): Boolean
 
     /**
      * Check whether the VPN service is currently running.
@@ -205,8 +212,10 @@ object ShoesNative {
     /**
      * Get the last error message from the shoes service.
      *
-     * Returns the error string if the service stopped due to an error,
-     * or null if no error has occurred (normal shutdown or still running).
+     * Returns the error string if the service stopped without being asked
+     * — a failure's message, or "service ended without being asked" for an
+     * unrequested but clean end — and null while the service is running
+     * normally or after a stop this process requested.
      */
     external fun getLastError(): String?
 
