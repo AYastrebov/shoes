@@ -794,7 +794,9 @@ mod tests {
 
         let yaml = format!(
             r#"
-- device_fd: 0
+- device_name: "tun0"
+  address: "10.99.0.1"
+  netmask: "255.255.255.0"
   dns:
     servers:
       - url: "udp://{dns_addr}"

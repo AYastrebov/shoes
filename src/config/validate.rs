@@ -2726,7 +2726,9 @@ mod tests {
         };
         format!(
             r#"
-- device_fd: 0
+- device_name: "tun0"
+  address: "10.99.0.1"
+  netmask: "255.255.255.0"
   dns:
     servers:
       - url: "{server_url}"{bootstrap_line}
@@ -2780,7 +2782,9 @@ mod tests {
 - dns_group: "sysgroup"
   dns_servers:
     - url: "system"
-- device_fd: 0
+- device_name: "tun0"
+  address: "10.99.0.1"
+  netmask: "255.255.255.0"
   dns:
     servers:
       - url: "https://dns.example.com/dns-query"
@@ -2814,7 +2818,9 @@ mod tests {
     #[tokio::test]
     async fn tun_dns_with_hostname_chain_hop_is_rejected() {
         let yaml = r#"
-- device_fd: 0
+- device_name: "tun0"
+  address: "10.99.0.1"
+  netmask: "255.255.255.0"
   dns:
     servers:
       - url: "https://1.1.1.1/dns-query"
