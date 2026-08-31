@@ -185,8 +185,11 @@ pub async fn run_tun_server(
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
 
-    // Channel for sending UDP responses back (stack thread will write to TUN)
-    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+    // Channel for sending UDP responses back (stack thread will write to
+    // TUN). Bounded with drop-on-full at the sender: if the stack thread
+    // stalls, datagrams are shed rather than queued without limit. 512
+    // MTU-sized packets is a few megabytes at worst.
+    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(512);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
     let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
@@ -452,7 +455,7 @@ where
 /// - Routes responses using the stored address (no NAT table lookup)
 async fn handle_udp_packets(
     from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
-    to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
+    to_stack_tx: mpsc::Sender<PacketBuffer>,
     waker: stack_common::StackWaker,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,

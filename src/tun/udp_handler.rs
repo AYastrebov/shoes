@@ -15,7 +15,7 @@ use std::{
 use etherparse::PacketBuilder;
 use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::stack_common::StackWaker;
 
@@ -29,7 +29,7 @@ pub struct UdpHandler {
     /// Receiver for UDP packets from TUN
     from_tun_rx: UnboundedReceiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
-    to_tun_tx: UnboundedSender<PacketBuffer>,
+    to_tun_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
     /// Wakes the stack thread after a send, so the response is written now
     /// rather than when the stack's idle wait times out.
     waker: StackWaker,
@@ -39,7 +39,7 @@ impl UdpHandler {
     /// Create a new UDP handler.
     pub fn new(
         from_tun_rx: UnboundedReceiver<PacketBuffer>,
-        to_tun_tx: UnboundedSender<PacketBuffer>,
+        to_tun_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
         waker: StackWaker,
     ) -> Self {
         Self {
@@ -70,21 +70,34 @@ pub struct UdpReader {
 
 /// Write half for sending UDP packets.
 pub struct UdpWriter {
-    to_tun_tx: UnboundedSender<PacketBuffer>,
+    to_tun_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
     waker: StackWaker,
 }
 
 impl UdpWriter {
-    /// Synchronous send that builds the UDP packet and sends it directly
-    /// on the unbounded channel, avoiding the need for an async runtime.
+    /// Synchronous send that builds the UDP packet and queues it without
+    /// needing an async runtime -- try_send never blocks, so a bounded
+    /// channel serves the synchronous caller as well as the unbounded one
+    /// did.
     pub fn send_sync(&self, message: UdpMessage) -> io::Result<()> {
         let (payload, src_addr, dst_addr) = message;
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
-        self.to_tun_tx
-            .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
-        (self.waker)();
-        Ok(())
+        match self.to_tun_tx.try_send(packet) {
+            Ok(()) => {
+                (self.waker)();
+                Ok(())
+            }
+            // Full: the stack thread is not draining. Dropping is correct
+            // for UDP -- the sender retransmits or the app retries -- and
+            // queuing without limit was the alternative.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                log::debug!("UDP response queue full; dropping datagram");
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+            }
+        }
     }
 }
 
@@ -111,18 +124,13 @@ impl Sink<UdpMessage> for UdpWriter {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Unbounded channel is always ready
+        // Always ready: start_send sheds on a full queue instead of
+        // blocking, which is the right backpressure for datagrams.
         Poll::Ready(Ok(()))
     }
 
     fn start_send(self: Pin<&mut Self>, item: UdpMessage) -> Result<(), Self::Error> {
-        let (payload, src_addr, dst_addr) = item;
-        let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
-        self.to_tun_tx
-            .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
-        (self.waker)();
-        Ok(())
+        self.send_sync(item)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

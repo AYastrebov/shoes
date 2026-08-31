@@ -114,7 +114,7 @@ impl TcpStackDirect {
     }
 
     /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: UnboundedReceiver<PacketBuffer>) {
+    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
         self.handle.set_udp_response_tx(rx)
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let client_fd = client.into_raw_fd();
 
         let mut stack = TcpStackDirect::new(client_fd, owning_options());
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         stack.set_udp_response_tx(rx);
         let waker = stack.udp_waker();
 

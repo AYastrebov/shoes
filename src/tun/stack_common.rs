@@ -153,8 +153,10 @@ pub struct NewTcpConnection {
 
 /// Shared state for communication between main thread and stack thread.
 pub struct SharedState {
-    /// Channel for UDP responses to write to TUN
-    pub udp_response_rx: Option<UnboundedReceiver<PacketBuffer>>,
+    /// Channel for UDP responses to write to TUN. Bounded, with
+    /// drop-on-full at the sender: a stalled stack thread must shed
+    /// datagrams, not queue them without limit.
+    pub udp_response_rx: Option<tokio::sync::mpsc::Receiver<PacketBuffer>>,
     /// Channel for notifying tokio about new TCP connections
     pub new_conn_tx: Option<UnboundedSender<NewTcpConnection>>,
 }
@@ -290,7 +292,7 @@ impl StackHandle {
     }
 
     /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: UnboundedReceiver<PacketBuffer>) {
+    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
         }
@@ -1150,7 +1152,7 @@ mod tests {
         running: Arc<AtomicBool>,
         conn_rx: UnboundedReceiver<NewTcpConnection>,
         udp_rx: UnboundedReceiver<PacketBuffer>,
-        udp_response_tx: UnboundedSender<PacketBuffer>,
+        udp_response_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -1161,7 +1163,7 @@ mod tests {
             let running = Arc::new(AtomicBool::new(true));
             let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
             let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (udp_response_tx, udp_response_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (udp_response_tx, udp_response_rx) = tokio::sync::mpsc::channel(64);
 
             let device = ScriptedDevice {
                 rx: script_rx,
@@ -1335,7 +1337,7 @@ mod tests {
             "10.0.0.2:5353".parse().unwrap(),
         )
         .unwrap();
-        harness.udp_response_tx.send(response.clone()).unwrap();
+        harness.udp_response_tx.try_send(response.clone()).unwrap();
         // The loop only drains the response channel when it wakes; give it a
         // packet-shaped reason rather than waiting out the idle timeout.
         harness
