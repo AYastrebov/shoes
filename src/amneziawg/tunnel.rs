@@ -123,6 +123,90 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// errors. Reaching this is the only way out of the decapsulate loop.
 const RECV_ERROR_FATAL_STREAK: u32 = 100;
 
+/// How often the liveness watchdog samples the traffic counters.
+const LIVENESS_TICK: Duration = Duration::from_secs(1);
+
+/// Deaf ticks -- outbound traffic on the tick, nothing received since the
+/// silence began -- before the watchdog asks for a rebind, and between
+/// repeat requests while the silence lasts. A rebind is the cheap repair
+/// for the silent failures a socket cannot report: a NAT mapping that
+/// expired while the device slept, a path that moved without an errno.
+const SILENCE_REBIND_TICKS: u32 = 20;
+
+/// Deaf ticks before the tunnel is declared dead. Only counts when a
+/// rebind *succeeded* during the silence: a fresh socket on a working
+/// network heard nothing either, so the peer is genuinely unreachable.
+/// While rebinds fail the device is between networks, and an outage is
+/// ridden out, not converted into an engine stop.
+const SILENCE_FATAL_TICKS: u32 = 90;
+
+/// Inbound-liveness accounting. The error streak above catches a socket
+/// that fails loudly; this catches one that fails silently -- traffic
+/// keeps going out, nothing ever comes back, and recv just blocks.
+///
+/// Counter snapshots are parameters rather than read here, so tests
+/// drive it without a tunnel.
+struct LivenessWatch {
+    offered_seen: usize,
+    received_seen: usize,
+    rebinds_seen: usize,
+    /// Ticks in the current silence on which traffic actually went out.
+    /// Idle ticks freeze the count rather than advancing it: silence
+    /// proves nothing when nothing was sent to answer.
+    deaf_ticks: u32,
+    /// Whether a rebind completed during this silence.
+    rebound_during_silence: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LivenessVerdict {
+    Fine,
+    Rebind,
+    Dead,
+}
+
+impl LivenessWatch {
+    fn new() -> Self {
+        Self {
+            offered_seen: 0,
+            received_seen: 0,
+            rebinds_seen: 0,
+            deaf_ticks: 0,
+            rebound_during_silence: false,
+        }
+    }
+
+    fn on_tick(&mut self, offered: usize, received: usize, rebinds: usize) -> LivenessVerdict {
+        // Inequality rather than subtraction: the counters wrap, and the
+        // only fact needed is whether each moved since the last tick.
+        let received_advanced = received != self.received_seen;
+        let offered_advanced = offered != self.offered_seen;
+        if rebinds != self.rebinds_seen {
+            self.rebound_during_silence = true;
+        }
+        self.offered_seen = offered;
+        self.received_seen = received;
+        self.rebinds_seen = rebinds;
+
+        if received_advanced {
+            self.deaf_ticks = 0;
+            self.rebound_during_silence = false;
+            return LivenessVerdict::Fine;
+        }
+        if !offered_advanced {
+            return LivenessVerdict::Fine;
+        }
+        self.deaf_ticks += 1;
+        if self.deaf_ticks >= SILENCE_FATAL_TICKS && self.rebound_during_silence {
+            return LivenessVerdict::Dead;
+        }
+        if self.deaf_ticks.is_multiple_of(SILENCE_REBIND_TICKS) {
+            return LivenessVerdict::Rebind;
+        }
+        LivenessVerdict::Fine
+    }
+}
+
 /// Consecutive-error accounting for the receive loop. Time is a
 /// parameter rather than read here, so tests inject it.
 struct RecvErrorStreak {
@@ -172,8 +256,10 @@ pub struct TunnelRuntime {
     pub ip_to_tunnel_tx: mpsc::Sender<Vec<u8>>,
     /// Channel to receive decapsulated IP packets for the virtual stack.
     pub ip_from_tunnel_rx: ParkingMutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    /// Set when the receive loop has terminated. The engine hears about
-    /// that through crate::fatal; the standalone binary has no engine, so
+    /// Set when the receive path is gone -- the receive loop terminated
+    /// on an error streak, or the liveness watchdog gave up on a socket
+    /// that stayed silent under traffic. The engine hears about either
+    /// through crate::fatal; the standalone binary has no engine, so
     /// the connector polls this instead and rebuilds the tunnel.
     dead: Arc<AtomicBool>,
     /// Abort handles for background tasks.
@@ -318,9 +404,16 @@ impl TunnelRuntime {
             })
         };
 
+        // Successful rebinds, ever. The liveness watchdog reads this to
+        // tell "silent because we are between networks" from "silent on a
+        // socket a rebind just renewed" -- only the second one implicates
+        // the peer.
+        let rebinds_completed = Arc::new(AtomicUsize::new(0));
+
         // Task 4: Rebind the endpoint socket when the network moves.
         let rebind_task = {
             let tunn = tunn.clone();
+            let rebinds = rebinds_completed.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
                 // mark of datagrams seen on this path. A rebind is a new path,
@@ -329,7 +422,26 @@ impl TunnelRuntime {
                 // its own; upstream's `Device` does the same on a peer roam.
                 // A no-op when random trailers are off.
                 tunn.lock().reset_udp_window();
+                rebinds.fetch_add(1, Ordering::Relaxed);
             }))
+        };
+
+        // Task 5: the liveness watchdog. The recv task catches a socket
+        // that fails loudly; this catches one that fails silently.
+        let liveness_task = {
+            let udp = udp_socket.clone();
+            let offered = packets_offered.clone();
+            let received = datagrams_received.clone();
+            let rebinds = rebinds_completed.clone();
+            let dead = dead.clone();
+            tokio::spawn(liveness_loop(
+                udp,
+                offered,
+                received,
+                rebinds,
+                dead,
+                fatal_generation,
+            ))
         };
 
         let mut abort_handles = vec![
@@ -337,9 +449,10 @@ impl TunnelRuntime {
             send_task.abort_handle(),
             timer_task.abort_handle(),
             rebind_task.abort_handle(),
+            liveness_task.abort_handle(),
         ];
 
-        // Task 5: only for a tunnel that asked for AmneziaWG 3.1 random
+        // Task 6: only for a tunnel that asked for AmneziaWG 3.1 random
         // trailers, which is the one setting here that cannot be wrong on its
         // own — it has to match the peer, and a mismatch is silent.
         if rebuild.amnezia.random_trailers {
@@ -714,6 +827,57 @@ async fn trailer_probe_loop(
                 // The same configuration validated at startup, so this is not
                 // reachable by a config error; log rather than kill the tunnel.
                 error!("AmneziaWG: could not rebuild the tunnel to probe trailers: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Watch the traffic counters for a receive path that died without an
+/// error: outbound traffic on tick after tick, nothing ever received.
+///
+/// The ladder is rebind first, death second. A rebind repairs the silent
+/// failures that are really ours -- an expired NAT mapping, a path that
+/// moved under the socket -- and costs nothing when it is wrong. Death is
+/// declared only once a rebind has succeeded during the silence and the
+/// peer still says nothing: at that point a fresh socket on a working
+/// network is being ignored, which no amount of waiting repairs, and the
+/// engine stopping with the reason beats an engine reporting healthy
+/// over a tunnel that cannot hear its peer.
+async fn liveness_loop(
+    udp: Arc<EndpointSocket>,
+    packets_offered: Arc<AtomicUsize>,
+    datagrams_received: Arc<AtomicUsize>,
+    rebinds_completed: Arc<AtomicUsize>,
+    dead: Arc<AtomicBool>,
+    fatal_generation: u64,
+) {
+    let mut watch = LivenessWatch::new();
+    loop {
+        tokio::time::sleep(LIVENESS_TICK).await;
+        match watch.on_tick(
+            packets_offered.load(Ordering::Relaxed),
+            datagrams_received.load(Ordering::Relaxed),
+            rebinds_completed.load(Ordering::Relaxed),
+        ) {
+            LivenessVerdict::Fine => {}
+            LivenessVerdict::Rebind => {
+                info!(
+                    "AmneziaWG: {} ticks of outbound traffic with nothing received; \
+                     rebinding the endpoint socket",
+                    watch.deaf_ticks
+                );
+                udp.request_rebind();
+            }
+            LivenessVerdict::Dead => {
+                let reason = format!(
+                    "AmneziaWG receive path went silent: {} seconds of outbound traffic \
+                     with nothing received, and a rebind did not help",
+                    watch.deaf_ticks
+                );
+                dead.store(true, Ordering::SeqCst);
+                error!("{reason}");
+                crate::fatal::report(fatal_generation, reason);
                 return;
             }
         }
@@ -1157,6 +1321,104 @@ mod tests {
             let now = t0 + std::time::Duration::from_secs(5 * i);
             assert!(matches!(streak.on_error(now), StreakVerdict::KeepGoing));
         }
+    }
+
+    /// Drive a LivenessWatch through `ticks` ticks of outbound traffic
+    /// with nothing received, returning what each tick said.
+    fn deaf_ticks(watch: &mut LivenessWatch, ticks: u32) -> Vec<LivenessVerdict> {
+        (0..ticks)
+            .map(|_| {
+                let offered = watch.offered_seen.wrapping_add(1);
+                let received = watch.received_seen;
+                let rebinds = watch.rebinds_seen;
+                watch.on_tick(offered, received, rebinds)
+            })
+            .collect()
+    }
+
+    /// An idle tunnel receives nothing because nothing asked the peer to
+    /// answer. Silence without traffic behind it must prove nothing.
+    #[test]
+    fn an_idle_tunnel_never_trips_the_liveness_watchdog() {
+        let mut watch = LivenessWatch::new();
+        for _ in 0..1000 {
+            assert_eq!(watch.on_tick(7, 3, 0), LivenessVerdict::Fine);
+        }
+    }
+
+    #[test]
+    fn a_tunnel_whose_peer_answers_stays_fine() {
+        let mut watch = LivenessWatch::new();
+        for i in 1..=1000usize {
+            assert_eq!(watch.on_tick(i, i, 0), LivenessVerdict::Fine);
+        }
+    }
+
+    #[test]
+    fn sustained_silence_under_traffic_asks_for_a_rebind() {
+        let mut watch = LivenessWatch::new();
+        let verdicts = deaf_ticks(&mut watch, SILENCE_REBIND_TICKS);
+        assert!(
+            verdicts[..verdicts.len() - 1]
+                .iter()
+                .all(|v| *v == LivenessVerdict::Fine),
+            "rebind came early: {verdicts:?}"
+        );
+        assert_eq!(*verdicts.last().unwrap(), LivenessVerdict::Rebind);
+    }
+
+    /// A device between networks cannot rebind, and its silence is an
+    /// outage to ride out -- the watchdog keeps asking for the rebind but
+    /// must never convert unrebindable silence into a death.
+    #[test]
+    fn without_a_successful_rebind_the_watchdog_never_declares_death() {
+        let mut watch = LivenessWatch::new();
+        let verdicts = deaf_ticks(&mut watch, 10 * SILENCE_FATAL_TICKS);
+        assert!(verdicts.iter().all(|v| *v != LivenessVerdict::Dead));
+        assert!(verdicts.contains(&LivenessVerdict::Rebind));
+    }
+
+    /// A fresh socket on a working network that still hears nothing is
+    /// the one silence that implicates the peer.
+    #[test]
+    fn silence_that_survives_a_rebind_is_death() {
+        let mut watch = LivenessWatch::new();
+        deaf_ticks(&mut watch, SILENCE_REBIND_TICKS);
+        // The requested rebind succeeds: the rebind counter moves on the
+        // next deaf tick.
+        watch.on_tick(
+            watch.offered_seen.wrapping_add(1),
+            watch.received_seen,
+            watch.rebinds_seen.wrapping_add(1),
+        );
+        let verdicts = deaf_ticks(&mut watch, SILENCE_FATAL_TICKS - SILENCE_REBIND_TICKS - 1);
+        assert_eq!(*verdicts.last().unwrap(), LivenessVerdict::Dead);
+        assert!(
+            !verdicts[..verdicts.len() - 1].contains(&LivenessVerdict::Dead),
+            "death came early"
+        );
+    }
+
+    /// One received datagram ends the episode entirely: the deaf count
+    /// and the rebind evidence both reset, so a healthy tunnel that
+    /// later goes quiet starts from zero.
+    #[test]
+    fn a_received_datagram_resets_the_liveness_episode() {
+        let mut watch = LivenessWatch::new();
+        deaf_ticks(&mut watch, SILENCE_FATAL_TICKS - 1);
+        // A rebind lands and, on the same tick, a datagram arrives.
+        assert_eq!(
+            watch.on_tick(
+                watch.offered_seen,
+                watch.received_seen.wrapping_add(1),
+                watch.rebinds_seen.wrapping_add(1),
+            ),
+            LivenessVerdict::Fine
+        );
+        // A full fatal window of deaf traffic is needed again, and the
+        // old rebind no longer counts as evidence.
+        let verdicts = deaf_ticks(&mut watch, SILENCE_FATAL_TICKS + 10);
+        assert!(verdicts.iter().all(|v| *v != LivenessVerdict::Dead));
     }
 
     #[test]
