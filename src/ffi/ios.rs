@@ -121,9 +121,14 @@ struct IosSocketProtector;
 
 impl crate::socket_protector::SocketProtector for IosSocketProtector {
     fn protect(&self, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-        let callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
+        // Copied out under the lock, called with it released -- the same
+        // discipline as fire_stopped. Holding the slot across the Swift
+        // call let a slow protect() block shoes_stop's final clear for
+        // as long as Swift took, unbounded, against shoes_stop's
+        // documented five-second ceiling.
+        let callback = *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
 
-        if let Some(callback) = *callback_guard {
+        if let Some(callback) = callback {
             if callback(fd as c_int) {
                 Ok(())
             } else {

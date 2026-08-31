@@ -38,6 +38,18 @@
 //! - `shoes_start` / `shoes_start_tun` starts a background thread for the TUN service
 //! - `shoes_stop` signals shutdown and waits for cleanup
 
+// The whole surface is written against panic = "abort": ExitGuard's Drop
+// never runs on a panic (a claim control/mod.rs states outright), the
+// callback contract promises a panicking engine cannot report a clean
+// stop, and a panic must never unwind across extern "C" (UB). Only the
+// release-mobile profile sets abort, so an artifact cut with plain
+// --release silently got the unwinding behavior: a panicking engine
+// delivered on_exit as a reasonless clean stop. Refuse the build
+// instead. Debug and test builds unwind by design and are exempt --
+// cargo test runs this module's suites under unwinding.
+#[cfg(all(not(panic = "abort"), not(test), not(debug_assertions)))]
+compile_error!("release FFI builds require panic = \"abort\"; build with --profile release-mobile");
+
 // Common utilities shared between the Apple and Android surfaces
 #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos", test))]
 mod common;
