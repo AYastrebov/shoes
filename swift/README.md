@@ -38,7 +38,7 @@ Subclass `ShoesPacketTunnelProvider` and supply what is yours:
 import ShoesTunnel
 
 final class Provider: ShoesPacketTunnelProvider {
-    override func loadConfiguration() throws -> ShoesConfiguration {
+    override func loadConfiguration() async throws -> ShoesConfiguration {
         // However your app hands the config over -- an App Group file, for
         // instance. The YAML is passed through verbatim; write
         // `device_fd: 0` or omit the field, the descriptor is supplied by
