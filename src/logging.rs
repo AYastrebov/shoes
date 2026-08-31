@@ -41,31 +41,77 @@ impl LogWriter for StderrWriter {
     }
 }
 
+/// Bytes a log file may reach before it is rotated to `<path>.old`,
+/// replacing the previous rotation. Two files bound the disk cost at about
+/// twice this: an unattended machine that wakes into a broken network used
+/// to append error lines without limit for as long as nobody looked.
+const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Writes to a file opened at init time. Each log line is a single write() syscall
 /// to the kernel page cache (no BufWriter needed -- the kernel handles writeback).
+/// Rotates at [`LOG_ROTATE_BYTES`].
 pub struct FileLogWriter {
-    file: parking_lot::Mutex<File>,
+    state: parking_lot::Mutex<FileLogState>,
+    path: String,
+    rotate_at: u64,
+}
+
+struct FileLogState {
+    file: File,
+    written: u64,
 }
 
 impl FileLogWriter {
     pub fn new(path: &str) -> std::io::Result<Self> {
+        Self::with_rotation(path, LOG_ROTATE_BYTES)
+    }
+
+    /// The threshold is a parameter so tests rotate in bytes, not
+    /// megabytes.
+    fn with_rotation(path: &str, rotate_at: u64) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Counted from the existing size: appending to a file already at
+        // the cap must rotate on the first write, not a full cap later.
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
-            file: parking_lot::Mutex::new(file),
+            state: parking_lot::Mutex::new(FileLogState { file, written }),
+            path: path.to_owned(),
+            rotate_at,
         })
+    }
+
+    fn rotate(&self, state: &mut FileLogState) {
+        // Rename-then-reopen: on Unix the rename succeeds under the open
+        // descriptor. On Windows it can fail while the file is open; the
+        // reopen then lands on the same file and the reset counter retries
+        // at the next threshold -- no rotation there, but bounded retries
+        // and never a lost line.
+        let _ = std::fs::rename(&self.path, format!("{}.old", self.path));
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            state.file = file;
+        }
+        state.written = 0;
     }
 }
 
 impl LogWriter for FileLogWriter {
     fn write_log(&self, _record: &Record, formatted: &str) {
-        let mut guard = self.file.lock();
+        let mut guard = self.state.lock();
         let mut line = formatted.to_string();
         line.push('\n');
-        let _ = guard.write_all(line.as_bytes());
+        let _ = guard.file.write_all(line.as_bytes());
+        guard.written += line.len() as u64;
+        if guard.written >= self.rotate_at {
+            self.rotate(&mut guard);
+        }
     }
 
     fn flush(&self) {
-        let _ = self.file.lock().flush();
+        let _ = self.state.lock().file.flush();
     }
 }
 
@@ -594,5 +640,34 @@ mod tests {
             // A build with Trace compiled in has nothing past the ceiling.
             None => assert_eq!(ceiling, LevelFilter::Trace),
         }
+    }
+
+    /// -l wrote a file that grew forever; the writer must rotate at its
+    /// threshold and keep writing to a fresh file.
+    #[test]
+    fn the_file_writer_rotates_at_the_threshold() {
+        let dir = std::env::temp_dir().join(format!("shoes-log-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        let path_str = path.to_str().unwrap();
+
+        let writer = FileLogWriter::with_rotation(path_str, 64).unwrap();
+        for _ in 0..10 {
+            writer.write_log(
+                &Record::builder().args(format_args!("")).build(),
+                "a-sixteen-byte-l",
+            );
+        }
+
+        let old = format!("{path_str}.old");
+        assert!(
+            std::path::Path::new(&old).exists(),
+            "rotation never happened"
+        );
+        // The live file was reopened fresh: smaller than the threshold even
+        // though ten times it was written in total.
+        assert!(std::fs::metadata(path_str).unwrap().len() < 64);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
