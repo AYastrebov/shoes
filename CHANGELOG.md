@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### The TUN server honours its `dns:` config
+
+A TUN entry's `dns:` block parsed, validated, had its resolvers built --
+and the datapath used the system resolver anyway. It is real now: the
+configured resolver answers client-chain hostnames, UDP destinations,
+and the WireGuard/AmneziaWG endpoint's re-resolution on rebinds and
+rebuilds. **Behaviour changes only for configs that already carry
+`dns:` on a TUN entry** (previously ignored); without the block nothing
+changes. Every DNS upstream socket goes through the socket protector,
+so a query cannot route into the tunnel it resolves for. One new
+validation rule: a hostname DNS URL without a `bootstrap_url` is
+rejected in TUN configs -- it would silently use the system resolver,
+the exact leak the block exists to prevent; IP-address URLs
+(`https://1.1.1.1/dns-query`) keep needing no bootstrap.
+
 ### The desktop binary behaves like a daemon
 
 SIGINT and SIGTERM stop the accept loops, flush the logs, and exit
