@@ -236,7 +236,9 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
-    // Validate TUN configs.
+    // Validate TUN configs. The dns-safety verdicts are computed once for
+    // all groups; each TUN entry is then a lookup.
+    let tun_dns_verdicts = tun_dns_verdicts(&final_dns_groups);
     for config in tun_configs.iter_mut() {
         validate_tun_config(
             config,
@@ -246,7 +248,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut outbounds,
         )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
-        validate_tun_dns_needs_no_system_resolver(&config.dns, &final_dns_groups)?;
+        validate_tun_dns_needs_no_system_resolver(&config.dns, &tun_dns_verdicts)?;
     }
 
     // Combine into Config list (only Server and TunServer variants)
@@ -468,57 +470,133 @@ fn expand_dns_groups_composition(
 /// A hostname URL is resolved through the spec's bootstrap resolver, and
 /// without `bootstrap_url` that is the system resolver -- on a TUN whose
 /// whole point is to keep names off plaintext UDP:53, a silent leak
-/// dressed as DoH. IP-address URLs (`https://1.1.1.1/dns-query`) need no
-/// resolution and keep working with no bootstrap; `url: system` stays
-/// allowed because it asks for the system resolver explicitly. Groups a
-/// bootstrap_url names are checked transitively: the leak is the same one
-/// hop down. Plain server configs keep the system-bootstrap convenience.
-fn validate_tun_dns_needs_no_system_resolver(
-    dns: &Option<DnsConfig>,
-    groups: &[ExpandedDnsGroup],
-) -> std::io::Result<()> {
-    let Some(group_name) = dns.as_ref().and_then(|c| c.resolved_group()) else {
-        return Ok(());
-    };
-    let by_name: HashMap<&str, &ExpandedDnsGroup> =
-        groups.iter().map(|g| (g.name.as_str(), g)).collect();
-    let mut visited: HashSet<&str> = HashSet::new();
-    let mut stack = vec![group_name];
-    while let Some(name) = stack.pop() {
-        if !visited.insert(name) {
-            continue;
-        }
-        let Some(group) = by_name.get(name) else {
-            continue; // the group ref was validated already
-        };
-        for spec in &group.specs {
-            // Parsed successfully once during expansion; a parse failure
-            // here would already have failed validation.
-            let parsed = ParsedDnsUrl::parse(&spec.url).map_err(|e| {
-                std::io::Error::other(format!("invalid DNS url '{}': {e}", spec.url))
-            })?;
-            match &spec.bootstrap_url {
-                Some(bootstrap) => {
-                    // An IP-only bootstrap URL was validated in expansion;
-                    // a group name recurses, since a hostname there leaks
-                    // the same way one hop down.
-                    if by_name.contains_key(bootstrap.as_str()) {
-                        stack.push(bootstrap.as_str());
+/// dressed as DoH. The same fallback hides two more ways: a bootstrap
+/// chain that bottoms out in `url: system` (explicit at the root, but a
+/// silent fallback when a hostname resolves THROUGH it), and a
+/// `client_chain` hop at a hostname, which the DNS builder resolves with
+/// a plain system resolver. IP-address URLs need no resolution and keep
+/// working with no bootstrap; `url: system` directly in the TUN's own
+/// group stays allowed as the explicit request it is. Plain server
+/// configs keep the system-bootstrap convenience.
+///
+/// Verdicts are computed once for all groups, in the bootstrap-first
+/// order `final_dns_groups` already carries, so each group reuses its
+/// bootstrap groups' verdicts -- the same edges the topological sort
+/// walked -- instead of re-deriving them per TUN entry.
+struct TunDnsVerdict {
+    /// Why this group cannot be a TUN entry's own dns group.
+    as_root: Option<String>,
+    /// Why this group cannot sit anywhere in a TUN entry's bootstrap
+    /// chain: everything in `as_root`, plus `url: system`, which is only
+    /// explicit at the root.
+    as_bootstrap: Option<String>,
+}
+
+fn tun_dns_verdicts(groups: &[ExpandedDnsGroup]) -> HashMap<&str, TunDnsVerdict> {
+    fn chain_hop_hostname(chains: &[ClientChain]) -> Option<&str> {
+        chains
+            .iter()
+            .flat_map(|chain| chain.hops.iter())
+            .flat_map(
+                |hop| -> Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> {
+                    match hop {
+                        ClientChainHop::Single(sel) => Box::new(std::iter::once(sel)),
+                        ClientChainHop::Pool(pool) => Box::new(pool.iter()),
                     }
-                }
+                },
+            )
+            .find_map(|sel| match sel {
+                ConfigSelection::Config(cfg) => cfg.address.address().hostname(),
+                // Group refs are resolved to configs during expansion.
+                ConfigSelection::GroupName(_) => None,
+            })
+    }
+
+    let mut verdicts: HashMap<&str, TunDnsVerdict> = HashMap::new();
+    for group in groups {
+        let mut as_root: Option<String> = None;
+        let mut as_bootstrap: Option<String> = None;
+        for spec in &group.specs {
+            // Parsed successfully during expansion; unparseable URLs never
+            // reach this point.
+            let Ok(parsed) = ParsedDnsUrl::parse(&spec.url) else {
+                continue;
+            };
+            if matches!(parsed, ParsedDnsUrl::System) {
+                as_bootstrap.get_or_insert_with(|| {
+                    format!(
+                        "group '{}' contains 'url: system': reached through a bootstrap \
+                         chain, that IS the silent system-resolver fallback",
+                        group.name
+                    )
+                });
+                continue;
+            }
+            if let Some(host) = chain_hop_hostname(&spec.client_chains) {
+                let msg = format!(
+                    "TUN dns server '{}' reaches its upstream through a client_chain hop \
+                     at hostname '{host}', which is resolved by the system resolver. Use \
+                     an IP address for the hop.",
+                    spec.url
+                );
+                as_root.get_or_insert_with(|| msg.clone());
+                as_bootstrap.get_or_insert(msg);
+            }
+            match &spec.bootstrap_url {
                 None => {
                     if parsed.has_hostname() {
-                        return Err(std::io::Error::other(format!(
+                        let msg = format!(
                             "TUN dns server '{}' has a hostname URL and no bootstrap_url: \
                              resolving it would silently use the system resolver, which is \
                              the leak the dns block exists to prevent. Use an IP-address URL \
                              (e.g. https://1.1.1.1/dns-query) or add a bootstrap_url.",
                             spec.url
-                        )));
+                        );
+                        as_root.get_or_insert_with(|| msg.clone());
+                        as_bootstrap.get_or_insert(msg);
+                    }
+                }
+                Some(bootstrap) => {
+                    // A group-name bootstrap inherits that group's
+                    // as-bootstrap verdict; groups are in dependency order,
+                    // so it is already computed. IP-only bootstrap URLs
+                    // were validated during expansion.
+                    if let Some(v) = verdicts.get(bootstrap.as_str())
+                        && let Some(reason) = &v.as_bootstrap
+                    {
+                        let msg = format!(
+                            "TUN dns server '{}' bootstraps through group '{bootstrap}', \
+                             which cannot serve a TUN bootstrap chain: {reason}",
+                            spec.url
+                        );
+                        as_root.get_or_insert_with(|| msg.clone());
+                        as_bootstrap.get_or_insert(msg);
                     }
                 }
             }
         }
+        verdicts.insert(
+            group.name.as_str(),
+            TunDnsVerdict {
+                as_root,
+                as_bootstrap,
+            },
+        );
+    }
+    verdicts
+}
+
+fn validate_tun_dns_needs_no_system_resolver(
+    dns: &Option<DnsConfig>,
+    verdicts: &HashMap<&str, TunDnsVerdict>,
+) -> std::io::Result<()> {
+    let Some(group_name) = dns.as_ref().and_then(|c| c.resolved_group()) else {
+        return Ok(());
+    };
+    if let Some(v) = verdicts.get(group_name)
+        && let Some(reason) = &v.as_root
+    {
+        return Err(std::io::Error::other(reason.clone()));
     }
     Ok(())
 }
@@ -2691,6 +2769,71 @@ mod tests {
         let yaml = tun_yaml_with_dns("https://dns.example.com/dns-query", Some("udp://1.1.1.1"));
         let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
         validate_configs_test(configs).await.unwrap();
+    }
+
+    /// `system` one hop down is the same silent fallback the direct form
+    /// is rejected for: a hostname URL bootstrapped by a group containing
+    /// `url: system` still resolves the hostname over plaintext UDP:53.
+    #[tokio::test]
+    async fn tun_dns_bootstrapped_by_a_system_group_is_rejected() {
+        let yaml = r#"
+- dns_group: "sysgroup"
+  dns_servers:
+    - url: "system"
+- device_fd: 0
+  dns:
+    servers:
+      - url: "https://dns.example.com/dns-query"
+        bootstrap_url: "sysgroup"
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_configs_test(configs).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("system"), "got: {msg}");
+        assert!(msg.contains("bootstrap"), "got: {msg}");
+    }
+
+    /// `url: system` directly in the TUN's own group is the explicit
+    /// request it looks like, and stays allowed.
+    #[tokio::test]
+    async fn tun_dns_with_explicit_system_url_is_allowed() {
+        let yaml = tun_yaml_with_dns("system", None);
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        validate_configs_test(configs).await.unwrap();
+    }
+
+    /// A DNS upstream reached through a client_chain hop at a hostname
+    /// resolves that hop with the system resolver -- the leak moves one
+    /// layer, it does not close. Rejected with the hop named.
+    #[tokio::test]
+    async fn tun_dns_with_hostname_chain_hop_is_rejected() {
+        let yaml = r#"
+- device_fd: 0
+  dns:
+    servers:
+      - url: "https://1.1.1.1/dns-query"
+        client_chain:
+          - address: "proxy.example.com:1080"
+            protocol:
+              type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_configs_test(configs).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("proxy.example.com"), "got: {msg}");
+        assert!(msg.contains("client_chain"), "got: {msg}");
     }
 
     /// The same hostname-without-bootstrap group on a plain server keeps
