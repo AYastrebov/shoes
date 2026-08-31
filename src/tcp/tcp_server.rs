@@ -28,6 +28,34 @@ use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 #[cfg(any(unix, windows))]
 use crate::tun::start_tun_server;
 
+/// How long an accept loop sleeps after an error that means the process is
+/// out of a resource. Long enough to stop the spin, short enough that the
+/// first connection after recovery waits imperceptibly.
+const ACCEPT_EXHAUSTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether an accept error means a process- or system-wide resource ran out.
+///
+/// These do not consume the pending connection: `accept` fails and the
+/// backlog entry stays, so the same error returns immediately and a bare
+/// `continue` spins the loop at CPU speed, logging each turn -- fd
+/// exhaustion elsewhere in the process turned into a hot loop and a log
+/// flood here. Per-connection errors (`ECONNABORTED`) do consume their
+/// entry and are safe to retry at once.
+fn accept_exhausted_a_resource(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEMFILE, WSAENOBUFS: WinSock's numbers for the same facts.
+        matches!(e.raw_os_error(), Some(10024 | 10055))
+    }
+}
+
 async fn run_tcp_server(
     bind_address: SocketAddr,
     tcp_config: TcpConfig,
@@ -44,6 +72,9 @@ async fn run_tcp_server(
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e}");
+                if accept_exhausted_a_resource(&e) {
+                    tokio::time::sleep(ACCEPT_EXHAUSTION_BACKOFF).await;
+                }
                 continue;
             }
         };
@@ -97,6 +128,9 @@ async fn run_unix_server(
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e:?}");
+                if accept_exhausted_a_resource(&e) {
+                    tokio::time::sleep(ACCEPT_EXHAUSTION_BACKOFF).await;
+                }
                 continue;
             }
         };
@@ -425,4 +459,27 @@ async fn start_tcp_servers(
     }
 
     Ok(handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// EMFILE does not consume the backlog entry, so retrying instantly
+    /// spins; ECONNABORTED does consume it, so backing off would only
+    /// slow real clients behind it.
+    #[test]
+    #[cfg(unix)]
+    fn only_resource_exhaustion_backs_the_accept_loop_off() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(accept_exhausted_a_resource(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        for errno in [libc::ECONNABORTED, libc::EAGAIN, libc::EINTR] {
+            assert!(!accept_exhausted_a_resource(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+    }
 }
