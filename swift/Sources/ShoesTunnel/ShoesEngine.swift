@@ -79,13 +79,19 @@ public final class ShoesEngine: Sendable {
     /// descriptor: milliseconds in practice, bounded at five seconds by the
     /// library. Runs `shoes_stop` off the caller's executor, so it is safe
     /// to await from a provider callback that has a deadline of its own.
-    public func stop() async {
+    ///
+    /// Returns whether the engine confirmed the release. `false` means the
+    /// wait timed out and the engine may still be reading the descriptor --
+    /// the answer `shoes_stop` has always computed and this wrapper used to
+    /// discard. Discarding it still reproduces the old behavior.
+    @discardableResult
+    public func stop() async -> Bool {
         // Cleared first, as the library clears its own slot before it stops:
         // a requested stop is not an event, and a traffic tick during it is
         // not worth delivering.
         CallbackBridge.shared.clear()
-        await Task.detached(priority: .userInitiated) {
-            shoes_stop(1)
+        return await Task.detached(priority: .userInitiated) {
+            shoes_stop(1) == 1
         }.value
     }
 
