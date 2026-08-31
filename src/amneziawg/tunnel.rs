@@ -335,6 +335,13 @@ impl TunnelRuntime {
         // counts, the trailer probe reads -- to tell "the peer answers but
         // nothing parses" from "nothing arrives at all" (probe_message).
         let datagrams_received = Arc::new(AtomicUsize::new(0));
+
+        // Datagrams that decapsulated, ever. The liveness watchdog reads
+        // this one, not arrivals: a peer spraying traffic a stale session
+        // cannot decrypt would otherwise count as "answering" while apps
+        // see a black hole -- the exact deafness the watchdog exists to
+        // catch, hidden by sampling one layer too low.
+        let datagrams_decapsulated = Arc::new(AtomicUsize::new(0));
         let dead = Arc::new(AtomicBool::new(false));
 
         // The live trailer setting, for EMSGSIZE handling. An atomic
@@ -364,6 +371,7 @@ impl TunnelRuntime {
             let udp = udp_socket.clone();
             let tx = ip_from_tunnel_tx;
             let received = datagrams_received.clone();
+            let decapsulated = datagrams_decapsulated.clone();
             let trailers = trailers_on.clone();
             let dead = dead.clone();
             tokio::spawn(async move {
@@ -372,7 +380,7 @@ impl TunnelRuntime {
                 // builds with panic = "abort", where the process's death
                 // is its own announcement. An abort of this task merely
                 // drops the future -- no catch, no false report.
-                let loop_future = decapsulate_loop(tunn, udp, tx, received, trailers);
+                let loop_future = decapsulate_loop(tunn, udp, tx, received, decapsulated, trailers);
                 let reason = match std::panic::AssertUnwindSafe(loop_future)
                     .catch_unwind()
                     .await
@@ -461,13 +469,13 @@ impl TunnelRuntime {
         let liveness_task = {
             let udp = udp_socket.clone();
             let offered = packets_offered.clone();
-            let received = datagrams_received.clone();
+            let decapsulated = datagrams_decapsulated.clone();
             let rebinds = rebinds_completed.clone();
             let dead = dead.clone();
             tokio::spawn(liveness_loop(
                 udp,
                 offered,
-                received,
+                decapsulated,
                 rebinds,
                 dead,
                 fatal_generation,
@@ -521,6 +529,7 @@ async fn decapsulate_loop(
     udp: Arc<EndpointSocket>,
     tx: mpsc::Sender<Vec<u8>>,
     datagrams_received: Arc<AtomicUsize>,
+    datagrams_decapsulated: Arc<AtomicUsize>,
     trailers_on: Arc<AtomicBool>,
 ) -> String {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
@@ -579,6 +588,13 @@ async fn decapsulate_loop(
             let mut tunn = tunn.lock();
             tunn.decapsulate(None, &buf[..n], &mut out)
         };
+
+        // Anything but Err means the datagram was genuinely the peer's:
+        // decrypted data, a handshake message, or a keepalive. That is
+        // what the liveness watchdog means by "answered".
+        if !matches!(result, TunnResult::Err(_)) {
+            datagrams_decapsulated.fetch_add(1, Ordering::Relaxed);
+        }
 
         match result {
             TunnResult::Done => {}
@@ -877,7 +893,7 @@ async fn trailer_probe_loop(
 async fn liveness_loop(
     udp: Arc<EndpointSocket>,
     packets_offered: Arc<AtomicUsize>,
-    datagrams_received: Arc<AtomicUsize>,
+    datagrams_decapsulated: Arc<AtomicUsize>,
     rebinds_completed: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
     fatal_generation: u64,
@@ -887,7 +903,7 @@ async fn liveness_loop(
         tokio::time::sleep(LIVENESS_TICK).await;
         match watch.on_tick(
             packets_offered.load(Ordering::Relaxed),
-            datagrams_received.load(Ordering::Relaxed),
+            datagrams_decapsulated.load(Ordering::Relaxed),
             rebinds_completed.load(Ordering::Relaxed),
         ) {
             LivenessVerdict::Fine => {}
