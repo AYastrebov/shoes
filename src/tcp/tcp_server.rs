@@ -67,22 +67,6 @@ fn accept_exhausted_a_resource(e: &std::io::Error) -> bool {
 /// has to ride out.
 const MAX_INFLIGHT_PER_LISTENER: usize = 4096;
 
-/// Whether a connection's terminal error is routine client behavior -- a
-/// scanner probing the port, a peer that reset mid-handshake, a setup that
-/// timed out -- rather than something an operator should read at error
-/// level. Logging these per connection at error level was a log flood any
-/// internet-facing listener produced continuously.
-fn is_routine_disconnect(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::TimedOut
-    )
-}
-
 async fn run_tcp_server(
     listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
@@ -129,10 +113,13 @@ async fn run_tcp_server(
             let _permit = permit;
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
-                Err(e) if is_routine_disconnect(&e) => {
-                    debug!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e)
-                }
-                Err(e) => error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e),
+                Err(e) => log::log!(
+                    crate::util::connection_end_level(&e),
+                    "{}:{} finished with error: {:?}",
+                    addr.ip(),
+                    addr.port(),
+                    e
+                ),
             }
         });
     }
@@ -185,10 +172,10 @@ async fn run_unix_server(
             let _permit = permit;
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{addr:?} finished successfully"),
-                Err(e) if is_routine_disconnect(&e) => {
-                    debug!("{addr:?} finished with error: {e:?}")
-                }
-                Err(e) => error!("{addr:?} finished with error: {e:?}"),
+                Err(e) => log::log!(
+                    crate::util::connection_end_level(&e),
+                    "{addr:?} finished with error: {e:?}"
+                ),
             }
         });
     }
