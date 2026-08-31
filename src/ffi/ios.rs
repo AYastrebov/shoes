@@ -34,6 +34,13 @@ use super::common::{self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE
 /// Socket protector callback type.
 /// Called from Rust to protect sockets from VPN routing.
 /// The callback receives a file descriptor and should return true if protected successfully.
+///
+/// Like the stopped callback, a call already in flight when `shoes_stop`
+/// begins may still complete after `shoes_stop` returns -- the pointer
+/// must stay valid until then (a non-capturing function, not a freed
+/// trampoline). A protect that runs after the slot is cleared reports
+/// success without protecting; the socket it was for belongs to a
+/// session that is already gone.
 pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 
 /// Traffic statistics callback type.
@@ -49,7 +56,10 @@ pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes:
 ///
 /// Called once, from a shoes worker thread, when the engine stops without
 /// `shoes_stop` having been called: a failure, or a task that ended on its
-/// own. `reason` is the failure message, or NULL when there is none; it is
+/// own. `reason` is the failure message -- currently always non-NULL: an
+/// unrequested clean end carries "service ended without being asked".
+/// NULL stays reserved for "no reason", so treat it as such if it ever
+/// appears; the pointer is
 /// valid for the duration of the call only, and `shoes_get_last_error`
 /// returns the same text afterwards. Never called for a stop the host
 /// requested and never for a start that failed; a call already in flight
@@ -85,16 +95,6 @@ fn stopped_slot_is_empty() -> bool {
         .is_none_or(|slot| slot.lock().is_none())
 }
 
-/// A C string from an arbitrary message. An interior NUL is replaced
-/// rather than allowed to fail the conversion: the messages are io::Error
-/// text derived from config values and peer data, and a failure whose
-/// message could not cross the boundary used to be delivered as a clean
-/// stop -- NULL to the callback AND NULL from shoes_get_last_error, the
-/// one state the contract reserves for "no reason".
-fn c_string_lossy(s: String) -> CString {
-    CString::new(s.replace('\0', "\u{fffd}")).expect("NULs were just replaced")
-}
-
 /// Deliver an exit to the host. The reason is stored for
 /// `shoes_get_last_error` first, and the lock is released before the call
 /// so a callback that calls `shoes_stop` cannot deadlock on this slot.
@@ -107,7 +107,7 @@ fn fire_stopped(reason: Option<String>) {
         .lock()
         .take();
     let Some(callback) = callback else { return };
-    match reason.map(c_string_lossy) {
+    match reason.map(common::c_string_lossy) {
         Some(c) => callback(c.as_ptr()),
         None => callback(std::ptr::null()),
     }
@@ -295,18 +295,12 @@ unsafe fn start_service(
     traffic_callback: ShoesTrafficCallback,
     stopped_callback: ShoesStoppedCallback,
 ) -> c_long {
-    // The natural auto-reconnect mistake: shoes_start from inside the
-    // stopped callback, which runs on a worker of the dying session's
-    // runtime. block_on below then panics ("Cannot start a runtime from
-    // within a runtime"), and panic = "abort" turns that into process
-    // death. Refused with a reason instead.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        error!("{who}: called from a shoes runtime thread (the stopped callback?)");
-        common::set_last_error(
-            "shoes_start called from a shoes callback thread; \
-             dispatch the restart to another thread"
-                .to_string(),
-        );
+    // block_on below panics on a thread that already has a tokio
+    // runtime context -- process death under panic = "abort". See
+    // common::refuse_start_from_runtime_thread for the contexts this
+    // covers (the stopped callback being the common one) and the
+    // deliberate over-breadth.
+    if common::refuse_start_from_runtime_thread(who) {
         return -1;
     }
 
@@ -617,7 +611,7 @@ pub extern "C" fn shoes_get_last_error() -> *mut c_char {
         // Lossy rather than NULL on an interior NUL: NULL means "no
         // error", and a message that cannot cross the boundary must not
         // read as one.
-        Some(msg) => c_string_lossy(msg).into_raw(),
+        Some(msg) => common::c_string_lossy(msg).into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -738,7 +732,7 @@ mod tests {
         });
         assert_eq!(handle, -1);
         let err = common::get_last_error().unwrap_or_default();
-        assert!(err.contains("callback thread"), "got: {err}");
+        assert!(err.contains("tokio runtime context"), "got: {err}");
         assert!(!shoes_is_running());
     }
 

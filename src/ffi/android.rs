@@ -43,7 +43,10 @@ impl LogWriter for LogcatWriter {
         {
             use std::ffi::CString;
             let tag = CString::new("shoes").unwrap_or_default();
-            let msg = CString::new(format!("{}", record.args())).unwrap_or_default();
+            // Lossy, not unwrap_or_default: a log line containing a NUL
+            // became an EMPTY logcat entry -- the line most worth reading
+            // (it quoted hostile input) was the one that vanished.
+            let msg = common::c_string_lossy(format!("{}", record.args()));
             let priority = match record.level() {
                 log::Level::Error => 6, // ANDROID_LOG_ERROR
                 log::Level::Warn => 5,  // ANDROID_LOG_WARN
@@ -179,15 +182,11 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     protect_callback: JObject<'local>,
     traffic_callback: JObject<'local>,
 ) -> jlong {
-    // A start from inside the traffic callback runs on a worker of the
-    // running session's runtime, and block_on below then panics ("Cannot
-    // start a runtime from within a runtime") -- process death under
-    // panic = "abort". Refused with a reason instead.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        error!("start: called from a shoes runtime thread (a callback?)");
-        common::set_last_error(
-            "start called from a shoes callback thread; dispatch it to another thread".to_string(),
-        );
+    // block_on below panics on a thread that already has a tokio
+    // runtime context (the traffic callback's worker being the way in
+    // here) -- process death under panic = "abort". Shared with iOS; see
+    // common::refuse_start_from_runtime_thread.
+    if common::refuse_start_from_runtime_thread("start") {
         return -1;
     }
 
