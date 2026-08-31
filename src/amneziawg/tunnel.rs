@@ -118,6 +118,13 @@ const RECV_ERROR_BACKOFF_AFTER: u32 = 4;
 /// How long that sleep is.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// The Ignore-class streak's second rung: once the streak reaches what
+/// would be the fatal count for Suspect errors, the outage is settled --
+/// ENETDOWN on an interface that has been down for minutes is not about
+/// to clear between polls -- and the loop drops from ~20 Hz to 1 Hz.
+/// Still never a death: this class is ridden out by design.
+const RECV_ERROR_BACKOFF_SETTLED: Duration = Duration::from_secs(1);
+
 /// Streak length at which the receive path is declared dead: with the
 /// backoff, roughly five seconds of a socket producing nothing but
 /// errors. Reaching this is the only way out of the decapsulate loop.
@@ -564,13 +571,16 @@ async fn decapsulate_loop(
                         // Usually latched ICMP echoes, one per send -- but
                         // ENETDOWN can be the socket's persistent state on a
                         // dead interface, returned back-to-back as fast as
-                        // recv is called. Same backoff ladder as Suspect,
-                        // never the death: an outage is ridden out, just not
-                        // at full CPU with a rebind request per iteration.
+                        // recv is called. Same ladder as Suspect up to the
+                        // give-up count, where this class settles into a
+                        // 1 Hz poll instead of dying: an outage is ridden
+                        // out, just not at ~20 wakeups a second on battery
+                        // for hours.
                         match ignore_streak.on_error(std::time::Instant::now()) {
                             StreakVerdict::KeepGoing => {}
-                            StreakVerdict::Backoff | StreakVerdict::GiveUp => {
-                                tokio::time::sleep(RECV_ERROR_BACKOFF).await
+                            StreakVerdict::Backoff => tokio::time::sleep(RECV_ERROR_BACKOFF).await,
+                            StreakVerdict::GiveUp => {
+                                tokio::time::sleep(RECV_ERROR_BACKOFF_SETTLED).await
                             }
                         }
                     }
