@@ -619,7 +619,7 @@ pub async fn run_prepared(
     // behaviour is unchanged for configs that never carried one.
     #[cfg(any(unix, windows))]
     let result = {
-        let tun_resolver = dns_registry.get_for_server(tun_config.dns.as_ref());
+        let tun_resolver = dns_registry.get_for_tun(tun_config.dns.as_ref());
         run_tun_from_config(
             tun_config,
             tun_resolver,
