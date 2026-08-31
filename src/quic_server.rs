@@ -92,7 +92,14 @@ async fn start_quic_server(
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
                     {
-                        error!("Connection ended with error: {e}");
+                        // Same triage as the TCP accept loops: scanner
+                        // probes and half-open handshakes are continuous on
+                        // an internet-facing listener, and at error level
+                        // they rotated the real errors away.
+                        log::log!(
+                            crate::util::connection_end_level(&e),
+                            "Connection ended with error: {e}"
+                        );
                     }
                 });
             }

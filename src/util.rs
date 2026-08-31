@@ -102,3 +102,32 @@ pub const EMSGSIZE_RAW: i32 = libc::EMSGSIZE;
 pub const EINVAL_RAW: i32 = 10022; // WSAEINVAL
 #[cfg(not(windows))]
 pub const EINVAL_RAW: i32 = libc::EINVAL;
+
+/// How loudly to log a connection that ended with `e`.
+///
+/// One table instead of a per-file copy: the accept loops had grown
+/// their own, it missed `NotConnected`, and every new kind would have
+/// had to be remembered in each. (The resolver's refresh table and the
+/// AWG recv classifier stay separate on purpose -- they answer
+/// different questions than "how loudly", and coupling the decisions
+/// would let a logging tweak change retry behavior.)
+///
+/// - `Debug`: client-side teardowns -- scanners probing the port, peers
+///   resetting mid-handshake, half-closed sockets. Routine, continuous,
+///   and worthless above debug on any internet-facing listener.
+/// - `Info`, not debug, for timeouts: a half-open probe and a stalled
+///   upstream produce the same `TimedOut` here, and release builds
+///   compile debug out entirely (`release_max_level_info` in
+///   Cargo.toml) -- an upstream serving nothing must not leave an empty
+///   log while every connection dies.
+/// - `Error` for the rest.
+pub fn connection_end_level(e: &std::io::Error) -> log::Level {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        ConnectionAborted | ConnectionReset | UnexpectedEof | BrokenPipe | NotConnected => {
+            log::Level::Debug
+        }
+        TimedOut => log::Level::Info,
+        _ => log::Level::Error,
+    }
+}
