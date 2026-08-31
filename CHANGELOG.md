@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### The FFI surface answers honestly and refuses what would kill it
+
+Also from the audit's should-fix list. `shoes_stop` returns whether the
+descriptor is actually released (1/0; the Android `stop` returns a
+`Boolean`, which changes its Kotlin declaration) instead of telling the
+host to close the fd even after a timeout. An unrequested clean exit
+carries "service ended without being asked" through the stopped
+callback and `shoes_get_last_error` instead of a NULL that left a stale
+message readable; an interior NUL in a reason no longer silences the
+failure into a clean-stop shape; and a requested stop no longer keeps
+an error the exit-guard race wrote mid-stop. A `shoes_start` from
+inside a callback is refused with a reason instead of aborting the
+process, a stack thread that cannot spawn fails the start instead of
+aborting the app, a release FFI build without `panic = "abort"` is a
+compile error naming the right profile, and the socket protector calls
+into Swift with its lock released.
+
 ### The reconnection paths sand off their remaining edges
 
 From the resilience audit's should-fix list, the Rust-core cluster. A
