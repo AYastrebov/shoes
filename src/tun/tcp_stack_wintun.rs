@@ -137,7 +137,7 @@ impl TcpStackWintun {
     }
 
     /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: UnboundedReceiver<PacketBuffer>) {
+    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
         self.handle.set_udp_response_tx(rx)
     }
 
