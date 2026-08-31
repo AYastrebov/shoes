@@ -59,6 +59,12 @@ pub struct FileLogWriter {
 struct FileLogState {
     file: File,
     written: u64,
+    /// Rotation hit a condition it cannot fix (a symlinked path, a
+    /// directory that refuses the rename). Announced once on stderr --
+    /// the broken piece here IS the logger -- then rotation stands down
+    /// rather than retrying per threshold or, worse, quietly redirecting
+    /// the stream into `<path>.old`.
+    rotation_broken: bool,
 }
 
 impl FileLogWriter {
@@ -74,27 +80,70 @@ impl FileLogWriter {
         // the cap must rotate on the first write, not a full cap later.
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
-            state: parking_lot::Mutex::new(FileLogState { file, written }),
+            state: parking_lot::Mutex::new(FileLogState {
+                file,
+                written,
+                rotation_broken: false,
+            }),
             path: path.to_owned(),
             rotate_at,
         })
     }
 
     fn rotate(&self, state: &mut FileLogState) {
+        // A symlinked -l path is a deliberate operator arrangement (a
+        // collector, a volume mount): fs::rename would rotate the LINK
+        // itself away and plant a plain file at the configured path,
+        // permanently silencing whatever tails the real destination.
+        // Refuse, announce once, and let the file grow -- the operator
+        // who linked it manages it.
+        let is_symlink = std::fs::symlink_metadata(&self.path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            self.break_rotation(state, "the path is a symlink");
+            return;
+        }
+
         // Rename-then-reopen: on Unix the rename succeeds under the open
-        // descriptor. On Windows it can fail while the file is open; the
-        // reopen then lands on the same file and the reset counter retries
-        // at the next threshold -- no rotation there, but bounded retries
-        // and never a lost line.
-        let _ = std::fs::rename(&self.path, format!("{}.old", self.path));
-        if let Ok(file) = OpenOptions::new()
+        // descriptor; failures here mean the DIRECTORY refuses it (a 0755
+        // root-owned dir, Windows lock semantics). Standing down beats
+        // pretending: resetting the counter regardless grew the file
+        // without bound in silent 32 MiB steps.
+        if let Err(e) = std::fs::rename(&self.path, format!("{}.old", self.path)) {
+            self.break_rotation(state, &format!("rename failed: {e}"));
+            return;
+        }
+        match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
-            state.file = file;
+            Ok(file) => {
+                state.file = file;
+                state.written = 0;
+            }
+            Err(e) => {
+                // The stream currently points at the inode now named
+                // `.old`; undo the rename so the configured path stays
+                // the live log. If even that fails, the old handle keeps
+                // every line -- misnamed but not lost -- and rotation
+                // stands down either way.
+                let _ = std::fs::rename(format!("{}.old", self.path), &self.path);
+                self.break_rotation(state, &format!("reopen failed: {e}"));
+            }
         }
-        state.written = 0;
+    }
+
+    /// Give up on rotating this file, once and audibly.
+    fn break_rotation(&self, state: &mut FileLogState, why: &str) {
+        if !state.rotation_broken {
+            state.rotation_broken = true;
+            eprintln!(
+                "shoes: log rotation disabled for {}: {why}; the file will grow unbounded",
+                self.path
+            );
+        }
     }
 }
 
@@ -103,9 +152,14 @@ impl LogWriter for FileLogWriter {
         let mut guard = self.state.lock();
         let mut line = formatted.to_string();
         line.push('\n');
-        let _ = guard.file.write_all(line.as_bytes());
-        guard.written += line.len() as u64;
-        if guard.written >= self.rotate_at {
+        // Counted only when the write landed: 32 MiB of ENOSPC failures
+        // advancing the counter rotated a stale file over the .old that
+        // held the last lines written before the disk filled -- the
+        // evidence of the outage, destroyed to make room for nothing.
+        if guard.file.write_all(line.as_bytes()).is_ok() {
+            guard.written += line.len() as u64;
+        }
+        if guard.written >= self.rotate_at && !guard.rotation_broken {
             self.rotate(&mut guard);
         }
     }
@@ -667,6 +721,78 @@ mod tests {
         // The live file was reopened fresh: smaller than the threshold even
         // though ten times it was written in total.
         assert!(std::fs::metadata(path_str).unwrap().len() < 64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked -l path must never be rotated: renaming the LINK away
+    /// plants a plain file at the configured path and permanently
+    /// silences whatever tails the real destination.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_log_path_is_never_rotated() {
+        let dir = std::env::temp_dir().join(format!("shoes-log-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.log");
+        let link = dir.join("link.log");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let writer = FileLogWriter::with_rotation(link.to_str().unwrap(), 64).unwrap();
+        for _ in 0..10 {
+            writer.write_log(
+                &Record::builder().args(format_args!("")).build(),
+                "a-sixteen-byte-l",
+            );
+        }
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was rotated away"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}.old", link.to_str().unwrap())).exists(),
+            "a rotation happened despite the symlink"
+        );
+        // Every line still reached the real destination through the link.
+        assert!(std::fs::metadata(&target).unwrap().len() >= 170);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the directory refuses the rename, rotation stands down
+    /// instead of resetting the counter and growing the file in silent
+    /// threshold-sized steps -- and instead of redirecting the stream.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_rename_stands_rotation_down_but_keeps_logging() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("shoes-log-noren-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        let path_str = path.to_str().unwrap();
+
+        let writer = FileLogWriter::with_rotation(path_str, 64).unwrap();
+        // Directory read-only: appends to the open file still work, the
+        // rename cannot.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        for _ in 0..10 {
+            writer.write_log(
+                &Record::builder().args(format_args!("")).build(),
+                "a-sixteen-byte-l",
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !std::path::Path::new(&format!("{path_str}.old")).exists(),
+            "a rotation happened despite the refused rename"
+        );
+        // Every line landed in the one file; nothing was lost or moved.
+        assert!(std::fs::metadata(&path).unwrap().len() >= 170);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
