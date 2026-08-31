@@ -178,9 +178,9 @@ pub async fn run_tun_server(
     // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the
     // platform's readiness primitive).
     #[cfg(unix)]
-    let mut tcp_stack = TcpStackDirect::new(fd, stack_options);
+    let mut tcp_stack = TcpStackDirect::new(fd, stack_options)?;
     #[cfg(windows)]
-    let mut tcp_stack = TcpStackWintun::new(wintun, stack_options);
+    let mut tcp_stack = TcpStackWintun::new(wintun, stack_options)?;
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");

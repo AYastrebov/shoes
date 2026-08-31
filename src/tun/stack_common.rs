@@ -239,7 +239,15 @@ impl StackHandle {
     /// `make_device` builds — on the stack thread itself, so a device whose
     /// handles are not `Send` (raw Windows event handles) never crosses a
     /// thread boundary.
-    pub fn spawn<D, F>(thread_name: &str, options: TcpStackOptions, make_device: F) -> Self
+    /// Fallible: `thread::spawn` fails with EAGAIN under thread or
+    /// memory pressure -- plausible inside a Network Extension's memory
+    /// cap -- and an `expect` here aborted the whole host app instead of
+    /// failing the start with a reason.
+    pub fn spawn<D, F>(
+        thread_name: &str,
+        options: TcpStackOptions,
+        make_device: F,
+    ) -> io::Result<Self>
     where
         D: StackDevice,
         F: FnOnce() -> io::Result<D> + Send + 'static,
@@ -269,18 +277,20 @@ impl StackHandle {
                         run_stack_loop(device, options, udp_tx, running.clone(), shared_state);
                     });
                 })
-                .expect("failed to spawn smoltcp stack thread")
+                .map_err(|e| {
+                    io::Error::other(format!("failed to spawn the smoltcp stack thread: {e}"))
+                })?
         };
 
         let stack_thread = thread_handle.thread().clone();
 
-        Self {
+        Ok(Self {
             thread_handle: Some(thread_handle),
             stack_thread,
             running,
             udp_rx: Some(udp_rx),
             shared_state,
-        }
+        })
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
