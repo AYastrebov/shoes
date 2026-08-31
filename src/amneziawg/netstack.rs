@@ -201,7 +201,21 @@ struct PendingTcp {
     notify: Arc<Notify>,
     reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
     target: SocketAddr,
+    /// When the connect gives up. smoltcp has no SYN retry limit -- with
+    /// no timeout it retransmits forever -- so an unreachable server
+    /// would otherwise park the caller for good and pin this entry's
+    /// buffers with it.
+    deadline: std::time::Instant,
 }
+
+/// How long a virtual TCP connect may wait for the peer. Under the
+/// forwarder's 60 s budget, and near what mobile OS stacks allow a SYN.
+const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Sockets this stack will hold at once, pending and established
+/// together. Each one owns ~576 KiB of buffers, so an unbounded map is
+/// an OOM on mobile; the TUN stack has the same cap on its side.
+const MAX_TCP_SOCKETS: usize = crate::buffer_sizing::default_max_connections();
 
 // ---------------------------------------------------------------------------
 // VirtualNetStack
@@ -345,11 +359,24 @@ impl VirtualNetStack {
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
     ) {
+        if self.pending_tcp.len() + self.active_tcp.len() >= MAX_TCP_SOCKETS {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("virtual TCP socket limit reached ({MAX_TCP_SOCKETS})"),
+            )));
+            return;
+        }
+
         let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
         let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
         let mut socket = SmolTcpSocket::new(rx_buf, tx_buf);
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(CongestionControl::Cubic);
+        // Matched to the TUN stack (stack_common.rs): probe an idle peer,
+        // and abort one that stops answering. Without a timeout smoltcp
+        // waits on a dead peer forever.
+        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
+        socket.set_timeout(Some(smoltcp::time::Duration::from_secs(7200)));
 
         let local_port = allocate_ephemeral_port();
         let remote = to_smol_endpoint(target);
@@ -380,42 +407,68 @@ impl VirtualNetStack {
                 notify,
                 reply,
                 target,
+                deadline: std::time::Instant::now() + TCP_CONNECT_TIMEOUT,
             },
         );
     }
 
     fn service_pending_tcp(&mut self) {
+        self.service_pending_tcp_at(std::time::Instant::now());
+    }
+
+    // Time is a parameter so tests reach the deadline without waiting it out.
+    fn service_pending_tcp_at(&mut self, now: std::time::Instant) {
+        enum Outcome {
+            Established,
+            Failed,
+            TimedOut,
+        }
         let mut completed = Vec::new();
 
-        for handle in self.pending_tcp.keys() {
+        for (handle, pending) in &self.pending_tcp {
             let socket = self.sockets.get::<SmolTcpSocket>(*handle);
             match socket.state() {
-                TcpState::Established => completed.push((*handle, true)),
-                TcpState::Closed | TcpState::TimeWait => completed.push((*handle, false)),
+                TcpState::Established => completed.push((*handle, Outcome::Established)),
+                TcpState::Closed | TcpState::TimeWait => completed.push((*handle, Outcome::Failed)),
+                _ if now >= pending.deadline => completed.push((*handle, Outcome::TimedOut)),
                 _ => {}
             }
         }
 
-        for (handle, success) in completed {
+        for (handle, outcome) in completed {
             let pending = self.pending_tcp.remove(&handle).unwrap();
-            if success {
-                let stream = VirtualTcpStream {
-                    control: pending.control.clone(),
-                    notify: pending.notify.clone(),
-                };
-                self.active_tcp.insert(
-                    handle,
-                    ActiveTcp {
-                        control: pending.control,
-                    },
-                );
-                let _ = pending.reply.send(Ok(stream));
-            } else {
-                let _ = pending.reply.send(Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("TCP to {} failed", pending.target),
-                )));
-                self.sockets.remove(handle);
+            match outcome {
+                Outcome::Established => {
+                    let stream = VirtualTcpStream {
+                        control: pending.control.clone(),
+                        notify: pending.notify.clone(),
+                    };
+                    self.active_tcp.insert(
+                        handle,
+                        ActiveTcp {
+                            control: pending.control,
+                        },
+                    );
+                    let _ = pending.reply.send(Ok(stream));
+                }
+                Outcome::Failed => {
+                    let _ = pending.reply.send(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("TCP to {} failed", pending.target),
+                    )));
+                    self.sockets.remove(handle);
+                }
+                Outcome::TimedOut => {
+                    let _ = pending.reply.send(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "TCP connect to {} got no answer in {}s",
+                            pending.target,
+                            TCP_CONNECT_TIMEOUT.as_secs()
+                        ),
+                    )));
+                    self.sockets.remove(handle);
+                }
             }
         }
     }
@@ -796,5 +849,89 @@ mod tests {
         let p1 = allocate_ephemeral_port();
         let p2 = allocate_ephemeral_port();
         assert_eq!(p2, p1 + 1);
+    }
+
+    fn stack() -> (VirtualNetStack, mpsc::Receiver<Vec<u8>>) {
+        let (to_tunnel_tx, to_tunnel_rx) = mpsc::channel(16);
+        let (_from_tunnel_tx, from_tunnel_rx) = mpsc::channel::<Vec<u8>>(16);
+        let stack = VirtualNetStack::new(
+            &[("10.0.0.2".parse().unwrap(), 32)],
+            1400,
+            to_tunnel_tx,
+            from_tunnel_rx,
+        );
+        (stack, to_tunnel_rx)
+    }
+
+    /// smoltcp has no SYN retry limit, so without the deadline a connect
+    /// nobody answers parked the caller forever and pinned ~576 KiB of
+    /// buffers per stuck flow -- a browser retrying against a dead
+    /// tunnel was an OOM on the extension's memory cap.
+    #[test]
+    fn a_connect_nobody_answers_fails_at_the_deadline() {
+        let (mut stack, _tunnel_rx) = stack();
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        stack.initiate_tcp("192.0.2.1:443".parse().unwrap(), reply_tx);
+
+        let now = std::time::Instant::now();
+        stack.service_pending_tcp_at(now);
+        assert!(reply_rx.try_recv().is_err(), "failed before the deadline");
+        assert_eq!(stack.pending_tcp.len(), 1);
+
+        stack.service_pending_tcp_at(now + TCP_CONNECT_TIMEOUT + std::time::Duration::from_secs(1));
+        let err = reply_rx
+            .try_recv()
+            .expect("the deadline must resolve the connect")
+            .map(|_| ())
+            .expect_err("nobody answered, so it cannot succeed");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // The entry and its buffers are gone, not parked.
+        assert!(stack.pending_tcp.is_empty());
+        assert!(stack.sockets.iter().next().is_none());
+    }
+
+    /// The stack refuses the socket that would exceed its budget instead
+    /// of growing without bound.
+    #[test]
+    fn the_socket_budget_refuses_the_overflow_connect() {
+        let (mut stack, _tunnel_rx) = stack();
+        // Occupy the whole budget cheaply: entries in pending_tcp are
+        // what the cap counts, so seed the map's len without paying for
+        // real sockets.
+        for i in 0..MAX_TCP_SOCKETS {
+            let handle = stack.sockets.add(SmolTcpSocket::new(
+                TcpSocketBuffer::new(vec![0u8; 1]),
+                TcpSocketBuffer::new(vec![0u8; 1]),
+            ));
+            stack.pending_tcp.insert(
+                handle,
+                PendingTcp {
+                    control: Arc::new(Mutex::new(TcpControl {
+                        send_buf: smoltcp::storage::RingBuffer::new(vec![0u8; 1]),
+                        send_waker: None,
+                        send_closed: false,
+                        recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; 1]),
+                        recv_waker: None,
+                        recv_closed: false,
+                    })),
+                    notify: Arc::new(Notify::new()),
+                    reply: {
+                        let (tx, _) = tokio::sync::oneshot::channel();
+                        tx
+                    },
+                    target: format!("192.0.2.1:{}", 1 + (i % 60000)).parse().unwrap(),
+                    deadline: std::time::Instant::now(),
+                },
+            );
+        }
+
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        stack.initiate_tcp("192.0.2.2:443".parse().unwrap(), reply_tx);
+        let err = reply_rx
+            .try_recv()
+            .expect("the refusal must be immediate")
+            .map(|_| ())
+            .expect_err("over budget, so it cannot succeed");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
