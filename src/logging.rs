@@ -105,12 +105,20 @@ impl FileLogWriter {
             return;
         }
 
+        // The stale rotation goes first: on Windows, fs::rename refuses
+        // an existing destination, so without this the SECOND rotation
+        // ever would fail and stand rotation down for good -- "replacing
+        // the previous rotation" held for exactly one cycle. On Unix the
+        // rename replaces anyway and the remove is a harmless no-op.
+        let old = format!("{}.old", self.path);
+        let _ = std::fs::remove_file(&old);
+
         // Rename-then-reopen: on Unix the rename succeeds under the open
         // descriptor; failures here mean the DIRECTORY refuses it (a 0755
         // root-owned dir, Windows lock semantics). Standing down beats
         // pretending: resetting the counter regardless grew the file
         // without bound in silent 32 MiB steps.
-        if let Err(e) = std::fs::rename(&self.path, format!("{}.old", self.path)) {
+        if let Err(e) = std::fs::rename(&self.path, &old) {
             self.break_rotation(state, &format!("rename failed: {e}"));
             return;
         }
@@ -129,7 +137,7 @@ impl FileLogWriter {
                 // the live log. If even that fails, the old handle keeps
                 // every line -- misnamed but not lost -- and rotation
                 // stands down either way.
-                let _ = std::fs::rename(format!("{}.old", self.path), &self.path);
+                let _ = std::fs::rename(&old, &self.path);
                 self.break_rotation(state, &format!("reopen failed: {e}"));
             }
         }
@@ -720,6 +728,46 @@ mod tests {
         );
         // The live file was reopened fresh: smaller than the threshold even
         // though ten times it was written in total.
+        assert!(std::fs::metadata(path_str).unwrap().len() < 64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second rotation must succeed too: it replaces the previous
+    /// `.old`, which on Windows requires removing it first -- fs::rename
+    /// there refuses an existing destination, and without the removal
+    /// rotation worked for exactly one cycle before standing down.
+    #[test]
+    fn the_second_rotation_replaces_the_first() {
+        let dir = std::env::temp_dir().join(format!("shoes-log-rot2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        let path_str = path.to_str().unwrap();
+
+        let writer = FileLogWriter::with_rotation(path_str, 64).unwrap();
+        for _ in 0..10 {
+            writer.write_log(
+                &Record::builder().args(format_args!("")).build(),
+                "a-sixteen-byte-l",
+            );
+        }
+        let first_old = std::fs::metadata(format!("{path_str}.old"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        for _ in 0..10 {
+            writer.write_log(
+                &Record::builder().args(format_args!("")).build(),
+                "a-sixteen-byte-l",
+            );
+        }
+
+        let second_old = std::fs::metadata(format!("{path_str}.old"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(second_old >= first_old, "the .old was not replaced");
+        // Rotation is still live, not stood down.
         assert!(std::fs::metadata(path_str).unwrap().len() < 64);
 
         let _ = std::fs::remove_dir_all(&dir);
