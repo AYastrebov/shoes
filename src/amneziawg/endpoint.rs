@@ -157,8 +157,15 @@ impl EndpointSocket {
     ///
     /// `on_rebound` is called after each successful swap, for the state that
     /// belongs to the path rather than to the peer — see the AmneziaWG 3.1
-    /// trailer window in `tunnel.rs`.
-    pub async fn run_rebind_task(self: Arc<Self>, on_rebound: impl Fn() + Send + 'static) {
+    /// trailer window in `tunnel.rs`. The datagrams it returns are sent on the
+    /// new socket, in order: a rebind only repairs the path once the server
+    /// hears from the new address (roaming updates the peer's endpoint on the
+    /// first authenticated packet), and an idle tunnel would otherwise stay
+    /// deaf until the app happened to transmit.
+    pub async fn run_rebind_task(
+        self: Arc<Self>,
+        on_rebound: impl Fn() -> Vec<Vec<u8>> + Send + 'static,
+    ) {
         loop {
             self.rebind_requested.notified().await;
 
@@ -173,7 +180,14 @@ impl EndpointSocket {
                     // which is most of the time — the tunnel tasks subscribe
                     // only for the duration of a recv.
                     self.socket.send_replace(Arc::new(socket));
-                    on_rebound();
+                    for datagram in on_rebound() {
+                        if let Err(e) = self.send(&datagram).await {
+                            // send() has already scheduled the next rebind if
+                            // this means the route is gone again.
+                            warn!("AmneziaWG post-rebind announcement failed: {e}");
+                            break;
+                        }
+                    }
                     info!(
                         "AmneziaWG endpoint rebound to {} -> {}",
                         local, self.endpoint
@@ -237,7 +251,7 @@ mod tests {
         let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
         let before = endpoint.local_addr().unwrap();
 
-        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
+        tokio::spawn(endpoint.clone().run_rebind_task(Vec::new));
         endpoint.request_rebind();
 
         // The rebind is asynchronous; wait for the address to actually move.
@@ -277,7 +291,7 @@ mod tests {
     async fn recv_follows_the_socket_across_a_rebind() {
         let (peer_socket, peer_addr) = peer().await;
         let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
-        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
+        tokio::spawn(endpoint.clone().run_rebind_task(Vec::new));
 
         // Park a receive on the pre-rebind socket, then move it. Without the
         // watch channel this future would wait on the old address forever.
@@ -333,6 +347,7 @@ mod tests {
         let counter = calls.clone();
         tokio::spawn(endpoint.clone().run_rebind_task(move || {
             counter.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
         }));
 
         assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing rebound yet");
@@ -348,6 +363,41 @@ mod tests {
         }
     }
 
+    /// The datagrams the callback returns are what tell the server the
+    /// new address — roaming updates the peer's endpoint on the first
+    /// authenticated packet — so a rebind that swapped the socket but
+    /// sent nothing would leave an idle tunnel deaf until the app
+    /// happened to transmit.
+    #[tokio::test]
+    async fn a_rebind_sends_the_announcement_from_the_new_socket() {
+        let (peer_socket, peer_addr) = peer().await;
+        let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
+        let before = endpoint.local_addr().unwrap();
+
+        tokio::spawn(
+            endpoint
+                .clone()
+                .run_rebind_task(|| vec![b"decoy".to_vec(), b"keepalive".to_vec()]),
+        );
+        endpoint.request_rebind();
+
+        let mut buf = [0u8; 32];
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let (n, from) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                peer_socket.recv_from(&mut buf),
+            )
+            .await
+            .expect("the announcement never arrived")
+            .unwrap();
+            assert_ne!(from, before, "sent from the pre-rebind socket");
+            received.push(buf[..n].to_vec());
+        }
+        // In order: awgtun requires queued decoys to lead the exchange.
+        assert_eq!(received, vec![b"decoy".to_vec(), b"keepalive".to_vec()]);
+    }
+
     #[tokio::test]
     async fn a_network_change_reaches_a_live_endpoint_and_not_a_dropped_one() {
         let (_peer_socket, peer_addr) = peer().await;
@@ -355,7 +405,7 @@ mod tests {
         drop(dropped);
 
         let live = EndpointSocket::connect(peer_addr).await.unwrap();
-        tokio::spawn(live.clone().run_rebind_task(|| {}));
+        tokio::spawn(live.clone().run_rebind_task(Vec::new));
         let before = live.local_addr().unwrap();
 
         // Other tests in this binary may have live endpoints of their own, so
