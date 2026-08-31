@@ -154,7 +154,12 @@ struct LivenessWatch {
     /// Idle ticks freeze the count rather than advancing it: silence
     /// proves nothing when nothing was sent to answer.
     deaf_ticks: u32,
-    /// Whether a rebind completed during this silence.
+    /// Whether a rebind completed during this silence -- the evidence
+    /// death requires. Set only by a rebind that lands mid-silence, and
+    /// the deaf count restarts when it does: death is judged against the
+    /// fresh socket, so silence endured before it proves nothing. A
+    /// rebind while the tunnel was fine (a routine network change) says
+    /// nothing about a silence that starts later.
     rebound_during_silence: bool,
 }
 
@@ -181,9 +186,7 @@ impl LivenessWatch {
         // only fact needed is whether each moved since the last tick.
         let received_advanced = received != self.received_seen;
         let offered_advanced = offered != self.offered_seen;
-        if rebinds != self.rebinds_seen {
-            self.rebound_during_silence = true;
-        }
+        let rebind_advanced = rebinds != self.rebinds_seen;
         self.offered_seen = offered;
         self.received_seen = received;
         self.rebinds_seen = rebinds;
@@ -192,6 +195,14 @@ impl LivenessWatch {
             self.deaf_ticks = 0;
             self.rebound_during_silence = false;
             return LivenessVerdict::Fine;
+        }
+        // Only the episode's first successful rebind restarts the count:
+        // the fatal window measures silence on a socket a rebind renewed,
+        // and restarting on every later rebind would push death out
+        // forever while the periodic re-requests keep succeeding.
+        if rebind_advanced && self.deaf_ticks > 0 && !self.rebound_during_silence {
+            self.rebound_during_silence = true;
+            self.deaf_ticks = 0;
         }
         if !offered_advanced {
             return LivenessVerdict::Fine;
@@ -1398,24 +1409,69 @@ mod tests {
     }
 
     /// A fresh socket on a working network that still hears nothing is
-    /// the one silence that implicates the peer.
+    /// the one silence that implicates the peer -- and the fatal window
+    /// is measured on that fresh socket, from the rebind, with later
+    /// rebinds not restarting it (they keep succeeding every re-request,
+    /// and each restart would push death out forever).
     #[test]
     fn silence_that_survives_a_rebind_is_death() {
         let mut watch = LivenessWatch::new();
         deaf_ticks(&mut watch, SILENCE_REBIND_TICKS);
         // The requested rebind succeeds: the rebind counter moves on the
-        // next deaf tick.
+        // next deaf tick, and the deaf count restarts from it.
         watch.on_tick(
             watch.offered_seen.wrapping_add(1),
             watch.received_seen,
             watch.rebinds_seen.wrapping_add(1),
         );
-        let verdicts = deaf_ticks(&mut watch, SILENCE_FATAL_TICKS - SILENCE_REBIND_TICKS - 1);
+        // A later successful rebind mid-window must not restart it again.
+        deaf_ticks(&mut watch, 40);
+        watch.on_tick(
+            watch.offered_seen.wrapping_add(1),
+            watch.received_seen,
+            watch.rebinds_seen.wrapping_add(1),
+        );
+        // 42 deaf ticks since the first rebind; the rest of the window
+        // runs out without a datagram.
+        let verdicts = deaf_ticks(&mut watch, SILENCE_FATAL_TICKS - 42);
         assert_eq!(*verdicts.last().unwrap(), LivenessVerdict::Dead);
         assert!(
             !verdicts[..verdicts.len() - 1].contains(&LivenessVerdict::Dead),
             "death came early"
         );
+    }
+
+    /// The subway ride: 90+ deaf ticks accrue while every rebind fails.
+    /// When the network returns and a rebind finally lands, the peer
+    /// gets a full window to answer from the fresh socket -- killing the
+    /// engine one tick after connectivity recovers would turn recovery
+    /// itself into the failure.
+    #[test]
+    fn a_rebind_after_a_long_outage_gets_a_full_window() {
+        let mut watch = LivenessWatch::new();
+        deaf_ticks(&mut watch, 10 * SILENCE_FATAL_TICKS);
+        // The network returns and the requested rebind finally lands.
+        watch.on_tick(
+            watch.offered_seen.wrapping_add(1),
+            watch.received_seen,
+            watch.rebinds_seen.wrapping_add(1),
+        );
+        let verdicts = deaf_ticks(&mut watch, SILENCE_FATAL_TICKS - 2);
+        assert!(
+            verdicts.iter().all(|v| *v != LivenessVerdict::Dead),
+            "death before the fresh socket's own window elapsed"
+        );
+        assert_eq!(deaf_ticks(&mut watch, 1)[0], LivenessVerdict::Dead);
+    }
+
+    /// A rebind while the tunnel was fine -- a routine network change --
+    /// is not evidence about a silence that starts later.
+    #[test]
+    fn an_idle_time_rebind_is_not_evidence_for_a_later_silence() {
+        let mut watch = LivenessWatch::new();
+        watch.on_tick(0, 0, 1);
+        let verdicts = deaf_ticks(&mut watch, 10 * SILENCE_FATAL_TICKS);
+        assert!(verdicts.iter().all(|v| *v != LivenessVerdict::Dead));
     }
 
     /// One received datagram ends the episode entirely: the deaf count
