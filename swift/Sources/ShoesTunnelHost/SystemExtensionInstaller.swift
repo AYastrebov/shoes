@@ -18,12 +18,22 @@
         /// old code turned "reboot required" into a mystery. An UPGRADE
         /// deferred to reboot is different -- the already-approved older
         /// extension keeps serving -- and is treated as success.
-        public struct RebootRequired: Error, Sendable {}
+        public struct RebootRequired: LocalizedError, Sendable {
+            public var errorDescription: String? {
+                "The system extension is installed but requires a reboot before it can run. "
+                    + "Restart the Mac, then start the tunnel again."
+            }
+        }
 
         /// Thrown for an `OSSystemExtensionRequest.Result` this code does
         /// not know. Unknown is not "completed": surfacing it beats
         /// starting a tunnel on an extension in an unmodeled state.
-        public struct UnexpectedActivationResult: Error, Sendable {}
+        public struct UnexpectedActivationResult: LocalizedError, Sendable {
+            public var errorDescription: String? {
+                "The system extension activation finished with a result this version does not "
+                    + "recognize. Update the app, or reinstall the extension."
+            }
+        }
 
         /// Activate, reporting progress through `onEvent` (delivered on the
         /// main queue). Throws [`RebootRequired`] when a first install is

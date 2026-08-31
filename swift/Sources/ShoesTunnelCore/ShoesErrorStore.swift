@@ -59,11 +59,15 @@ public final class ShoesErrorStore: @unchecked Sendable {
         stopReasonURL = directory.appendingPathComponent(stopReasonKey).appendingPathExtension("json")
     }
 
-    /// Persist a fatal error. Synchronous and durable on return; safe to
-    /// call from `report(error:)` right before the process exits.
-    public func save(_ error: ShoesError) {
-        guard let data = try? JSONEncoder().encode(error) else { return }
-        try? data.write(to: errorURL, options: .atomic)
+    /// Persist a fatal error. Synchronous, and durable on a `true` return;
+    /// safe to call from `report(error:)` right before the process exits.
+    /// `false` means the write failed -- a full disk, a permissions problem
+    /// -- and the error will NOT survive the process; a host with a second
+    /// channel (os_log, an analytics queue) can fall back to it.
+    @discardableResult
+    public func save(_ error: ShoesError) -> Bool {
+        guard let data = try? JSONEncoder().encode(error) else { return false }
+        return (try? data.write(to: errorURL, options: .atomic)) != nil
     }
 
     /// The last persisted error, if any. Typically read by the app when the
@@ -80,10 +84,12 @@ public final class ShoesErrorStore: @unchecked Sendable {
 
     /// Persist why the system stopped the tunnel, as
     /// `NEProviderStopReason.rawValue`. An `Int` rather than the enum so
-    /// this target needs no NetworkExtension dependency.
-    public func saveStopReason(_ rawValue: Int) {
-        guard let data = try? JSONEncoder().encode(rawValue) else { return }
-        try? data.write(to: stopReasonURL, options: .atomic)
+    /// this target needs no NetworkExtension dependency. Returns whether
+    /// the write landed, like [`save(_:)`].
+    @discardableResult
+    public func saveStopReason(_ rawValue: Int) -> Bool {
+        guard let data = try? JSONEncoder().encode(rawValue) else { return false }
+        return (try? data.write(to: stopReasonURL, options: .atomic)) != nil
     }
 
     /// The last persisted stop reason's `rawValue`, or `nil` when none was
