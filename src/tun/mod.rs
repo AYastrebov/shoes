@@ -524,7 +524,8 @@ fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpR
 /// `resolver` reaches everything in the session that resolves: the
 /// client-chain selector, `connect_tcp`, the UDP manager's destination
 /// connects, and the WireGuard/AmneziaWG endpoint (re-)resolution on
-/// rebinds and rebuilds. Callers pick it from the DnsRegistry, so a TUN
+/// tunnel builds and rebuilds -- a network-change rebind reuses the
+/// already-resolved address. Callers pick it from the DnsRegistry, so a TUN
 /// entry's `dns:` block is what answers -- and without one, the
 /// registry's default is the same system resolver this function used to
 /// build in place.
