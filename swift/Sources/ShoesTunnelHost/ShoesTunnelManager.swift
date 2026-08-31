@@ -42,6 +42,17 @@ public final class ShoesTunnelManager {
     ///   `serverAddress`, `includeAllNetworks`, the exclusion flags,
     ///   `disconnectOnSleep`. `providerBundleIdentifier` is set already.
     public func start(configure: (NETunnelProviderProtocol) -> Void) async throws {
+        try await start { _, proto in configure(proto) }
+    }
+
+    /// The two-parameter form, for policy that lives on the manager rather
+    /// than the protocol object: on-demand rules (`onDemandRules`,
+    /// `isOnDemandEnabled` -- always-on VPN), `localizedDescription`. The
+    /// one-parameter form could not express these at all, which forced any
+    /// app wanting always-on to bypass `start()` entirely.
+    public func start(
+        configure: (NETunnelProviderManager, NETunnelProviderProtocol) -> Void
+    ) async throws {
         #if os(macOS)
             try await SystemExtensionInstaller.activate(bundleIdentifier: providerBundleIdentifier)
         #endif
@@ -56,15 +67,34 @@ public final class ShoesTunnelManager {
 
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = providerBundleIdentifier
-        configure(proto)
+        configure(manager, proto)
         manager.protocolConfiguration = proto
         manager.isEnabled = true
 
-        try await manager.saveToPreferences()
+        do {
+            try await manager.saveToPreferences()
+        } catch {
+            // The cached manager can be stale: the user deleting the VPN
+            // profile in Settings is routine, and saving the stale object
+            // then fails. One reload-and-retry recreates the profile
+            // instead of surfacing a configuration error for a state the
+            // user considers clean.
+            let fresh = try await load()
+            fresh.protocolConfiguration = proto
+            fresh.isEnabled = true
+            try await fresh.saveToPreferences()
+            try await fresh.loadFromPreferences()
+            try fresh.connection.startVPNTunnel()
+            return
+        }
         try await manager.loadFromPreferences()
         try manager.connection.startVPNTunnel()
     }
 
+    /// Fire-and-forget by design: the system delivers the outcome through
+    /// `statusUpdates` (`.disconnecting`, then `.disconnected`), and the
+    /// provider's own stop path is what guarantees teardown. An app that
+    /// wants a "stopping…" state builds it from the stream.
     public func stop() {
         manager?.connection.stopVPNTunnel()
     }
@@ -94,21 +124,51 @@ public final class ShoesTunnelManager {
         }
     }
 
-    /// Ask the running provider something. Throws if no session is
-    /// connected or the provider gave no answer.
-    public func send(_ message: ShoesAppMessage) async throws -> ShoesAppReply {
+    /// Ask the running provider something. Throws `.noSession` when no
+    /// session is connected, `.providerNoReply` when the provider answered
+    /// with nothing, and `.timedOut` when it answered with silence -- an
+    /// extension that dies between the send and the reply never invokes
+    /// the completion block at all, and without the deadline this call
+    /// parked its caller forever (a stats refresh on a UI timer being the
+    /// caller most exposed).
+    public func send(
+        _ message: ShoesAppMessage, timeout: Duration = .seconds(3)
+    ) async throws -> ShoesAppReply {
         guard let session = manager?.connection as? NETunnelProviderSession else {
             throw ShoesError.noSession
         }
         let request = try message.encoded()
         let response: Data? = try await withCheckedThrowingContinuation { continuation in
+            let claim = ClaimFlag()
             do {
-                try session.sendProviderMessage(request) { continuation.resume(returning: $0) }
+                try session.sendProviderMessage(request) { data in
+                    Task { if await claim.claim() { continuation.resume(returning: data) } }
+                }
             } catch {
-                continuation.resume(throwing: error)
+                Task { if await claim.claim() { continuation.resume(throwing: error) } }
+            }
+            Task {
+                try? await Task.sleep(for: timeout)
+                if await claim.claim() {
+                    continuation.resume(
+                        throwing: ShoesError.timedOut(seconds: Int(timeout.components.seconds)))
+                }
             }
         }
         guard let response else { throw ShoesError.providerNoReply }
         return try ShoesAppReply.decode(response)
+    }
+}
+
+/// First-wins between the reply and the deadline: exactly one racer
+/// resumes the continuation. The provider's start race uses the same
+/// shape; a `CheckedContinuation` diagnoses a double resume, not a
+/// never-resume, which is the failure this exists to close.
+private actor ClaimFlag {
+    private var claimed = false
+    func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
