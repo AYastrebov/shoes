@@ -208,6 +208,15 @@ impl SocketConnectorImpl {
     }
 }
 
+/// Per-attempt deadline for both transports' connects. The OS default is
+/// ~75 s per TCP attempt and quinn's handshake is bounded only by its 30 s
+/// idle timeout -- either way a black-holed server costs its whole bound
+/// serially per resolved address while the caller's own budget (60 s in
+/// the forwarder) burns, so later addresses are never usefully tried.
+/// 10 s comfortably covers a real handshake anywhere and lets a
+/// two-address target fail over inside the caller's budget.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait]
 impl SocketConnector for SocketConnectorImpl {
     async fn connect(
@@ -222,14 +231,6 @@ impl SocketConnector for SocketConnectorImpl {
 
         match &self.transport {
             TransportConfig::Tcp { no_delay } => {
-                // The OS default is ~75 s per attempt, and a black-holed
-                // server otherwise costs that much serially per resolved
-                // address while the caller's own budget (60 s in the
-                // forwarder) burns. 10 s comfortably covers a real
-                // handshake anywhere and lets a two-address target fail
-                // over inside the caller's budget.
-                const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
                     let tcp_socket =
@@ -295,7 +296,13 @@ impl SocketConnector for SocketConnectorImpl {
                     };
 
                     match endpoint.connect(*target_addr, domain) {
-                        Ok(connecting) => match connecting.await {
+                        // The same deadline as the TCP arm: quinn retries
+                        // its handshake until the idle timeout otherwise.
+                        Ok(connecting) => match tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                            .await
+                            .map_err(|_| quinn::ConnectionError::TimedOut)
+                            .and_then(|r| r.map_err(Into::into))
+                        {
                             Ok(conn) => match conn.open_bi().await {
                                 Ok((send, recv)) => {
                                     if i > 0 {
