@@ -665,6 +665,17 @@ fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
     datagrams
 }
 
+/// Consecutive failed sends, across all of the tunnel's send contexts.
+/// Log throttling only -- detection belongs to the liveness watchdog,
+/// which sees the silence these failures produce. Process-global because
+/// the log it protects is.
+static SEND_FAILURE_STREAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Warn on the first failure of a streak and every 1000th after, so a
+/// send path that fails permanently -- a dead interface a phone carries
+/// for hours -- does not write a warning per attempted packet.
+const SEND_FAILURE_WARN_EVERY: usize = 1000;
+
 /// One send error, wherever the send happened. EMSGSIZE gets the same
 /// remediation as on recv -- once the kernel caches the lower path MTU
 /// it rejects oversized sends synchronously, and the recv side may never
@@ -678,7 +689,12 @@ fn report_send_error(
     if e.raw_os_error() == Some(EMSGSIZE_RAW) {
         handle_path_mtu_exceeded(tunn, trailers_on, context);
     } else {
-        warn!("AmneziaWG UDP send ({}) error: {}", context, e);
+        let nth = SEND_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+        if nth == 1 || nth.is_multiple_of(SEND_FAILURE_WARN_EVERY) {
+            warn!("AmneziaWG UDP send ({context}) error ({nth} consecutive): {e}");
+        } else {
+            debug!("AmneziaWG UDP send ({context}) error: {e}");
+        }
     }
 }
 
@@ -697,8 +713,9 @@ async fn send_to_network(
         }
     }
 
-    if let Err(e) = udp.send(packet).await {
-        report_send_error(tunn, trailers_on, context, &e);
+    match udp.send(packet).await {
+        Ok(_) => SEND_FAILURE_STREAK.store(0, Ordering::Relaxed),
+        Err(e) => report_send_error(tunn, trailers_on, context, &e),
     }
 }
 
