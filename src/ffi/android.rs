@@ -179,6 +179,12 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     protect_callback: JObject<'local>,
     traffic_callback: JObject<'local>,
 ) -> jlong {
+    // Serialized against stop (and any concurrent start): a stop in
+    // flight empties the service slot before its five-second wait, and a
+    // start that slipped into that window used to pass the guard below
+    // and run a second engine on the same descriptor.
+    let _transition = common::transition_guard();
+
     info!("Starting shoes service");
 
     // Overwriting a live handle would drop its Runtime on this thread, which
