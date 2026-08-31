@@ -165,6 +165,18 @@ pub fn protect_socket(fd: i32) -> io::Result<()> {
     }
 }
 
+/// Serializes every test that touches the process-global protector.
+/// pub(crate) because the tests live in three modules (here, socket_util,
+/// dns::proxy_runtime) inside one test binary; two lock domains over one
+/// global is a flake.
+#[cfg(test)]
+pub(crate) fn serialise_protector_tests() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| Mutex::new(()));
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
