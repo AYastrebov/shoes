@@ -50,6 +50,23 @@ impl DnsRegistry {
             .clone()
     }
 
+    /// Get the resolver for a TUN entry's dns field.
+    ///
+    /// Unlike listeners, a TUN without a `dns:` block gets a FRESH system
+    /// resolver rather than the caching default. The honoured-dns change
+    /// promised "without the block nothing changes", and the caching
+    /// default's flat one-hour cap (record TTLs ignored) would break it:
+    /// a WireGuard/AmneziaWG tunnel rebuild would resolve a failed-over
+    /// endpoint hostname to its dead pre-failover address for up to an
+    /// hour, where the old in-place resolver followed the provider on the
+    /// next lookup.
+    pub fn get_for_tun(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
+        match dns.and_then(|c| c.resolved_group()) {
+            Some(_) => self.get_for_server(dns),
+            None => Arc::new(NativeResolver::new()),
+        }
+    }
+
     /// Get resolver for a server config's dns field.
     /// After validation, dns.servers should be a single group name or None.
     pub fn get_for_server(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
@@ -678,6 +695,21 @@ async fn build_entry_and_plan(
 
 #[cfg(test)]
 mod tests {
+    /// The no-dns TUN default must be the uncached system resolver: the
+    /// caching default's flat one-hour cap would pin a failed-over
+    /// WG/AWG endpoint to its dead address across rebuilds. Asserted by
+    /// pointer identity against the caching default.
+    #[test]
+    fn a_tun_without_dns_gets_a_fresh_uncached_resolver() {
+        let mut registry = super::DnsRegistry::new();
+        let default = registry.get_or_create_default();
+        let tun = registry.get_for_tun(None);
+        assert!(
+            !std::sync::Arc::ptr_eq(&default, &tun),
+            "the TUN default must not be the caching default"
+        );
+    }
+
     use super::*;
     use crate::config::ExpandedDnsSpec;
     use crate::dns::parsed::{IpStrategy, ParsedDnsServer};

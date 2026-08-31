@@ -684,13 +684,14 @@ async fn launch_servers(
 
     let mut join_handles: Vec<tokio::task::JoinHandle<()>> = vec![];
     for server_config in server_configs {
-        // Get the resolver for this server from the registry
-        let dns_ref = match &server_config {
-            config::Config::Server(s) => s.dns.as_ref(),
-            config::Config::TunServer(t) => t.dns.as_ref(),
-            _ => None,
+        // Get the resolver for this server from the registry. TUN entries
+        // without a dns: block keep the uncached system resolver they
+        // always had -- see DnsRegistry::get_for_tun.
+        let resolver = match &server_config {
+            config::Config::Server(s) => dns_registry.get_for_server(s.dns.as_ref()),
+            config::Config::TunServer(t) => dns_registry.get_for_tun(t.dns.as_ref()),
+            _ => dns_registry.get_for_server(None),
         };
-        let resolver = dns_registry.get_for_server(dns_ref);
         match start_servers(server_config, resolver).await {
             Ok(handles) => join_handles.extend(handles),
             Err(e) => {
