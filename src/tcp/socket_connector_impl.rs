@@ -222,11 +222,31 @@ impl SocketConnector for SocketConnectorImpl {
 
         match &self.transport {
             TransportConfig::Tcp { no_delay } => {
+                // The OS default is ~75 s per attempt, and a black-holed
+                // server otherwise costs that much serially per resolved
+                // address while the caller's own budget (60 s in the
+                // forwarder) burns. 10 s comfortably covers a real
+                // handshake anywhere and lets a two-address target fail
+                // over inside the caller's budget.
+                const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
                     let tcp_socket =
                         new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
-                    match tcp_socket.connect(*target_addr).await {
+                    let attempt =
+                        tokio::time::timeout(CONNECT_TIMEOUT, tcp_socket.connect(*target_addr))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "TCP connect to {target_addr} timed out after {}s",
+                                        CONNECT_TIMEOUT.as_secs()
+                                    ),
+                                ))
+                            });
+                    match attempt {
                         Ok(stream) => {
                             if i > 0 {
                                 debug!(
