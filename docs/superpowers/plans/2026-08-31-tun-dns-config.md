@@ -8,7 +8,7 @@ calling it done.
    - `tun::run_tun_from_config(config, resolver, shutdown_rx, close_fd)`;
      delete the in-place `NativeResolver::new()`.
    - `tun::start_tun_server`: `_resolver` → used.
-   - `control::run_prepared`: `dns_registry.get_for_server(tun_config.dns.as_ref())`
+   - `control::run_prepared`: `dns_registry.get_for_tun(tun_config.dns.as_ref())`
      inside the `cfg(any(unix, windows))` TUN branch.
    - Tests: the mock-upstream end-to-end test (spec §Tests 1) plus the
      protector-counting test (spec §Tests 4).

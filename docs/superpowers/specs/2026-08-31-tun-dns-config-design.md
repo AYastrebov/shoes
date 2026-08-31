@@ -33,9 +33,11 @@ Thread the resolver instead of building one in place:
   AWG connector's endpoint (re-)resolution all take the resolver
   `run_tun_server` receives.
 - `control::run_prepared` selects
-  `dns_registry.get_for_server(tun_config.dns.as_ref())` and passes it.
-  Absent `dns:`, `get_for_server(None)` answers the default
-  `CachingNativeResolver` — behaviour without the block is unchanged.
+  `dns_registry.get_for_tun(tun_config.dns.as_ref())` and passes it.
+  Absent `dns:`, `get_for_tun(None)` answers a fresh uncached
+  `NativeResolver` — the pre-`dns:` TUN behaviour. The registry's caching
+  default is deliberately NOT used here: its flat one-hour cache would pin
+  a WireGuard/AmneziaWG endpoint to a dead address across rebuild failover.
 - `start_tun_server` passes its (already-correct) resolver through instead
   of discarding it.
 
@@ -80,11 +82,11 @@ there.
 
 1. End-to-end through the registry: a TUN config with
    `dns: { servers: [udp://127.0.0.1:<mock>] }` run through
-   `create_server_configs` → `build_dns_registry` → `get_for_server`
+   `create_server_configs` → `build_dns_registry` → `get_for_tun`
    resolves a client-chain hostname through the mock (which records the
    query and answers a canned A record) and the connection reaches the
    answered address. A small in-test UDP DNS responder; no such mock existed.
-2. Without `dns:`: `get_for_server(None)` yields the default resolver, and
+2. Without `dns:`: `get_for_tun(None)` yields a fresh uncached resolver, and
    the existing TUN datapath tests (which inject their own resolver) keep
    passing unchanged.
 3. Validation: a hostname-URL DoH server without bootstrap in a TUN config

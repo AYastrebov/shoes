@@ -526,10 +526,10 @@ fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpR
 /// client-chain selector, `connect_tcp`, the UDP manager's destination
 /// connects, and the WireGuard/AmneziaWG endpoint (re-)resolution on
 /// tunnel builds and rebuilds -- a network-change rebind reuses the
-/// already-resolved address. Callers pick it from the DnsRegistry, so a TUN
-/// entry's `dns:` block is what answers -- and without one, the
-/// registry's default is the same system resolver this function used to
-/// build in place.
+/// already-resolved address. Callers pick it from the DnsRegistry's
+/// `get_for_tun`, so a TUN entry's `dns:` block is what answers -- and
+/// without one, `get_for_tun(None)` hands back the same fresh uncached
+/// system resolver this function used to build in place.
 pub async fn run_tun_from_config(
     config: TunConfig,
     resolver: Arc<dyn Resolver>,
@@ -785,7 +785,7 @@ mod tests {
     /// resolves the client-chain hostname through the CONFIGURED upstream,
     /// not the system resolver. The resolver is obtained exactly the way
     /// `run_prepared` and `launch_servers` now obtain it -- config through
-    /// validation, registry, `get_for_server` -- and then drives the same
+    /// validation, registry, `get_for_tun` -- and then drives the same
     /// datapath the TUN session uses.
     #[tokio::test]
     async fn a_tun_dns_block_resolves_through_its_configured_upstream() {
@@ -822,14 +822,14 @@ mod tests {
                 _ => None,
             })
             .expect("the config parses to a TUN entry");
-        let resolver = registry.get_for_server(tun.dns.as_ref());
+        let resolver = registry.get_for_tun(tun.dns.as_ref());
 
         // The destination the mock's answer points at.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let payload_seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = payload_seen.clone();
-        tokio::spawn(async move {
+        let listener_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut payload = Vec::new();
             let _ = stream.read_to_end(&mut payload).await;
@@ -860,8 +860,12 @@ mod tests {
             "the configured upstream never saw the query; seen: {:?}",
             names.lock().unwrap()
         );
-        // Give the listener task a beat to record.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Wait for the observable condition -- the listener finishing its
+        // read -- rather than sleeping a fixed beat and hoping.
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener_task)
+            .await
+            .expect("the listener never saw the connection close")
+            .unwrap();
         assert_eq!(
             payload_seen.lock().unwrap().as_slice(),
             b"through-the-configured-dns",
