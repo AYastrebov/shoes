@@ -96,6 +96,10 @@ async fn start_quic_server(
                     }
                 });
             }
+            // accept() returning None means the endpoint closed. Ending
+            // silently left the process running with a QUIC port that no
+            // longer accepts and nothing in the log to say so.
+            error!("QUIC endpoint closed; this listener is no longer accepting connections");
         });
 
         join_handles.push(join_handle);
