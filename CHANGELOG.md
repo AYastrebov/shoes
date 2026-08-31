@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.18
 
 ### The TUN server honours its `dns:` config
 
