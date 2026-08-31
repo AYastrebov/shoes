@@ -430,8 +430,8 @@ fn main() {
             if reload_state.is_none() {
                 // No reload mode: nothing to do but serve until the OS
                 // asks the process to exit.
-                let what = signals.recv().await;
-                shut_down(what, join_handles).await;
+                let (what, code) = signals.recv().await;
+                shut_down(what, code, join_handles).await;
             }
 
             // Wait for a change, then keep trying until an edit produces a
@@ -444,15 +444,26 @@ fn main() {
                     changed = rx.recv() => {
                         changed.expect("the watcher thread is co-owned");
                     }
-                    what = signals.recv() => shut_down(what, join_handles).await,
+                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 }
 
-                println!("Configs changed, reloading in 3 seconds..");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                // Remove any extra events
-                while rx.try_recv().is_ok() {}
+                // The debounce and the prepare stay under the signal
+                // select: a SIGTERM during a reload whose DNS bootstrap
+                // is stalled on a dead network used to buffer for the
+                // whole stall -- long enough for systemd to escalate to
+                // SIGKILL, the unflushed death this handler removes.
+                let outcome = tokio::select! {
+                    outcome = async {
+                        println!("Configs changed, reloading in 3 seconds..");
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        // Remove any extra events
+                        while rx.try_recv().is_ok() {}
+                        prepare_servers(&args, Some(watcher)).await
+                    } => outcome,
+                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
+                };
 
-                match prepare_servers(&args, Some(watcher)).await {
+                match outcome {
                     Ok(p) => break p,
                     Err(e) => {
                         eprintln!(
@@ -475,15 +486,22 @@ fn main() {
     });
 }
 
-/// Stop accepting, flush the logs, and exit 0.
+/// Stop accepting, flush the logs, and exit with the signal's
+/// conventional code.
 ///
-/// The default disposition -- die mid-instruction with a signal exit code,
-/// log writers unflushed -- was the entire shutdown story. In-flight
-/// connections still end with the process (draining them is a policy the
-/// config should own someday); what this buys is an orderly stop: no new
-/// accepts, buffered log lines on disk, and an exit code that says
-/// "asked to stop" rather than "killed".
-async fn shut_down(what: &'static str, join_handles: Vec<tokio::task::JoinHandle<()>>) -> ! {
+/// The default disposition -- die mid-instruction, log writers unflushed
+/// -- was the entire shutdown story. In-flight connections still end with
+/// the process (draining them is a policy the config should own someday);
+/// what this buys is an orderly stop: no new accepts, buffered log lines
+/// on disk. The exit code is 130 for SIGINT and 143 for SIGTERM, as the
+/// shell convention (128+signum) has it -- exiting 0 made wrappers that
+/// key on "user interrupted" (shell loops, make, CI) restart the proxy
+/// they had just asked to stop.
+async fn shut_down(
+    what: &'static str,
+    code: i32,
+    join_handles: Vec<tokio::task::JoinHandle<()>>,
+) -> ! {
     println!("\nReceived {what}, shutting down..");
     for join_handle in &join_handles {
         join_handle.abort();
@@ -492,7 +510,7 @@ async fn shut_down(what: &'static str, join_handles: Vec<tokio::task::JoinHandle
         let _ = join_handle.await;
     }
     log::logger().flush();
-    std::process::exit(0);
+    std::process::exit(code);
 }
 
 /// The OS's stop requests, as resumable streams.
@@ -501,6 +519,13 @@ struct ShutdownSignals {
     interrupt: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     terminate: Option<tokio::signal::unix::Signal>,
+    /// Persistent, like the unix streams: a fresh `ctrl_c()` future per
+    /// wait is the one-shot pattern the comment at the install site
+    /// forbids -- dropped between waits, a Ctrl-C during the reload
+    /// debounce was hard-killed (handler finds no receiver, OS default)
+    /// or silently swallowed.
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
 }
 
 impl ShutdownSignals {
@@ -523,15 +548,26 @@ impl ShutdownSignals {
                 terminate: try_install(SignalKind::terminate(), "SIGTERM"),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            match tokio::signal::windows::ctrl_c() {
+                Ok(s) => Self { ctrl_c: Some(s) },
+                Err(e) => {
+                    eprintln!("Could not install the Ctrl-C handler: {e}");
+                    Self { ctrl_c: None }
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Self {}
         }
     }
 
-    /// Resolves when the OS asks the process to exit; pends forever if no
+    /// Resolves when the OS asks the process to exit, with the name and
+    /// the conventional exit code (128+signum); pends forever if no
     /// handler could be installed.
-    async fn recv(&mut self) -> &'static str {
+    async fn recv(&mut self) -> (&'static str, i32) {
         #[cfg(unix)]
         {
             async fn wait(s: &mut Option<tokio::signal::unix::Signal>) {
@@ -543,16 +579,23 @@ impl ShutdownSignals {
                 }
             }
             tokio::select! {
-                _ = wait(&mut self.interrupt) => "SIGINT",
-                _ = wait(&mut self.terminate) => "SIGTERM",
+                _ = wait(&mut self.interrupt) => ("SIGINT", 130),
+                _ = wait(&mut self.terminate) => ("SIGTERM", 143),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => "Ctrl-C",
-                Err(_) => futures::future::pending().await,
+            match &mut self.ctrl_c {
+                Some(s) => {
+                    s.recv().await;
+                    ("Ctrl-C", 130)
+                }
+                None => futures::future::pending().await,
             }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            futures::future::pending().await
         }
     }
 }
