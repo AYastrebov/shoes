@@ -71,7 +71,22 @@ pub static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::
 /// holds the lock waits here for at most that stop's five-second bound --
 /// the holder never waits on the callback's thread past its timeout, so
 /// this cannot deadlock, only queue.
+///
+/// The start paths are the other holders, and they are bounded too: the
+/// one open-ended thing a start does is prepare the config, which is
+/// capped at [`PREPARE_TIMEOUT`]. Without that cap a stop queued behind
+/// a start stuck in DNS resolution would blow the very budgets --
+/// Android's ANR window, iOS's stopTunnel deadline -- the five-second
+/// stop bound exists to respect.
 static TRANSITION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The most a start may spend preparing a config -- parsing, binding,
+/// and any DNS resolution the config asks for. The OS resolver on a
+/// captive portal or a mid-change network can hang for tens of seconds,
+/// and the whole prepare runs under the transition lock (see
+/// [`TRANSITION`]), so an unbounded prepare holds every later stop and
+/// start hostage to it.
+pub const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Take the transition lock. Held across all of `stop_service` and all of
 /// each platform's start path.

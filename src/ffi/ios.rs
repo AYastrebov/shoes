@@ -354,9 +354,24 @@ unsafe fn start_service(
     // cannot run is reported as a failed start. Doing it inside the spawned
     // task meant shoes_start() returned success and the app had to discover
     // the failure by noticing shoes_is_running() had gone false on its own.
-    let prepared = match runtime.block_on(common::prepare_from_config(&config_str, device_fd)) {
-        Ok(prepared) => prepared,
-        Err(e) => return fail(format!("invalid config: {e}")),
+    // Bounded, because this runs under the transition lock: an unbounded
+    // DNS hang here would hold a queued shoes_stop past every budget the
+    // platform gives it (see common::PREPARE_TIMEOUT).
+    let prepared = match runtime.block_on(async {
+        tokio::time::timeout(
+            common::PREPARE_TIMEOUT,
+            common::prepare_from_config(&config_str, device_fd),
+        )
+        .await
+    }) {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return fail(format!("invalid config: {e}")),
+        Err(_) => {
+            return fail(format!(
+                "config preparation timed out after {}s (DNS unreachable?)",
+                common::PREPARE_TIMEOUT.as_secs()
+            ));
+        }
     };
 
     // The runtime is built here, with two worker threads, rather than inside
