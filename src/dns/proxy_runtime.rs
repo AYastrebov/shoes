@@ -450,12 +450,32 @@ mod tests {
     /// sockets through the shared global cannot confuse the result.
     #[cfg(unix)]
     #[tokio::test]
+    // The serialisation guard intentionally spans the bind's await: it
+    // exists precisely to keep other protector tests out for the whole
+    // duration, and each test runs on its own libtest thread.
+    #[allow(clippy::await_holding_lock)]
     async fn bind_udp_routes_the_dns_socket_through_the_protector() {
         use std::os::unix::io::AsRawFd;
 
+        // Restored through a Drop guard, so a panicking assertion cannot
+        // leave the recorder installed for every later test.
+        struct Restore(Option<Arc<dyn crate::socket_protector::SocketProtector>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(p) => crate::socket_protector::set_global_socket_protector(p),
+                    None => crate::socket_protector::clear_global_socket_protector(),
+                }
+            }
+        }
+
+        // The global is process-wide and socket_util's protector tests
+        // replace it too; two lock domains over one global is a flake.
+        let _serial = crate::socket_protector::serialise_protector_tests();
+        let _restore = Restore(crate::socket_protector::get_global_socket_protector());
+
         let seen: Arc<std::sync::Mutex<Vec<i32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let previous = crate::socket_protector::get_global_socket_protector();
         crate::socket_protector::set_global_socket_protector(Arc::new(
             crate::socket_protector::FnSocketProtector::new(move |fd| {
                 recorder.lock().unwrap().push(fd);
@@ -479,13 +499,6 @@ mod tests {
             .await
             .unwrap();
         let fd = socket.as_raw_fd();
-
-        // Restore before asserting, so a failure does not leave the
-        // counting protector installed for every later test.
-        match previous {
-            Some(p) => crate::socket_protector::set_global_socket_protector(p),
-            None => crate::socket_protector::clear_global_socket_protector(),
-        }
 
         assert!(
             seen.lock().unwrap().contains(&fd),

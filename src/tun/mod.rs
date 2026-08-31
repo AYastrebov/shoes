@@ -54,8 +54,9 @@ use tokio::task::JoinHandle;
 use crate::address::NetLocation;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::selection::ConfigSelection;
-use crate::config::{FakeIpConfig, TunConfig};
+use crate::config::{FakeIpConfig, RuleConfig, TunConfig};
 use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpResponder};
+use crate::option_util::NoneOrSome;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
@@ -584,8 +585,7 @@ pub async fn run_tun_from_config(
     // Resolved once per TUN session rather than per connection.
     let sniff = config.sniff.as_ref().and_then(|s| s.to_settings());
 
-    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
+    let client_proxy_selector = build_session_selector(config.rules, resolver.clone());
 
     run_tun_server(
         tun_server_config,
@@ -596,6 +596,18 @@ pub async fn run_tun_from_config(
         shutdown_rx,
     )
     .await
+}
+
+/// The selector a TUN session routes through, wired from the config's
+/// rules and the resolver the session was handed. Device-free, so the
+/// dns end-to-end test drives this exact function: reintroducing an
+/// in-place `NativeResolver` here fails that test, not just review.
+fn build_session_selector(
+    rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    resolver: Arc<dyn Resolver>,
+) -> Arc<ClientProxySelector> {
+    let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
+    Arc::new(create_tcp_client_proxy_selector(rules, resolver))
 }
 
 #[cfg(test)]
@@ -717,54 +729,52 @@ mod tests {
     }
 
     /// A minimal UDP DNS upstream: records every queried name and answers
-    /// A queries with 127.0.0.1. Nothing this small existed in the tree.
+    /// A queries with 127.0.0.1. Parses and builds through hickory's wire
+    /// types, so a truncated or malformed datagram is dropped instead of
+    /// panicking the mock.
     async fn spawn_recording_dns_upstream(names: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+        use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+        use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata};
+
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             while let Ok((n, from)) = socket.recv_from(&mut buf).await {
-                if n < 12 {
+                let Ok(request) = Message::from_vec(&buf[..n]) else {
                     continue;
-                }
-                // Question name: labels from offset 12 until the root label.
-                let mut pos = 12;
-                let mut labels: Vec<String> = Vec::new();
-                while pos < n {
-                    let len = buf[pos] as usize;
-                    pos += 1;
-                    if len == 0 {
-                        break;
-                    }
-                    labels.push(String::from_utf8_lossy(&buf[pos..pos + len]).to_string());
-                    pos += len;
-                }
-                if pos + 4 > n {
+                };
+                let [query] = request.queries.as_slice() else {
                     continue;
-                }
-                let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-                let question_end = pos + 4;
-                names.lock().unwrap().push(labels.join("."));
+                };
+                names
+                    .lock()
+                    .unwrap()
+                    .push(query.name().to_utf8().trim_end_matches('.').to_string());
 
-                // Echo the ID and question; answer A queries with 127.0.0.1
-                // and everything else with an empty NOERROR.
-                let answers: u16 = if qtype == 1 { 1 } else { 0 };
-                let mut resp = Vec::with_capacity(question_end + 16);
-                resp.extend_from_slice(&buf[0..2]);
-                resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01]);
-                resp.extend_from_slice(&answers.to_be_bytes());
-                resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                resp.extend_from_slice(&buf[12..question_end]);
-                if qtype == 1 {
-                    resp.extend_from_slice(&[
-                        0xC0, 0x0C, // name: pointer to the question
-                        0x00, 0x01, 0x00, 0x01, // TYPE A, CLASS IN
-                        0x00, 0x00, 0x00, 0x3C, // TTL 60
-                        0x00, 0x04, 127, 0, 0, 1, // RDATA
-                    ]);
+                // Answer A queries with 127.0.0.1; everything else gets an
+                // empty NOERROR (NODATA), which nudges the client to retry
+                // with A.
+                let mut response = Message::new(
+                    request.metadata.id,
+                    MessageType::Response,
+                    request.metadata.op_code,
+                );
+                response.metadata.recursion_desired = request.metadata.recursion_desired;
+                response.metadata.recursion_available = true;
+                response.metadata.response_code = ResponseCode::NoError;
+                response.add_query(query.clone());
+                if query.query_type() == RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        RData::A(rdata::A(std::net::Ipv4Addr::LOCALHOST)),
+                    ));
                 }
-                let _ = socket.send_to(&resp, from).await;
+                if let Ok(bytes) = response.to_vec() {
+                    let _ = socket.send_to(&bytes, from).await;
+                }
             }
         });
 
@@ -824,14 +834,9 @@ mod tests {
             *recorded.lock().unwrap() = payload;
         });
 
-        // A direct chain, as the default TUN rules build one.
-        let group = crate::tcp::chain_builder::build_direct_chain_group(resolver.clone());
-        let rule = ConnectRule::new(
-            vec![NetLocationMask::ANY],
-            vec![],
-            ConnectAction::new_allow(None, group),
-        );
-        let selector = Arc::new(ClientProxySelector::new(vec![rule]));
+        // The production wiring itself: the same rules-to-selector function
+        // `run_tun_from_config` calls, fed the config's own rules.
+        let selector = build_session_selector(tun.rules.clone(), resolver.clone());
 
         let target = NetLocation::new(
             Address::Hostname("tun-dns-upstream-test.internal".to_string()),

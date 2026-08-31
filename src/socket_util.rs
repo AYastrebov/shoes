@@ -286,16 +286,15 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 mod protection_tests {
     use super::*;
     use crate::socket_protector::{SocketProtector, protect_socket, set_global_socket_protector};
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     /// The protector is process-wide, so these tests take turns. Without this
     /// one test's recorder replaces another's between its install and its
     /// socket, and the assertion fails for a reason that has nothing to do
-    /// with the code under test.
+    /// with the code under test. Shared crate-wide: proxy_runtime's
+    /// protector test takes the same lock.
     fn serialise() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = LOCK.get_or_init(|| Mutex::new(()));
-        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::socket_protector::serialise_protector_tests()
     }
 
     /// Both protectors below act only for the thread that installed them.
