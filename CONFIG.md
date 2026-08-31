@@ -362,9 +362,34 @@ fake_ip:
   max_entries: int             # Live mapping ceiling. Default: 8192
   bypass_domains: [string]     # Globs that must resolve for real. Default: none
 
+# DNS for this TUN session (optional; see "DNS" below for the full shape)
+dns:
+  servers:
+    - url: "https://1.1.1.1/dns-query"
+
 # Routing rules
 rules: [RuleConfig]
 ```
+
+### DNS
+
+The `dns:` block chooses the resolver for everything this TUN session
+resolves: client-chain hostnames on connect, UDP destinations, and the
+WireGuard/AmneziaWG endpoint's re-resolution on network-change rebinds and
+tunnel rebuilds. Without the block, the system resolver is used, as before.
+
+Two TUN-specific rules:
+
+- **Prefer IP-address URLs** (`https://1.1.1.1/dns-query`). They need no
+  resolution before use. A hostname URL without a `bootstrap_url` is
+  rejected at validation in TUN configs — resolving it would silently use
+  the system resolver, which is the plaintext leak the block exists to
+  prevent. (`url: system` stays allowed: it asks for the system resolver
+  explicitly.)
+- **Upstream sockets are excluded from the tunnel.** Every DNS upstream
+  socket — UDP, TCP, DoT, DoH, DoQ — goes through the same socket-protector
+  path as the proxy connection itself, so on Android/iOS a query cannot
+  route into the TUN it is resolving for.
 
 ### Memory
 
