@@ -80,6 +80,16 @@ fn stopped_slot_is_empty() -> bool {
         .is_none_or(|slot| slot.lock().is_none())
 }
 
+/// A C string from an arbitrary message. An interior NUL is replaced
+/// rather than allowed to fail the conversion: the messages are io::Error
+/// text derived from config values and peer data, and a failure whose
+/// message could not cross the boundary used to be delivered as a clean
+/// stop -- NULL to the callback AND NULL from shoes_get_last_error, the
+/// one state the contract reserves for "no reason".
+fn c_string_lossy(s: String) -> CString {
+    CString::new(s.replace('\0', "\u{fffd}")).expect("NULs were just replaced")
+}
+
 /// Deliver an exit to the host. The reason is stored for
 /// `shoes_get_last_error` first, and the lock is released before the call
 /// so a callback that calls `shoes_stop` cannot deadlock on this slot.
@@ -92,7 +102,7 @@ fn fire_stopped(reason: Option<String>) {
         .lock()
         .take();
     let Some(callback) = callback else { return };
-    match reason.and_then(|r| CString::new(r).ok()) {
+    match reason.map(c_string_lossy) {
         Some(c) => callback(c.as_ptr()),
         None => callback(std::ptr::null()),
     }
@@ -567,10 +577,10 @@ pub extern "C" fn shoes_network_changed() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_get_last_error() -> *mut c_char {
     match common::get_last_error() {
-        Some(msg) => match CString::new(msg) {
-            Ok(cstr) => cstr.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        },
+        // Lossy rather than NULL on an interior NUL: NULL means "no
+        // error", and a message that cannot cross the boundary must not
+        // read as one.
+        Some(msg) => c_string_lossy(msg).into_raw(),
         None => std::ptr::null_mut(),
     }
 }
