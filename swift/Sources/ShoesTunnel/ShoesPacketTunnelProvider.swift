@@ -295,7 +295,11 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         guard let config = configuration else { return }
         // One at a time. The actor is reentrant at every await below, so a
         // second debounced rebind could otherwise interleave with this one.
-        guard !isRebinding else { return }
+        // And never against a stop: `stop()` cancels the debounce task, but
+        // a rebind past that point used to run to completion regardless --
+        // restarting the engine after `stopTunnel`'s completion handler had
+        // returned, on a descriptor the system was free to reclaim.
+        guard !isRebinding, !isStopping else { return }
         isRebinding = true
         reasserting = true
         defer {
@@ -303,13 +307,25 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             reasserting = false
         }
         await engine.stop()
+        guard !isStopping else { return }
         do {
             // Nil then re-apply, so the system re-evaluates the default path.
             try await setTunnelNetworkSettings(nil)
+            guard !isStopping else { return }
             try await setTunnelNetworkSettings(makeNetworkSettings())
+            guard !isStopping else { return }
             try await startEngine(config)
+            if isStopping {
+                // stopTunnel ran while the engine was starting, so its own
+                // stop saw nothing running. Undo the start it could not see.
+                await engine.stop()
+                return
+            }
             log.info("rebind succeeded")
         } catch {
+            // A stop tearing the tunnel down mid-rebind makes these calls
+            // fail; that is the stop's outcome, not a rebind failure.
+            guard !isStopping else { return }
             let shoesError = (error as? ShoesError) ?? .startFailed(error.localizedDescription)
             fail(shoesError, prefix: "rebind failed")
             cancelTunnelWithError(shoesError)
