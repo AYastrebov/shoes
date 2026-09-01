@@ -132,13 +132,19 @@ impl TxToken for VirtualTxToken<'_> {
 // TCP: shared control buffer (ring-buffer + waker pattern)
 // ---------------------------------------------------------------------------
 
-/// The socket's receive window and its in-flight send data.
+/// The socket's receive window.
 ///
-/// This socket's peer is a server on the internet, so these are
-/// bandwidth-delay products rather than local buffering: cutting them to the
-/// size of a local buffer measured as a straight 6x throughput loss. See
+/// This socket's peer is a server on the internet, so this is a
+/// bandwidth-delay product rather than local buffering: it is the ceiling on
+/// download throughput, `window / RTT`, and smoltcp never grows it. See
 /// src/buffer_sizing.rs.
-const TCP_WINDOW: usize = crate::buffer_sizing::default_remote_window_size();
+const TCP_RX_WINDOW: usize = crate::buffer_sizing::default_remote_rx_window_size();
+
+/// The socket's in-flight, unacknowledged send data.
+///
+/// Sized apart from the receive window on purpose: smoltcp does not pace, so
+/// enlarging this one converts into drops rather than throughput.
+const TCP_TX_WINDOW: usize = crate::buffer_sizing::default_remote_tx_window_size();
 
 /// The ring buffers between this socket and the async side, which are local and
 /// so need only cover scheduling jitter.
@@ -376,8 +382,8 @@ impl VirtualNetStack {
             return;
         }
 
-        let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
-        let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
+        let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_RX_WINDOW]);
+        let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_TX_WINDOW]);
         let mut socket = SmolTcpSocket::new(rx_buf, tx_buf);
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(CongestionControl::Cubic);

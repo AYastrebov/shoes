@@ -272,15 +272,46 @@ Both are configuration now — `tcp_buffer_size` and `max_connections` on the TU
 config, carried through `TunServerConfig` and `TcpStackOptions` — and both
 default by platform, the way `mtu` already did:
 
-| | local buffer | remote window | max connections | worst case, both stacks |
-|---|---|---|---|---|
-| iOS, Android | 32 KiB | 256 KiB | 256 | 176 MiB |
-| everywhere else | 64 KiB | 256 KiB | 1024 | 1 GiB |
+| | local buffer | remote rx window | remote tx window | max connections | worst case, both stacks |
+|---|---|---|---|---|---|
+| iOS | 32 KiB | 256 KiB | 256 KiB | 256 | 176 MiB |
+| Android | 32 KiB | 1 MiB | 256 KiB | 256 | 368 MiB |
+| everywhere else | 64 KiB | 4 MiB | 256 KiB | 1024 | 4.75 GiB |
 
 A connection through both stacks costs four local buffers in the TUN stack and
 two window buffers plus two local ones in the AmneziaWG stack: 704 KiB on
 mobile, against 2.3 MB before. Those are ceilings on what a connection
 *allocates*; what it costs resident is about a third — see finding 10.
+
+**The receive window is the exception to that "about a third", and it is why
+mobile keeps 256 KiB.** A sustained transfer wraps smoltcp's ring across the
+whole buffer, so the window goes fully resident rather than staying on untouched
+zero pages. Measured on macOS with 16 concurrent downloads through the
+AmneziaWG stack, sampling RSS against an idle baseline of 13 MiB:
+
+| receive window | download, 26 ms RTT | per connection | RSS at 16 concurrent |
+|---|---|---|---|
+| 256 KiB | 52.0 Mbit/s | 1.08 MiB | 30 MiB |
+| 1 MiB | 136.3 Mbit/s | 1.83 MiB | 42 MiB |
+| 4 MiB | ~154 Mbit/s | 4.99 MiB | 91 MiB |
+
+An iOS extension is killed at roughly 50 MB, so sixteen bulk downloads at a
+4 MiB window is not survivable there, and 1 MiB reaches 42 MiB with no headroom
+for anything else. iOS therefore keeps 256 KiB.
+
+Android does not share that limit — a `VpnService` runs in the app process with
+an ordinary heap, not inside an extension under jetsam — so it was being sized
+by a constraint it does not have. It takes 1 MiB, which is most of the
+throughput for 0.75 MiB per connection.
+
+Only bulk transfers pay the full figure: the window goes resident to the extent
+bytes flow through it, so a page of small assets does not reach it.
+
+Lifting iOS needs a *total* window budget rather than a larger per-connection
+size. Total data in flight is bounded by the link's bandwidth-delay product, not
+by the connection count, so a handful of bulk connections could hold large
+windows while the rest keep small ones, and the worst case would stop scaling
+with `max_connections` at all.
 
 Neither buffer spans a network round trip: both sit between the device and a
 proxy connection inside this process, so their size buys burst tolerance rather
