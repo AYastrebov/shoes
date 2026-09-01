@@ -177,8 +177,9 @@ struct TcpControl {
     /// connection up) and frees its slot. Without this, a stream dropped
     /// without shutdown left the socket Established forever: the peer
     /// answers keepalive probes, so the idle timeout never fires, and
-    /// each leak pinned ~576 KiB plus one slot of MAX_TCP_SOCKETS until
-    /// the leaks alone had the cap refusing every new connect.
+    /// each leak pinned that socket's whole buffer set plus one slot of
+    /// MAX_TCP_SOCKETS until the leaks alone had the cap refusing every
+    /// new connect.
     dropped: bool,
 }
 
@@ -228,8 +229,11 @@ struct PendingTcp {
 const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sockets this stack will hold at once, pending and established
-/// together. Each one owns ~576 KiB of buffers, so an unbounded map is
-/// an OOM on mobile; the TUN stack has the same cap on its side.
+/// together. Each one owns a receive window, a send buffer and two local
+/// buffers -- 576 KiB inside a Network Extension, but 1.3 MiB on Android
+/// and 4.4 MiB on desktop, since the window is sized per platform (see
+/// `crate::buffer_sizing`). At any of those an unbounded map is an OOM;
+/// the TUN stack has the same cap on its side.
 const MAX_TCP_SOCKETS: usize = crate::buffer_sizing::default_max_connections();
 
 // ---------------------------------------------------------------------------
@@ -897,8 +901,8 @@ mod tests {
     }
 
     /// smoltcp has no SYN retry limit, so without the deadline a connect
-    /// nobody answers parked the caller forever and pinned ~576 KiB of
-    /// buffers per stuck flow -- a browser retrying against a dead
+    /// nobody answers parked the caller forever and pinned a whole
+    /// buffer set per stuck flow -- a browser retrying against a dead
     /// tunnel was an OOM on the extension's memory cap.
     #[test]
     fn a_connect_nobody_answers_fails_at_the_deadline() {

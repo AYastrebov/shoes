@@ -54,7 +54,13 @@ PROFILE_DIR="release-mobile"
 # the 256-connection mobile ceiling, below one page. MOBILE.md section 10
 # carries the measurement. control-logs stays off: it is a Rust-side sink no
 # C caller can reach.
-FEATURES="control-stats"
+#
+# --features network-extension: every slice this script builds is linked into
+# ShoesPacketTunnelProvider, so all three take the per-connection budget of a
+# process the system kills at a cap. iOS would get that from its target
+# anyway; the macOS slice would not, since aarch64-apple-darwin is also the
+# desktop binary's target. See src/buffer_sizing.rs.
+FEATURES="control-stats,network-extension"
 
 echo "==> Building for aarch64-apple-ios (physical device)"
 cargo build --profile release-mobile --features "$FEATURES" --target aarch64-apple-ios

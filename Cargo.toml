@@ -52,6 +52,16 @@ ffi = []  # Enable FFI module for non-Android builds
 control-logs = []   # subscribable log stream; bounded in-memory ring
 control-stats = []  # counters beyond the two byte totals
 desktop = ["control-logs", "control-stats"]
+# This build is linked into an Apple Network Extension, so the system kills it
+# at a memory cap rather than warning it, and src/buffer_sizing.rs picks the
+# constrained per-connection budget.
+#
+# A feature rather than a `target_os` test because `target_os` cannot answer
+# the question. Every iOS build is an extension, but aarch64-apple-darwin is
+# both the XCFramework slice Package.swift links into
+# ShoesPacketTunnelProvider and the desktop binary, and only the first is
+# under a cap. scripts/build-apple.sh sets this; no desktop build does.
+network-extension = []
 
 [dependencies]
 async-trait = "*"

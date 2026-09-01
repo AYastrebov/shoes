@@ -53,6 +53,13 @@ keeps the extension's own sockets out of its tunnel (the protect callback is
 a no-op on that assumption), and the memory budget a macOS system extension
 gets, which is not iOS's 50 MB.
 
+Because that budget is unverified, the macOS slice takes iOS's per-connection
+buffer sizes rather than desktop's: `scripts/build-apple.sh` builds it with the
+`network-extension` feature, which `src/buffer_sizing.rs` reads. That is the
+conservative reading, not a measured one — a 256 KiB receive window caps
+download near 50 Mbit/s where 4 MiB reaches 150. Once the extension runs and
+its real limit is known, this is the knob to revisit.
+
 ## A Rust host instead
 
 `shoes::control` (`src/control/mod.rs`) is the same lifecycle without the C

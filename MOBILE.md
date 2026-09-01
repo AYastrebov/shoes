@@ -272,19 +272,27 @@ Both are configuration now — `tcp_buffer_size` and `max_connections` on the TU
 config, carried through `TunServerConfig` and `TcpStackOptions` — and both
 default by platform, the way `mtu` already did:
 
-| | local buffer | remote rx window | remote tx window | max connections | worst case, both stacks |
-|---|---|---|---|---|---|
-| iOS | 32 KiB | 256 KiB | 256 KiB | 256 | 176 MiB |
-| Android | 32 KiB | 1 MiB | 256 KiB | 256 | 368 MiB |
-| everywhere else | 64 KiB | 4 MiB | 256 KiB | 1024 | 4.75 GiB |
+| | local buffer | remote rx window | remote tx window | max connections | per connection | worst case, both stacks |
+|---|---|---|---|---|---|---|
+| Network Extension (iOS, macOS) | 32 KiB | 256 KiB | 256 KiB | 256 | 704 KiB | 176 MiB |
+| Android | 32 KiB | 1 MiB | 256 KiB | 256 | 1.4375 MiB | 368 MiB |
+| everywhere else | 64 KiB | 4 MiB | 256 KiB | 1024 | 4.625 MiB | 4.625 GiB |
 
 A connection through both stacks costs four local buffers in the TUN stack and
-two window buffers plus two local ones in the AmneziaWG stack: 704 KiB on
-mobile, against 2.3 MB before. Those are ceilings on what a connection
-*allocates*; what it costs resident is about a third — see finding 10.
+two window buffers plus two local ones in the AmneziaWG stack, which is the
+"per connection" column above — 704 KiB inside an extension, against 2.3 MB
+before. Those are ceilings on what a connection *allocates*; what it costs
+resident is about a third — see finding 10.
+
+Note that the first row is keyed on being a Network Extension rather than on
+iOS, because `aarch64-apple-darwin` builds both the XCFramework slice that
+`ShoesPacketTunnelProvider` links and the desktop binary. `target_os` cannot
+tell those apart, so `scripts/build-apple.sh` sets the `network-extension`
+feature and `src/buffer_sizing.rs` keys off that. A macOS extension takes the
+iOS budget because its own is unverified — see docs/MACOS.md.
 
 **The receive window is the exception to that "about a third", and it is why
-mobile keeps 256 KiB.** A sustained transfer wraps smoltcp's ring across the
+an extension keeps 256 KiB.** A sustained transfer wraps smoltcp's ring across the
 whole buffer, so the window goes fully resident rather than staying on untouched
 zero pages. Measured on macOS with 16 concurrent downloads through the
 AmneziaWG stack, sampling RSS against an idle baseline of 13 MiB:
@@ -297,7 +305,18 @@ AmneziaWG stack, sampling RSS against an idle baseline of 13 MiB:
 
 An iOS extension is killed at roughly 50 MB, so sixteen bulk downloads at a
 4 MiB window is not survivable there, and 1 MiB reaches 42 MiB with no headroom
-for anything else. iOS therefore keeps 256 KiB.
+for anything else. An extension therefore keeps 256 KiB.
+
+Two caveats on reading Android's 1 MiB off that table. The measurements are
+macOS, so the per-connection RSS is an extrapolation rather than a figure taken
+on a device: Android's own worst case works out near 256 × 1.3 MiB ≈ 330 MiB
+resident under sustained bulk load, roughly four times what it was, and a
+`VpnService` at that RSS is a candidate for the low-memory killer on a budget
+device — where killing the app kills the tunnel. And unlike the TUN side's
+`tcp_buffer_size`, the remote window has no config knob, so an operator who
+hits this has no way down without a rebuild. Measuring it on a low-RAM Android
+device, and exposing the window as configuration if it bites, are both open —
+see ROADMAP.md.
 
 Android does not share that limit — a `VpnService` runs in the app process with
 an ordinary heap, not inside an extension under jetsam — so it was being sized
@@ -570,6 +589,12 @@ figure for 256 saturated mobile connections is nearer 40 MiB — still the
 dominant term inside an iOS extension, which is why the ceiling matters, but not
 the number to quote.
 
+That measurement is the TUN stack's four *local* buffers (4 × 32 KiB = the
+128 KiB row), and "about a third" holds for buffers of that kind. It does not
+extend to the AmneziaWG receive window, which a sustained transfer wraps end to
+end and which therefore goes fully resident — the table under the platform
+defaults above is the one to read for that.
+
 **What does `control-stats` cost?** Asked by the downstream client, which
 wanted the figure measured rather than estimated before enabling it inside a
 Network Extension. Measured 2026-08-27, arm64, `release-mobile`:
@@ -655,10 +680,12 @@ this pass.
 What is left, in the order it is worth doing:
 
 1. Lazy buffer growth (1). The ceiling is survivable now, but a connection that
-   carries one HTTP request still pays the full window a video connection needs,
-   and the resident figure above says a third of that is real. Growing the
-   window from small toward 256 KiB as a connection proves it can use it is the
-   change that gets both numbers.
+   carries one HTTP request still pays the full window a video connection needs
+   — and the window is the buffer that goes fully resident once it is used, so
+   there is no zero-page discount to fall back on. Growing the window from
+   small toward its platform default as a connection proves it can use it is
+   the change that gets both numbers, and it is what would lift the extension
+   off 256 KiB without raising the ceiling.
 2. Confirm the allocator purge does something for `phys_footprint` on a real
    iOS extension (10). If it does not, the lever is (1) instead.
 3. Handle semantics (5). The API implies a multi-instance model it does not

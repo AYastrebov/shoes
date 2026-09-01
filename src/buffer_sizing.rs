@@ -75,16 +75,46 @@
 //!
 //! # What a connection costs
 //!
-//! Through both stacks on mobile: four local buffers in the TUN stack, and two
-//! window buffers plus two local buffers in the AmneziaWG stack — 128 KiB plus
-//! 576 KiB, about 704 KiB. Against [`default_max_connections`] that is a
-//! ceiling near 176 MiB, and roughly a third of that resident, since these are
-//! zero pages the kernel faults in only as they are written.
+//! A connection through both stacks allocates four local buffers in the TUN
+//! stack, and two window buffers plus two local buffers in the AmneziaWG
+//! stack. Three of those four sizes differ by platform, so the total does too:
+//!
+//! | | per connection | against [`default_max_connections`] |
+//! |---|---|---|
+//! | Network Extension (iOS, macOS) | 704 KiB | 176 MiB |
+//! | Android | 1.4375 MiB | 368 MiB |
+//! | desktop | 4.625 MiB | 4.625 GiB |
+//!
+//! Those are ceilings on what a connection *allocates*, which is not what it
+//! costs resident: the local and send buffers are zero pages the kernel faults
+//! in only as they are written. The receive window is the exception, and
+//! [`default_remote_rx_window_size`] carries the measured RSS.
+
+/// Whether this build is linked into an Apple Network Extension, where the
+/// system kills the process at a memory cap rather than warning it.
+///
+/// Deliberately not a `target_os` test, because `target_os` cannot answer the
+/// question. Every iOS build of this crate is an extension, so iOS answers yes
+/// by target. macOS is both: `scripts/build-apple.sh` builds the
+/// `aarch64-apple-darwin` slice that `Package.swift` links into
+/// `ShoesPacketTunnelProvider`, and the same target builds the desktop binary
+/// and any Rust host linking the crate. Only the first is under a cap, and
+/// nothing in `target_os` separates them — hence the feature.
+///
+/// A macOS extension takes the same budget as iOS rather than a looser one
+/// because its own budget is unverified: docs/MACOS.md records that the
+/// tunnel has not yet run there and that the limit is known only not to be
+/// iOS's 50 MB. Inheriting the tightest known extension budget is the
+/// conservative reading, and it is the one to revisit once the extension runs
+/// and the limit is measured.
+const fn in_network_extension() -> bool {
+    cfg!(any(target_os = "ios", feature = "network-extension"))
+}
 
 /// Bytes of buffering per direction for a buffer that does not span a network
 /// round trip: the TUN stack's socket buffers, and both stacks' ring buffers.
 pub const fn default_local_buffer_size() -> usize {
-    if cfg!(any(target_os = "ios", target_os = "android")) {
+    if in_network_extension() || cfg!(target_os = "android") {
         32 * 1024
     } else {
         64 * 1024
@@ -110,7 +140,7 @@ pub const fn default_local_buffer_size() -> usize {
 /// | 1 MiB | 136.3 Mbit/s | 1.83 MiB | 42 MiB |
 /// | 4 MiB | ~154 Mbit/s | 4.99 MiB | 91 MiB |
 ///
-/// Hence three values rather than two. iOS keeps 256 KiB: an
+/// Hence three values rather than two. A Network Extension keeps 256 KiB: an
 /// `NEPacketTunnelProvider` is killed rather than warned at roughly 50 MB, and
 /// MOBILE.md finding 1 records that kill actually happening. Android is not
 /// under that limit — a `VpnService` runs in the app process with an ordinary
@@ -120,10 +150,22 @@ pub const fn default_local_buffer_size() -> usize {
 ///
 /// Only a connection that moves bulk data pays the full figure; the window goes
 /// resident to the extent bytes flow through it, so a page of small assets does
-/// not. Lifting iOS needs a *total* window budget rather than a larger
-/// per-connection size — see MOBILE.md finding 1.
+/// not. Lifting the extension figure needs a *total* window budget rather than
+/// a larger per-connection size — see MOBILE.md finding 1.
+///
+/// # The reassembly ceiling the window does not lift
+///
+/// `Cargo.toml` pins smoltcp to `assembler-max-segment-count-32`, which is its
+/// largest setting: a socket tracks at most 32 discontiguous ranges however
+/// wide its window. 4 MiB holds roughly 3000 segments in flight where 256 KiB
+/// held 180, so the holes a lossy or reordering path opens scale with the
+/// window while the assembler does not. Past 32 holes smoltcp drops the
+/// arriving segment and returns without a reply — not even a duplicate ACK —
+/// so recovery waits out the RTO rather than a fast retransmit. Every
+/// measurement above ran on a clean path, which is where that does not show.
+/// ROADMAP.md records the lossy-path measurement that would bound it.
 pub const fn default_remote_rx_window_size() -> usize {
-    if cfg!(target_os = "ios") {
+    if in_network_extension() {
         256 * 1024
     } else if cfg!(target_os = "android") {
         1024 * 1024
@@ -143,10 +185,59 @@ pub const fn default_remote_tx_window_size() -> usize {
 }
 
 /// Connections a virtual TCP stack accepts before it refuses more.
+///
+/// This is the multiplier on every size above, so it moves with them: a
+/// platform on the constrained per-connection budget takes the constrained
+/// count too.
 pub const fn default_max_connections() -> usize {
-    if cfg!(any(target_os = "ios", target_os = "android")) {
+    if in_network_extension() || cfg!(target_os = "android") {
         256
     } else {
         1024
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What one connection through both stacks allocates: four local buffers in
+    /// the TUN stack, plus two window buffers and two local buffers in the
+    /// AmneziaWG stack.
+    fn per_connection_bytes() -> usize {
+        6 * default_local_buffer_size()
+            + default_remote_rx_window_size()
+            + default_remote_tx_window_size()
+    }
+
+    /// The per-connection and ceiling figures in this module's documentation,
+    /// in MOBILE.md and in CONFIG.md are derived from these constants by hand,
+    /// and drifted from them once already. Pinning the arithmetic means the
+    /// next retune that forgets a document fails here rather than in a
+    /// reader's memory budget.
+    #[test]
+    fn the_documented_per_connection_cost_still_matches_the_constants() {
+        let (per_connection, ceiling) = if in_network_extension() {
+            (704 * 1024, 176 * 1024 * 1024)
+        } else if cfg!(target_os = "android") {
+            (1472 * 1024, 368 * 1024 * 1024)
+        } else {
+            (4736 * 1024, 4736 * 1024 * 1024)
+        };
+
+        assert_eq!(per_connection_bytes(), per_connection);
+        assert_eq!(
+            per_connection_bytes() * default_max_connections(),
+            ceiling,
+            "the worst-case column in MOBILE.md"
+        );
+    }
+
+    /// The send buffer is deliberately not sized with the receive window --
+    /// raising it converts into drops rather than throughput, which is the
+    /// measurement the module documentation records.
+    #[test]
+    fn the_send_buffer_does_not_follow_the_receive_window() {
+        assert_eq!(default_remote_tx_window_size(), 256 * 1024);
     }
 }

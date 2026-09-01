@@ -414,13 +414,14 @@ They are sized apart. The send buffer is 256 KiB everywhere. The receive window
 is the ceiling on download throughput — `window / RTT`, never auto-tuned — and
 at 256 KiB a 26 ms path measured 47.5 Mbit/s where a kernel TCP stack over the
 same tunnel reached 156.7. It is 4 MiB on desktop, 1 MiB on Android, and
-256 KiB on iOS, where a Network Extension is killed at roughly 50 MB and the
-window is the one buffer here that goes fully resident rather than staying on
-untouched zero pages.
+256 KiB inside an Apple Network Extension — iOS, and the macOS extension too —
+which is killed at roughly 50 MB, where the window is the one buffer here that
+goes fully resident rather than staying on untouched zero pages.
 
-Note also that these are allocation ceilings: the buffers are zero-filled pages,
-so a connection's resident cost is roughly a third of what it allocates until it
-fills them.
+Note also that most of these are allocation ceilings rather than resident cost:
+the buffers are zero-filled pages, so a connection occupies roughly a third of
+what it allocates until it fills them. The receive window is the exception just
+named — count it in full.
 
 The mobile defaults are chosen for an iOS `NEPacketTunnelProvider`, which is
 killed rather than warned when it crosses roughly 50 MB. Neither buffer spans a

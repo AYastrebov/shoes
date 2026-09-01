@@ -774,3 +774,36 @@ specific to the send direction and is itself the first symptom to explain.
 
 Until a harness exists that can resolve a 20% upload difference, no upload
 change here can be justified by measurement.
+
+## Open risk: the receive window is only measured on a clean path
+
+Every measurement behind `default_remote_rx_window_size` ran on a 26 ms path
+with no meaningful loss, which is where a large window is unambiguously good.
+Two things that window interacts with have not been measured, and both would
+show up only on a worse path.
+
+**Reassembly holes scale with the window; the assembler does not.** `Cargo.toml`
+pins smoltcp to `assembler-max-segment-count-32`, and that is smoltcp's largest
+setting — there is no feature above it, so this is a ceiling to design around
+rather than raise. A 4 MiB window holds roughly 3000 segments in flight against
+256 KiB's 180, so the number of simultaneous holes a lossy or reordering path
+opens scales with the window while the assembler stays at 32. Past that,
+`Assembler::add_then_remove_front` returns `Err` and smoltcp's `process` drops
+the arriving segment and returns without a reply — not even a duplicate ACK —
+so the sender waits out an RTO instead of taking a fast retransmit. The
+plausible outcome is that on a path with around 1% loss the 4 MiB window is
+*slower* than 256 KiB. What settles it is a download benchmark against the same
+peer with loss and reordering injected (`dummynet` or `netem`), sweeping the
+window across 256 KiB, 1 MiB and 4 MiB. If the crossover is real, the answer is
+a smaller desktop window or a fork of the assembler, not a feature bump.
+
+**Android's window is extrapolated from macOS RSS.** The per-connection RSS
+table in MOBILE.md was sampled on macOS, and Android's 1 MiB was chosen from
+it rather than from a device. Android's worst case works out near 330 MiB
+resident under sustained bulk load, and a `VpnService` at that RSS is a
+low-memory-killer candidate on a budget device — where losing the app loses the
+tunnel. Sampling RSS on a low-RAM device under concurrent downloads would
+either confirm 1 MiB or argue it down. Related: the remote window has no config
+knob, unlike the TUN side's `tcp_buffer_size`, so an operator who hits this
+cannot lower it without a rebuild. Exposing it is cheap and worth doing if the
+measurement bites.

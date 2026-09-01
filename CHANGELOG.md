@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### The macOS Network Extension gets an extension's buffer budget
+
+The per-connection buffer sizes split on `target_os`, but the constraint they
+model is "runs inside a Network Extension" -- and macOS is where those two
+diverge. `aarch64-apple-darwin` builds both the XCFramework slice that
+`ShoesPacketTunnelProvider` links and the desktop binary, so the macOS
+extension was silently taking desktop's: a 4 MiB receive window against 1024
+connections, an allocation ceiling near 4.25 GiB where iOS sits at 176 MiB.
+`scripts/build-apple.sh` now sets a `network-extension` feature on every Apple
+slice and `src/buffer_sizing.rs` keys the budget off that instead. A macOS
+extension takes iOS's sizes, which is conservative rather than measured -- its
+real limit is still unverified, and docs/MACOS.md records that as the knob to
+revisit. **No effect on the desktop binary or on iOS**; only the macOS slice of
+the XCFramework changes.
+
+Alongside it, the reassembly ceiling the wider window runs into is now written
+down where the window is chosen: smoltcp is pinned at
+`assembler-max-segment-count-32`, which is its largest setting, so a 4 MiB
+window's ~3000 in-flight segments can open more holes than the assembler
+tracks, and past 32 smoltcp drops the segment without even a duplicate ACK.
+Every measurement behind the window ran on a clean path, so this is unbounded
+rather than known-bad; ROADMAP.md carries the lossy-path benchmark that would
+settle it, along with the note that Android's window is extrapolated from macOS
+RSS rather than measured on a device.
+
 ## v0.2.18
 
 ### The TUN server honours its `dns:` config
