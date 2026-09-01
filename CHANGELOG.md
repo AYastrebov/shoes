@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## v0.2.19
+
+### AmneziaWG download is roughly three times faster
+
+One constant fed both smoltcp socket buffers, so an AmneziaWG connection's
+receive window was 256 KiB. smoltcp never auto-tunes, which makes that a hard
+ceiling of `window / RTT` on download. Measured against an AmneziaWG 3.1 peer
+at 26 ms RTT, alternating each request with a native `amneziawg-go` tunnel to
+the same server so path drift hit both arms equally, that was **47.5 Mbit/s
+where the kernel stack over the same tunnel reached 156.7**. Crypto was not the
+limit -- 34% of one core against `amneziawg-go`'s 125-140%.
+
+The receive window is now sized apart from the send buffer, and by platform:
+4 MiB on desktop, 1 MiB on Android, 256 KiB inside an Apple Network Extension.
+The send buffer stays at 256 KiB everywhere, deliberately -- raising both to
+2 MiB took *upload* from 49 to 16.6 Mbit/s, because smoltcp does not pace and a
+send buffer larger than the tunnel's queue bursts into drops that Cubic reads
+as congestion.
+
+**This costs memory, and the receive window is the one buffer that does not get
+the zero-page discount** -- a sustained transfer wraps smoltcp's ring across the
+whole thing, so it goes fully resident. A desktop connection now allocates
+4.625 MiB against 704 KiB before. The per-platform ceilings are tabulated in
+`src/buffer_sizing.rs` and MOBILE.md. Both are defaults, and the TUN side's
+`tcp_buffer_size` still covers the device half.
 
 ### The macOS Network Extension gets an extension's buffer budget
 
@@ -26,6 +50,20 @@ Every measurement behind the window ran on a clean path, so this is unbounded
 rather than known-bad; ROADMAP.md carries the lossy-path benchmark that would
 settle it, along with the note that Android's window is extrapolated from macOS
 RSS rather than measured on a device.
+
+### Documentation
+
+ROADMAP.md's competitive comparison is current again and now has three columns:
+it was re-checked against sing-box v1.14.0 and Xray-core v26.7.28, and
+Xray-core, previously named in the framing but absent from the table, is a
+column of its own. Our own side was re-verified against the tree rather than
+against the table, which corrected four stale claims -- macOS missing from the
+TUN platforms, HTTPUpgrade missing from both protocol lists, destination-port
+matching missing from the routing row, and `src/control/` described as a
+"control API" when it is an in-process module with no network surface. The
+same pass established that `X25519MLKEM768` is already the first key-exchange
+group we offer on every rustls path, inherited from a rustls default rather
+than chosen, and that ECH remains a genuine gap.
 
 ## v0.2.18
 
