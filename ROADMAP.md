@@ -24,6 +24,15 @@ defaults IPV6_V6ONLY on. Refreshed 2026-08-28 against `mobile` at `2cccb2e`
 what it cost and asked for what it lacked: the package split into a host and
 an extension product, the engine gained a stop callback that replaced the
 provider's health check, and the rest of that list is a section of its own.
+Refreshed 2026-09-01 against `mobile` at `a87c616` (v0.2.18), when the two
+comparison sections were re-verified against the source tree and both
+competitors were re-checked against their current releases — sing-box v1.14.0
+and Xray-core v26.7.28, which is where Xray-core joined the table. That pass
+corrected four claims about our own tree that had gone stale rather than
+merely old: macOS was missing from the TUN platforms, HTTPUpgrade from both
+protocol lists, destination-port matching from the routing row, and
+`src/control/` was being described as a "control API" when it is an in-process
+module with no network surface at all.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -41,40 +50,96 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
+- [Open risk: AmneziaWG upload throughput is unmeasured](#open-risk-amneziawg-upload-throughput-is-unmeasured)
+- [Open risk: the receive window is only measured on a clean path](#open-risk-the-receive-window-is-only-measured-on-a-clean-path)
 
 ## Where we already compete
 
-The protocol surface is close to parity with sing-box.
+On circumvention protocols the surface is close to parity with sing-box, and
+ahead of Xray-core in places.
+
+That framing needs one update, though. sing-box 1.14 stopped being only a
+circumvention proxy: it added an **OpenVPN client *and server*, an OpenConnect
+client**, Snell, and a `bridge` outbound doing layer-3 forwarding. So the
+protocol gap has widened along an axis that did not exist a year ago — classic
+enterprise VPN — rather than along the one this list measures. Whether that
+axis matters to us is a product question nobody has asked yet; it is worth
+asking before it answers itself.
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
-TLS, WebSocket.
+TLS, WebSocket, HTTPUpgrade.
 
 Client: Direct, HTTP, SOCKS5, Shadowsocks, Snell, VMess, VLESS, Trojan, AnyTLS,
 NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1,
-port-forward, plus TLS, Reality, ShadowTLS and WebSocket as wrapping layers.
+port-forward, plus TLS, Reality, ShadowTLS, WebSocket and HTTPUpgrade as
+wrapping layers.
 
-Transports and obfuscation: TCP and QUIC for every protocol, XTLS Reality (a
-hand-written TLS 1.3 stack, `src/reality/`), XTLS Vision, ShadowTLS v3, H2MUX,
-SagerNet UDP-over-TCP, XUDP.
+Transports and obfuscation: TCP, UDP and QUIC — though not every protocol takes
+every one, since mieru is TCP-only and Hysteria2 and TUIC are QUIC-native
+terminal connectors. XTLS Reality (a hand-written TLS 1.3 stack, `src/reality/`),
+XTLS Vision, ShadowTLS v3, H2MUX, SagerNet UDP-over-TCP, XUDP, QUIC Salamander
+obfuscation and Hysteria2 port hopping.
 
-TUN mode with a Fake IP pool, on Linux, Android, iOS and Windows 11.
+TUN mode with a Fake IP pool, on Linux, Android, iOS, Windows 11 and macOS. The
+macOS path is the Network Extension system extension and **has never actually
+been run** — see [docs/MACOS.md](./docs/MACOS.md), and note that
+`validate_tun_config` has no macOS arm, so a macOS TUN config is not validated
+the way the other four are.
+
+Three things worth naming because the table below has no row for them and they
+are real work: a DNS subsystem with `system`, UDP, TCP, DoT, DoH and DoH3
+resolvers, bootstrap chains, and per-server resolution over a proxy chain with
+every DNS socket protected against routing into the tunnel it resolves for;
+multi-hop proxy chains with per-hop round-robin; and mTLS with certificate
+pinning in both directions.
+
+Two protocols we have that **neither** competitor does: **mieru** (sing-box
+rejected the PR in June 2026 and closed the thread; Xray has never had it) and
+**AmneziaWG 2.0/3.0/3.1**, which is the whole reason this fork exists.
 
 ## Where we do not
 
 The gap is not in protocols. It is in everything around them.
 
-| Capability | shoes | sing-box |
-| --- | --- | --- |
-| Routing rule matchers | CIDR and `*.domain` masks | 43 fields |
-| Domain/IP lists (geosite, geoip) | `.srs` rule-sets, local files | `.srs` rule-sets, remote, auto-updating |
-| Protocol sniffing (SNI, Host, QUIC, DNS) | SNI and Host, TCP only | yes |
-| Per-app routing on Android | none | `package_name` |
-| Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
-| Per-connection statistics | global counters, a live connection count, and per-outbound bytes — readable from a mobile host over FFI | Clash API |
-| Extra transports | WebSocket, HTTPUpgrade, H2MUX | + gRPC, HTTP/2 |
-| Hysteria2 / TUIC as a *client* | yes | yes |
-| Desktop client | control API and a Swift package for the Apple extension and app; no GUI | full GUI on three platforms |
+Checked 2026-09-01 against **sing-box v1.14.0** (2026-08-31) and **Xray-core
+v26.7.28** (2026-07-28). Two caveats on those versions: Xray marks nearly every
+release a pre-release, so `releases/latest` still resolves to v26.3.27 even
+though v26.7.28 is the real head; and Xray publishes no changelog text, so its
+column is reconstructed from the commit log and the docs site rather than from
+release notes.
+
+| Capability | shoes | sing-box 1.14 | Xray-core v26.7 |
+| --- | --- | --- | --- |
+| Routing rule matchers | CIDR and `*.domain` masks, destination port, plus rule-sets | ~45 fields, incl. process, package name (+ regex), WiFi SSID, network type, MAC and source hostname | ~14 fields, incl. `process` (macOS since 26.4, UID on Android) and `vlessRoute` |
+| Domain/IP lists | `.srs` rule-sets, local files only | `.srs` local, remote with `update_interval`, and inline; `type: logical` | `geosite.dat`/`geoip.dat` + `ext:`, auto-updating and hot-reloading since 2026 |
+| Protocol sniffing | TLS SNI and HTTP Host, TCP only | 10 protocols over TCP *and* UDP (QUIC, DNS, STUN, BitTorrent, DTLS, NTP, SSH, RDP), plus `protocol` and `client` matchers | sniffing with `domainsExcluded`/`ipsExcluded`, FakeDNS destination override |
+| Per-app routing on Android | none | `package_name`, `package_name_regex` (1.14) | `process` matcher, by UID on Android |
+| Outbound selection | round-robin, no health check | `urltest` (latency, tolerance, idle timeout), `selector` | `observatory`/`burstObservatory` + balancers: random, roundRobin, leastPing, leastLoad |
+| Statistics | global byte counters, live connection count, per-outbound bytes | Clash API, V2Ray gRPC stats (per inbound/outbound/user) | gRPC StatsService per user/inbound/outbound, online users and per-user IP lists |
+| Management interface | **none over the network** — an in-process Rust module plus the mobile FFI | Clash API, plus a first-party gRPC API and web Dashboard new in 1.14 | gRPC API: Handler, Logger, Stats, Routing services |
+| Extra transports | WebSocket, HTTPUpgrade, H2MUX | + gRPC (build tag) and HTTP/2 | XHTTP over H2 and H3, gRPC, WebSocket, HTTPUpgrade, mKCP; WS and gRPC now soft-deprecated in favour of XHTTP |
+| Modern TLS | `X25519MLKEM768` first on every rustls path (a rustls default we inherit); **no ECH**; Reality is classical X25519 | ECH; `X25519MLKEM768` in `curve_preferences` | ECH (forced when configured); ML-KEM-768 VLESS Encryption; ML-DSA-65 REALITY certificates |
+| TUN | Linux, Android, iOS, Windows 11, macOS (unrun) | Linux, Windows, macOS; mobile via the platform VPN API in the GUI clients | Windows, Linux, macOS, FreeBSD natively; iOS and Android take an fd via `XRAY_TUN_FD` |
+| Hysteria2 / TUIC as a *client* | both | both | Hysteria2 yes (since 26.1); **no TUIC, no AnyTLS** |
+| Desktop client | a Swift package for the Apple extension and app; no GUI | full GUI on three platforms, plus a new desktop app for Windows and Linux | none — Xray is a core, GUIs are third-party |
+
+Two rows deserve a caveat rather than a footnote.
+
+**Statistics.** Ours are counters, not a table keyed by connection, and that is
+deliberate — `Cargo.toml` records why, since a per-connection table is exactly
+the runtime state a phone cannot spare. But the two top-level byte totals are
+incremented only on the TUN path, so in plain server mode they read zero while
+`outbounds[]` still populates. Anyone quoting them should know which mode they
+were measured in.
+
+**Management interface.** The previous version of this table called ours a
+"control API", which oversold it. `src/control/` is an in-process Rust module
+extracted from the FFI so a Rust host can drive a tunnel — no listener, no
+endpoints, no port, no auth — and it is feature-gated off by default. Both
+competitors ship a real network management API, and sing-box 1.14 just made
+that a first-party gRPC service with its own dashboard rather than leaning on
+the Clash API. This is now the widest single gap in the table.
 
 ## Tier 1 — closes most of the gap
 
@@ -212,6 +277,30 @@ v0.2.13.
 
 `DnsConfigGroup` exists (`src/config/types/dns.rs:166`) but nothing selects a
 group per rule, so split DNS cannot be expressed. Half the mechanism is built.
+
+### 9. A management interface over the network
+
+Added 2026-09-01, out of the comparison refresh, where it is the widest single
+gap. `shoes::control` is in-process only: a Rust host that links the crate gets
+`status`, `stats::snapshot` and a log sink, and nothing else can reach them.
+Every competitor ships a network API — Xray a gRPC service, sing-box the Clash
+API and, as of 1.14, a first-party gRPC service with its own web dashboard —
+and every third-party GUI and panel in this ecosystem is built against one of
+those two. Not having one is what keeps shoes a library with a CLI rather than
+something an existing panel can drive.
+
+The pieces are mostly present: `StatsSnapshot` and `StatusSnapshot` already
+serialise, the log sink is already subscribable, and `ServiceHandle` already
+has the lifecycle. What is missing is a listener, an auth story, and a
+decision about shape — Clash-API compatibility would inherit an ecosystem of
+clients for free, where a native API would be cleaner and reach nobody. That
+choice should be made deliberately rather than by whichever is easier to write,
+and it wants a spec before code.
+
+Note the mobile constraint this does *not* escape: a management API that keeps
+a connection table costs the RSS item 6 declined. Whatever ships should be
+feature-gated the way `control-logs` and `control-stats` already are, so a
+Network Extension can decline it.
 
 ## Tier 3 — not urgent
 
@@ -747,6 +836,33 @@ easier to pick out by standing still. Our QUIC outbounds at least take their
 transport parameters from the reference implementations rather than inventing
 plausible-looking numbers, so we do not pay for a unique signature we never
 chose; the handshake itself remains ours.
+
+A second divergence opened in 2026, and checking it corrected an assumption
+worth recording, because the intuition was wrong in our favour.
+
+**Post-quantum key exchange we already have, by accident rather than by
+decision.** `prefer-post-quantum` is a default feature of rustls, our build
+resolves it on, and `src/rustls_config_util.rs:191` takes
+`aws_lc_rs::default_provider()` — so `X25519MLKEM768` is the *first* group
+offered on every rustls path, client and server, QUIC included. Nobody chose
+that here; it arrived with a dependency default. It should be treated as a
+property to hold deliberately rather than one to keep by luck: nothing in the
+tree pins the group list or would fail if a future rustls reordered it.
+
+Two places do not inherit it. **`src/reality/` is classical X25519 only** — the
+hand-written TLS 1.3 stack does its own `agreement::X25519`
+(`reality_server_connection.rs:513`, `reality_client_connection.rs:163`), and
+the REALITY protocol pins that construction, so this is not ours to change
+unilaterally. Xray has moved here already, signing REALITY certificates with
+ML-DSA-65 via `mldsa65Seed`, which is a protocol-level change we would have to
+follow rather than invent. And **we have no ECH at all**, where sing-box
+supports it and Xray now forces it whenever it is configured.
+
+ECH is the real gap of the two, and it is a fingerprinting gap rather than a
+confidentiality one: without it the SNI is in the clear on every plain-TLS
+path, which is exactly what Reality exists to work around and exactly what a
+non-Reality deployment still leaks. Worth scoping against rustls' ECH support
+rather than assuming, the way the post-quantum question should have been.
 
 ## Open risk: AmneziaWG upload throughput is unmeasured
 
