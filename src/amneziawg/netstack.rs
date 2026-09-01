@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -236,6 +236,23 @@ const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// the TUN stack has the same cap on its side.
 const MAX_TCP_SOCKETS: usize = crate::buffer_sizing::default_max_connections();
 
+/// UDP sessions this stack holds at once.
+///
+/// A quarter of the TCP ceiling rather than the same number, because the two
+/// are not alike in either cost or count. A UDP session owns two
+/// `UdpPacketBuffer`s of [`UDP_PAYLOAD_BUF`] -- 64 KiB the pair on Android --
+/// and unlike a TCP receive window those are packet buffers that go resident
+/// as soon as anything is queued in them. And real UDP through a tunnel is
+/// DNS, which is transient, plus a browser's QUIC connections, which number in
+/// the tens rather than the hundreds. 64 sessions is 4 MiB on mobile, against
+/// an iOS extension killed at roughly 50 MB.
+///
+/// Any number here is better than the none this had. `initiate_tcp` has
+/// refused past its ceiling since it was written, on the reasoning above
+/// `MAX_TCP_SOCKETS` that an unbounded map is an OOM; `initiate_udp` was
+/// simply left out of it, so a QUIC-heavy page could allocate without limit.
+const MAX_UDP_SOCKETS: usize = MAX_TCP_SOCKETS / 4;
+
 // ---------------------------------------------------------------------------
 // VirtualNetStack
 // ---------------------------------------------------------------------------
@@ -343,8 +360,27 @@ impl VirtualNetStack {
                         }
                     }
                 }
-                Some(packet) = self.ip_from_tunnel.recv() => {
-                    self.device.rx_queue.push(packet);
+                packet = self.ip_from_tunnel.recv() => {
+                    match packet {
+                        Some(packet) => self.device.rx_queue.push(packet),
+                        // The decapsulate task owns the only sender, so a
+                        // closed channel means the tunnel's receive path is
+                        // gone and nothing will ever arrive again. Matched
+                        // explicitly rather than left as a `Some(..)` pattern:
+                        // a failed pattern only disables the branch, so this
+                        // loop went on polling smoltcp and servicing every
+                        // socket at up to 100 Hz for the life of the process,
+                        // with no possible input. On a phone that is a wakeup
+                        // source that never stops.
+                        //
+                        // Returning drops `request_rx`, which closes the
+                        // sender the connector holds, which is what its
+                        // `is_closed()` check rebuilds on.
+                        None => {
+                            info!("AmneziaWG netstack: tunnel receive path gone, stopping");
+                            return;
+                        }
+                    }
                 }
                 _ = sleep => {}
             }
@@ -579,6 +615,14 @@ impl VirtualNetStack {
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpStream>>,
     ) {
+        if self.active_udp.len() >= MAX_UDP_SOCKETS {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("virtual UDP socket limit reached ({MAX_UDP_SOCKETS})"),
+            )));
+            return;
+        }
+
         let rx_buf = UdpPacketBuffer::new(
             vec![UdpPacketMetadata::EMPTY; UDP_PACKET_SLOTS],
             vec![0u8; UDP_PAYLOAD_BUF],
@@ -627,11 +671,18 @@ impl VirtualNetStack {
         for (handle, active) in &mut self.active_udp {
             let socket = self.sockets.get_mut::<SmolUdpSocket>(*handle);
 
-            // Drain outgoing packets from async side -> smoltcp send
-            while let Ok(data) = active.outgoing_rx.try_recv() {
-                if socket.can_send()
-                    && let Err(e) = socket.send_slice(&data, active.target)
-                {
+            // Drain outgoing packets from async side -> smoltcp send.
+            //
+            // The `can_send` test gates the dequeue rather than the send. It
+            // used to sit inside the loop body, after `try_recv` had already
+            // taken the datagram, so a socket that could not send discarded
+            // every datagram in the channel instead of leaving them queued --
+            // and said so in a `debug!` that release builds compile out.
+            while socket.can_send() {
+                let Ok(data) = active.outgoing_rx.try_recv() else {
+                    break;
+                };
+                if let Err(e) = socket.send_slice(&data, active.target) {
                     debug!("AmneziaWG UDP send error: {}", e);
                 }
             }
@@ -925,6 +976,37 @@ mod tests {
         // The entry and its buffers are gone, not parked.
         assert!(stack.pending_tcp.is_empty());
         assert!(stack.sockets.iter().next().is_none());
+    }
+
+    /// UDP had no budget at all: `initiate_tcp` refused past its ceiling
+    /// from the day it was written and `initiate_udp` was left out, so a
+    /// QUIC-heavy page could allocate two packet buffers per flow without
+    /// limit -- 64 KiB a session on Android, against an extension the system
+    /// kills at roughly 50 MB.
+    #[test]
+    fn the_udp_budget_refuses_the_overflow_session() {
+        let (mut stack, _tunnel_rx) = stack();
+
+        for i in 0..MAX_UDP_SOCKETS {
+            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+            stack.initiate_udp(format!("192.0.2.1:{}", 1000 + i).parse().unwrap(), reply_tx);
+            assert!(
+                reply_rx.try_recv().expect("a reply").is_ok(),
+                "session {i} is inside the budget"
+            );
+        }
+        assert_eq!(stack.active_udp.len(), MAX_UDP_SOCKETS);
+
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        stack.initiate_udp("192.0.2.1:9999".parse().unwrap(), reply_tx);
+        let err = reply_rx
+            .try_recv()
+            .expect("the overflow session must be answered, not parked")
+            .map(|_| ())
+            .expect_err("it is past the budget");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        // Refused, not admitted-then-trimmed: no buffers were allocated.
+        assert_eq!(stack.active_udp.len(), MAX_UDP_SOCKETS);
     }
 
     /// The stack refuses the socket that would exceed its budget instead
