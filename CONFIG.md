@@ -404,11 +404,19 @@ at startup.
 
 A connection through an AmneziaWG outbound pays again on the far side, where the
 tunnel's own virtual stack keeps two ring buffers of the same size plus two
-256 KiB socket buffers. That larger number is deliberate and not configurable
-here: those two are the receive window and in-flight send data of a connection
-whose far end is across the internet, and shrinking them to the size of a local
-buffer measured as a 6x throughput loss. `tcp_buffer_size` covers the device
-side only, where there is no round trip to cover.
+socket buffers. Those two are deliberate and not configurable here: they are the
+receive window and in-flight send data of a connection whose far end is across
+the internet, and shrinking them to the size of a local buffer measured as a 6x
+throughput loss. `tcp_buffer_size` covers the device side only, where there is
+no round trip to cover.
+
+They are sized apart. The send buffer is 256 KiB everywhere. The receive window
+is the ceiling on download throughput — `window / RTT`, never auto-tuned — and
+at 256 KiB a 26 ms path measured 47.5 Mbit/s where a kernel TCP stack over the
+same tunnel reached 156.7. It is 4 MiB on desktop, 1 MiB on Android, and
+256 KiB on iOS, where a Network Extension is killed at roughly 50 MB and the
+window is the one buffer here that goes fully resident rather than staying on
+untouched zero pages.
 
 Note also that these are allocation ceilings: the buffers are zero-filled pages,
 so a connection's resident cost is roughly a third of what it allocates until it

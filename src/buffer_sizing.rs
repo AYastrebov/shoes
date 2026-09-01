@@ -40,6 +40,39 @@
 //! bytes take five times as long to move. So the window keeps its size and the
 //! local buffers get cut instead.
 //!
+//! # The linear region continues above 256 KiB
+//!
+//! Those measurements only went downward from 256 KiB, so they establish that
+//! shrinking the window hurts without establishing that 256 KiB is enough. It
+//! is not. Measured against an AmneziaWG 3.1 peer at 26 ms RTT, 50 MiB per
+//! transfer, alternating each request with a native `amneziawg-go` tunnel to
+//! the same server so that path drift hits both arms equally:
+//!
+//! | receive window | download | native arm, same run |
+//! |---|---|---|
+//! | 256 KiB | 47.5 Mbit/s | 156.7 Mbit/s |
+//! | 2 MiB | 129.5 Mbit/s | 162.5 Mbit/s |
+//! | 8 MiB | 142.7 Mbit/s | 151.4 Mbit/s |
+//!
+//! At 256 KiB the stack reached 30% of what the same path gave a kernel TCP
+//! stack over the same tunnel; the shortfall was the window, not the crypto,
+//! which ran at 34% of one core against `amneziawg-go`'s 125-140%. A kernel
+//! peer auto-tunes its receive window into the megabytes and smoltcp cannot, so
+//! the number it is given up front is the number it keeps.
+//!
+//! # Why receive and send are sized apart
+//!
+//! They were one constant, which made the send buffer inherit any increase
+//! meant for the receive window. That is not free: raising both to 2 MiB took
+//! upload from 49 to 16.6 Mbit/s, because smoltcp does not pace, and a send
+//! buffer far larger than the tunnel's queue bursts into drops that Cubic reads
+//! as congestion.
+//!
+//! So only the receive window grows here. The send buffer keeps the size it has
+//! been measured at. Upload is *not* known to be well-sized — see
+//! ROADMAP.md, which records why the measurement that would settle it does not
+//! exist yet.
+//!
 //! # What a connection costs
 //!
 //! Through both stacks on mobile: four local buffers in the TUN stack, and two
@@ -58,13 +91,54 @@ pub const fn default_local_buffer_size() -> usize {
     }
 }
 
-/// Bytes of receive window, and of unacknowledged send data, for a connection
-/// whose far end is across the internet.
+/// Bytes of receive window for a connection whose far end is across the
+/// internet, reached through the AmneziaWG tunnel.
 ///
-/// Not platform-dependent: a phone's round trip is longer than a server's, not
-/// shorter, so there is nothing here to save by being on a phone. 256 KiB
-/// carries about 6 MB/s at 40 ms and about 2.5 MB/s at 100 ms.
-pub const fn default_remote_window_size() -> usize {
+/// This is the ceiling on download throughput: `window / RTT`, since smoltcp
+/// holds the size it is constructed with and never auto-tunes. 256 KiB carries
+/// about 6 MB/s at 40 ms and about 2.5 MB/s at 100 ms; 4 MiB carries a gigabit
+/// at 30 ms and does not become the limit until the round trip is long.
+///
+/// Unlike the other buffers here, this one is not saved by lazy zero pages: a
+/// sustained transfer wraps smoltcp's ring across the whole buffer, so the
+/// window goes fully resident. Measured at 26 ms RTT with 16 concurrent
+/// downloads, against an idle baseline of 13 MiB:
+///
+/// | window | download | RSS per connection | RSS at 16 |
+/// |---|---|---|---|
+/// | 256 KiB | 52.0 Mbit/s | 1.08 MiB | 30 MiB |
+/// | 1 MiB | 136.3 Mbit/s | 1.83 MiB | 42 MiB |
+/// | 4 MiB | ~154 Mbit/s | 4.99 MiB | 91 MiB |
+///
+/// Hence three values rather than two. iOS keeps 256 KiB: an
+/// `NEPacketTunnelProvider` is killed rather than warned at roughly 50 MB, and
+/// MOBILE.md finding 1 records that kill actually happening. Android is not
+/// under that limit — a `VpnService` runs in the app process with an ordinary
+/// heap — so it takes 1 MiB, which buys most of the throughput for 0.75 MiB
+/// per connection. Desktop takes 4 MiB, where the round trip rather than the
+/// memory decides.
+///
+/// Only a connection that moves bulk data pays the full figure; the window goes
+/// resident to the extent bytes flow through it, so a page of small assets does
+/// not. Lifting iOS needs a *total* window budget rather than a larger
+/// per-connection size — see MOBILE.md finding 1.
+pub const fn default_remote_rx_window_size() -> usize {
+    if cfg!(target_os = "ios") {
+        256 * 1024
+    } else if cfg!(target_os = "android") {
+        1024 * 1024
+    } else {
+        4096 * 1024
+    }
+}
+
+/// Bytes of unacknowledged send data for a connection whose far end is across
+/// the internet.
+///
+/// Deliberately not raised alongside the receive window: smoltcp does not pace
+/// its sends, so a send buffer much larger than the tunnel's queue converts
+/// into drops rather than throughput. See the module documentation.
+pub const fn default_remote_tx_window_size() -> usize {
     256 * 1024
 }
 

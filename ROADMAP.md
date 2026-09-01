@@ -747,3 +747,30 @@ easier to pick out by standing still. Our QUIC outbounds at least take their
 transport parameters from the reference implementations rather than inventing
 plausible-looking numbers, so we do not pay for a unique signature we never
 chose; the handshake itself remains ours.
+
+## Open risk: AmneziaWG upload throughput is unmeasured
+
+Raising the AmneziaWG receive window fixed download (see `src/buffer_sizing.rs`
+for the numbers). Upload was left alone, and it is not known to be well sized.
+
+Two things are recorded here so the next person does not repeat the work.
+
+**Enlarging the send buffer makes upload worse, not better.** Moving both
+buffers to 2 MiB took upload from 49 to 16.6 Mbit/s, and 8 MiB gave 21.9.
+smoltcp does not pace its sends, so a send buffer much larger than the tunnel's
+queue bursts into drops that Cubic reads as congestion. The drops are not the
+`tunnel TX full` path in `src/amneziawg/netstack.rs` — that warning never fired
+during any of these transfers — so they are happening below it, most likely in
+the endpoint UDP socket. Whoever picks this up should find the drop before
+changing the buffer.
+
+**The upload measurement itself is not yet trustworthy.** An A/A control — the
+same binary on two peer sessions of one server, requests alternating — produced
+medians of 25.6 and 29.3 Mbit/s with both arms ranging 13 to 55. That spread is
+wider than any effect worth chasing, and it is bimodal rather than merely noisy,
+which suggests the upload path falls into a bad state and climbs out of it. The
+same harness measured download tightly (51-55 against 137-182), so this is
+specific to the send direction and is itself the first symptom to explain.
+
+Until a harness exists that can resolve a 20% upload difference, no upload
+change here can be justified by measurement.
