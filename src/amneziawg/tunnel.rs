@@ -272,6 +272,15 @@ pub struct TunnelRuntime {
     pub ip_to_tunnel_tx: mpsc::Sender<Vec<u8>>,
     /// Channel to receive decapsulated IP packets for the virtual stack.
     pub ip_from_tunnel_rx: ParkingMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Packets the virtual stack offered the outbound queue, delivered or
+    /// dropped. The netstack increments it at its push site; the liveness
+    /// watchdog reads it as its evidence of demand. It must come from
+    /// upstream of the drain loop: `packets_offered` is incremented by the
+    /// drain loop itself, so a drain loop that stalls takes the watchdog's
+    /// evidence of demand with it, and a tunnel discarding every packet is
+    /// indistinguishable from one nobody is using. An emulator stall sat
+    /// exactly there for ten minutes while the app reported Connected.
+    pub outbound_offered: Arc<AtomicUsize>,
     /// Set when the receive path is gone -- the receive loop terminated
     /// on an error streak, or the liveness watchdog gave up on a socket
     /// that stayed silent under traffic. The engine hears about either
@@ -335,6 +344,12 @@ impl TunnelRuntime {
         // tell "no handshake because nothing was ever sent" — an idle tunnel,
         // which is fine — from "no handshake although we kept trying".
         let packets_offered = Arc::new(AtomicUsize::new(0));
+
+        // Demand as seen upstream of the drain loop -- see the field doc on
+        // TunnelRuntime::outbound_offered. The netstack is the main writer;
+        // the rebind announcement below is the one producer that does not go
+        // through the netstack, so it counts itself at its own send site.
+        let outbound_offered = Arc::new(AtomicUsize::new(0));
 
         // Outer datagrams successfully received, ever. The receive loop
         // counts, the trailer probe reads -- to tell "the peer answers but
@@ -447,6 +462,7 @@ impl TunnelRuntime {
             let tunn = tunn.clone();
             let rebinds = rebinds_completed.clone();
             let announce = ip_to_tunnel_tx.clone();
+            let announce_offered = outbound_offered.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
                 rebinds.fetch_add(1, Ordering::Relaxed);
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
@@ -467,6 +483,9 @@ impl TunnelRuntime {
                 // sending its own datagrams raced the timer task's rekey) and
                 // a send failure gets the loop's EMSGSIZE remediation. If the
                 // queue is full, the traffic filling it announces instead.
+                // Counted like any other packet offered to the queue, so the
+                // watchdog does not quietly narrow what it considers traffic.
+                announce_offered.fetch_add(1, Ordering::Relaxed);
                 let _ = announce.try_send(Vec::new());
             }))
         };
@@ -475,7 +494,7 @@ impl TunnelRuntime {
         // that fails loudly; this catches one that fails silently.
         let liveness_task = {
             let udp = udp_socket.clone();
-            let offered = packets_offered.clone();
+            let offered = outbound_offered.clone();
             let decapsulated = datagrams_decapsulated.clone();
             let rebinds = rebinds_completed.clone();
             let dead = dead.clone();
@@ -519,6 +538,7 @@ impl TunnelRuntime {
         Ok(Arc::new(Self {
             ip_to_tunnel_tx,
             ip_from_tunnel_rx: ParkingMutex::new(Some(ip_from_tunnel_rx)),
+            outbound_offered,
             dead,
             abort_handles,
         }))
@@ -968,7 +988,7 @@ async fn trailer_probe_loop(
 /// over a tunnel that cannot hear its peer.
 async fn liveness_loop(
     udp: Arc<EndpointSocket>,
-    packets_offered: Arc<AtomicUsize>,
+    outbound_offered: Arc<AtomicUsize>,
     datagrams_decapsulated: Arc<AtomicUsize>,
     rebinds_completed: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
@@ -985,8 +1005,12 @@ async fn liveness_loop(
         if dead.load(Ordering::SeqCst) {
             return;
         }
+        // Demand read from what the netstack offered the outbound queue,
+        // not from `packets_offered`, which the drain loop increments and
+        // which therefore stops when the drain loop does -- a stalled drain
+        // loop must not read as an idle tunnel.
         match watch.on_tick(
-            packets_offered.load(Ordering::Relaxed),
+            outbound_offered.load(Ordering::Relaxed),
             datagrams_decapsulated.load(Ordering::Relaxed),
             rebinds_completed.load(Ordering::Relaxed),
         ) {

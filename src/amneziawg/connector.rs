@@ -236,6 +236,7 @@ impl AmneziaWgConnector {
             runtime_config.mtu,
             tunnel_runtime.ip_to_tunnel_tx.clone(),
             ip_from_tunnel_rx,
+            tunnel_runtime.outbound_offered.clone(),
         );
 
         let (request_tx, request_rx) = mpsc::channel::<NetStackRequest>(64);

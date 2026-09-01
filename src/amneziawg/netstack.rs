@@ -14,6 +14,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use log::{debug, info, warn};
@@ -266,6 +267,12 @@ pub struct VirtualNetStack {
     pending_tcp: HashMap<SocketHandle, PendingTcp>,
     active_tcp: HashMap<SocketHandle, ActiveTcp>,
     active_udp: HashMap<SocketHandle, ActiveUdp>,
+    /// Every packet this stack offers the outbound queue, delivered or
+    /// dropped. The tunnel's liveness watchdog reads it as its evidence of
+    /// demand -- from here, upstream of the drain loop it is watching,
+    /// because a counter the drain loop increments stops when the drain
+    /// loop does. See the field doc on `TunnelRuntime::outbound_offered`.
+    outbound_offered: Arc<AtomicUsize>,
 }
 
 impl VirtualNetStack {
@@ -274,6 +281,7 @@ impl VirtualNetStack {
         mtu: u16,
         ip_to_tunnel: mpsc::Sender<Vec<u8>>,
         ip_from_tunnel: mpsc::Receiver<Vec<u8>>,
+        outbound_offered: Arc<AtomicUsize>,
     ) -> Self {
         let mut device = VirtualDevice::new(mtu as usize);
 
@@ -326,6 +334,7 @@ impl VirtualNetStack {
             pending_tcp: HashMap::new(),
             active_tcp: HashMap::new(),
             active_udp: HashMap::new(),
+            outbound_offered,
         }
     }
 
@@ -391,6 +400,7 @@ impl VirtualNetStack {
 
             // Flush outbound IP packets to tunnel
             for packet in self.device.drain_tx() {
+                self.outbound_offered.fetch_add(1, Ordering::Relaxed);
                 if self.ip_to_tunnel.try_send(packet).is_err() {
                     warn!("AmneziaWG netstack: tunnel TX full, dropping packet");
                 }
@@ -947,6 +957,7 @@ mod tests {
             1400,
             to_tunnel_tx,
             from_tunnel_rx,
+            Arc::new(AtomicUsize::new(0)),
         );
         (stack, to_tunnel_rx)
     }
