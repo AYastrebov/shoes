@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.2.20
+
+### AmneziaWG upload is two to four times faster, and the reason corrects v0.2.19
+
+v0.2.19 raised the receive window and said the send buffer stays at 256 KiB
+everywhere, deliberately, because raising it had measured upload getting
+*worse*. That measurement was real and the conclusion was wrong. The send
+window is the same `window / RTT` ceiling on upload that the receive window is
+on download -- 256 KiB caps a 24 ms path at ~85 Mbit/s however fast the link --
+and what made raising it backfire was never pacing in the abstract: smoltcp
+dumps an opened window into the tunnel's outbound channel in one poll, the
+256-slot channel overflowed, and the stack's own dropped segments read back to
+Cubic as path congestion. The bimodal 13-55 Mbit/s upload this produced is the
+"falls into a bad state and climbs out of it" spread ROADMAP.md used to carry
+as an open risk.
+
+Three changes, each closing the failure the previous one exposes:
+
+- **The virtual device backpressures instead of letting the channel drop.**
+  `transmit` refuses tokens past the channel's free slots, so a burst waits in
+  the socket's own buffer, and what a poll emitted but the channel would not
+  take carries to the next pass. Correct for any window size, any number of
+  concurrent uploads, any MTU -- and the channel stays at 256 slots, so DNS,
+  SYNs and a concurrent download's ACKs never queue behind a deep FIFO.
+- **The send window is sized per platform like the receive window**: 1 MiB on
+  desktop, 512 KiB on Android, 256 KiB inside an Apple Network Extension
+  (unchanged there -- the same ~50 MB kill limit that pins the receive window).
+  Single stream at 24 ms measured 56 / 102 / 136 / 156 Mbit/s at
+  256 KiB / 512 KiB / 768 KiB / 1 MiB, zero drops at every size.
+- **The endpoint UDP socket asks for real buffers** (4 MiB each way,
+  best-effort descending -- macOS gives a datagram socket ~9 KB by default,
+  which surfaced as a thousand consecutive ENOBUFS once the channel stopped
+  dropping), and a send that hits transient ENOBUFS waits it out briefly
+  instead of converting kernel queue pressure into loss.
+
+Interleaved against v0.2.19 on the same minutes: single-stream upload median
+52 to 82 Mbit/s with 143-157 in stable windows, four-stream aggregate 41 to
+~192 Mbit/s, download unchanged at path rate. The memory cost lands on the
+send buffer, which is lazy -- resident only to the extent an upload fills
+it -- and the per-platform ceilings in MOBILE.md moved accordingly (Android
+worst case 368 to 432 MiB, desktop per-connection 4.625 to 5.375 MiB
+allocated).
+
+### A config that would fragment now says so at startup
+
+A full-size AmneziaWG transport packet reaches the wire at `mtu + s4 + 60`
+bytes, and S4 -- unlike the content padding and the random trailer -- is never
+clamped against the MTU. Amnezia's own generator pairs MTU 1420 with S4 drawn
+up to 27, so a copied config silently fragments every large packet as soon as
+S4 >= 21. shoes now warns at startup when the sum crosses 1500. The example
+config documents that rule and one more from the same survey: with random
+trailers on, keep S1-S4 equal on the server side -- unequal values expose a
+classifier defect in unpatched amneziawg-go peers that silently drops ~3.5% of
+transport packets (amnezia-vpn/amneziawg-go#183; the AmneziaWG implementation
+this crate ships is immune in both directions, but only one end of a tunnel is
+ever shoes).
+
+
 ## v0.2.19
 
 ### AmneziaWG download is roughly three times faster
