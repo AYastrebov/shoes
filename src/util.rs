@@ -103,6 +103,12 @@ pub const EINVAL_RAW: i32 = 10022; // WSAEINVAL
 #[cfg(not(windows))]
 pub const EINVAL_RAW: i32 = libc::EINVAL;
 
+/// See [`EMSGSIZE_RAW`].
+#[cfg(windows)]
+pub const ENOBUFS_RAW: i32 = 10055; // WSAENOBUFS
+#[cfg(not(windows))]
+pub const ENOBUFS_RAW: i32 = libc::ENOBUFS;
+
 /// How loudly to log a connection that ended with `e`.
 ///
 /// One table instead of a per-file copy: the accept loops had grown

@@ -272,14 +272,18 @@ pub struct TunnelRuntime {
     pub ip_to_tunnel_tx: mpsc::Sender<Vec<u8>>,
     /// Channel to receive decapsulated IP packets for the virtual stack.
     pub ip_from_tunnel_rx: ParkingMutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    /// Packets the virtual stack offered the outbound queue, delivered or
-    /// dropped. The netstack increments it at its push site; the liveness
-    /// watchdog reads it as its evidence of demand. It must come from
-    /// upstream of the drain loop: `packets_offered` is incremented by the
-    /// drain loop itself, so a drain loop that stalls takes the watchdog's
-    /// evidence of demand with it, and a tunnel discarding every packet is
-    /// indistinguishable from one nobody is using. An emulator stall sat
-    /// exactly there for ten minutes while the app reported Connected.
+    /// Push attempts the virtual stack made on the outbound queue. A packet
+    /// the full channel deferred counts again on each retry -- this is a
+    /// demand signal, read only for advancement, not a packet count. The
+    /// netstack increments it at its push site; the liveness watchdog reads
+    /// it as its evidence of demand. It must come from upstream of the drain
+    /// loop: `packets_offered` is incremented by the drain loop itself, so a
+    /// drain loop that stalls takes the watchdog's evidence of demand with
+    /// it, and a tunnel discarding every packet is indistinguishable from one
+    /// nobody is using. An emulator stall sat exactly there for ten minutes
+    /// while the app reported Connected. Counting retries preserves that
+    /// property under backpressure: a jammed channel keeps the netstack
+    /// retrying, so demand keeps advancing even though no packet moves.
     pub outbound_offered: Arc<AtomicUsize>,
     /// Set when the receive path is gone -- the receive loop terminated
     /// on an error streak, or the liveness watchdog gave up on a socket
@@ -385,9 +389,14 @@ impl TunnelRuntime {
 
         info!("AmneziaWG tunnel started, endpoint={}", endpoint_addr);
 
-        // Channels between virtual IP stack and tunnel
-        let (ip_to_tunnel_tx, ip_to_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (ip_from_tunnel_tx, ip_from_tunnel_rx) = mpsc::channel::<Vec<u8>>(256);
+        // Channels between virtual IP stack and tunnel. Depths and their
+        // rationale live in src/buffer_sizing.rs with the rest of the sizing
+        // decisions; neither is a correctness bound -- the netstack's device
+        // backpressures on the outbound one rather than letting it overflow.
+        let (ip_to_tunnel_tx, ip_to_tunnel_rx) =
+            mpsc::channel::<Vec<u8>>(crate::buffer_sizing::default_outbound_queue_depth());
+        let (ip_from_tunnel_tx, ip_from_tunnel_rx) =
+            mpsc::channel::<Vec<u8>>(crate::buffer_sizing::default_inbound_queue_depth());
 
         // Task 1: Read UDP datagrams from server, decapsulate, send IP packets to stack
         let recv_task = {

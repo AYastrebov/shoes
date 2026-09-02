@@ -275,8 +275,8 @@ default by platform, the way `mtu` already did:
 | | local buffer | remote rx window | remote tx window | max connections | per connection | worst case, both stacks |
 |---|---|---|---|---|---|---|
 | Network Extension (iOS, macOS) | 32 KiB | 256 KiB | 256 KiB | 256 | 704 KiB | 176 MiB |
-| Android | 32 KiB | 1 MiB | 256 KiB | 256 | 1.4375 MiB | 368 MiB |
-| everywhere else | 64 KiB | 4 MiB | 256 KiB | 1024 | 4.625 MiB | 4.625 GiB |
+| Android | 32 KiB | 1 MiB | 512 KiB | 256 | 1.6875 MiB | 432 MiB |
+| everywhere else | 64 KiB | 4 MiB | 1 MiB | 1024 | 5.375 MiB | 5.375 GiB |
 
 A connection through both stacks costs four local buffers in the TUN stack and
 two window buffers plus two local ones in the AmneziaWG stack, which is the

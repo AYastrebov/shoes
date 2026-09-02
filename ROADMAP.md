@@ -864,32 +864,57 @@ path, which is exactly what Reality exists to work around and exactly what a
 non-Reality deployment still leaks. Worth scoping against rustls' ECH support
 rather than assuming, the way the post-quantum question should have been.
 
-## Open risk: AmneziaWG upload throughput is unmeasured
+## Resolved: AmneziaWG upload was capped by the send window, and the drop was the outbound channel
 
-Raising the AmneziaWG receive window fixed download (see `src/buffer_sizing.rs`
-for the numbers). Upload was left alone, and it is not known to be well sized.
+The send window was raised per platform (`default_remote_tx_window_size` in
+`src/buffer_sizing.rs`), and the netstack's virtual device now backpressures
+when the tunnel's outbound channel is full — `VirtualDevice::transmit` refuses
+tokens, the burst waits in the socket's own buffer, and what an `iface.poll`
+emitted but the channel would not take is carried to the next pass instead of
+dropped. That holds for any window size, any number of concurrent uploads
+sharing the channel, and any configured MTU, and it keeps the channel itself
+small, so the standing queue that everything else in the tunnel (DNS, SYNs, a
+concurrent download's ACKs) waits behind stays bounded at the depth every
+earlier measurement ran on. What follows is the investigation, kept because it
+corrects two earlier readings.
 
-Two things are recorded here so the next person does not repeat the work.
+**The drop the previous note went looking for was the `tunnel TX full` path
+after all.** That earlier note said the warning "never fired" and put the drop
+below it in the endpoint UDP socket. It never fired on that path because it was
+too slow to burst past the 256-slot `ip_to_tunnel` channel. Measured against an
+AmneziaWG 3.1 peer at ~24 ms with a ~240 Mbit/s raw path, raising the send
+window with the channel still at 256 fired it hundreds of times per transfer
+(224 at 512 KiB, 602 at 2 MiB), and each burst of drops was what Cubic read as
+congestion. The send buffer was never the cause; the channel behind it was.
 
-**Enlarging the send buffer makes upload worse, not better.** Moving both
-buffers to 2 MiB took upload from 49 to 16.6 Mbit/s, and 8 MiB gave 21.9.
-smoltcp does not pace its sends, so a send buffer much larger than the tunnel's
-queue bursts into drops that Cubic reads as congestion. The drops are not the
-`tunnel TX full` path in `src/amneziawg/netstack.rs` — that warning never fired
-during any of these transfers — so they are happening below it, most likely in
-the endpoint UDP socket. Whoever picks this up should find the drop before
-changing the buffer.
+**With the burst kept out of the channel, the window scales cleanly.** Same
+peer, single stream, zero outbound drops at every size:
 
-**The upload measurement itself is not yet trustworthy.** An A/A control — the
-same binary on two peer sessions of one server, requests alternating — produced
-medians of 25.6 and 29.3 Mbit/s with both arms ranging 13 to 55. That spread is
-wider than any effect worth chasing, and it is bimodal rather than merely noisy,
-which suggests the upload path falls into a bad state and climbs out of it. The
-same harness measured download tightly (51-55 against 137-182), so this is
-specific to the send direction and is itself the first symptom to explain.
+| window | upload |
+|---|---|
+| 256 KiB | 56 Mbit/s |
+| 512 KiB | 102 Mbit/s |
+| 768 KiB | 136 Mbit/s |
+| 1 MiB | 156 Mbit/s |
 
-Until a harness exists that can resolve a 20% upload difference, no upload
-change here can be justified by measurement.
+Linear in the window, which is the signature of a window-limited transfer:
+upload is `window / RTT` below the path's bandwidth-delay product, exactly as
+download is. Download was unaffected (~200 Mbit/s throughout) — its inbound
+channel stays at 256 because the network paces arrivals into it, where the
+send side dumps a whole window in one poll.
+
+**The bimodal spread was the same collapse.** The A/A control's 13-55 range was
+this: whenever a burst overflowed the channel, that connection fell into the bad
+state and Cubic climbed back out. Over the public internet the residual RTT and
+path-bandwidth drift are still large enough (13-152 Mbit/s within minutes as RTT
+moves 13-66 ms) that a clean absolute A/B is not possible from a WAN client, but
+the fixed build no longer collapses: across interleaved rounds it held 103-160
+Mbit/s where the 256 KiB baseline still dropped to 11 and 45.
+
+**Still open: ~19% of upload wall-clock is idle gaps even at a window above the
+BDP**, a per-cycle send-refill stall that raising the window does not remove. It
+caps the ceiling below the raw path and is the next thing to chase, on a
+controlled path rather than the WAN.
 
 ## Open risk: the receive window is only measured on a clean path
 

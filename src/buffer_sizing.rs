@@ -63,15 +63,14 @@
 //! # Why receive and send are sized apart
 //!
 //! They were one constant, which made the send buffer inherit any increase
-//! meant for the receive window. That is not free: raising both to 2 MiB took
-//! upload from 49 to 16.6 Mbit/s, because smoltcp does not pace, and a send
-//! buffer far larger than the tunnel's queue bursts into drops that Cubic reads
-//! as congestion.
-//!
-//! So only the receive window grows here. The send buffer keeps the size it has
-//! been measured at. Upload is *not* known to be well-sized — see
-//! ROADMAP.md, which records why the measurement that would settle it does not
-//! exist yet.
+//! meant for the receive window. That coupling was removed after raising both
+//! to 2 MiB took upload from 49 to 16.6 Mbit/s. The size was blamed on pacing
+//! alone, but the real mechanism was the tunnel's outbound channel overflowing
+//! under the unpaced burst — the drop the ROADMAP could not place. The
+//! netstack's virtual device now backpressures instead of letting the channel
+//! drop (see `VirtualDevice::transmit` in src/amneziawg/netstack.rs), so the
+//! send window scales cleanly and is sized per platform, apart from the
+//! receive window because the two spend memory against different limits.
 //!
 //! # What a connection costs
 //!
@@ -82,8 +81,8 @@
 //! | | per connection | against [`default_max_connections`] |
 //! |---|---|---|
 //! | Network Extension (iOS, macOS) | 704 KiB | 176 MiB |
-//! | Android | 1.4375 MiB | 368 MiB |
-//! | desktop | 4.625 MiB | 4.625 GiB |
+//! | Android | 1.6875 MiB | 432 MiB |
+//! | desktop | 5.375 MiB | 5.375 GiB |
 //!
 //! Those are ceilings on what a connection *allocates*, which is not what it
 //! costs resident: the local and send buffers are zero pages the kernel faults
@@ -177,11 +176,69 @@ pub const fn default_remote_rx_window_size() -> usize {
 /// Bytes of unacknowledged send data for a connection whose far end is across
 /// the internet.
 ///
-/// Deliberately not raised alongside the receive window: smoltcp does not pace
-/// its sends, so a send buffer much larger than the tunnel's queue converts
-/// into drops rather than throughput. See the module documentation.
+/// This is the ceiling on upload throughput, `window / RTT`, the mirror of the
+/// receive window's hold on download: smoltcp never grows it either. At 256 KiB
+/// and a 24 ms path it caps upload near 85 Mbit/s, and the number is linear in
+/// the window below the path's bandwidth-delay product.
+///
+/// It was held at 256 KiB after enlarging it was measured to make upload
+/// *worse*, and the module documentation blamed the absence of pacing. The
+/// real mechanism was narrower: an unpaced smoltcp send dumps the whole window
+/// into `ip_to_tunnel` in one poll, and on a fast path that burst overflowed
+/// that 256-slot channel — the drop the ROADMAP went looking for in the UDP
+/// socket and did not find. The netstack's virtual device now applies
+/// backpressure instead (`transmit` refuses tokens while the channel is full,
+/// so the burst waits in the socket's own buffer), which removes the drops for
+/// any window, any number of concurrent senders, and any configured MTU, and
+/// lets the window scale: measured against an AmneziaWG 3.1 peer at 24 ms,
+/// single stream, zero drops at every size,
+///
+/// | window | upload |
+/// |---|---|
+/// | 256 KiB | 56 Mbit/s |
+/// | 512 KiB | 102 Mbit/s |
+/// | 768 KiB | 136 Mbit/s |
+/// | 1 MiB | 156 Mbit/s |
+///
+/// So three values, sized against the platform's memory the way the receive
+/// window is. A Network Extension keeps 256 KiB — the 50 MB kill limit that
+/// pins the receive window pins this one too. Android takes 512 KiB, doubling
+/// upload for 0.25 MiB more per connection. Desktop takes 1 MiB, where memory
+/// is not the constraint and the round trip is.
+///
+/// Unlike the receive window, the send buffer is lazy: it goes resident only to
+/// the extent an upload fills it, and only a connection sending bulk data does.
 pub const fn default_remote_tx_window_size() -> usize {
-    256 * 1024
+    if in_network_extension() {
+        256 * 1024
+    } else if cfg!(target_os = "android") {
+        512 * 1024
+    } else {
+        1024 * 1024
+    }
+}
+
+/// How many IP packets the tunnel's outbound channel (`ip_to_tunnel`) buffers.
+///
+/// Not a correctness bound: the netstack's virtual device refuses to emit past
+/// the channel's free slots, so nothing overflows at any depth. What this sets
+/// is pipelining and shared latency. Deeper keeps the encapsulate task fed
+/// across scheduling gaps; shallower bounds how long a DNS query, a SYN, or a
+/// competing flow's ACK can sit behind one connection's bulk upload, since
+/// every packet through the tunnel crosses this one FIFO. 256 packets is a few
+/// hundred kilobytes — milliseconds of standing queue on a fast path — and is
+/// the depth every download measurement has been carried on.
+pub const fn default_outbound_queue_depth() -> usize {
+    256
+}
+
+/// How many IP packets the tunnel's inbound channel (`ip_from_tunnel`) buffers.
+///
+/// The network paces arrivals into this one, so it never sees a window-sized
+/// burst the way the outbound side does; it only covers the netstack loop's
+/// scheduling jitter. Download saturates the path at this depth.
+pub const fn default_inbound_queue_depth() -> usize {
+    256
 }
 
 /// Connections a virtual TCP stack accepts before it refuses more.
@@ -220,9 +277,9 @@ mod tests {
         let (per_connection, ceiling) = if in_network_extension() {
             (704 * 1024, 176 * 1024 * 1024)
         } else if cfg!(target_os = "android") {
-            (1472 * 1024, 368 * 1024 * 1024)
+            (1728 * 1024, 432 * 1024 * 1024)
         } else {
-            (4736 * 1024, 4736 * 1024 * 1024)
+            (5504 * 1024, 5504 * 1024 * 1024)
         };
 
         assert_eq!(per_connection_bytes(), per_connection);
@@ -233,11 +290,18 @@ mod tests {
         );
     }
 
-    /// The send buffer is deliberately not sized with the receive window --
-    /// raising it converts into drops rather than throughput, which is the
-    /// measurement the module documentation records.
+    /// The send window outgrew the outbound channel on purpose — the device's
+    /// backpressure, not the channel's depth, is what keeps a window burst from
+    /// overflowing. This pins the relationship so a future reader who sees
+    /// window >> channel knows it is load-bearing design, not an oversight.
     #[test]
-    fn the_send_buffer_does_not_follow_the_receive_window() {
-        assert_eq!(default_remote_tx_window_size(), 256 * 1024);
+    fn the_send_window_is_allowed_to_exceed_the_outbound_queue() {
+        let window_packets = default_remote_tx_window_size() / 1280;
+        assert!(
+            window_packets > default_outbound_queue_depth() / 2,
+            "if the window has shrunk to fit the channel again, the device \
+             backpressure in src/amneziawg/netstack.rs may no longer be earning \
+             its keep -- re-read this module's history before simplifying either",
+        );
     }
 }
