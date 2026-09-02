@@ -42,7 +42,7 @@ use crate::async_stream::{
 // ---------------------------------------------------------------------------
 
 struct VirtualDevice {
-    rx_queue: Vec<Vec<u8>>,
+    rx_queue: std::collections::VecDeque<Vec<u8>>,
     /// RefCell avoids a raw pointer: smoltcp's `receive()` needs to hand out
     /// both an RxToken (consuming from rx_queue) and a TxToken (pushing to
     /// tx_queue) simultaneously.  RefCell lets us borrow tx_queue separately
@@ -64,7 +64,7 @@ struct VirtualDevice {
 impl VirtualDevice {
     fn new(mtu: usize) -> Self {
         Self {
-            rx_queue: Vec::new(),
+            rx_queue: std::collections::VecDeque::new(),
             tx_queue: RefCell::new(std::collections::VecDeque::new()),
             tx_budget: 0,
             mtu,
@@ -87,7 +87,7 @@ impl Device for VirtualDevice {
         if self.rx_queue.is_empty() {
             return None;
         }
-        let packet = self.rx_queue.remove(0);
+        let packet = self.rx_queue.pop_front().expect("checked non-empty above");
         // The paired TxToken ignores the budget: it exists so smoltcp can
         // answer what it is receiving (an RST, an ICMP reply), and refusing it
         // would drop the reply entirely rather than defer it. The overshoot is
@@ -403,7 +403,7 @@ impl VirtualNetStack {
                 }
                 packet = self.ip_from_tunnel.recv() => {
                     match packet {
-                        Some(packet) => self.device.rx_queue.push(packet),
+                        Some(packet) => self.device.rx_queue.push_back(packet),
                         // The decapsulate task owns the only sender, so a
                         // closed channel means the tunnel's receive path is
                         // gone and nothing will ever arrive again. Matched
