@@ -1268,9 +1268,17 @@ mod tests {
     /// Serialise against everything else that reads the process-global
     /// connection counter: a SYN increments it and the loop's exit path
     /// resets it, so any harness test can zero another test's count.
+    ///
+    /// A poisoned lock is taken anyway: the guard protects a counter the
+    /// next test resets before use, so the only thing poisoning would add
+    /// is turning one test's failure into a `PoisonError` cascade across
+    /// every other test that uses the counter -- which is exactly what a
+    /// Windows CI run produced (one real assertion failure, four phantoms).
     #[cfg(feature = "control-stats")]
     fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        super::super::traffic::COUNTER_TEST_LOCK.lock().unwrap()
+        super::super::traffic::COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Receive with a deadline, so a loop that stops delivering fails the
@@ -1424,19 +1432,22 @@ mod tests {
             .send(Script::Die(io::ErrorKind::UnexpectedEof))
             .unwrap();
 
+        // `running` goes false at the failure site, inside the loop; the
+        // counter reset runs later, on the way out of the stack function. A
+        // loaded runner can schedule this thread into that gap, so the count
+        // is polled to the same deadline rather than asserted the instant the
+        // flag flips -- what the test owes the loop is "the count does not
+        // survive the exit", not "the exit is atomic".
         let start = std::time::Instant::now();
-        while harness.running.load(Ordering::Relaxed) {
+        while harness.running.load(Ordering::Relaxed)
+            || super::super::traffic::active_connections() != 0
+        {
             assert!(
                 start.elapsed() < StdDuration::from_secs(2),
-                "the loop never exited"
+                "the loop exited but the connection count survived it: {}",
+                super::super::traffic::active_connections()
             );
             thread::sleep(StdDuration::from_millis(10));
         }
-
-        assert_eq!(
-            super::super::traffic::active_connections(),
-            0,
-            "connections stayed counted after the loop exited"
-        );
     }
 }
