@@ -1512,6 +1512,28 @@ fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> st
         ));
     }
 
+    // A full-size transport packet reaches the wire at mtu + S4 junk prefix
+    // + 16 transport header + 16 AEAD tag + 8 UDP + 20 IPv4 = mtu + S4 + 60,
+    // and S4, unlike the content padding and the random trailer, is never
+    // clamped against the MTU. Amnezia's own generator draws S4 up to 27 and
+    // pairs it with the WireGuard-default MTU of 1420, which crosses 1500 at
+    // S4 >= 21 -- so a copied config can silently fragment every full-size
+    // packet it sends (3x-ui#6376 measured the threshold byte-for-byte).
+    // A warning, not an error: paths with jumbo or sub-1500 MTUs exist, and
+    // only the operator knows theirs.
+    let wire_size = u32::from(config.mtu) + u32::from(config.awg.s4) + 60;
+    if wire_size > 1500 {
+        log::warn!(
+            "AmneziaWG mtu {} + s4 {} puts full-size packets at {} bytes on the wire, \
+             past a standard 1500-byte path MTU -- every large packet will fragment. \
+             Lower mtu to {} or reduce s4.",
+            config.mtu,
+            config.awg.s4,
+            wire_size,
+            1440 - u32::from(config.awg.s4),
+        );
+    }
+
     // Parse and validate the obfuscation parameters now, so a bad H-range or a
     // header protection key with too little padding is a startup error rather
     // than a tunnel that silently never completes a handshake.
