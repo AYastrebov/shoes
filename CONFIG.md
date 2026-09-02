@@ -410,13 +410,16 @@ the internet, and shrinking them to the size of a local buffer measured as a 6x
 throughput loss. `tcp_buffer_size` covers the device side only, where there is
 no round trip to cover.
 
-They are sized apart. The send buffer is 256 KiB everywhere. The receive window
-is the ceiling on download throughput — `window / RTT`, never auto-tuned — and
-at 256 KiB a 26 ms path measured 47.5 Mbit/s where a kernel TCP stack over the
-same tunnel reached 156.7. It is 4 MiB on desktop, 1 MiB on Android, and
-256 KiB inside an Apple Network Extension — iOS, and the macOS extension too —
-which is killed at roughly 50 MB, where the window is the one buffer here that
-goes fully resident rather than staying on untouched zero pages.
+They are sized apart, but both are now sized per platform. Each is a ceiling on
+throughput in its own direction — `window / RTT`, never auto-tuned. The receive
+window governs download: at 256 KiB a 26 ms path measured 47.5 Mbit/s where a
+kernel TCP stack over the same tunnel reached 156.7. The send buffer governs
+upload the same way, and scaling it lifted a single stream from 56 to 156
+Mbit/s at 24 ms. Both are 4 MiB / 1 MiB (receive) and 1 MiB / 512 KiB (send) on
+desktop / Android, and both stay at 256 KiB inside an Apple Network Extension —
+iOS, and the macOS extension too — which is killed at roughly 50 MB. The receive
+window is the one buffer here that goes fully resident rather than staying on
+untouched zero pages; the send buffer, like the local ones, is lazy.
 
 Note also that most of these are allocation ceilings rather than resident cost:
 the buffers are zero-filled pages, so a connection occupies roughly a third of

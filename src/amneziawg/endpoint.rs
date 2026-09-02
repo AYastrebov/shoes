@@ -102,6 +102,28 @@ impl EndpointSocket {
 
         let socket = UdpSocket::bind(bind_addr).await?;
 
+        // The OS defaults are sized for request-reply UDP, not for carrying a
+        // TCP send window: macOS gives a datagram socket about 9 KB of send
+        // buffer -- seven tunnel packets -- so the first real upload burst
+        // came back ENOBUFS a thousand sends in a row. wireguard-go asks for
+        // 7 MiB on its sockets for the same reason. Best-effort and
+        // descending, because macOS rejects a request above its sockbuf limit
+        // where Linux silently clamps, and a socket at the OS default still
+        // works -- it just paces harder through the ENOBUFS retry in `send`.
+        {
+            let sock_ref = socket2::SockRef::from(&socket);
+            for bytes in [4 << 20, 1 << 20, 256 << 10] {
+                if sock_ref.set_send_buffer_size(bytes).is_ok() {
+                    break;
+                }
+            }
+            for bytes in [4 << 20, 1 << 20, 256 << 10] {
+                if sock_ref.set_recv_buffer_size(bytes).is_ok() {
+                    break;
+                }
+            }
+        }
+
         // Exclude the endpoint socket from the VPN route before connecting.
         // Without this the tunnel's own UDP is captured by the TUN interface it
         // feeds, and every packet loops back into itself. This socket is bound
@@ -126,7 +148,25 @@ impl EndpointSocket {
     /// recovers even when the app never reports the network change itself.
     pub async fn send(&self, datagram: &[u8]) -> std::io::Result<usize> {
         let socket = self.socket.borrow().clone();
-        let result = socket.send(datagram).await;
+        let mut result = socket.send(datagram).await;
+
+        // ENOBUFS is the kernel's send queue momentarily full, not a lost
+        // route: the datagram was never sent, and giving up here turns queue
+        // pressure into loss that the virtual stack's congestion control
+        // reads as a congested path. Waiting out the queue instead paces
+        // this sender to the interface's drain rate -- backpressure, the
+        // same thing a blocking sendto would have done. Bounded, so a
+        // kernel that stays out of buffers for tens of milliseconds still
+        // surfaces the error to the failure accounting.
+        let mut retries = 0;
+        while let Err(ref e) = result {
+            if e.raw_os_error() != Some(crate::util::ENOBUFS_RAW) || retries >= 20 {
+                break;
+            }
+            retries += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            result = socket.send(datagram).await;
+        }
 
         if let Err(ref e) = result
             && is_route_gone(e)

@@ -47,7 +47,17 @@ struct VirtualDevice {
     /// both an RxToken (consuming from rx_queue) and a TxToken (pushing to
     /// tx_queue) simultaneously.  RefCell lets us borrow tx_queue separately
     /// through a shared reference while rx_queue is being mutated.
-    tx_queue: RefCell<Vec<Vec<u8>>>,
+    tx_queue: RefCell<std::collections::VecDeque<Vec<u8>>>,
+    /// How many more packets this poll may emit -- the outbound channel's free
+    /// slots, set by the run loop before each `iface.poll`. When the queue
+    /// reaches it, `transmit` refuses the token: smoltcp keeps the segment in
+    /// its socket buffer and retries on a later poll, exactly as it would with
+    /// a busy NIC ring. That refusal is the device's backpressure, and it is
+    /// what makes overflowing the outbound channel impossible no matter how
+    /// many sockets burst their windows into one poll -- without it, an unpaced
+    /// window-sized burst overflowed the channel, and Cubic read the dropped
+    /// segments as congestion (the bimodal upload collapse ROADMAP.md records).
+    tx_budget: usize,
     mtu: usize,
 }
 
@@ -55,14 +65,14 @@ impl VirtualDevice {
     fn new(mtu: usize) -> Self {
         Self {
             rx_queue: Vec::new(),
-            tx_queue: RefCell::new(Vec::new()),
+            tx_queue: RefCell::new(std::collections::VecDeque::new()),
+            tx_budget: 0,
             mtu,
         }
     }
 
-    /// Drain transmitted packets.
-    fn drain_tx(&self) -> Vec<Vec<u8>> {
-        self.tx_queue.borrow_mut().drain(..).collect()
+    fn has_pending_tx(&self) -> bool {
+        !self.tx_queue.borrow().is_empty()
     }
 }
 
@@ -78,6 +88,10 @@ impl Device for VirtualDevice {
             return None;
         }
         let packet = self.rx_queue.remove(0);
+        // The paired TxToken ignores the budget: it exists so smoltcp can
+        // answer what it is receiving (an RST, an ICMP reply), and refusing it
+        // would drop the reply entirely rather than defer it. The overshoot is
+        // at most one packet per inbound packet processed.
         Some((
             VirtualRxToken { buffer: packet },
             VirtualTxToken {
@@ -87,6 +101,12 @@ impl Device for VirtualDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        // See `tx_budget`: refusing the token here is the backpressure that
+        // keeps a window-sized burst inside the socket's own buffer instead of
+        // overflowing the outbound channel.
+        if self.tx_queue.borrow().len() >= self.tx_budget {
+            return None;
+        }
         Some(VirtualTxToken {
             tx_queue: &self.tx_queue,
         })
@@ -114,7 +134,7 @@ impl RxToken for VirtualRxToken {
 }
 
 struct VirtualTxToken<'a> {
-    tx_queue: &'a RefCell<Vec<Vec<u8>>>,
+    tx_queue: &'a RefCell<std::collections::VecDeque<Vec<u8>>>,
 }
 
 impl TxToken for VirtualTxToken<'_> {
@@ -124,7 +144,7 @@ impl TxToken for VirtualTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        self.tx_queue.borrow_mut().push(buffer);
+        self.tx_queue.borrow_mut().push_back(buffer);
         result
     }
 }
@@ -143,8 +163,12 @@ const TCP_RX_WINDOW: usize = crate::buffer_sizing::default_remote_rx_window_size
 
 /// The socket's in-flight, unacknowledged send data.
 ///
-/// Sized apart from the receive window on purpose: smoltcp does not pace, so
-/// enlarging this one converts into drops rather than throughput.
+/// The mirror of the receive window: the ceiling on upload throughput,
+/// `window / RTT`. It scales safely because `VirtualDevice::transmit` refuses
+/// tokens once the outbound channel is full -- smoltcp does not pace, and
+/// without that backpressure an unpaced window-sized burst overflowed the
+/// channel and read back as congestion. See src/buffer_sizing.rs for the
+/// sizing and the measurements.
 const TCP_TX_WINDOW: usize = crate::buffer_sizing::default_remote_tx_window_size();
 
 /// The ring buffers between this socket and the async side, which are local and
@@ -347,11 +371,19 @@ impl VirtualNetStack {
             // Use smoltcp's poll_delay to determine how long to sleep,
             // capped at 10ms to balance CPU usage vs throughput (matches
             // the existing TUN stack in tcp_stack_direct.rs).
+            //
+            // While the outbound channel is the constraint -- deferred packets
+            // waiting, or every slot taken -- poll on a 1ms tick instead: the
+            // encapsulate task frees slots at its own pace and holds no waker
+            // to this loop, so a 10ms sleep here would quantize the send rate
+            // to a channel-full per 10ms.
+            let tx_backlogged = self.device.has_pending_tx() || self.ip_to_tunnel.capacity() == 0;
+            let cap_ms = if tx_backlogged { 1 } else { 10 };
             let delay = self
                 .iface
                 .poll_delay(crate::util::smol_now(), &self.sockets)
-                .map(|d| std::time::Duration::from_millis(d.total_millis().min(10)))
-                .unwrap_or(std::time::Duration::from_millis(10));
+                .map(|d| std::time::Duration::from_millis(d.total_millis().min(cap_ms)))
+                .unwrap_or(std::time::Duration::from_millis(cap_ms));
             let sleep = tokio::time::sleep(delay);
 
             tokio::select! {
@@ -394,15 +426,33 @@ impl VirtualNetStack {
                 _ = sleep => {}
             }
 
-            // Poll smoltcp
+            // Poll smoltcp. The budget hands the device the channel's free
+            // slots, less what earlier polls already emitted and the channel
+            // has not yet accepted; `transmit` refuses tokens past it.
+            self.device.tx_budget = self.ip_to_tunnel.capacity();
             let now = crate::util::smol_now();
             self.iface.poll(now, &mut self.device, &mut self.sockets);
 
-            // Flush outbound IP packets to tunnel
-            for packet in self.device.drain_tx() {
-                self.outbound_offered.fetch_add(1, Ordering::Relaxed);
-                if self.ip_to_tunnel.try_send(packet).is_err() {
-                    warn!("AmneziaWG netstack: tunnel TX full, dropping packet");
+            // Flush outbound IP packets to the tunnel. What the channel will
+            // not take stays queued for the next pass rather than being
+            // dropped: a drop here is invisible to the peer, so smoltcp's
+            // congestion control would read it as path loss and collapse --
+            // the bimodal upload ROADMAP.md records. Each attempt counts as
+            // demand (a deferred packet counts again when retried), which is
+            // what keeps the liveness watchdog seeing an active tunnel while
+            // the channel is jammed.
+            {
+                let mut tx_queue = self.device.tx_queue.borrow_mut();
+                while let Some(packet) = tx_queue.pop_front() {
+                    self.outbound_offered.fetch_add(1, Ordering::Relaxed);
+                    match self.ip_to_tunnel.try_send(packet) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(packet)) => {
+                            tx_queue.push_front(packet);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
                 }
             }
 
