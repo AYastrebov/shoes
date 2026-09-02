@@ -7,6 +7,19 @@
 # parameters, the header protection key, the content padding) must match the
 # server exactly. A mismatch is never reported — the peer cannot recognise the
 # packets as WireGuard at all, so the handshake simply never completes.
+#
+# Two sizing rules worth knowing when adapting a generated config:
+#
+#   - A full-size packet reaches the wire at mtu + s4 + 60 bytes. Amnezia's
+#     generator pairs mtu 1420 with s4 up to 27, which crosses a standard
+#     1500-byte path MTU at s4 >= 21 and silently fragments every large
+#     packet. Keep mtu <= 1440 - s4 (shoes warns at startup when it isn't).
+#
+#   - With random_trailers on, keep s1 = s2 = s3 = s4 on the server side.
+#     Unequal values expose a classifier defect in unpatched amneziawg-go
+#     peers that silently drops ~3.5% of transport packets
+#     (amnezia-vpn/amneziawg-go#183). shoes itself is immune in both
+#     directions, but only one end of a tunnel is ever shoes.
 
 # --- AmneziaWG 2.0 ---
 - address: 127.0.0.1:1080
