@@ -16,7 +16,7 @@ are behind a trait so the logic lands and is tested before the first live run.
    `proto/shoes/daemon/v1/daemon.proto` carrying the service from the spec, plus
    the proposed `Stats.active_connections`. A `build.rs` that compiles it only
    for macOS. `src/bin/shoesd/main.rs` with a `run` subcommand that binds
-   `/var/run/shoesd.sock` — unlinking a stale path first, then `chown` to
+   `/var/run/shoesd/shoesd.sock` — unlinking a stale path first, then `chown` to
    `root:<group>` and `chmod 0660` before accepting — and serves a `Hello` that
    answers with version and capabilities. An interceptor rejects a peer whose
    `UCred::uid()` is neither 0 nor in the group, with `PERMISSION_DENIED`.
@@ -95,7 +95,7 @@ are behind a trait so the logic lands and is tested before the first live run.
    record sub-project #4 as done and name the new asset. `CHANGELOG.md`.
    `examples/tun_macos.yaml`, added to the macOS leg of `build.yml`'s smoke-test
    loop the way `tun_windows.yaml` is added to Windows'. A `shoesd-macos-arm64.tar.gz`
-   release job building `--bin shoesd --features desktop` in its own cargo
+   release job building `--bin shoesd --features daemon` in its own cargo
    invocation, so the `shoes` CLI keeps its feature-free build.
 
 8. **Verification.** The full gate on macOS and Linux, including the `ffi` and
@@ -212,6 +212,26 @@ through `pub use types::*`, which CI proves on five runners). The rest:
   burst produces while it sleeps between its two looks.
 - **`install`/`uninstall` exited 0 in silence**, because only `run` installs a
   logger.
+
+## What CI caught that the review did not
+
+The device override landed applied *after* `create_server_configs`, so the
+per-platform arms in `validate_tun_config` judged the client's document as
+written. Windows refuses a `device_fd` outright, so both Windows unit-test jobs
+went red; macOS had passed only because its arm short-circuits when a
+descriptor is present. The override now runs on the parsed configs before
+validation, which is the only position where it can do what it promises.
+
+`DeviceOverride` was also macOS-shaped: it cleared `device_name` and set
+`destination`, and Windows requires the first and refuses the second. It now
+carries `device_name`, and every field is replaced rather than merged -- a
+document written for another host holds values that are wrong here rather than
+absent.
+
+Two things this is a reminder of. Adding a macOS-only feature still needs the
+other platforms' arms thought through, because the library half is shared. And
+the macOS runner added in this branch would not have caught it: the bug was
+visible only where the arm does *not* short-circuit.
 
 ## Status
 

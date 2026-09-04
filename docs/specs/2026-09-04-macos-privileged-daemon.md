@@ -274,8 +274,14 @@ Two notes where it meets the library:
   in the schema changes; a client that ignores the field is unaffected.
 
 **Authentication is peer credentials and nothing else.** The socket is
-`/var/run/shoesd.sock`, owner `root`, mode `0660`, group from an install flag
-defaulting to `admin`. Every call reads the peer's uid and rejects one that is
+`/var/run/shoesd/shoesd.sock`, owner `root`, mode `0660`, group from an install
+flag defaulting to `admin`. In its own directory, which the daemon creates
+`0750` root:group -- `bind` takes no mode, so the socket exists at whatever the
+umask allowed for an instant, and a connection made in that instant is queued
+on the same listener and survives the mode being corrected. Reaching a socket
+requires search permission on every directory above it, so the directory is
+what closes that window; narrowing the umask instead would apply to every
+other thread creating a file at the same moment. Every call reads the peer's uid and rejects one that is
 neither 0 nor a member of that group with `PERMISSION_DENIED` — a returned
 status, not a dropped connection, because a dropped socket is indistinguishable
 from a daemon that is not running and the client would offer to install it
@@ -309,12 +315,14 @@ before the listener accepts.
 ## Error mapping
 
 gRPC status codes, message in `status.message`, because the client switches on
-the code:
+the code. The daemon produces exactly the six below that are not marked
+reserved -- checked against the source rather than asserted, because a
+documented code nothing returns is a promise a client writes a branch for:
 
 | Code | When |
 | --- | --- |
 | `ALREADY_EXISTS` | `Start` while a session exists. Never a silent replace. |
-| `NOT_FOUND` | Something needing a session has none. **Not** `Stop`, which returns `RELEASED`. |
+| `NOT_FOUND` | **Reserved, and not currently produced.** The consumer's brief listed it for "something needing a session has none", but nothing needs one: `GetStatus` answers `STOPPED`, `Stop` answers `RELEASED`, and the watches stream nothing rather than failing. A client may switch on it; the daemon will not send it until a method exists that has no other answer. |
 | `INVALID_ARGUMENT` | `prepare_from_config` failed — parse, validation, resolver. Message forwarded verbatim. |
 | `FAILED_PRECONDITION` | The `utun` could not be created. |
 | `UNAVAILABLE` | Routes or DNS failed. The daemon has already reverted what it applied. |
@@ -528,9 +536,9 @@ and exits.
 
 ## Buffer sizing and RSS
 
-`shoesd` is built with `--features desktop` (`control-stats` + `control-logs`)
-and **without** `network-extension`, so `src/buffer_sizing.rs` gives it desktop
-sizing: a 1 MiB TCP send window and ~5.375 MiB per connection, per the v0.2.20
+`shoesd` is built with `--features daemon`, which pulls in `desktop`
+(`control-stats` + `control-logs`) along with the gRPC stack, and **without**
+`network-extension`, so `src/buffer_sizing.rs` gives it desktop sizing: a 1 MiB TCP send window and ~5.375 MiB per connection, per the v0.2.20
 changes. That is the right budget for a root process on a Mac and the wrong one
 for a 50 MB extension, which is exactly the split the two feature flags exist to
 express.
@@ -542,10 +550,12 @@ under-load RSS is therefore a number to measure and write down, not to predict �
 it is a verification item below, and the answer belongs in `docs/MACOS.md`.
 
 Building it needs its own cargo invocation. Features are additive per build, so
-`cargo build --release --features desktop` would also compile `control-stats`
+`cargo build --release --features daemon` would also compile `control-stats`
 and `control-logs` into the `shoes` CLI. The release job builds
-`--bin shoes` with no features and `--bin shoesd --features desktop`
-separately.
+`--bin shoes` with no features and `--bin shoesd --features daemon`
+separately -- and the feature name is not interchangeable with `desktop`:
+`[[bin]] shoesd` carries `required-features = ["daemon"]`, so
+`--features desktop` refuses to build it at all.
 
 ## Security notes
 
