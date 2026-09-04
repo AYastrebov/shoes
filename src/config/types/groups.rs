@@ -846,6 +846,7 @@ client_proxies:
             let tun_example_platforms: &[&str] = match file_name {
                 "tun_vpn.yaml" | "tun_fake_ip.yaml" => &["linux"],
                 "tun_windows.yaml" => &["linux", "windows"],
+                "tun_macos.yaml" => &["macos"],
                 _ => &[],
             };
             if !tun_example_platforms.is_empty()

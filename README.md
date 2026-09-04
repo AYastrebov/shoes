@@ -41,7 +41,7 @@ All server protocols plus:
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - **Fake IP** - answers DNS locally from a private pool, so nothing resolves on the device
-- Supported platforms: Linux, Android, iOS, Windows 11 (via [wintun](https://www.wintun.net); see `examples/tun_windows.yaml`), and macOS through a Network Extension system extension (see [docs/MACOS.md](docs/MACOS.md) — compiled and tested to the C boundary, but not yet run)
+- Supported platforms: Linux, Android, iOS, Windows 11 (via [wintun](https://www.wintun.net); see `examples/tun_windows.yaml`), and macOS — either through a Network Extension system extension, or through `shoesd`, the privileged launchd daemon that also configures routes and DNS (see [docs/MACOS.md](docs/MACOS.md) and `examples/tun_macos.yaml`)
 
 ### Supported Ciphers
 - **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`

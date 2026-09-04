@@ -216,5 +216,12 @@ which way it went here, with what was observed.
     `uninstall` relies on `bootout` sending `SIGTERM`, which is what makes the
     daemon revert its routes and DNS through the same path a shutdown uses
     rather than a second one written for the occasion.
-- [ ] 7. Docs, example, release job
+- [x] 7. Docs, example, release job (`HEAD`). `docs/MACOS.md`, `CONFIG.md`,
+  `README.md`, `ROADMAP.md` (sub-project #4 now describes what shipped and what
+  is left), `CHANGELOG.md`, `examples/tun_macos.yaml` added to the macOS leg of
+  `build.yml`'s smoke loop and to the example-validation list, and a release
+  step building `--bin shoesd --features daemon` in its own cargo invocation
+  into `shoesd-macos-arm64.tar.gz`. That step installs `protoc` first, since
+  `prost-build` no longer vendors one. The RSS figures `docs/MACOS.md` still
+  records as unknown come from step 8.
 - [ ] 8. Full gate + five live items

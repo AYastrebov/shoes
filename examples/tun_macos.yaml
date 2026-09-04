@@ -1,0 +1,76 @@
+# TUN VPN on macOS (utun)
+#
+# shoes opens a `utun` device, assigns it `address`/`netmask`/`destination`
+# and speaks IP through it. Two shapes are valid on macOS and this is the
+# second:
+#
+#   - a Network Extension provider passes `device_fd` from `packetFlow`, and
+#     configures the interface itself (see docs/MACOS.md);
+#   - a privileged host creates the device, which is this file.
+#
+# Requirements:
+# - run as root (creating a utun and configuring it needs it)
+# - routes and DNS stay yours — shoes configures the interface and nothing
+#   else. `shoesd` is the daemon that does the rest; see the notes below.
+#
+# Naming: `device_name` must be `utunN`, and is best left out. Omitted, the
+# kernel hands back the next free unit; choosing one races every other utun
+# user on the machine (another VPN, a corporate client) and the failure is an
+# errno from `connect` with no retry.
+
+- address: "10.0.0.2"
+  netmask: "255.255.255.0"
+  # The point-to-point peer. Not strictly required — validation warns rather
+  # than refuses — but a utun without one has no peer address, so set it.
+  destination: "10.0.0.1"
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  icmp_enabled: true
+  # Answer DNS locally from a private pool, so hostname rules keep working
+  # and nothing resolves on the host. Optional; delete to forward DNS.
+  fake_ip:
+    network: "198.18.0.0/16"
+    bypass_domains:
+      - "*.local"
+      - "captive.apple.com"
+      - "*.pool.ntp.org"
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+
+# =============================================================================
+# Usage Notes
+# =============================================================================
+#
+# 1. This config brings the interface up and nothing else. To carry traffic,
+#    routes have to point into it (as root, and `utun4` is whatever the kernel
+#    picked — `ifconfig` will say, and `shoesd` reports it as `interface`):
+#      route -q -n add -inet 0.0.0.0/1   -interface utun4
+#      route -q -n add -inet 128.0.0.0/1 -interface utun4
+#
+#    Two halves rather than replacing `default`: each is more specific, so
+#    they win without deleting the real default route — which stays in the
+#    table for the next step, and is untouched if shoes dies.
+#
+# 2. When the exit is a proxy server rather than `direct`, pin that server to
+#    the physical gateway first, or the tunnel swallows its own transport:
+#      route -q -n add -inet <proxy-ip> -gateway <original-gateway>
+#
+#    Find the gateway with `netstat -rn -f inet` and take the first `default`
+#    row whose gateway is *not* a `link#N` entry — a `link#` row is a
+#    point-to-point interface, quite possibly this tunnel.
+#
+# 3. IPv6 leaks to the physical interface unless it is dealt with. shoes does
+#    not carry v6 here, so refuse it rather than leaving it:
+#      route -q -n add -inet6 ::/1     ::1 -reject
+#      route -q -n add -inet6 8000::/1 ::1 -reject
+#
+# 4. Undo everything by deleting those routes; the interface goes away when
+#    shoes exits.
+#
+# All of the above is what `shoesd` does for you, including putting it back
+# afterwards and after a crash. See docs/specs/2026-09-04-macos-privileged-daemon.md.

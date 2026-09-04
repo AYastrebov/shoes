@@ -81,11 +81,13 @@ terminal connectors. XTLS Reality (a hand-written TLS 1.3 stack, `src/reality/`)
 XTLS Vision, ShadowTLS v3, H2MUX, SagerNet UDP-over-TCP, XUDP, QUIC Salamander
 obfuscation and Hysteria2 port hopping.
 
-TUN mode with a Fake IP pool, on Linux, Android, iOS, Windows 11 and macOS. The
-macOS path is the Network Extension system extension and **has never actually
-been run** — see [docs/MACOS.md](./docs/MACOS.md), and note that
-`validate_tun_config` has no macOS arm, so a macOS TUN config is not validated
-the way the other four are.
+TUN mode with a Fake IP pool, on Linux, Android, iOS, Windows 11 and macOS.
+macOS has two hosts: the Network Extension system extension, and `shoesd`, a
+root launchd daemon that also configures routes and DNS. Neither has been run
+end to end yet — the extension needs an entitlement a Personal Team cannot
+hold, and the daemon's live run is outstanding. See
+[docs/MACOS.md](./docs/MACOS.md). The device-creation and validation arms that
+were missing on macOS now exist.
 
 Three things worth naming because the table below has no row for them and they
 are real work: a DNS subsystem with `system`, UDP, TCP, DoT, DoH and DoH3
@@ -498,19 +500,34 @@ executable per product for the simulator and asserts with `nm` that the
 host has no engine symbol and the extension does. Design:
 [docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md](./docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md).
 
-### 4. Privileged helper and IPC contract
+### 4. Privileged helper and IPC contract — macOS done, pending its live run
 
-One protocol, three genuinely different mechanisms — `SMAppService` on macOS, a
-service running as SYSTEM on Windows, systemd with polkit on Linux. The GUI must
-have no platform branches, which means it asks the helper what it can do rather
-than inferring it from the OS.
+`shoesd` (`src/bin/shoesd/`, `--features daemon`) is a root launchd daemon
+serving gRPC over a Unix domain socket, with the `.proto` owned here in
+`proto/shoes/daemon/v1/`. It hosts `shoes::control` in-process and configures
+the host around it: the split default route, a host route per excluded address,
+IPv6 rejects, and DNS through `SCDynamicStore` — reverted on stop, and after a
+crash from a record written before each change. Authentication is the socket's
+peer credentials; there is no token and no TCP listener. Design and the
+decisions taken:
+[docs/specs/2026-09-04-macos-privileged-daemon.md](./docs/specs/2026-09-04-macos-privileged-daemon.md).
 
-This is where **host network configuration** lives, and shoes deliberately does
-not do it: nothing in `src/` touches routes, `resolv.conf`, systemd-resolved or
-`netsh`. shoes moves packets; the host owns the network. On Linux that is the
-awkward part — systemd-resolved, resolvconf, NetworkManager and a bare
-`/etc/resolv.conf` are four different mechanisms, and without one of them a TUN
-device exists that no traffic is routed into.
+The GUI has no platform branches because it asks: `Hello` reports
+`capabilities`, so a build without a routes or DNS arm says so rather than
+failing at `Start`.
+
+This is where **host network configuration** lives, and shoes still deliberately
+does not do it: nothing in `src/` touches routes, `resolv.conf`,
+systemd-resolved or `netsh`. shoes moves packets; the host owns the network,
+and the daemon is a host — the same seat as `NEPacketTunnelProvider`, written
+in Rust and linking the library rather than crossing a C boundary.
+
+**What is left.** The live run on Apple Silicon (step 8 of
+[the plan](./docs/plans/2026-09-04-macos-privileged-daemon.md)), and Windows and
+Linux. Linux is the awkward one — systemd-resolved, resolvconf, NetworkManager
+and a bare `/etc/resolv.conf` are four different mechanisms — and both are left
+as `unimplemented` arms behind the same protocol, with `capabilities` there so
+a client asks rather than infers.
 
 ### 5. The Tauri GUI
 

@@ -169,7 +169,7 @@ jobs:
           case "$RUNNER_OS" in
             Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client" ;;
             Windows) configs="$configs tun_windows" ;;
-            macOS) configs="$configs amneziawg_client" ;;
+            macOS) configs="$configs amneziawg_client tun_macos" ;;
           esac
 
           for cfg in $configs; do
@@ -206,6 +206,45 @@ jobs:
         with:
           name: ${{ github.event.repository.name }}-${{ matrix.asset_name }}
           path: artifacts/*.tar.gz
+          if-no-files-found: error
+
+      # The privileged daemon, macOS only and its own artifact.
+      #
+      # Its own cargo invocation because features are additive per build:
+      # folding `--features daemon` into the step above would compile
+      # control-stats and control-logs into the `shoes` CLI as well, which is
+      # a different binary for a different audience. Its own tarball for the
+      # same reason, plus one the consumer cares about — a Gradle task fetches
+      # it by asset name and checks the SHA-256 the API reports, so the name
+      # has to be stable and mean one thing.
+      #
+      # protoc is an install step rather than a crate: prost-build stopped
+      # vendoring one.
+      - name: Install protoc
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: brew install protobuf
+
+      - name: Build and package shoesd
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features daemon \
+            --bin shoesd --target ${{ matrix.target }}
+          bin="target/${{ matrix.target }}/release/shoesd"
+          file "$bin"
+          "$bin" --version
+          mkdir -p daemon-artifacts
+          tar -czf "daemon-artifacts/shoesd-${{ matrix.asset_name }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" shoesd
+          ls -la daemon-artifacts/
+
+      - name: Upload shoesd
+        if: matrix.target == 'aarch64-apple-darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shoesd-${{ matrix.asset_name }}
+          path: daemon-artifacts/*.tar.gz
           if-no-files-found: error
 
   release:
