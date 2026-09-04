@@ -27,6 +27,14 @@ compile_error!(
 );
 
 mod auth;
+// Nothing calls into `host` yet: its consumer is the supervisor, which arrives
+// with the session methods (step 5 of
+// docs/plans/2026-09-04-macos-privileged-daemon.md). The module lands first
+// because the sequencing it encodes -- what to undo when a step fails -- is
+// the part worth getting right before anything can run it, and the allow goes
+// away when the supervisor calls `Session::apply`.
+#[allow(dead_code)]
+mod host;
 mod service;
 mod socket;
 

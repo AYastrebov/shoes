@@ -81,6 +81,7 @@ daemon = [
     "dep:prost",
     "dep:tokio-stream",
     "dep:tonic-prost-build",
+    "dep:serde_json",
 ]
 
 [[bin]]
@@ -193,6 +194,11 @@ prost = { version = "0.14", optional = true }
 # `net` is what carries UnixListenerStream, which is how the listener reaches
 # `serve_with_incoming_shutdown`.
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
+# The revert state file. JSON rather than the YAML this crate already parses:
+# it is written by a program and read by a program, never edited by hand, and
+# a crash-recovery record wants the format with the fewest ways to be
+# ambiguous.
+serde_json = { version = "*", optional = true }
 
 # Only the daemon's own tests, to build a client that speaks to a real Unix
 # socket. tonic's client takes a URI, so reaching a socket path means handing

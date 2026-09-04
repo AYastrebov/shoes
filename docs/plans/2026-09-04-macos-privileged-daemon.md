@@ -153,7 +153,20 @@ which way it went here, with what was observed.
     on the path shoes takes once `enable_routing` is off, and requiring it
     would have made macOS the only platform whose valid config Windows
     refuses. The 14 test failures that surfaced this were each correct.
-- [ ] 3. `HostNetwork` trait, state file, revert sequencing + tests
+- [x] 3. `HostNetwork` trait, state file, revert sequencing + tests (`HEAD`).
+  Eighteen tests over a recording double; the five sequencing rules each proven
+  able to fail (revert order, revert-on-failed-apply, revert not stopping at
+  the first failure, the no-gateway blackhole, and record-before-apply). Two
+  refinements to what the plan described:
+  - `apply` reverts the route whose *install* failed, not only the ones before
+    it. That is record-before-apply showing through: the route was written down
+    before it was attempted, so a crash between those moments leaves it
+    described. `delete_route` is therefore required to treat an absent route as
+    success, which is now part of the trait's contract.
+  - The exclusion gateway is family-checked. A machine with only an IPv6
+    default route would otherwise get a v4 host route through a v6 gateway,
+    which the kernel rejects with an error that explains nothing; it blackholes
+    instead.
 - [ ] 4. macOS implementation of `HostNetwork`
 - [ ] 5. Supervisor, service methods, streams
 - [ ] 6. `install`/`uninstall`/`SIGTERM`
