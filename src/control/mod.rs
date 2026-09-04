@@ -387,6 +387,15 @@ struct ExitGuard {
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
+        // Before `running` goes false, and the order is load-bearing rather
+        // than tidy. `stop_handle` returns the moment it observes that flag,
+        // so a caller is free to start the next session while the rest of this
+        // guard is still running -- and a clear that happened after the store
+        // could wipe the *new* session's interface name. Here, no new session
+        // can exist yet.
+        #[cfg(any(unix, windows))]
+        crate::tun::clear_device_name();
+
         self.running.store(false, Ordering::SeqCst);
         if self.stop_requested.load(Ordering::SeqCst) {
             return;
@@ -883,27 +892,59 @@ mod tests {
         );
         assert!(matches!(stop_handle(running), StopOutcome::Released));
 
-        // The other half, and the half that matters: the static still holds
-        // the name, and a service that has ended must not report it anyway.
+        // The other half: the gate itself. The exit guard clears the static
+        // when a session ends -- `a_session_that_ends_forgets_its_interface`
+        // covers that -- so this stages the name again afterwards, which is
+        // the only way left to ask whether `status` would report a device on a
+        // service that is not running.
         let ended = start_with(test_runtime(), |_shutdown| async { Ok(()) }, |_| {});
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while ended.is_running() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!ended.is_running(), "the stub service should have exited");
-        assert_eq!(
-            crate::tun::device_name().as_deref(),
-            Some("utun9"),
-            "the static outlives the session -- that is the hazard under test"
-        );
+
+        crate::tun::set_device_name("utun9".to_string());
         assert_eq!(
             ended.status().device_name,
             None,
-            "a stopped service must not name an interface a host could act on"
+            "a stopped service must not name an interface a host could act on, \
+             whatever the static happens to hold"
         );
 
         let _ = stop_handle(ended);
         crate::tun::clear_device_name();
+    }
+
+    /// A session that ends forgets its interface, so nothing reports a device
+    /// that is gone.
+    ///
+    /// `device_name()` is public and is read directly -- the daemon polls it
+    /// while waiting for the engine to create its device -- so leaving the
+    /// static set after a stop makes it answer with an interface that no
+    /// longer exists. The `running` gate on `StatusSnapshot` hides that from
+    /// one caller; this makes it untrue for all of them.
+    #[test]
+    fn a_session_that_ends_forgets_its_interface() {
+        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        crate::tun::set_device_name("utun9".to_string());
+
+        let handle = start_with(test_runtime(), |_shutdown| async { Ok(()) }, |_| {});
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while handle.is_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!handle.is_running(), "the stub service should have exited");
+
+        assert_eq!(
+            crate::tun::device_name(),
+            None,
+            "the exit guard must clear it, not leave the next reader a device \
+             that is gone"
+        );
+
+        let _ = stop_handle(handle);
     }
 
     /// And a session start clears whatever the last one left behind, so a

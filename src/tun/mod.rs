@@ -99,6 +99,11 @@ pub(crate) static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex
 
 /// The interface the running session created, if it created one.
 ///
+/// Cleared at both ends of a session, so this does not outlive the device it
+/// names. A host that wants the answer tied to a lifecycle state should read
+/// `control::StatusSnapshot::device_name`, which additionally gates it on the
+/// service actually running.
+///
 /// Unused by the `shoes` binary, and permanently so: reading this is a
 /// privileged host's job, and `src/main.rs` is not one -- it runs a config and
 /// configures no routes. Its consumers are `shoes::control::StatusSnapshot`
@@ -122,8 +127,12 @@ pub(crate) fn set_device_name(name: String) {
     *DEVICE_NAME.lock() = Some(name);
 }
 
-/// Forget it. Called when a session starts, so a failed start cannot leave
-/// the previous session's interface visible, and when one ends.
+/// Forget it.
+///
+/// Called at both ends of a session: when one starts, so a failed start cannot
+/// leave the previous session's interface visible, and when the service task
+/// exits, so nothing reports a device that is gone. The second is the first
+/// thing `control`'s exit guard does -- see the ordering note there.
 ///
 /// Unused by the `shoes` binary -- see [`device_name`].
 #[allow(dead_code)]
