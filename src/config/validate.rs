@@ -1915,6 +1915,87 @@ fn validate_server_proxy_config(
 }
 
 /// Validates a TUN configuration.
+/// macOS is the one platform with two legitimate device shapes, so this arm
+/// accepts either rather than requiring one.
+///
+/// A Network Extension provider hands over a descriptor from `packetFlow`
+/// (`DevicePolicy::BorrowedFd`), exactly as on iOS. The privileged daemon
+/// creates the device itself (`DevicePolicy::Owned`), and then `address` and
+/// `netmask` are load-bearing, as they are on Windows: an interface without
+/// them comes up reachable by nothing and says nothing about it.
+///
+/// `destination` is warned about rather than required, and the distinction is
+/// worth stating because it nearly went the other way. The `tun` crate applies
+/// all three together as a point-to-point alias and skips the whole step --
+/// without an error -- if any one is missing, which reads like an argument for
+/// demanding the trio. But that path runs only with the crate's macOS
+/// `enable_routing` on, and shoes turns it off so that the crate does not
+/// install a route the host will later have to revert (see
+/// `create_sync_device`). With it off, `configure()` applies address, netmask
+/// and destination through separate ioctls, so a missing `destination` costs
+/// the peer address and nothing else. Requiring it would also make macOS the
+/// only platform whose valid config Windows refuses, since Windows rejects
+/// `destination` outright.
+///
+/// The name rule is the crate's: `Device::new` parses everything after `utun`
+/// as the control unit and otherwise fails with `Error::InvalidName`, or with
+/// a bare integer-parse error for a non-numeric suffix. Neither says what the
+/// rule is, so it is stated here. Omitting the name asks the kernel for the
+/// next free unit, which is what a host should do -- picking one races every
+/// other utun user on the machine.
+///
+/// That rule applies only when shoes creates the device. With a descriptor the
+/// name is documented as ignored (see `TunConfig::device_name`) and the crate
+/// never reads it, so rejecting one would refuse a config that works -- the
+/// macOS provider is handed whatever YAML the app generates, and a Linux-shaped
+/// `tun0` in it is meaningless rather than wrong.
+#[cfg(target_os = "macos")]
+fn validate_macos_tun_device(
+    device_fd: Option<i32>,
+    device_name: Option<&str>,
+    address: Option<std::net::IpAddr>,
+    netmask: Option<std::net::IpAddr>,
+    destination: Option<std::net::IpAddr>,
+) -> std::io::Result<()> {
+    // With a descriptor the host has already configured the interface, and
+    // the crate returns before it reads any of the fields below.
+    if device_fd.is_some() {
+        return Ok(());
+    }
+
+    if let Some(name) = device_name
+        && name
+            .strip_prefix("utun")
+            .is_none_or(|unit| unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "TUN 'device_name' {name:?} is not valid on macOS: it must be 'utun' followed \
+                 by a number (e.g. 'utun4'), or omitted so the kernel picks the next free unit"
+            ),
+        ));
+    }
+
+    if address.is_none() || netmask.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN on macOS requires either 'device_fd' (from \
+             NEPacketTunnelProvider.packetFlow) or both 'address' and 'netmask'; without \
+             them the interface comes up reachable by nothing",
+        ));
+    }
+
+    if destination.is_none() {
+        log::warn!(
+            "TUN on macOS has no 'destination': the utun is a point-to-point interface and \
+             will have no peer address. Set it to the other end of the tunnel subnet."
+        );
+    }
+
+    Ok(())
+}
+
 fn validate_tun_config(
     config: &mut TunConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
@@ -1977,6 +2058,14 @@ fn validate_tun_config(
             ));
         }
     }
+    #[cfg(target_os = "macos")]
+    validate_macos_tun_device(
+        config.device_fd,
+        config.device_name.as_deref(),
+        config.address,
+        config.netmask,
+        config.destination,
+    )?;
     #[cfg(target_os = "windows")]
     {
         // No descriptor to inject: a wintun handle does not survive a process
@@ -2339,7 +2428,134 @@ fn expand_selection(
 mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
+    use crate::config::types::tun::TEST_TUN_DEVICE_NAME;
     use crate::dns::IpStrategy;
+
+    /// The macOS device shapes, checked directly rather than through a whole
+    /// `TunConfig`, because the interesting part is the interaction between
+    /// five fields.
+    ///
+    /// This is the arm that did not exist: until it landed, a macOS TUN config
+    /// was not validated the way the other four platforms' are, and the
+    /// resulting device came up with no address and no complaint.
+    #[cfg(target_os = "macos")]
+    mod macos_tun_device {
+        use super::*;
+        use std::net::IpAddr;
+
+        fn ip(s: &str) -> IpAddr {
+            s.parse().unwrap()
+        }
+
+        fn owned(
+            name: Option<&str>,
+            address: Option<&str>,
+            netmask: Option<&str>,
+            destination: Option<&str>,
+        ) -> std::io::Result<()> {
+            validate_macos_tun_device(
+                None,
+                name,
+                address.map(ip),
+                netmask.map(ip),
+                destination.map(ip),
+            )
+        }
+
+        #[test]
+        fn the_daemon_shape_is_accepted() {
+            owned(
+                None,
+                Some("10.0.0.2"),
+                Some("255.255.255.0"),
+                Some("10.0.0.1"),
+            )
+            .expect("address, netmask and destination is the shape the daemon writes");
+        }
+
+        /// An address or a netmask missing is refused: the interface would
+        /// come up reachable by nothing.
+        #[test]
+        fn an_unaddressable_interface_is_refused() {
+            for (case, address, netmask) in [
+                ("no address", None, Some("255.255.255.0")),
+                ("no netmask", Some("10.0.0.2"), None),
+                ("neither", None, None),
+            ] {
+                let err = owned(None, address, netmask, Some("10.0.0.1"))
+                    .expect_err(&format!("{case} must be refused"));
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{case}");
+                assert!(
+                    err.to_string().contains("'netmask'"),
+                    "{case}: the message must name the fields, got {err}"
+                );
+            }
+        }
+
+        /// `destination` is a warning, not a rejection.
+        ///
+        /// Requiring it would make macOS the only platform whose valid config
+        /// Windows refuses -- Windows rejects `destination` outright, because
+        /// its adapter path would turn it into a default route -- and the
+        /// crate hazard that would have justified demanding it (the
+        /// all-three-or-silently-skip alias) is not on the path shoes takes.
+        #[test]
+        fn a_missing_destination_is_allowed() {
+            owned(None, Some("10.0.0.2"), Some("255.255.255.0"), None)
+                .expect("a missing peer address costs the peer address, not the interface");
+        }
+
+        /// The Network Extension shape. The crate returns before it reads any
+        /// address field, so requiring them here would reject the provider
+        /// that already works on this platform.
+        #[test]
+        fn a_descriptor_needs_no_address_fields() {
+            validate_macos_tun_device(Some(7), None, None, None, None)
+                .expect("a borrowed descriptor is the Network Extension's shape");
+        }
+
+        #[test]
+        fn the_device_name_must_be_utun_and_a_number() {
+            for name in ["utun", "tun0", "utunx", "utun4x", "en0", ""] {
+                let err = owned(
+                    Some(name),
+                    Some("10.0.0.2"),
+                    Some("255.255.255.0"),
+                    Some("10.0.0.1"),
+                )
+                .expect_err(&format!("{name:?} is not a utun unit"));
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    err.to_string().contains("utun"),
+                    "the message must state the rule, got {err}"
+                );
+            }
+
+            for name in ["utun0", "utun4", "utun12"] {
+                owned(
+                    Some(name),
+                    Some("10.0.0.2"),
+                    Some("255.255.255.0"),
+                    Some("10.0.0.1"),
+                )
+                .unwrap_or_else(|e| panic!("{name:?} is a valid unit, got {e}"));
+            }
+        }
+
+        /// The name rule applies only when shoes creates the device.
+        ///
+        /// `TunConfig::device_name` is documented as ignored where the device
+        /// arrives as a descriptor, and the crate never reads it there. The
+        /// macOS Network Extension provider is handed whatever YAML the app
+        /// generated, which is the same document Linux and Android use, so a
+        /// `tun0` in it is meaningless rather than wrong. Rejecting it broke
+        /// fourteen existing tests, each of them right.
+        #[test]
+        fn a_descriptor_makes_the_name_irrelevant_rather_than_wrong() {
+            validate_macos_tun_device(Some(7), Some("tun0"), None, None, None)
+                .expect("a name the platform ignores must not fail the config");
+        }
+    }
 
     mod quic_outbounds {
         use super::*;
@@ -2748,7 +2964,7 @@ mod tests {
         };
         format!(
             r#"
-- device_name: "tun0"
+- device_name: "{TEST_TUN_DEVICE_NAME}"
   address: "10.99.0.1"
   netmask: "255.255.255.0"
   dns:
@@ -2800,11 +3016,12 @@ mod tests {
     /// `url: system` still resolves the hostname over plaintext UDP:53.
     #[tokio::test]
     async fn tun_dns_bootstrapped_by_a_system_group_is_rejected() {
-        let yaml = r#"
+        let yaml = &format!(
+            r#"
 - dns_group: "sysgroup"
   dns_servers:
     - url: "system"
-- device_name: "tun0"
+- device_name: "{TEST_TUN_DEVICE_NAME}"
   address: "10.99.0.1"
   netmask: "255.255.255.0"
   dns:
@@ -2817,7 +3034,8 @@ mod tests {
       client_chain:
         - protocol:
             type: direct
-"#;
+"#
+        );
         let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
         let err = validate_configs_test(configs).await.unwrap_err();
         let msg = err.to_string();
@@ -2839,8 +3057,9 @@ mod tests {
     /// layer, it does not close. Rejected with the hop named.
     #[tokio::test]
     async fn tun_dns_with_hostname_chain_hop_is_rejected() {
-        let yaml = r#"
-- device_name: "tun0"
+        let yaml = &format!(
+            r#"
+- device_name: "{TEST_TUN_DEVICE_NAME}"
   address: "10.99.0.1"
   netmask: "255.255.255.0"
   dns:
@@ -2856,7 +3075,8 @@ mod tests {
       client_chain:
         - protocol:
             type: direct
-"#;
+"#
+        );
         let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
         let err = validate_configs_test(configs).await.unwrap_err();
         let msg = err.to_string();
@@ -3337,8 +3557,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tun_config_parsing() {
-        let yaml = r#"
-- device_name: "tun0"
+        let yaml = &format!(
+            r#"
+- device_name: "{TEST_TUN_DEVICE_NAME}"
   address: "10.0.0.1"
   netmask: "255.255.255.0"
   mtu: 1400
@@ -3351,13 +3572,14 @@ mod tests {
       client_chain:
         - protocol:
             type: direct
-"#;
+"#
+        );
         let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(configs.len(), 1);
 
         match &configs[0] {
             Config::TunServer(tun) => {
-                assert_eq!(tun.device_name, Some("tun0".to_string()));
+                assert_eq!(tun.device_name, Some(TEST_TUN_DEVICE_NAME.to_string()));
                 assert_eq!(tun.address, Some("10.0.0.1".parse().unwrap()));
                 assert_eq!(tun.netmask, Some("255.255.255.0".parse().unwrap()));
                 assert_eq!(tun.mtu, 1400);
@@ -3453,10 +3675,11 @@ mod tests {
 
     fn tun_config_with_fake_ip(fake_ip: crate::config::types::FakeIpConfig) -> TunConfig {
         TunConfig {
-            device_name: Some("tun0".to_string()),
+            device_name: Some(TEST_TUN_DEVICE_NAME.to_string()),
             device_fd: None,
             address: Some("10.0.0.1".parse().unwrap()),
-            // Windows requires a netmask; these tests are about fake_ip.
+            // Windows requires a netmask, macOS a `utunN` name; these tests
+            // are about fake_ip.
             netmask: Some("255.255.255.0".parse().unwrap()),
             destination: None,
             mtu: 1500,

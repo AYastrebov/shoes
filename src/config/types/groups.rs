@@ -205,11 +205,24 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_pem = map.contains_key(Value::String("pem".to_string()));
 
         // Check if this is a TUN config
-        // TUN configs have 'device_name' (Linux) or 'device_fd' (iOS/Android)
-        // These fields are unique to TUN and don't appear in other config types
+        // TUN configs have 'device_name' (Linux/Windows) or 'device_fd'
+        // (iOS/Android/macOS-NE). These fields are unique to TUN and don't
+        // appear in other config types.
+        //
+        // `netmask` and `destination` are in the set for a shape neither of
+        // those two covers: a macOS host that creates the device and lets the
+        // kernel choose the `utun` unit. It has no descriptor, and naming the
+        // interface is exactly what it must not do -- picking a unit races
+        // every other utun user on the machine -- so without these it would
+        // fall through to the `address` branch below and be read as a server
+        // config. Both field names exist only on `TunConfig`, and a server
+        // config carrying one is already an unknown-field error rather than
+        // something that used to work.
         let has_device_name = map.contains_key(Value::String("device_name".to_string()));
         let has_device_fd = map.contains_key(Value::String("device_fd".to_string()));
-        let is_tun_config = has_device_name || has_device_fd;
+        let has_netmask = map.contains_key(Value::String("netmask".to_string()));
+        let has_destination = map.contains_key(Value::String("destination".to_string()));
+        let is_tun_config = has_device_name || has_device_fd || has_netmask || has_destination;
 
         // Try to determine which variant based on fields
         if has_pem {
@@ -687,6 +700,36 @@ client_proxies:
         );
     }
 
+    /// A TUN entry with neither `device_name` nor `device_fd` is still a TUN
+    /// entry.
+    ///
+    /// This is the shape the macOS daemon writes: it creates the device and
+    /// must not name it, because choosing a `utun` unit races every other utun
+    /// user on the machine, and it has no descriptor to declare. Before
+    /// `netmask` joined the discriminators this fell through to the `address`
+    /// branch and was read as a server config -- which fails as a confusing
+    /// unknown-field error somewhere else entirely, rather than starting a
+    /// tunnel.
+    #[test]
+    fn a_tun_entry_is_recognised_without_a_name_or_a_descriptor() {
+        let yaml = r#"
+- address: "10.0.0.2"
+  netmask: "255.255.255.0"
+  destination: "10.0.0.1"
+  mtu: 1500
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).expect("should parse");
+        assert_eq!(configs.len(), 1);
+        match &configs[0] {
+            Config::TunServer(tun) => {
+                assert_eq!(tun.device_name, None);
+                assert_eq!(tun.device_fd, None);
+                assert_eq!(tun.netmask, Some("255.255.255.0".parse().unwrap()));
+            }
+            other => panic!("expected a TUN config, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_rejects_unknown_field_in_rule_config_group() {
         let yaml = r#"
@@ -786,6 +829,32 @@ client_proxies:
                 || content.contains("YOUR_");
             if needs_a_fixture {
                 println!("  ✓ Parsed successfully ({} configs)", configs.len());
+                continue;
+            }
+
+            // A TUN example is written for one platform's device rules, and
+            // those rules genuinely conflict: Windows requires `device_name`
+            // and refuses `destination`, macOS accepts only a `utunN` name,
+            // Linux takes `tun0`. No single document satisfies all three, so
+            // an example that does not validate here is correct rather than
+            // broken -- it belongs to another platform.
+            //
+            // The same split already exists in `.github/workflows/build.yml`,
+            // whose smoke-test loop dry-runs each example only on the
+            // platforms whose arm accepts it. This list is that list; keep the
+            // two together. Every non-TUN example still validates everywhere.
+            let tun_example_platforms: &[&str] = match file_name {
+                "tun_vpn.yaml" | "tun_fake_ip.yaml" => &["linux"],
+                "tun_windows.yaml" => &["linux", "windows"],
+                _ => &[],
+            };
+            if !tun_example_platforms.is_empty()
+                && !tun_example_platforms.contains(&std::env::consts::OS)
+            {
+                println!(
+                    "  ✓ Parsed; the TUN shape belongs to {tun_example_platforms:?}, not {}",
+                    std::env::consts::OS
+                );
                 continue;
             }
 
