@@ -233,6 +233,33 @@ other platforms' arms thought through, because the library half is shared. And
 the macOS runner added in this branch would not have caught it: the bug was
 visible only where the arm does *not* short-circuit.
 
+## KVN's second pass, addressed
+
+They confirmed all four findings from the first brief fixed, and raised one new
+one plus two observations.
+
+- **IPv6 was refused for `exclude` and accepted for `dns`** — the reasoning in
+  `refuse_ipv6`'s own doc comment applied to both fields and was wired to one.
+  A v6 resolver is the worse half: advertising an address does not exempt it
+  from routing, so with `::/1` rejected the session reports RUNNING while every
+  lookup fails. A test of mine asserted the wrong behaviour outright, on the
+  reasoning that resolvers are "advertised rather than routed around" the
+  tunnel; it now asserts the refusal. KVN flagged this as reachable rather than
+  hypothetical — their custom-DNS field accepts a v6 literal today.
+- **The monitor test leaked a detached thread** for the life of the test
+  binary. Splitting `open_route_socket` out of `spawn` lets the test check the
+  half that can fail without starting the loop that cannot be stopped, which is
+  better than `#[ignore]` — and a second test now pins `ENOBUFS` as
+  recoverable.
+- **The monitor's lifetime consequences** are recorded in the spec rather than
+  changed: a non-recoverable read error ends it for the life of the process,
+  and the resolvers are rewritten twice per network change.
+
+Both v6 call sites are covered by a test that goes through `Start` over the
+real socket. Deleting either one previously left every test green, because the
+unit tests call `refuse_ipv6` directly — the same gap that hid the `stage()`
+call site earlier in this branch.
+
 ## Status
 
 - [x] 1. IPC stack answering on the socket, peer check enforced (`HEAD`).

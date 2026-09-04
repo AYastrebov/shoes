@@ -68,6 +68,13 @@ message StartRequest {
   // would be unreachable behind a session that otherwise looked healthy.
   repeated string exclude = 2;
   // Resolvers to advertise to the host. Inside the tunnel by design.
+  //
+  // IPv4 only in v1, and an IPv6 address here is INVALID_ARGUMENT. Advertising
+  // an address does not exempt it from routing: the host still sends queries to
+  // it, and the daemon rejects ::/1 and 8000::/1 for the life of the session --
+  // so a v6 resolver means every lookup fails while the session reports
+  // RUNNING, which reads to a user as a broken internet rather than a broken
+  // proxy.
   repeated string dns = 3;
 }
 

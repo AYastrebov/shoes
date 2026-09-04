@@ -90,6 +90,7 @@ impl Daemon for DaemonService {
         let exclude = parse_addresses(&request.exclude, "exclude")?;
         refuse_ipv6(&exclude, "exclude")?;
         let dns = parse_addresses(&request.dns, "dns")?;
+        refuse_ipv6(&dns, "dns")?;
 
         let supervisor = self.supervisor.clone();
         let result =
@@ -354,11 +355,21 @@ fn parse_addresses(values: &[String], field: &str) -> Result<Vec<IpAddr>, Status
 /// Refuse an IPv6 address where the daemon cannot carry one.
 ///
 /// v1 has no IPv6 inside the tunnel and installs `::/1` and `8000::/1` as
-/// reject routes. An excluded v6 address would need a v6 gateway to escape
-/// past them, and the gateway lookup reads `netstat -rn -f inet` -- so it
-/// would be blackholed instead, and the session would come up with a proxy it
-/// cannot reach and no error to say why. Refusing at the door is the honest
-/// answer until v6 is carried.
+/// reject routes, so *every* v6 destination is unreachable for the life of the
+/// session. That applies to both fields this guards, and the second was missed
+/// on the first pass:
+///
+/// - An excluded v6 address would need a v6 gateway to escape past those
+///   rejects, and the gateway lookup reads `netstat -rn -f inet` -- so it
+///   would be blackholed instead, and the session would come up with a proxy
+///   it cannot reach.
+/// - A v6 *resolver* is worse. Advertising it through `SCDynamicStore` does
+///   not exempt it from routing: the host still has to send queries to that
+///   address, and the reject route answers them. The session reports RUNNING
+///   while every lookup fails, which reads to a user as a broken internet
+///   rather than a broken proxy.
+///
+/// Refusing at the door is the honest answer until v6 is carried.
 fn refuse_ipv6(addresses: &[IpAddr], field: &str) -> Result<(), Status> {
     if let Some(address) = addresses.iter().find(|address| address.is_ipv6()) {
         return Err(Status::invalid_argument(format!(
@@ -494,6 +505,20 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `expect_err` with the field in the message.
+    trait UnwrapErrNamed<T> {
+        fn unwrap_err_or_else_panic(self, field: &str) -> Status;
+    }
+
+    impl<T: std::fmt::Debug> UnwrapErrNamed<T> for Result<T, Status> {
+        fn unwrap_err_or_else_panic(self, field: &str) -> Status {
+            match self {
+                Err(status) => status,
+                Ok(value) => panic!("{field} should have been refused, got {value:?}"),
+            }
+        }
+    }
     use crate::host::double::Recorder;
 
     fn service_with(authorizer: Authorizer) -> DaemonService {
@@ -604,13 +629,26 @@ mod tests {
         refuse_ipv6(&["203.0.113.7".parse().unwrap()], "exclude").expect("v4 is fine");
     }
 
-    /// `dns` is not subject to that rule: resolvers live *inside* the tunnel,
-    /// which carries v4, and their addresses are advertised rather than
-    /// routed around it.
+    /// A v6 resolver is refused for the same reason, which this test used to
+    /// assert the opposite of.
+    ///
+    /// The reasoning that let it through was that resolvers are "advertised
+    /// rather than routed around" the tunnel. That is wrong: advertising an
+    /// address does not exempt it from routing, the host still has to send
+    /// queries to it, and `::/1` rejects them. A session would report RUNNING
+    /// with every lookup failing.
     #[test]
-    fn a_v6_resolver_is_not_refused() {
-        let parsed = parse_addresses(&["2001:db8::1".to_string()], "dns").expect("parses");
-        assert_eq!(parsed.len(), 1);
+    fn a_v6_resolver_is_refused_too() {
+        let status = refuse_ipv6(&["2001:db8::1".parse().unwrap()], "dns")
+            .expect_err("a resolver behind a reject route is unreachable");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("dns"),
+            "the message names the field: {}",
+            status.message()
+        );
+
+        refuse_ipv6(&["1.1.1.1".parse().unwrap()], "dns").expect("v4 resolvers are fine");
     }
 
     #[test]
@@ -881,6 +919,50 @@ mod tests {
             proto::status::State::Stopped as i32,
             "a failed start must not leave the session STARTING"
         );
+
+        let _ = shutdown.send(());
+    }
+
+    /// Both v6 guards, over the real transport.
+    ///
+    /// The unit tests above call `refuse_ipv6` directly, which says nothing
+    /// about whether `Start` actually calls it -- deleting either call site
+    /// left them all green. This drives the request a client would send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_refuses_ipv6_in_either_field() {
+        let gid = unsafe { libc::getgid() } as u32;
+        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+
+        for (field, request) in [
+            (
+                "exclude",
+                proto::StartRequest {
+                    yaml: "---\n[]\n".into(),
+                    exclude: vec!["2001:db8::1".into()],
+                    dns: vec![],
+                },
+            ),
+            (
+                "dns",
+                proto::StartRequest {
+                    yaml: "---\n[]\n".into(),
+                    exclude: vec![],
+                    dns: vec!["2001:db8::1".into()],
+                },
+            ),
+        ] {
+            let status = client.start(request).await.unwrap_err_or_else_panic(field);
+            assert_eq!(
+                status.code(),
+                tonic::Code::InvalidArgument,
+                "{field} must be refused before anything is applied"
+            );
+            assert!(
+                status.message().contains(field),
+                "{field}: the message names the field, got {}",
+                status.message()
+            );
+        }
 
         let _ = shutdown.send(());
     }

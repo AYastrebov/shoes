@@ -410,6 +410,16 @@ questions, which is the part this kind of code usually gets wrong:
   so the re-apply is serialised with `Start` and `Stop` rather than racing
   them.)
 
+The monitor is one thread for the life of the process, not one per session: a
+change while stopped is answered by the next start reading the table anyway,
+and one thread is simpler to reason about than one that comes and goes with the
+tunnel. Two consequences follow, both accepted rather than designed around. A
+read error that is not recoverable ends it permanently -- it is logged and
+never restarted, so a daemon up for weeks may no longer be watching and nothing
+says so. And the resolvers are rewritten on every notification, which is two
+`write_dns` calls and two `mDNSResponder` flushes per network change; cheap,
+and the alternative is comparing state the system reverts on its own schedule.
+
 Parsing routing messages to decide what changed is where the bugs live, and it
 is unnecessary — a signal plus an idempotent re-read gives the same answer and
 cannot drift. A Mac moving from Wi-Fi to Ethernet is the ordinary case this
@@ -671,7 +681,7 @@ Steps 1 and 2 are independent and can go in either order; 3 gates 4 and 5.
 | Close `Status::Starting` now? | No | The daemon reports its own `STARTING` — device, routes, DNS, engine spawn — which is the interval a GUI can see. The library's own starting window is the microseconds before `start` returns, and widening `Status` reaches mobile |
 | Daemon in the existing tarball, or its own? | Its own, `shoesd-macos-arm64.tar.gz` | Different feature set, different build, different audience |
 | Who owns the TUN section? | The daemon, through `control::prepare_from_config_owning_device` | The consumer's brief requires it and the proto promises it; it was documented and not implemented until a review caught it. A client sends one document for every platform with `device_fd: 0` as a stand-in, and a host that creates its own device cannot validate that shape -- it has to replace it. `mtu` stays the client's |
-| IPv6 addresses in `exclude`? | Refused at `Start` with `INVALID_ARGUMENT` | The gateway lookup reads `netstat -rn -f inet`, so a v6 exclusion would fail the family check and be blackholed -- and with `::/1` rejected, the proxy would be unreachable behind a session that looked healthy. Carrying v6 is what would change this |
+| IPv6 addresses in `exclude` or `dns`? | Refused at `Start` with `INVALID_ARGUMENT` | `::/1` and `8000::/1` are rejected for the life of the session, so *every* v6 destination is unreachable. An exclusion would additionally need a v6 gateway the lookup cannot return. A v6 resolver is the worse of the two: advertising an address does not exempt it from routing, so the session reports RUNNING while every lookup fails — which reads as a broken internet rather than a broken proxy. Carrying v6 is what would change this |
 | launchd socket activation? | No; `KeepAlive`, daemon binds its own socket | The process must run continuously and must run at boot for crash recovery, and `launch_activate_socket(3)` needs hand-written FFI to close a window `chown`/`chmod` already closes |
 | Let the `tun` crate install its route? | No — `enable_routing(false)`, daemon owns every route | One owner for everything the revert path must undo. Carries a live-verification obligation, since the same flag also skips the point-to-point alias |
 | `networksetup` or `SCDynamicStore` for DNS? | `SCDynamicStore`, with the previous values saved to the state file | `networksetup` addresses a service by display name and has been broken since macOS 14.3; and a `kill -9`-survivable revert needs the backup on disk either way |
