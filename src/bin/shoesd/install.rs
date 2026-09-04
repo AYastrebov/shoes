@@ -69,10 +69,31 @@ fn plist(socket_path: &Path, state_path: &Path, group: &str) -> String {
 </dict>
 </plist>
 "#,
-        socket = socket_path.display(),
-        state = state_path.display(),
-        group = group,
+        socket = xml(&socket_path.display().to_string()),
+        state = xml(&state_path.display().to_string()),
+        group = xml(group),
     )
+}
+
+/// Escape a value for an XML text node.
+///
+/// The paths and the group name come from the command line, and `&` is a legal
+/// character in a filename. Interpolated raw, one produces a plist that is not
+/// well-formed, and `launchctl bootstrap` then fails with an error naming
+/// neither the character nor the key it was in.
+fn xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// Copy the running executable into place, write the plist, and bootstrap it.
@@ -309,6 +330,33 @@ mod tests {
             "{plist}"
         );
         assert!(plist.contains("<string>staff</string>"), "{plist}");
+    }
+
+    /// A path or group name is escaped rather than interpolated raw. `&` is a
+    /// legal character in a filename, and a plist that is not well-formed
+    /// fails `launchctl bootstrap` with an error naming neither the character
+    /// nor the key.
+    #[test]
+    fn values_are_escaped_into_the_xml() {
+        let rendered = plist(
+            Path::new("/var/run/a&b.sock"),
+            Path::new("/var/db/<state>.json"),
+            "ops&admins",
+        );
+        assert!(
+            rendered.contains("<string>/var/run/a&amp;b.sock</string>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<string>/var/db/&lt;state&gt;.json</string>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<string>ops&amp;admins</string>"),
+            "{rendered}"
+        );
+        // And nothing raw survives that would break the parse.
+        assert!(!rendered.contains("a&b"), "{rendered}");
     }
 
     /// Both refuse before touching anything when not root, with a sentence

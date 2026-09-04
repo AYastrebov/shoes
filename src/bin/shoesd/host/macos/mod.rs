@@ -49,17 +49,24 @@ impl HostNetwork for MacosHost {
     }
 
     fn delete_route(&self, route: &Route) -> std::io::Result<()> {
-        // A route that is not in the table is success. Revert runs after a
-        // partial apply and after a crash, so it is routinely asked to remove
-        // routes that were never added; failing there would abort the revert
-        // and leave the rest installed. The trait says so, and this is where
-        // it has to be true.
+        // A route that is not in the table is success -- and *only* that.
+        // Revert runs after a partial apply and after a crash, so it is
+        // routinely asked to remove routes that were never added; failing
+        // there would abort the revert and leave the rest installed.
+        //
+        // Every other failure has to propagate. `Session::revert` reports what
+        // failed, and the supervisor keeps the on-disk record when it does;
+        // swallowing an EPERM or a missing `route` here would report a clean
+        // revert, delete the record, and leave the Mac with its default routed
+        // into a utun that no longer exists -- the exact failure the record
+        // exists to prevent.
         match run("route", &route_args("delete", route)) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                log::debug!("removing {route:?} reported: {e}");
+            Err(e) if is_absent_route(&e.to_string()) => {
+                log::debug!("{route:?} was already gone");
                 Ok(())
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -172,6 +179,17 @@ fn parse_default_gateway(table: &str) -> Option<IpAddr> {
         .and_then(|gateway| gateway.parse().ok())
 }
 
+/// Whether a `route delete` failure means the route was simply not there.
+///
+/// macOS answers a delete for an absent route with `not in table`, and for an
+/// absent *interface* route with `bad address`. Both mean the same thing to a
+/// revert: nothing to remove. Matched on the message rather than the exit
+/// status, because `route` returns 1 for every failure alike.
+fn is_absent_route(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not in table") || message.contains("bad address")
+}
+
 /// Run a command, failing if it does.
 fn run(program: &str, args: &[String]) -> std::io::Result<()> {
     let output = Command::new(program).args(args).output().map_err(|e| {
@@ -217,9 +235,9 @@ mod tests {
     /// `link#` pseudo-gateway. Taking that one would send the proxy's own
     /// connection into the tunnel carrying it.
     ///
-    /// Column layout, flags and the `link#N` form follow real output; the
-    /// addresses are documentation-range, because a fixture has no business
-    /// carrying the topology of whichever machine it was written on.
+    /// Column layout, flags and the `link#N` form are copied from real output;
+    /// the addresses are documentation-range, because a fixture has no business
+    /// carrying the topology of whichever machine it was captured on.
     const TABLE_WITH_A_TUNNEL_UP: &str = "\
 Routing tables
 
@@ -291,6 +309,31 @@ Destination        Gateway            Flags               Netif Expire
     #[test]
     fn headers_are_not_mistaken_for_routes() {
         assert_eq!(parse_default_gateway("Routing tables\n\nInternet:\n"), None);
+    }
+
+    /// Only "it was not there" is success. Anything else -- no permission,
+    /// no `route` binary, a kernel refusal -- has to reach `Session::revert`,
+    /// which is what keeps the on-disk record instead of deleting it and
+    /// leaving routes installed that nothing remembers.
+    #[test]
+    fn only_an_absent_route_counts_as_already_removed() {
+        for absent in [
+            "route [-q, -n, delete, -inet, -net, 0.0.0.0/1] failed (exit status: 1): \
+             route: writing to routing socket: not in table",
+            "delete net 0.0.0.0: bad address",
+            "route: writing to routing socket: Not in table",
+        ] {
+            assert!(is_absent_route(absent), "{absent}");
+        }
+
+        for real in [
+            "route [...] failed (exit status: 1): route: writing to routing socket: \
+             Operation not permitted",
+            "could not run route [...]: No such file or directory (os error 2)",
+            "route: must be root to alter routing table",
+        ] {
+            assert!(!is_absent_route(real), "{real} must not be swallowed");
+        }
     }
 
     #[test]

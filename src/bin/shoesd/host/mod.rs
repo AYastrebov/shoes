@@ -23,6 +23,10 @@ pub mod double;
 
 pub use plan::{Plan, Session};
 pub use state::AppliedState;
+// Only tests construct a backup directly; the apply path builds it from what
+// it read.
+#[cfg(test)]
+pub use state::DnsBackup;
 
 use std::net::IpAddr;
 

@@ -202,9 +202,17 @@ fn run_daemon(args: RunArgs) -> ExitCode {
     let result = runtime.block_on(service::serve(
         &args.socket_path,
         &args.group,
-        supervisor,
+        supervisor.clone(),
         logs,
     ));
+
+    // Unconditionally, and before the join: `serve` can fail during setup --
+    // an unknown group, a socket it cannot bind -- and the supervisor thread
+    // holds a clone of its own command sender, so this is the only thing that
+    // ends it. Without it a failed start would hang here forever, having
+    // printed nothing, and launchd would see a live process rather than a job
+    // to restart.
+    supervisor.shutdown();
 
     // The supervisor reverts the session on its way out, and the process must
     // not exit before it has: routes into an interface this process owns

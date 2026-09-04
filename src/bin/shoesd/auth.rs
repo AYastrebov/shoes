@@ -114,28 +114,25 @@ fn groups_of(uid: u32, basegid: u32) -> Vec<u32> {
         return Vec::new();
     };
 
-    // Asked twice: once with a generous guess, and again at the size the
-    // kernel reports if that was not enough. `getgrouplist` returns -1 and
-    // writes the required count rather than truncating silently.
-    let mut count: libc::c_int = 32;
-    let mut gids: Vec<libc::c_int> = vec![0; count as usize];
+    // The buffer grows geometrically rather than trusting the count the call
+    // writes back on failure. Darwin and Linux disagree about what that count
+    // means -- one reports the space required, the other what it managed to
+    // fill -- so asking again at the size just reported can repeat the same
+    // failure forever, which on Darwin locks out anyone in more than 32
+    // groups. Doubling is correct under either reading.
+    //
+    // The cap is a real ceiling rather than a formality: this runs inside a
+    // per-call authorization check, and an unbounded loop there is a way to
+    // hang the daemon.
+    let mut capacity: libc::c_int = 32;
+    loop {
+        let mut count = capacity;
+        let mut gids: Vec<libc::c_int> = vec![0; capacity as usize];
 
-    // SAFETY: `name` is a valid NUL-terminated string, and `gids` has `count`
-    // writable elements. `getgrouplist` writes at most `count` of them and
-    // updates `count` with what it needed.
-    let mut rc = unsafe {
-        libc::getgrouplist(
-            name.as_ptr(),
-            basegid as libc::c_int,
-            gids.as_mut_ptr(),
-            &mut count,
-        )
-    };
-
-    if rc == -1 && count > 0 {
-        gids = vec![0; count as usize];
-        // SAFETY: as above, with the buffer the previous call asked for.
-        rc = unsafe {
+        // SAFETY: `name` is a valid NUL-terminated string, and `gids` has
+        // `capacity` writable elements with `count` saying so. `getgrouplist`
+        // writes at most that many.
+        let rc = unsafe {
             libc::getgrouplist(
                 name.as_ptr(),
                 basegid as libc::c_int,
@@ -143,28 +140,84 @@ fn groups_of(uid: u32, basegid: u32) -> Vec<u32> {
                 &mut count,
             )
         };
-    }
 
-    if rc == -1 {
-        return Vec::new();
-    }
+        if rc != -1 {
+            gids.truncate(count.clamp(0, capacity) as usize);
+            return gids.into_iter().map(|gid| gid as u32).collect();
+        }
 
-    gids.truncate(count.max(0) as usize);
-    gids.into_iter().map(|gid| gid as u32).collect()
+        if capacity >= MAX_GROUPS {
+            log::warn!(
+                "uid {uid} is in more than {MAX_GROUPS} groups; refusing rather than guessing"
+            );
+            return Vec::new();
+        }
+        capacity = (capacity * 2).min(MAX_GROUPS);
+    }
 }
 
+/// Ceiling on the group list one uid can have.
+///
+/// Well past anything real, and it exists so that a lookup which keeps failing
+/// ends rather than spins inside an authorization check.
+const MAX_GROUPS: libc::c_int = 8192;
+
 /// The login name for a uid.
+///
+/// `getpwuid_r`, not `getpwuid`. The plain form returns a pointer into a
+/// shared static, and this runs per gRPC call on tonic's worker threads --
+/// where the supplementary-group path is the *common* one, since a macOS
+/// administrator's primary group is `staff` and `admin` is supplementary. Two
+/// concurrent calls would race the read of `pw_name`.
+///
+/// `None` for a uid with no account, which the caller turns into a refusal.
 fn username_of(uid: u32) -> Option<CString> {
-    // SAFETY: `getpwuid` takes a scalar and returns a pointer to a static
-    // buffer, copied out before this function returns.
-    let entry = unsafe { libc::getpwuid(uid as libc::uid_t) };
-    if entry.is_null() {
-        return None;
+    // The suggested size, or what most libcs use when sysconf declines.
+    // SAFETY: a scalar argument and no pointers.
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut capacity = if suggested > 0 {
+        suggested as usize
+    } else {
+        4096
+    };
+
+    loop {
+        // SAFETY: `passwd` is only read after `getpwuid_r` reports success,
+        // which is what fills it.
+        let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buffer = vec![0 as libc::c_char; capacity];
+
+        // SAFETY: `passwd` and `result` are valid out-parameters and `buffer`
+        // has `capacity` writable bytes. On success `result` points at
+        // `passwd`, whose `pw_name` borrows `buffer` -- still alive where it
+        // is copied out below.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                &mut passwd,
+                buffer.as_mut_ptr(),
+                capacity,
+                &mut result,
+            )
+        };
+
+        if rc == 0 {
+            if result.is_null() {
+                return None;
+            }
+            // SAFETY: `result` is non-null, so `pw_name` is a NUL-terminated
+            // string inside `buffer`; `to_owned` copies it before `buffer` is
+            // dropped.
+            return Some(unsafe { CStr::from_ptr(passwd.pw_name) }.to_owned());
+        }
+
+        // ERANGE is the only failure worth another try, and only up to a point.
+        if rc != libc::ERANGE || capacity >= 1 << 20 {
+            return None;
+        }
+        capacity *= 2;
     }
-    // SAFETY: checked non-null; `pw_name` is a NUL-terminated string owned by
-    // that buffer, and `to_owned` copies it.
-    let name = unsafe { CStr::from_ptr((*entry).pw_name) };
-    Some(name.to_owned())
 }
 
 #[cfg(test)]

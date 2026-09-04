@@ -245,16 +245,17 @@ jobs:
           fi
 
       # Last, so nothing can disturb the dylib the check above reads. A check
-      # rather than a build: this exists only to compile the
-      # not(control-stats) arms of src/ffi/ios.rs, which return NULL and which
-      # nothing else in CI sees -- test.yml runs on ubuntu, where the module
-      # is cfg'd out entirely. It guards the promise that a build without the
-      # feature still compiles and keeps the same symbols.
+      # rather than a build: this exists to compile the not(control-stats)
+      # arms of src/ffi/ios.rs, which return NULL. test.yml now has a macOS
+      # runner and so does compile the module, but only with the feature on --
+      # this is still the one place the arms without it are seen.
       - name: Check the FFI surface with stats off
         run: cargo check --locked --profile release-mobile --lib --features ffi --target aarch64-apple-darwin
 
-      # src/ffi/ios.rs carries tests that only compile where the module does;
-      # test.yml runs on ubuntu and never sees them.
+      # src/ffi/ios.rs carries tests that only compile where the module does.
+      # test.yml's macOS runner covers them on the host profile; this runs
+      # them against release-mobile and the pinned target, which is the
+      # artifact that actually ships.
       - name: Test the FFI module
         run: "cargo test --locked --lib --features ffi,control-stats --target aarch64-apple-darwin ffi::"
 
