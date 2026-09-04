@@ -216,7 +216,13 @@ pub(crate) const TEST_TUN_DEVICE_NAME: &str = if cfg!(target_os = "macos") {
 /// one races every other utun user. Linux requires a name alongside the
 /// address; Windows requires one because a wintun adapter has no other
 /// identity.
+///
+/// Unused by the `shoes` binary's own test build: the only consumer is
+/// `control`'s tests, and `src/main.rs` re-declares the module tree without
+/// `mod control`. A property of the build rather than something a later change
+/// removes -- the same shape as the permanent allow on `mod socket_protector`.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) const TEST_OWNED_DEVICE_NAME: Option<&str> = if cfg!(target_os = "macos") {
     None
 } else {
@@ -227,5 +233,9 @@ pub(crate) const TEST_OWNED_DEVICE_NAME: Option<&str> = if cfg!(target_os = "mac
 ///
 /// Windows refuses one: its adapter path would turn it into a system default
 /// route, and routes stay the host's.
+///
+/// Unused by the `shoes` binary's own test build -- see
+/// [`TEST_OWNED_DEVICE_NAME`].
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) const TEST_ACCEPTS_DESTINATION: bool = !cfg!(windows);

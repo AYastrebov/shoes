@@ -36,11 +36,7 @@ const SECOND_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
 /// able to finish without waiting on a socket read that only the kernel can
 /// end.
 pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
-    // SAFETY: a plain socket call with constant arguments.
-    let fd: RawFd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = open_route_socket()?;
 
     std::thread::Builder::new()
         .name("shoesd-route-monitor".to_owned())
@@ -98,6 +94,19 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open the routing socket.
+///
+/// Separate from [`spawn`] so a test can check the part that can fail without
+/// starting the thread that cannot be stopped -- see the test below.
+fn open_route_socket() -> std::io::Result<RawFd> {
+    // SAFETY: a plain socket call with constant arguments.
+    let fd: RawFd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
 /// Whether a read error is one to carry on from.
 ///
 /// `ENOBUFS` has no `ErrorKind` of its own, so it is matched by errno.
@@ -140,27 +149,48 @@ impl Drop for FdGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Opening the socket must work for an unprivileged process, because a
     /// failure here would be the daemon's first act and the message would name
     /// the wrong thing. Reading it needs no privilege either -- `route -n
     /// monitor` runs as any user.
+    ///
+    /// `open_route_socket` rather than `spawn`: the thread `spawn` starts is
+    /// detached and blocks in `read` until the kernel says otherwise, so a
+    /// test that called it would leave a thread running for the rest of the
+    /// binary, waking on every routing change a CI runner happens to have.
+    /// This checks the half that can fail; that the loop then reads is the
+    /// live run's to show.
     #[test]
     fn the_route_socket_opens_without_privilege() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
+        let fd = open_route_socket().expect("a PF_ROUTE socket is available to any process");
+        assert!(fd >= 0);
+        // SAFETY: opened just above and not shared.
+        unsafe { libc::close(fd) };
+    }
 
-        spawn(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        })
-        .expect("a PF_ROUTE socket is available to any process");
+    /// `ENOBUFS` is the one that matters: the thread stops reading for over
+    /// two seconds per event, so a burst on a busy network overflows the
+    /// socket buffer -- and treating that as fatal would end the monitor after
+    /// the first Wi-Fi-to-Ethernet move, which is the event it exists for.
+    #[test]
+    fn a_full_socket_buffer_is_not_fatal() {
+        assert!(recoverable(&std::io::Error::from_raw_os_error(
+            libc::ENOBUFS
+        )));
+        assert!(recoverable(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(recoverable(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
 
-        // Nothing is asserted about callbacks: the test machine's routing
-        // table may sit still for the whole run, and a test that waited for a
-        // network change would hang on a quiet host. That the socket opens and
-        // the thread starts is what this can honestly check; the rest is the
-        // live run's.
+        // A socket that is genuinely gone is not something to spin on.
+        assert!(!recoverable(&std::io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+        assert!(!recoverable(&std::io::Error::from_raw_os_error(
+            libc::ENOTCONN
+        )));
     }
 }
