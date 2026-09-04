@@ -68,18 +68,23 @@ pub struct TunServerConfig {
     pub tun_name: Option<String>,
     /// TUN device address.
     /// - **Linux**: Sets the device's IP address
-    /// - **macOS**: Sets it, and is required together with `netmask` and
-    ///   `destination` -- the three are applied as one point-to-point alias
+    /// - **macOS**: Sets it, and is required together with `netmask` where
+    ///   shoes creates the device -- an interface with neither comes up
+    ///   reachable by nothing
     /// - **Android/iOS**: Informational only (address is set by VPN service)
     pub address: Option<IpAddr>,
     /// TUN device netmask.
     /// - **Linux**: Sets the device's netmask
-    /// - **macOS**: Required; see `address`
+    /// - **macOS**: Required where shoes creates the device; see `address`
     /// - **Android/iOS**: Informational only
     pub netmask: Option<IpAddr>,
-    /// TUN device destination/gateway.
+    /// TUN device destination/gateway, the point-to-point peer.
     /// - **Linux**: Sets the device's destination address
-    /// - **macOS**: Required; see `address`
+    /// - **macOS**: Strongly recommended, not required. A `utun` without one
+    ///   has no peer address; validation warns rather than refuses, because
+    ///   the crate hazard that would justify demanding it is not on the path
+    ///   shoes takes, and requiring it would make macOS the only platform
+    ///   whose valid config Windows refuses. See `validate_macos_tun_device`
     /// - **Android/iOS**: Not used
     pub destination: Option<IpAddr>,
     /// Raw file descriptor for the TUN device.
@@ -177,13 +182,15 @@ impl TunServerConfig {
         self
     }
 
-    /// Set the TUN device netmask (Linux, macOS, Android).
+    /// Set the TUN device netmask (Linux, macOS, Android). Required on macOS
+    /// where shoes creates the device.
     pub fn netmask(mut self, mask: IpAddr) -> Self {
         self.netmask = Some(mask);
         self
     }
 
-    /// Set the TUN device destination/gateway (Linux, macOS).
+    /// Set the TUN device destination/gateway (Linux, macOS). Recommended on
+    /// macOS, where it is the point-to-point peer, but not required.
     pub fn destination(mut self, dest: IpAddr) -> Self {
         self.destination = Some(dest);
         self
