@@ -121,6 +121,32 @@ fallback is to restore `enable_routing` to its default and treat the crate's
 on-link route as one the daemon did not install and must not revert. Record
 which way it went here, with what was observed.
 
+## Review findings, addressed
+
+A `/code-review high` over the branch's own commits found seven, all real. The
+two that mattered:
+
+- **The daemon hung forever when `serve` failed during setup.** `Inner` holds a
+  clone of its own command sender, so the receive loop never sees a closed
+  channel — only `Command::Shutdown` ends the thread. `serve` sent that after
+  serving, past two `?` returns (an unknown group, a socket it cannot bind), so
+  a mistyped `--group` gave a process that printed nothing, exited never, and
+  looked alive to launchd's `KeepAlive`. The caller now sends it on every path
+  out.
+- **`delete_route` turned every failure into success**, not just "not in
+  table". A revert blocked by EPERM was therefore reported clean, the record
+  deleted, and the Mac left with its default routed into a utun that no longer
+  exists — the exact failure the record exists to prevent. Only an absent route
+  counts now, matched on the message.
+
+The rest: a failed recovery could be overwritten by the next `apply` (a start
+is refused until it succeeds, and retries); the `getgrouplist` retry was a
+no-op on Darwin, locking out anyone in more than 32 groups; `getpwuid` is
+non-reentrant and ran on concurrent gRPC workers (now `getpwuid_r`); the plist
+interpolated paths and the group name into XML unescaped; and a client `Stop`
+erased the reason an engine death had recorded, which is the only place a
+tunnel's cause of death is reported.
+
 ## Status
 
 - [x] 1. IPC stack answering on the socket, peer check enforced (`HEAD`).

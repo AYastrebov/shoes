@@ -33,6 +33,11 @@ jobs:
   # On Windows the wintun-specific half (adapter creation, the event wait)
   # stays behind an #[ignore]d test that needs Administrator and wintun.dll,
   # run by hand — see docs/specs/2026-08-27-windows-tun-backend.md.
+  #
+  # macOS joined late, and its absence had been costing more than it looked.
+  # Every `cfg(target_os = "macos")` arm — TUN device creation, the validation
+  # arm and its tests, the macOS branch of the example check — was compiled by
+  # nobody in CI, on the platform where the least of it had ever run.
   test:
     name: Unit Tests (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -40,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
 
     steps:
       - uses: actions/checkout@v4
@@ -82,3 +87,18 @@ jobs:
       # features hold runtime state, and mobile must not inherit it.
       - name: Run tests with the desktop control surface enabled
         run: cargo test --locked --features desktop
+
+      # The privileged daemon, which exists only on macOS: its dependencies
+      # sit under a macOS target section and its host-network arms have no
+      # implementation elsewhere. Without this its tests — the revert
+      # sequencing, the peer check, the plist — run nowhere.
+      #
+      # protoc is an install step rather than a crate: prost-build stopped
+      # vendoring one.
+      - name: Install protoc
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Run tests with the privileged daemon enabled
+        if: runner.os == 'macOS'
+        run: cargo test --locked --features daemon

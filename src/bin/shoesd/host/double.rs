@@ -32,6 +32,9 @@ pub struct Recorder {
     fail_add_after: Option<usize>,
     fail_delete: bool,
     fail_write_dns: bool,
+    /// The live version of `fail_write_dns`, shared so a test can flip it
+    /// after the recorder has been moved onto the supervisor thread.
+    fail_write_dns_now: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Recorder {
@@ -43,6 +46,7 @@ impl Recorder {
             fail_add_after: None,
             fail_delete: false,
             fail_write_dns: false,
+            fail_write_dns_now: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -63,6 +67,8 @@ impl Recorder {
         self
     }
 
+    /// Fail every route deletion with something other than "not in table",
+    /// which is what a revert must report rather than swallow.
     pub fn failing_delete_route(mut self) -> Self {
         self.fail_delete = true;
         self
@@ -70,7 +76,20 @@ impl Recorder {
 
     pub fn failing_write_dns(mut self) -> Self {
         self.fail_write_dns = true;
+        self.fail_write_dns_now
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
+    }
+
+    /// A callback that stops the DNS writes failing, usable after the recorder
+    /// has been moved onto the supervisor thread.
+    ///
+    /// The flag is shared rather than owned so that a test can flip it from
+    /// outside: a recovery that fails once and succeeds on the retry is the
+    /// case that matters, and the recorder itself is gone by then.
+    pub fn allow_handle(&self) -> impl Fn() + Send + 'static {
+        let flag = self.fail_write_dns_now.clone();
+        move || flag.store(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn steps(&self) -> Vec<Step> {
@@ -140,7 +159,10 @@ impl HostNetwork for Recorder {
     }
 
     fn write_dns(&self, service: &str, servers: &[IpAddr]) -> std::io::Result<()> {
-        if self.fail_write_dns {
+        if self
+            .fail_write_dns_now
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(std::io::Error::other("write_dns refused by the test"));
         }
         self.record(Step::WriteDns(service.to_string(), servers.to_vec()));

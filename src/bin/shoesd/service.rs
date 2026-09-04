@@ -386,6 +386,14 @@ fn passes(line: &shoes::control::logs::LogLine, floor: Option<log::LevelFilter>)
 }
 
 /// Serve until `SIGTERM`.
+///
+/// Stopping the session is deliberately *not* done here. This function has two
+/// `?` returns before it ever starts serving -- an unknown group, and a socket
+/// it cannot bind -- and a shutdown sent only on the way out would be skipped
+/// by both. The supervisor thread holds a clone of its own command sender, so
+/// nothing else can make it exit, and the caller would then block forever in
+/// `join` having printed nothing. The caller sends it, unconditionally, on
+/// every path out of this function.
 pub async fn serve(
     socket_path: &std::path::Path,
     group: &str,
@@ -402,7 +410,6 @@ pub async fn serve(
         authorizer.group_gid()
     );
 
-    let shutdown_supervisor = supervisor.clone();
     let service = DaemonService {
         authorizer,
         supervisor,
@@ -414,11 +421,6 @@ pub async fn serve(
         .add_service(DaemonServer::new(service))
         .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await;
-
-    // A session outlives a client but not the process: SIGTERM means the
-    // machine is going down or the daemon is being replaced, and either way
-    // the routes and DNS come off before this process does.
-    let _ = tokio::task::spawn_blocking(move || shutdown_supervisor.shutdown()).await;
 
     // The socket file outlives the listener, and launchd restarts the daemon.
     // Leaving it behind is survivable -- `bind` removes a stale one -- but it

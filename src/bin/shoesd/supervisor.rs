@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use shoes::control::{self, DevicePolicy, ServiceHandle, StopOutcome};
 use tokio::sync::{broadcast, oneshot};
 
+#[cfg(test)]
+use crate::host::DnsBackup;
 use crate::host::{AppliedState, HostNetwork, Plan, Session};
 
 /// How long to wait for the engine to create its device.
@@ -154,6 +156,7 @@ impl Supervisor {
                     },
                     started_at: None,
                     interface: None,
+                    recovery_pending: false,
                 };
                 inner.run(rx);
             })?;
@@ -234,6 +237,15 @@ struct Inner<N: HostNetwork> {
     state: State,
     started_at: Option<Instant>,
     interface: Option<String>,
+    /// A previous session's record is still on disk and could not be undone.
+    ///
+    /// Kept rather than forgotten, because `apply` writes a *fresh* record over
+    /// the same path on its first route -- so starting anyway would erase the
+    /// DNS backup that is the only way back to the host's own resolvers. The
+    /// usual cause is transient (launchd restarts the daemon during early boot,
+    /// before there is a primary network service to read DNS from), so the next
+    /// start retries rather than refusing forever.
+    recovery_pending: bool,
 }
 
 impl<N: HostNetwork> Inner<N> {
@@ -242,7 +254,11 @@ impl<N: HostNetwork> Inner<N> {
         // crash: a record on disk means the machine is not in the state this
         // process is about to assume.
         if let Err(e) = self.session().recover() {
-            log::error!("could not undo what a previous session left behind: {e}");
+            log::error!(
+                "could not undo what a previous session left behind ({e}); \
+                 refusing to start until it can be"
+            );
+            self.recovery_pending = true;
         }
 
         while let Ok(command) = commands.recv() {
@@ -282,6 +298,21 @@ impl<N: HostNetwork> Inner<N> {
     ) -> Result<(), StartError> {
         if !matches!(self.state, State::Stopped { .. }) {
             return Err(StartError::AlreadyRunning);
+        }
+
+        // Retried here rather than only at startup: the usual reason recovery
+        // fails is that the machine had no network yet, and by the time
+        // someone asks for a tunnel it does.
+        if self.recovery_pending {
+            match self.session().recover() {
+                Ok(()) => self.recovery_pending = false,
+                Err(e) => {
+                    return Err(StartError::HostNetwork(std::io::Error::other(format!(
+                        "a previous session's routes or DNS are still applied and could not \
+                         be undone ({e}); starting now would overwrite the record of them"
+                    ))));
+                }
+            }
         }
 
         self.transition(State::Starting);
@@ -378,6 +409,17 @@ impl<N: HostNetwork> Inner<N> {
             // Nothing was running. Not an error: a client that reconnects and
             // stops a session that already ended wants to hear that it is
             // stopped, not that something went wrong.
+            //
+            // A recorded failure survives this. The engine's cause of death is
+            // reported nowhere else, and a GUI that shows the banner and then
+            // calls Stop -- or auto-stops on reconnect -- would otherwise erase
+            // it from every later GetStatus.
+            let reason = match &self.state {
+                State::Stopped {
+                    reason: failed @ StopReason::Failed(_),
+                } => failed.clone(),
+                _ => reason,
+            };
             self.transition(State::Stopped { reason });
             return StopOutcome::Released;
         };
@@ -456,6 +498,7 @@ impl<N: HostNetwork> Inner<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::DnsBackup;
     use crate::host::double::Recorder;
 
     /// The supervisor over a double, with no engine: enough to pin the state
@@ -556,6 +599,206 @@ mod tests {
             State::Stopped {
                 reason: StopReason::Requested
             }
+        );
+    }
+
+    /// `shutdown` must end the thread, because nothing else can.
+    ///
+    /// `Inner` holds a clone of its own command sender, so the receive loop
+    /// never sees a closed channel however many `Supervisor` handles are
+    /// dropped. `serve` has two `?` returns before it starts serving -- an
+    /// unknown group, a socket it cannot bind -- and the caller joins this
+    /// thread on every path out. Without this the daemon would hang there
+    /// forever having printed nothing, and launchd would see a live process
+    /// rather than a job to restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_ends_the_supervisor_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, thread) =
+            Supervisor::spawn(|| Ok(Recorder::new()), dir.path().join("applied.json")).unwrap();
+
+        supervisor.shutdown();
+        // Dropping every handle is deliberately not enough on its own, and
+        // this asserts the thread ends anyway.
+        drop(supervisor);
+
+        // The join is bounded rather than direct: without the fix this test
+        // is checking, `join` blocks forever -- and a test that hangs is worse
+        // in CI than one that fails, because it takes the whole run's timeout
+        // with it and names nothing.
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = thread.join();
+            let _ = done.send(());
+        });
+        wait.recv_timeout(Duration::from_secs(10))
+            .expect("the supervisor thread should have ended after shutdown");
+    }
+
+    /// A recovery that could not finish blocks the next start rather than
+    /// letting it overwrite the record.
+    ///
+    /// `apply` writes a fresh `AppliedState` over the same path on its first
+    /// route, so starting anyway would erase the DNS backup -- the only way
+    /// back to the host's own resolvers -- while those resolvers are still
+    /// overridden. The usual cause is transient: launchd restarts the daemon
+    /// during early boot, before there is a primary network service to write
+    /// DNS to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_is_refused_while_an_unrecovered_record_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.json");
+        AppliedState {
+            interface: Some("utun4".into()),
+            routes: Vec::new(),
+            dns: Some(DnsBackup {
+                service: "primary".into(),
+                servers: vec!["192.168.1.1".parse().unwrap()],
+            }),
+        }
+        .save(&path)
+        .unwrap();
+
+        let (supervisor, _thread) =
+            Supervisor::spawn(|| Ok(Recorder::new().failing_write_dns()), path.clone()).unwrap();
+
+        let result = tokio::task::spawn_blocking({
+            let supervisor = supervisor.clone();
+            move || supervisor.start("---\n[]\n".into(), vec![], vec![])
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, Err(StartError::HostNetwork(_))),
+            "got {result:?}"
+        );
+        assert!(
+            path.exists(),
+            "the record must survive, or the DNS backup in it is lost"
+        );
+    }
+
+    /// A Stop must not erase why the engine died.
+    ///
+    /// The cause of death is reported nowhere else, and a GUI that shows the
+    /// banner and then calls Stop -- or auto-stops on reconnect -- would
+    /// otherwise lose it from every later GetStatus.
+    ///
+    /// Driven against `Inner` rather than through the channel, because getting
+    /// there the long way needs an engine to die: `engine_exited` is a no-op
+    /// without a live handle, which is correct and also means the state this
+    /// tests cannot be reached from outside without a real session.
+    #[test]
+    fn stopping_after_a_failure_keeps_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (commands, _rx) = mpsc::channel();
+        let (transitions, _) = broadcast::channel(8);
+
+        let mut inner = Inner {
+            net: Recorder::new(),
+            state_path: dir.path().join("applied.json"),
+            exit_channel: commands,
+            transitions,
+            handle: None,
+            applied: None,
+            state: State::Stopped {
+                reason: StopReason::Failed("the tunnel died".into()),
+            },
+            started_at: None,
+            interface: None,
+            recovery_pending: false,
+        };
+
+        let outcome = inner.stop(StopReason::Requested);
+
+        assert!(matches!(outcome, StopOutcome::Released));
+        assert_eq!(
+            inner.state,
+            State::Stopped {
+                reason: StopReason::Failed("the tunnel died".into())
+            },
+            "a stop must not overwrite the failure"
+        );
+    }
+
+    /// And an ordinary stop still reports a requested one, so the rule above
+    /// does not pin every later session to a stale failure.
+    #[test]
+    fn stopping_a_clean_session_reports_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (commands, _rx) = mpsc::channel();
+        let (transitions, _) = broadcast::channel(8);
+
+        let mut inner = Inner {
+            net: Recorder::new(),
+            state_path: dir.path().join("applied.json"),
+            exit_channel: commands,
+            transitions,
+            handle: None,
+            applied: None,
+            state: State::Running,
+            started_at: None,
+            interface: None,
+            recovery_pending: false,
+        };
+
+        let _ = inner.stop(StopReason::Requested);
+
+        assert_eq!(
+            inner.state,
+            State::Stopped {
+                reason: StopReason::Requested
+            }
+        );
+    }
+
+    /// And once the reason recovery failed has passed, the retry clears the
+    /// block rather than leaving the daemon permanently unable to start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_recovery_unblocks_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.json");
+        AppliedState {
+            interface: Some("utun4".into()),
+            routes: Vec::new(),
+            dns: Some(DnsBackup {
+                service: "primary".into(),
+                servers: vec!["192.168.1.1".parse().unwrap()],
+            }),
+        }
+        .save(&path)
+        .unwrap();
+
+        // The double refuses DNS writes at startup, then stops refusing --
+        // which is the shape of the real case: launchd restarts the daemon
+        // before there is a primary network service, and a minute later there
+        // is one.
+        let net = Recorder::new().failing_write_dns();
+        let allow = net.allow_handle();
+        let (supervisor, _thread) = Supervisor::spawn(move || Ok(net), path.clone()).unwrap();
+
+        let blocked = tokio::task::spawn_blocking({
+            let supervisor = supervisor.clone();
+            move || supervisor.start("---\n[]\n".into(), vec![], vec![])
+        })
+        .await
+        .unwrap();
+        assert!(matches!(blocked, Err(StartError::HostNetwork(_))));
+
+        allow();
+
+        let unblocked = tokio::task::spawn_blocking({
+            let supervisor = supervisor.clone();
+            move || supervisor.start("---\n[]\n".into(), vec![], vec![])
+        })
+        .await
+        .unwrap();
+        // Past the recovery gate, and now failing on the empty config -- which
+        // is the point: the block is gone.
+        assert!(
+            matches!(unblocked, Err(StartError::Config(_))),
+            "got {unblocked:?}"
         );
     }
 
