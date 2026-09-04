@@ -19,16 +19,9 @@ mod state;
 pub mod macos;
 
 #[cfg(test)]
-mod double;
+pub mod double;
 
-// Re-exported for the supervisor that will drive them (step 5 of the plan).
-// `#[allow(dead_code)]` on `mod host` in main.rs does not cover an unused
-// re-export, so it is said again here; both go away together. The config
-// re-exports in `src/config/types/mod.rs` carry the same attribute for a
-// different reason, and the neighbouring pattern is worth matching.
-#[allow(unused_imports)]
 pub use plan::{Plan, Session};
-#[allow(unused_imports)]
 pub use state::AppliedState;
 
 use std::net::IpAddr;
