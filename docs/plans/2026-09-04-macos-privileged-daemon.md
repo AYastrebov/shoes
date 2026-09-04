@@ -123,8 +123,36 @@ which way it went here, with what was observed.
 
 ## Status
 
-- [ ] 1. IPC stack answering on the socket, peer check enforced
-- [ ] 2. Library gaps: macOS device creation, validation arm, interface name
+- [x] 1. IPC stack answering on the socket, peer check enforced (`HEAD`).
+  Nineteen tests; the peer check and the stale-socket rule each proven able to
+  fail. Three things the plan had not anticipated:
+  - `getgrouplist` echoes the base gid back into the list it fills, so passing
+    a fixed `0` would have reported every caller as a member of gid 0 — and
+    gid 0 is `wheel`, a plausible `--group`. It takes the peer's real primary
+    gid instead. Checking only `UCred::gid()` would also have rejected every
+    macOS administrator, whose primary group is `staff` and whose `admin` is
+    supplementary.
+  - The socket is chowned with `-1` for the uid rather than `0`. The daemon
+    runs as root so the file is already root-owned; naming root explicitly
+    would have made this the one step that cannot run outside production, and
+    it is the step whose correctness most wants a test.
+  - Feature cfgs *do* reach build scripts, so `build.rs` gates on
+    `#[cfg(feature = "daemon")]`. The `CARGO_FEATURE_*` env var does not help
+    on its own: the reference to the optional build dependency still has to
+    compile.
+- [x] 2. Library gaps: macOS device creation, validation arm, interface name
+  (`d0a5aa1`). Nine tests, each proven able to fail by reintroducing its
+  defect. Two things the plan had not anticipated, both fixed in the same
+  commit:
+  - A TUN entry was recognised only by `device_name` or `device_fd`, so the
+    shape the daemon writes — no descriptor, and deliberately no name — parsed
+    as a *server* config. `netmask` and `destination` joined the
+    discriminators; both are fields only `TunConfig` has.
+  - `destination` is warned about, not required. The crate hazard that would
+    have justified demanding it (the all-three-or-silently-skip alias) is not
+    on the path shoes takes once `enable_routing` is off, and requiring it
+    would have made macOS the only platform whose valid config Windows
+    refuses. The 14 test failures that surfaced this were each correct.
 - [ ] 3. `HostNetwork` trait, state file, revert sequencing + tests
 - [ ] 4. macOS implementation of `HostNetwork`
 - [ ] 5. Supervisor, service methods, streams
