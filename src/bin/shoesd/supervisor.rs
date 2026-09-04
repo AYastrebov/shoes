@@ -32,12 +32,18 @@ use crate::host::{AppliedState, HostNetwork, Plan, Session};
 ///
 /// The MTU is deliberately not overridden: it is a property of the path rather
 /// than of the host, and the client is the one that knows what it wants.
-const DEVICE_POLICY: DeviceOverride = DeviceOverride {
-    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
-    netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
-    destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
-    mtu: None,
-};
+fn device_policy() -> DeviceOverride {
+    DeviceOverride {
+        // Left to the kernel: choosing a `utun` unit races every other utun
+        // user on the machine, and the name comes back through
+        // `StatusSnapshot::device_name`.
+        device_name: None,
+        address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+        destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+        mtu: None,
+    }
+}
 
 /// How long to wait for the engine to create its device.
 ///
@@ -376,7 +382,7 @@ impl<N: HostNetwork> Inner<N> {
         let prepared = runtime
             .block_on(control::prepare_from_config_owning_device(
                 &yaml,
-                DEVICE_POLICY,
+                device_policy(),
             ))
             .map_err(|e| {
                 self.transition(State::Stopped {

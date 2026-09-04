@@ -485,11 +485,19 @@ pub async fn prepare_from_config_with_fd(
 /// replaces that section rather than asking the client to guess it. The
 /// generator writes `device_fd: 0` as a stand-in, and this is what makes that
 /// stand-in true.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DeviceOverride {
+    /// What to call the interface, where the platform needs a name.
+    ///
+    /// `None` clears it, which is what a host wants when the kernel assigns
+    /// the name -- macOS, where choosing a `utun` unit races every other utun
+    /// user. Windows is the opposite: its arm requires a name, because a
+    /// wintun adapter has no other identity, so a host there supplies one.
+    pub device_name: Option<String>,
     pub address: std::net::IpAddr,
     pub netmask: std::net::IpAddr,
-    /// The point-to-point peer. `None` leaves whatever the document said.
+    /// The point-to-point peer. `None` clears it, which Windows requires --
+    /// its adapter path would turn a destination into a system default route.
     pub destination: Option<std::net::IpAddr>,
     /// `None` leaves the document's MTU, which is where a client's own
     /// preference belongs.
@@ -510,6 +518,30 @@ pub async fn prepare_from_config_owning_device(
     prepare_configs(config_yaml, DevicePolicy::Owned, None, Some(device)).await
 }
 
+/// Replace the TUN entry's device section with the host's own.
+///
+/// Every field is replaced rather than merged, including the ones the override
+/// leaves `None`. A document written for a different host carries values that
+/// are wrong here rather than absent, and keeping one because the override did
+/// not mention it is how a stale `destination` reaches Windows -- where the
+/// adapter path would turn it into a system default route.
+///
+/// A document with no TUN entry is left alone; the caller reports that.
+fn apply_device_override(configs: &mut [Config], device: &DeviceOverride) {
+    for config in configs.iter_mut() {
+        if let Config::TunServer(tc) = config {
+            tc.device_fd = None;
+            tc.device_name = device.device_name.clone();
+            tc.address = Some(device.address);
+            tc.netmask = Some(device.netmask);
+            tc.destination = device.destination;
+            if let Some(mtu) = device.mtu {
+                tc.mtu = mtu;
+            }
+        }
+    }
+}
+
 async fn prepare_configs(
     config_yaml: &str,
     policy: DevicePolicy,
@@ -518,7 +550,16 @@ async fn prepare_configs(
 ) -> std::io::Result<PreparedService> {
     info!("Parsing config for TUN server");
 
-    let configs: Vec<Config> = load_config_str(config_yaml)?;
+    let mut configs: Vec<Config> = load_config_str(config_yaml)?;
+
+    // Before validation, not after. The per-platform arms in
+    // `validate_tun_config` judge the document as written -- Windows refuses a
+    // `device_fd` outright -- so an override applied afterwards would be too
+    // late to make the client's stand-in acceptable. It passed on macOS only
+    // because that arm short-circuits on a descriptor being present.
+    if let Some(device) = &device {
+        apply_device_override(&mut configs, device);
+    }
 
     let (configs, pem_count) = convert_cert_paths(configs).await?;
     if pem_count > 0 {
@@ -556,18 +597,6 @@ async fn prepare_configs(
                 // Likewise, and in the other direction: a host that creates
                 // the device owns this section, so whatever the document said
                 // about it is replaced rather than validated.
-                if let Some(device) = device {
-                    tc.device_fd = None;
-                    tc.device_name = None;
-                    tc.address = Some(device.address);
-                    tc.netmask = Some(device.netmask);
-                    if let Some(destination) = device.destination {
-                        tc.destination = Some(destination);
-                    }
-                    if let Some(mtu) = device.mtu {
-                        tc.mtu = mtu;
-                    }
-                }
                 device::validate(&tc, policy)?;
                 // unwrap_or(-1) rather than {:?} on the Option: an Owned host
                 // has no descriptor to report, and -1 says so without pulling
@@ -759,6 +788,31 @@ mod tests {
         current_thread_runtime().block_on(prepare_from_config(yaml, DevicePolicy::BorrowedFd))
     }
 
+    /// A device override shaped for the platform the tests are running on.
+    ///
+    /// The arms genuinely disagree: Windows requires a `device_name` and
+    /// refuses a `destination`, macOS wants the name left for the kernel and
+    /// takes a point-to-point peer. A host supplies its own policy, and a
+    /// fixture that hard-coded one would test the override on one platform and
+    /// the validator's rejection on another.
+    fn host_device_override() -> DeviceOverride {
+        DeviceOverride {
+            device_name: if cfg!(windows) {
+                Some(crate::config::tun::TEST_TUN_DEVICE_NAME.to_string())
+            } else {
+                None
+            },
+            address: "10.0.0.2".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+            destination: if cfg!(windows) {
+                None
+            } else {
+                Some("10.0.0.1".parse().unwrap())
+            },
+            mtu: None,
+        }
+    }
+
     /// The shape the consumer's brief specifies, and the one the proto tells
     /// vendoring clients to send: a document carrying `device_fd: 0` as a
     /// stand-in, which a host that creates its own device replaces.
@@ -772,27 +826,56 @@ mod tests {
         let prepared = current_thread_runtime()
             .block_on(prepare_from_config_owning_device(
                 "---\n- device_fd: 0\n  device_name: tun0\n  mtu: 1400\n",
-                DeviceOverride {
-                    address: "10.0.0.2".parse().unwrap(),
-                    netmask: "255.255.255.0".parse().unwrap(),
-                    destination: Some("10.0.0.1".parse().unwrap()),
-                    mtu: None,
-                },
+                host_device_override(),
             ))
             .expect("the stand-in descriptor is replaced, not refused");
 
         let tun = &prepared.tun_config;
         assert_eq!(tun.device_fd, None, "the stand-in is cleared");
         assert_eq!(
-            tun.device_name, None,
-            "and the name, which means nothing to a host that lets the kernel pick"
+            tun.device_name.as_deref(),
+            host_device_override().device_name.as_deref(),
+            "the name is the host's, not the document's"
         );
         assert_eq!(tun.address, Some("10.0.0.2".parse().unwrap()));
         assert_eq!(tun.netmask, Some("255.255.255.0".parse().unwrap()));
-        assert_eq!(tun.destination, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(
+            tun.destination,
+            host_device_override().destination,
+            "and the document's `destination` does not survive onto a platform \
+             that refuses one"
+        );
         assert_eq!(
             tun.mtu, 1400,
             "an MTU the host did not override stays the client's"
+        );
+    }
+
+    /// The override has to run *before* validation, and this is the half of
+    /// that which the host running these tests can prove.
+    ///
+    /// A document with no address and no descriptor is rejected by this
+    /// platform's own arm -- macOS wants an address and a netmask, Windows
+    /// wants those and a name. The override supplies them, so the document is
+    /// acceptable only if it is applied first. Applied afterwards, as it was
+    /// until CI caught it on Windows, this fails everywhere the arm does not
+    /// happen to short-circuit.
+    #[test]
+    fn the_override_is_applied_before_the_platform_arm_judges_the_document() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let prepared = current_thread_runtime()
+            .block_on(prepare_from_config_owning_device(
+                // Recognised as a TUN entry by `netmask`, and carrying nothing
+                // any platform's arm would accept on its own.
+                "---\n- netmask: 255.255.0.0\n  mtu: 1400\n",
+                host_device_override(),
+            ))
+            .expect("the host's own device section is what gets validated");
+
+        assert_eq!(
+            prepared.tun_config.netmask,
+            Some("255.255.255.0".parse().unwrap()),
+            "the host's netmask replaced the document's, rather than merging"
         );
     }
 
@@ -804,10 +887,8 @@ mod tests {
             .block_on(prepare_from_config_owning_device(
                 "---\n- device_fd: 0\n  mtu: 1400\n",
                 DeviceOverride {
-                    address: "10.0.0.2".parse().unwrap(),
-                    netmask: "255.255.255.0".parse().unwrap(),
-                    destination: None,
                     mtu: Some(1280),
+                    ..host_device_override()
                 },
             ))
             .expect("prepared");
