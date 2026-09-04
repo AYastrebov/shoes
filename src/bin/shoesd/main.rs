@@ -27,21 +27,22 @@ compile_error!(
 );
 
 mod auth;
-// Nothing calls into `host` yet: its consumer is the supervisor, which arrives
-// with the session methods (step 5 of
-// docs/plans/2026-09-04-macos-privileged-daemon.md). The module lands first
-// because the sequencing it encodes -- what to undo when a step fails -- is
-// the part worth getting right before anything can run it, and the allow goes
-// away when the supervisor calls `Session::apply`.
-#[allow(dead_code)]
 mod host;
 mod service;
 mod socket;
+mod supervisor;
 
 use std::process::ExitCode;
 
 /// Where the control socket lives. Root-owned, `0660`, group from `--group`.
 const DEFAULT_SOCKET_PATH: &str = "/var/run/shoesd.sock";
+
+/// Where the revert record lives. Root-only; see `host::AppliedState`.
+const DEFAULT_STATE_PATH: &str = "/var/db/shoesd/applied.json";
+
+/// Log lines retained for a client that attaches after the interesting part.
+/// A GUI started after a failed tunnel still needs to see why it failed.
+const LOG_BACKLOG: usize = 512;
 
 /// The group whose members may talk to the daemon. Admins by default: on
 /// macOS that is the set of users who could install the daemon in the first
@@ -57,6 +58,7 @@ fn usage() -> String {
          \n\
          OPTIONS:\n    \
              --socket <path>  Control socket path (default: {DEFAULT_SOCKET_PATH})\n    \
+             --state <path>   Revert record (default: {DEFAULT_STATE_PATH})\n    \
              --group <name>   Group allowed to connect (default: {DEFAULT_GROUP})\n    \
              -V, --version    Print version and exit\n",
         env!("CARGO_PKG_VERSION"),
@@ -67,11 +69,13 @@ fn usage() -> String {
 #[derive(Debug)]
 struct RunArgs {
     socket_path: std::path::PathBuf,
+    state_path: std::path::PathBuf,
     group: String,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut socket_path = std::path::PathBuf::from(DEFAULT_SOCKET_PATH);
+    let mut state_path = std::path::PathBuf::from(DEFAULT_STATE_PATH);
     let mut group = DEFAULT_GROUP.to_string();
 
     let mut rest = args.iter();
@@ -81,6 +85,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 socket_path = rest
                     .next()
                     .ok_or_else(|| "--socket needs a path".to_string())?
+                    .into();
+            }
+            "--state" => {
+                state_path = rest
+                    .next()
+                    .ok_or_else(|| "--state needs a path".to_string())?
                     .into();
             }
             "--group" => {
@@ -93,7 +103,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         }
     }
 
-    Ok(RunArgs { socket_path, group })
+    Ok(RunArgs {
+        socket_path,
+        state_path,
+        group,
+    })
 }
 
 fn main() -> ExitCode {
@@ -131,12 +145,66 @@ fn run_daemon(args: RunArgs) -> ExitCode {
         }
     };
 
-    match runtime.block_on(service::serve(&args.socket_path, &args.group)) {
+    // Installed before anything else logs, so a client that attaches later
+    // still sees why a start failed. The ring is bounded, which is what makes
+    // its memory a number chosen here rather than a leak.
+    let logs = std::sync::Arc::new(shoes::control::logs::BroadcastLogWriter::new(LOG_BACKLOG));
+    shoes::logging::init_multi_logger(
+        vec![
+            Box::new(shoes::logging::StderrWriter),
+            Box::new(SharedLogWriter(logs.clone())),
+        ],
+        vec![shoes::logging::Directive {
+            name: None,
+            level: log::LevelFilter::Info,
+        }],
+    );
+
+    let (supervisor, supervisor_thread) = match supervisor::Supervisor::spawn(
+        crate::host::macos::MacosHost::new,
+        args.state_path.clone(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("shoesd: could not start the supervisor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = runtime.block_on(service::serve(
+        &args.socket_path,
+        &args.group,
+        supervisor,
+        logs,
+    ));
+
+    // The supervisor reverts the session on its way out, and the process must
+    // not exit before it has: routes into an interface this process owns
+    // outlive the process itself.
+    let _ = supervisor_thread.join();
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("shoesd: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// A `LogWriter` the daemon can keep a handle on.
+///
+/// `init_multi_logger` takes ownership of its writers, and `WatchLogs` needs
+/// to subscribe to this one afterwards.
+struct SharedLogWriter(std::sync::Arc<shoes::control::logs::BroadcastLogWriter>);
+
+impl shoes::logging::LogWriter for SharedLogWriter {
+    fn write_log(&self, record: &log::Record, formatted: &str) {
+        self.0.write_log(record, formatted);
+    }
+
+    fn flush(&self) {
+        self.0.flush();
     }
 }
 
@@ -148,6 +216,7 @@ mod tests {
     fn run_takes_the_documented_defaults() {
         let args = parse_run_args(&[]).expect("no arguments is the launchd shape");
         assert_eq!(args.socket_path, std::path::Path::new(DEFAULT_SOCKET_PATH));
+        assert_eq!(args.state_path, std::path::Path::new(DEFAULT_STATE_PATH));
         assert_eq!(args.group, DEFAULT_GROUP);
     }
 

@@ -184,7 +184,27 @@ which way it went here, with what was observed.
     captured from this machine happens to list the real gateway before the
     tunnel's row. A second fixture with the order reversed is what actually
     pins the rule.
-- [ ] 5. Supervisor, service methods, streams
+- [x] 5. Supervisor, service methods, streams (`HEAD`). Sixty-six daemon tests,
+  including gRPC round-trips over a real Unix socket for `Stop`, `GetStatus`,
+  a rejected `Start` and `WatchStatus`. Three things the plan had not
+  anticipated:
+  - **The host is built on the supervisor thread, not moved onto it.**
+    `SCDynamicStore` is a CoreFoundation object behind a raw pointer and so not
+    `Send`. `Supervisor::spawn` takes a factory and waits for it to report, so
+    "the configuration store would not open" fails the daemon's startup rather
+    than returning a supervisor about to die.
+  - **The interface name has to be waited for.** `control::start` returns once
+    the service task is spawned, which is before the TUN device exists — and
+    routes are addressed to the interface. The supervisor polls
+    `shoes::tun::device_name()` to a 10 s deadline, failing the start rather
+    than applying routes to an interface that is not there. Threading a channel
+    out through `run_tun_from_config` would put a daemon's concern into code
+    four other hosts share.
+  - **A stop that timed out keeps the record.** `StopOutcome::TimedOut` means
+    the engine never confirmed it released the device, so the next start must
+    still know there may be something to undo. That is the decision the type
+    exists to force, and it is now made in `Inner::revert` rather than
+    discarded.
 - [ ] 6. `install`/`uninstall`/`SIGTERM`
 - [ ] 7. Docs, example, release job
 - [ ] 8. Full gate + five live items
