@@ -62,6 +62,31 @@ desktop = ["control-logs", "control-stats"]
 # ShoesPacketTunnelProvider and the desktop binary, and only the first is
 # under a cap. scripts/build-apple.sh sets this; no desktop build does.
 network-extension = []
+# The macOS privileged daemon (`shoesd`), its gRPC stack and its generated
+# protocol code. Off by default and additive: a library consumer, the CLI and
+# both mobile artifacts pay nothing for it, and no other platform can build it
+# at all -- the dependencies live under a macOS target section, and the arms
+# that touch routes and DNS are macOS-only.
+#
+# Separate from `desktop` even though the daemon always implies it, because
+# `desktop` is about what the engine keeps in memory and this is about what
+# the process is. A Tauri host wanting the log stream should not have to
+# compile tonic.
+#
+# See docs/specs/2026-09-04-macos-privileged-daemon.md.
+daemon = [
+    "desktop",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:tokio-stream",
+    "dep:tonic-prost-build",
+]
+
+[[bin]]
+name = "shoesd"
+path = "src/bin/shoesd/main.rs"
+required-features = ["daemon"]
 
 [dependencies]
 async-trait = "*"
@@ -137,6 +162,12 @@ url = "*"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
 
+# Optional so that only a `--features daemon` build compiles it: a build
+# dependency costs build time on every target otherwise, including the mobile
+# artifacts that will never speak gRPC.
+[build-dependencies]
+tonic-prost-build = { version = "0.14", optional = true }
+
 [dev-dependencies]
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde_json = "*"
@@ -149,6 +180,26 @@ tokio-rustls = "*"
 # double-buffered shape that backend exists to avoid.
 [target.'cfg(unix)'.dependencies]
 tun = { version = "*", features = ["async"] }
+
+# The daemon's gRPC stack. Optional and macOS-only, so nothing else resolves
+# them -- see the `daemon` feature. Pinned to a major rather than "*": tonic's
+# server API moved across 0.13 and 0.14 (the codec split into `tonic-prost`,
+# and `UdsConnectInfo::peer_addr` gained an Arc), and a silent jump would land
+# in the peer-credential check, which is the daemon's whole authentication.
+[target.'cfg(target_os = "macos")'.dependencies]
+tonic = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+# `net` is what carries UnixListenerStream, which is how the listener reaches
+# `serve_with_incoming_shutdown`.
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+
+# Only the daemon's own tests, to build a client that speaks to a real Unix
+# socket. tonic's client takes a URI, so reaching a socket path means handing
+# it a connector, and `service_fn` is how that is expressed. Already in the
+# graph via tonic; this makes it nameable.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 # verify_binary_signature: wintun.dll is resolved by the loader's search

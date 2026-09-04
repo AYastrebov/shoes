@@ -1,0 +1,125 @@
+// The privileged daemon's control surface.
+//
+// Owned by this repository and vendored by consumers, pinned to a shoes
+// release. Served over a Unix domain socket only -- never TCP, because a
+// loopback port is reachable by every process on the machine. Authentication
+// is the socket's peer credentials; there is no token and no TLS.
+//
+// Design notes live in docs/specs/2026-09-04-macos-privileged-daemon.md.
+//
+// Compatibility: this is version 1. Fields are added, never renumbered or
+// repurposed, and `HelloReply.protocol` is what a client checks before it
+// trusts anything else.
+
+syntax = "proto3";
+package shoes.daemon.v1;
+
+service Daemon {
+  rpc Hello(HelloRequest) returns (HelloReply);
+  rpc Start(StartRequest) returns (StartReply);
+  rpc Stop(StopRequest) returns (StopReply);
+  rpc GetStatus(StatusRequest) returns (Status);
+
+  // The current state first, then every transition.
+  rpc WatchStatus(StatusRequest) returns (stream Status);
+  // At interval_ms, only while RUNNING.
+  rpc WatchStats(StatsRequest) returns (stream Stats);
+  // The retained backlog first, then live lines. A subscriber that falls
+  // behind loses lines rather than stalling the writer.
+  rpc WatchLogs(LogsRequest) returns (stream LogLine);
+}
+
+message HelloRequest {
+  string client = 1;
+  string client_version = 2;
+}
+
+message HelloReply {
+  // 1. A client that does not recognise this must not proceed.
+  uint32 protocol = 1;
+  string daemon_version = 2;
+  string engine_version = 3;
+  // What this build can actually do to the host: "routes", "dns". A platform
+  // whose arm is unimplemented omits the capability rather than failing at
+  // Start, so a GUI asks instead of inferring from the operating system.
+  repeated string capabilities = 4;
+}
+
+message StartRequest {
+  // Verbatim from the client. Its TUN entry still carries `device_fd: 0` as a
+  // stand-in; the daemon replaces that section with its own per-OS device
+  // policy, so the client has no platform branches.
+  //
+  // This carries the user's credentials. The daemon never writes it to disk
+  // and never logs it.
+  string yaml = 1;
+  // Literal IP addresses that must bypass the tunnel -- the proxy server,
+  // which the client resolves before sending. Each gets a host route via the
+  // pre-tunnel default gateway; without them the proxy's own connection
+  // routes into the tunnel it is carrying.
+  repeated string exclude = 2;
+  // Resolvers to advertise to the host. Inside the tunnel by design.
+  repeated string dns = 3;
+}
+
+// Returned once the session is STARTING. Progress arrives on WatchStatus.
+message StartReply {}
+
+message StopRequest {}
+
+message StopReply {
+  // Mirrors shoes::control::StopOutcome. RELEASED when nothing was running.
+  //
+  // TIMED_OUT is not an error: the call succeeded and is reporting that the
+  // engine did not confirm it released the device.
+  enum Outcome {
+    RELEASED = 0;
+    TIMED_OUT = 1;
+  }
+  Outcome outcome = 1;
+}
+
+message StatusRequest {}
+
+message Status {
+  enum State {
+    STOPPED = 0;
+    STARTING = 1;
+    RUNNING = 2;
+    STOPPING = 3;
+  }
+  State state = 1;
+  // Only with STOPPED: "requested", or the failure message. A GUI shows a
+  // banner for the second and nothing for the first.
+  string reason = 2;
+  uint64 uptime_ms = 3;
+  uint64 upload_bytes = 4;
+  uint64 download_bytes = 5;
+  // The interface the session created -- "utun4". Empty unless RUNNING.
+  string interface = 6;
+}
+
+message StatsRequest {
+  uint32 interval_ms = 1;
+}
+
+message Stats {
+  // Cumulative since RUNNING. The engine zeroes its counters at start, so a
+  // second session does not report the first one's bytes.
+  uint64 upload_bytes = 1;
+  uint64 download_bytes = 2;
+  // Live proxied connections. The one number a server list wants that two
+  // byte totals cannot give; free, because the engine already keeps it.
+  uint32 active_connections = 3;
+}
+
+message LogsRequest {
+  string level = 1;
+}
+
+message LogLine {
+  string level = 1;
+  string target = 2;
+  string message = 3;
+  uint64 at_ms = 4;
+}
