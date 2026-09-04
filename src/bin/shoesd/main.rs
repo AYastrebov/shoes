@@ -11,6 +11,21 @@
 //! tree the way `src/main.rs` does, so what it can reach is exactly what
 //! `shoes` exports.
 
+// The daemon's dependencies live under a macOS target section, so building it
+// anywhere else fails with a pile of unresolved crates. Say why instead.
+//
+// Not a placeholder for a port: the protocol and the daemon's structure leave
+// room for Linux and Windows -- `capabilities` is reported rather than
+// inferred precisely so a client can ask -- but routes and DNS on those
+// platforms are their own design, and Linux alone has four mechanisms
+// (systemd-resolved, resolvconf, NetworkManager, a bare /etc/resolv.conf).
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "the `daemon` feature builds shoesd, which is macOS-only in v1: its host \
+     network configuration (routes, DNS) has no arm for this platform yet. \
+     Build without `--features daemon`."
+);
+
 mod auth;
 mod service;
 mod socket;
