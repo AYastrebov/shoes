@@ -470,6 +470,19 @@ Notes:
 - **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
 - **Android**: Use `device_fd` from `VpnService.Builder.establish()`. Routes configured via VpnService.
 - **iOS**: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`.
+- **macOS**: Two shapes are accepted, because the platform has two hosts. A
+  Network Extension provider passes `device_fd` from
+  `NEPacketTunnelProvider.packetFlow` and configures the interface itself. A
+  privileged host — see `shoesd` — has shoes create the device, and then
+  `address` and `netmask` are required. `destination` is the point-to-point
+  peer: leaving it out is warned about rather than refused, but a `utun`
+  without one has no peer address.
+
+  `device_name` must be `utunN` if given, and is best omitted — the kernel then
+  returns the next free unit, where choosing one races every other utun user on
+  the machine. `shoesd` reports the name it got as `interface`; without it,
+  `ifconfig` will say. shoes configures the interface only — routes and DNS
+  stay yours, and `examples/tun_macos.yaml` carries the commands.
 - **Windows 11**: shoes creates a [wintun](https://www.wintun.net) adapter named
   `device_name`; `address` and `netmask` are required, `device_fd` is refused.
   Requires Administrator and `wintun.dll` next to `shoes.exe` or in `System32`

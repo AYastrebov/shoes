@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### `shoesd`: a privileged macOS daemon, and a macOS TUN path that works
+
+The macOS TUN path had never run, and the reason was structural rather than
+incidental: everything that makes a device usable -- name, address, netmask,
+destination, `up()` -- was applied inside `cfg(target_os = "linux")`, and
+`validate_tun_config` had arms for Linux, Android, iOS and Windows and none for
+macOS. A macOS TUN config was therefore accepted and then quietly did nothing.
+Both arms now exist, and the interface name the kernel assigns is reported
+through `control::StatusSnapshot::device_name` -- a host needs it and cannot
+derive it, because choosing a `utun` unit races every other utun user on the
+machine.
+
+Two things surfaced while doing that. A TUN entry was recognised only by
+`device_name` or `device_fd`, so the shape a privileged host writes -- no
+descriptor, and deliberately no name -- parsed as a *server* config; `netmask`
+and `destination` join the discriminators. And `destination` is warned about
+rather than required: the `tun` crate hazard that would have justified
+demanding it is not on the path shoes takes, and requiring it would have made
+macOS the only platform whose valid config Windows refuses.
+
+On top of that, `shoesd`: a root launchd daemon behind a new `daemon` feature,
+shipped as `shoesd-macos-arm64.tar.gz`. It hosts `shoes::control` in-process
+and serves a desktop GUI over gRPC on a Unix domain socket, with the `.proto`
+owned in this repository. It configures the host -- the split default route, a
+host route per excluded address so the proxy's own connection escapes the
+tunnel, IPv6 rejects, and DNS through `SCDynamicStore` -- and reverts all of it
+on stop, on a failed start, and after a crash, from a record written before
+each change rather than after it.
+
+shoes itself still touches none of that. Nothing under `src/` configures routes
+or resolvers; the daemon is a host, in the same seat as the iOS packet-tunnel
+provider, and it links the library rather than crossing a C boundary. Every
+other build -- the CLI, both mobile artifacts, a library consumer -- compiles
+none of it.
+
+Authentication is the socket's peer credentials, `uid == 0` or membership of
+one group. No token, no TLS, and no TCP listener: a loopback port is reachable
+by every process on the machine.
+
+The live run on Apple Silicon is still outstanding, and `docs/MACOS.md` says
+so.
+
 ## v0.2.20
 
 ### AmneziaWG upload is two to four times faster, and the reason corrects v0.2.19
