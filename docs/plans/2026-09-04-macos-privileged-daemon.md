@@ -147,6 +147,35 @@ interpolated paths and the group name into XML unescaped; and a client `Stop`
 erased the reason an engine death had recorded, which is the only place a
 tunnel's cause of death is reported.
 
+## KVN's review of PR #20, addressed
+
+The consumer reviewed at `7404581` and accepted the contract. Four findings.
+
+- **The gateway-change monitor was described in three places and did not
+  exist** — the spec's decision table, the spec's network-setup section, and a
+  comment in `plan.rs` claiming the caller re-applies exclusions. Step 4 above
+  described the signal threads and was checked off without them. That is the
+  worst shape a comment can take: the next reader budgets for behaviour the
+  code does not have. Implemented rather than deleted, because it is the
+  ordinary case — a laptop moving from Wi-Fi to Ethernet leaves the exclusion
+  route pointing at a router that is gone, and the proxy connection dies with
+  the tunnel still nominally up. `src/bin/shoesd/host/macos/monitor.rs` reads a
+  `PF_ROUTE` socket purely as a signal and posts `Command::NetworkChanged`;
+  `Session::reapply` re-reads the table, compares, and swaps the exclusions if
+  the gateway moved. It reports twice per change — once settled, once a couple
+  of seconds later — which also covers the resolvers macOS restores on its own
+  schedule, and is why no `SCDynamicStore` watcher was added.
+- **Exclusions now go on before the tunnel routes**, with the gateway read
+  before either. The reviewer was right that the window was probably harmless
+  and equally right that it is not a reason to keep it.
+- **The staged binary is created at 0600** rather than copied and then
+  tightened: `std::fs::copy` carries the source's permission bits across.
+- **The log moved to `/var/log/shoesd/`, 0750 root:wheel.** launchd creates the
+  file it is pointed at as 0644, and a log every local user can read undoes the
+  care `WatchLogs` takes.
+- **Every tool is named by absolute path.** `shoesd install` and `shoesd run`
+  under `sudo` inherit the invoker's `PATH`.
+
 ## Status
 
 - [x] 1. IPC stack answering on the socket, peer check enforced (`HEAD`).
