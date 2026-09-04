@@ -205,6 +205,16 @@ which way it went here, with what was observed.
     still know there may be something to undo. That is the decision the type
     exists to force, and it is now made in `Inner::revert` rather than
     discarded.
-- [ ] 6. `install`/`uninstall`/`SIGTERM`
+- [x] 6. `install`/`uninstall`/`SIGTERM` (`HEAD`). Seven tests over the
+  rendered plist and the root check, each proven able to fail. Two details
+  worth keeping:
+  - The binary is staged as `shoesd.new` and renamed into place rather than
+    written over. Overwriting a running executable is how a copy that is half
+    old and half new gets executed.
+  - `install` boots the old job out before bootstrapping the new plist, so
+    installing over an existing install is not refused as "already loaded".
+    `uninstall` relies on `bootout` sending `SIGTERM`, which is what makes the
+    daemon revert its routes and DNS through the same path a shutdown uses
+    rather than a second one written for the occasion.
 - [ ] 7. Docs, example, release job
 - [ ] 8. Full gate + five live items

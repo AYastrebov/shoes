@@ -28,6 +28,7 @@ compile_error!(
 
 mod auth;
 mod host;
+mod install;
 mod service;
 mod socket;
 mod supervisor;
@@ -54,7 +55,9 @@ fn usage() -> String {
         "shoesd {}\n\
          \n\
          USAGE:\n    \
-             shoesd run [--socket <path>] [--group <name>]\n\
+             shoesd run [--socket <path>] [--state <path>] [--group <name>]\n    \
+             shoesd install [--socket <path>] [--state <path>] [--group <name>]\n    \
+             shoesd uninstall\n\
          \n\
          OPTIONS:\n    \
              --socket <path>  Control socket path (default: {DEFAULT_SOCKET_PATH})\n    \
@@ -121,12 +124,37 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // `install` takes the same arguments as `run`, because they are what
+        // it writes into the plist -- the job launchd starts must be the one
+        // the operator asked for.
+        Some("install") => match parse_run_args(&args[1..]) {
+            Ok(run) => report(install::install(
+                &run.socket_path,
+                &run.state_path,
+                &run.group,
+            )),
+            Err(e) => {
+                eprintln!("shoesd: {e}\n\n{}", usage());
+                ExitCode::FAILURE
+            }
+        },
+        Some("uninstall") => report(install::uninstall()),
         Some("-V" | "--version") => {
             println!("shoesd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
             eprint!("{}", usage());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn report(result: std::io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("shoesd: {e}");
             ExitCode::FAILURE
         }
     }
