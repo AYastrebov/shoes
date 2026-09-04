@@ -208,3 +208,24 @@ pub(crate) const TEST_TUN_DEVICE_NAME: &str = if cfg!(target_os = "macos") {
 } else {
     "tun0"
 };
+
+/// The device name a host that creates its own device must supply, or `None`
+/// where the platform assigns it.
+///
+/// macOS is the only `None`: the kernel picks the `utun` unit, and choosing
+/// one races every other utun user. Linux requires a name alongside the
+/// address; Windows requires one because a wintun adapter has no other
+/// identity.
+#[cfg(test)]
+pub(crate) const TEST_OWNED_DEVICE_NAME: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else {
+    Some(TEST_TUN_DEVICE_NAME)
+};
+
+/// Whether this platform accepts a point-to-point `destination`.
+///
+/// Windows refuses one: its adapter path would turn it into a system default
+/// route, and routes stay the host's.
+#[cfg(test)]
+pub(crate) const TEST_ACCEPTS_DESTINATION: bool = !cfg!(windows);
