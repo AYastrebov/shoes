@@ -790,25 +790,27 @@ mod tests {
 
     /// A device override shaped for the platform the tests are running on.
     ///
-    /// The arms genuinely disagree: Windows requires a `device_name` and
-    /// refuses a `destination`, macOS wants the name left for the kernel and
-    /// takes a point-to-point peer. A host supplies its own policy, and a
-    /// fixture that hard-coded one would test the override on one platform and
-    /// the validator's rejection on another.
+    /// The arms genuinely disagree, and all three ways:
+    ///
+    /// - **Linux** requires `device_name` and `address` together.
+    /// - **Windows** requires `device_name`, `address` and `netmask`, and
+    ///   refuses `destination`.
+    /// - **macOS** requires `address` and `netmask`, and wants the name left
+    ///   for the kernel.
+    ///
+    /// A host supplies its own policy, so a fixture that hard-coded one would
+    /// test the override on one platform and the validator's rejection on the
+    /// others -- which is exactly how this was got wrong twice: first shaped
+    /// for macOS, which Windows refused, then split on `cfg!(windows)`, which
+    /// Linux refused. The shape now comes from constants that live beside the
+    /// config types those arms judge, so there is one place to get it right.
     fn host_device_override() -> DeviceOverride {
         DeviceOverride {
-            device_name: if cfg!(windows) {
-                Some(crate::config::tun::TEST_TUN_DEVICE_NAME.to_string())
-            } else {
-                None
-            },
+            device_name: crate::config::tun::TEST_OWNED_DEVICE_NAME.map(str::to_string),
             address: "10.0.0.2".parse().unwrap(),
             netmask: "255.255.255.0".parse().unwrap(),
-            destination: if cfg!(windows) {
-                None
-            } else {
-                Some("10.0.0.1".parse().unwrap())
-            },
+            destination: crate::config::tun::TEST_ACCEPTS_DESTINATION
+                .then(|| "10.0.0.1".parse().unwrap()),
             mtu: None,
         }
     }
