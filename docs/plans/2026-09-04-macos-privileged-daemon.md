@@ -224,4 +224,26 @@ which way it went here, with what was observed.
   into `shoesd-macos-arm64.tar.gz`. That step installs `protoc` first, since
   `prost-build` no longer vendors one. The RSS figures `docs/MACOS.md` still
   records as unknown come from step 8.
-- [ ] 8. Full gate + five live items
+- [ ] 8. Full gate + five live items — **gate green, live run outstanding**.
+  On macOS: `cargo fmt --check` clean; 1442 lib, 1420 bin, 8 integration, 1485
+  under `ffi,control-stats,network-extension`, and 72 daemon tests, all passing;
+  clippy clean on every file this work touched (the four pre-existing warnings
+  in `src/util.rs` and `src/config/types/dns.rs` are untouched). Linux is CI's
+  to run, and `cargo tree --target x86_64-unknown-linux-gnu` confirms a default
+  build there pulls no gRPC stack.
+
+  The five live items all need root and a real config, so they need the
+  machine's owner:
+  1. `start` with a real AmneziaWG config, `curl` through it, `stop`, and
+     `netstat -rn` + `scutil --dns` identical before and after — both diffs
+     pasted.
+  2. `kill -9` mid-session; routes and DNS come back on the restart.
+  3. A call from a uid outside the group gets `PERMISSION_DENIED`.
+  4. Daemon RSS idle and under sustained download — the number `docs/MACOS.md`
+     records as unknown, and the first desktop-sized buffer configuration to
+     run on macOS.
+  5. Whichever way the `enable_routing` question above settles, recorded here.
+
+  Live-run credentials stay outside the working tree and are deleted
+  afterwards; `git status` is checked before committing anything from that
+  session.
