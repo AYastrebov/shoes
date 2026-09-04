@@ -61,18 +61,25 @@ pub struct TunServerConfig {
     pub icmp_enabled: bool,
     /// TUN device name.
     /// - **Linux**: Used to name the TUN device (e.g., "tun0")
+    /// - **macOS**: Must be `utunN`; omit it to let the kernel pick the next
+    ///   free unit, which is what the daemon does to avoid racing another
+    ///   utun user
     /// - **Android/iOS**: Ignored (device is provided via FD)
     pub tun_name: Option<String>,
     /// TUN device address.
     /// - **Linux**: Sets the device's IP address
+    /// - **macOS**: Sets it, and is required together with `netmask` and
+    ///   `destination` -- the three are applied as one point-to-point alias
     /// - **Android/iOS**: Informational only (address is set by VPN service)
     pub address: Option<IpAddr>,
     /// TUN device netmask.
     /// - **Linux**: Sets the device's netmask
+    /// - **macOS**: Required; see `address`
     /// - **Android/iOS**: Informational only
     pub netmask: Option<IpAddr>,
     /// TUN device destination/gateway.
     /// - **Linux**: Sets the device's destination address
+    /// - **macOS**: Required; see `address`
     /// - **Android/iOS**: Not used
     pub destination: Option<IpAddr>,
     /// Raw file descriptor for the TUN device.
@@ -158,25 +165,25 @@ impl TunServerConfig {
         self
     }
 
-    /// Set the TUN device name (Linux only).
+    /// Set the TUN device name (Linux, and macOS where it must be `utunN`).
     pub fn tun_name(mut self, name: impl Into<String>) -> Self {
         self.tun_name = Some(name.into());
         self
     }
 
-    /// Set the TUN device address (Linux only).
+    /// Set the TUN device address (Linux, macOS, Android).
     pub fn address(mut self, addr: IpAddr) -> Self {
         self.address = Some(addr);
         self
     }
 
-    /// Set the TUN device netmask (Linux only).
+    /// Set the TUN device netmask (Linux, macOS, Android).
     pub fn netmask(mut self, mask: IpAddr) -> Self {
         self.netmask = Some(mask);
         self
     }
 
-    /// Set the TUN device destination/gateway (Linux only).
+    /// Set the TUN device destination/gateway (Linux, macOS).
     pub fn destination(mut self, dest: IpAddr) -> Self {
         self.destination = Some(dest);
         self
@@ -287,6 +294,79 @@ impl TunServerConfig {
             config.platform_config(|p| {
                 p.packet_information(self.packet_information);
             });
+        }
+
+        // macOS creates its own device only for a privileged host that owns it
+        // -- the daemon. A Network Extension provider passes raw_fd instead,
+        // and `tun::Device::new` returns before any of this is read, so the
+        // arm costs that path nothing.
+        //
+        // Every check here is a backstop for a caller that skipped
+        // validate.rs, and it must agree with validate.rs rather than invent
+        // looser rules -- the same contract the Windows arm below keeps.
+        // Without it the failures are silent, which is the whole problem with
+        // this path today:
+        //
+        // - An interface with no address comes up reachable by nothing, and
+        //   the crate reports that no more loudly than it reports success.
+        //   (`Device::new` also has an all-three-or-nothing point-to-point
+        //   alias step, but `enable_routing(false)` below skips it -- see
+        //   validate.rs, where the same reasoning decides that `destination`
+        //   is warned about rather than required.)
+        // - A name not of the form `utunN` is the crate's opaque
+        //   `Error::InvalidName`, and a non-numeric suffix is a bare
+        //   `ParseIntError`. Neither says what the rule is.
+        #[cfg(target_os = "macos")]
+        {
+            if self.raw_fd.is_none() {
+                if let Some(ref name) = self.tun_name {
+                    if name.strip_prefix("utun").is_none_or(|unit| {
+                        unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_digit())
+                    }) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "TUN device_name {name:?} is not valid on macOS: it must be \
+                                 'utun' followed by a number, or omitted to let the kernel \
+                                 pick the next free unit"
+                            ),
+                        ));
+                    }
+                    config.tun_name(name);
+                }
+
+                match (self.address, self.netmask) {
+                    (Some(addr), Some(mask)) => {
+                        config.address(addr);
+                        config.netmask(mask);
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "TUN on macOS requires 'address' and 'netmask'; without them \
+                             the interface comes up reachable by nothing",
+                        ));
+                    }
+                }
+                if let Some(dest) = self.destination {
+                    config.destination(dest);
+                }
+
+                // The daemon owns every route it will later have to revert, so
+                // the crate must not add one behind it: `enable_routing`
+                // defaults to true and makes `set_alias` shell out to `route`.
+                //
+                // Note that the flag guards the whole of `set_alias`, not just
+                // that call, so this also drops the `SIOCAIFADDR` alias --
+                // `configure()` still applies address, destination, netmask and
+                // MTU through the individual ioctls, and `up()` below still
+                // brings the interface up. See the open decision in
+                // docs/plans/2026-09-04-macos-privileged-daemon.md.
+                config.platform_config(|p| {
+                    p.enable_routing(false);
+                });
+                config.up();
+            }
         }
 
         #[cfg(target_os = "android")]

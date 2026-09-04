@@ -190,3 +190,21 @@ pub struct FakeIpConfig {
     #[serde(default, skip_serializing_if = "NoneOrSome::is_unspecified")]
     pub bypass_domains: NoneOrSome<String>,
 }
+
+/// A TUN device name this platform's validation accepts.
+///
+/// Every platform has its own arm in `validate.rs`, so a fixture that
+/// hard-codes one platform's name tests parsing on the others and validation
+/// on none. macOS is the strict one: the `tun` crate derives the control unit
+/// from the digits after `utun` and refuses anything else, so `tun0` -- which
+/// Linux, Android and the Windows adapter path all accept as an ordinary name
+/// -- cannot be a device there.
+///
+/// Tests that are *about* the naming rule should spell names out rather than
+/// use this.
+#[cfg(test)]
+pub(crate) const TEST_TUN_DEVICE_NAME: &str = if cfg!(target_os = "macos") {
+    "utun9"
+} else {
+    "tun0"
+};

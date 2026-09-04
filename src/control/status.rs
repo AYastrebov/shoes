@@ -39,6 +39,18 @@ pub struct StatusSnapshot {
     pub uptime: Option<std::time::Duration>,
     pub upload_bytes: u64,
     pub download_bytes: u64,
+    /// The interface the running session created -- `utun4`, `tun0` -- or
+    /// `None`.
+    ///
+    /// A host that configures routes and DNS needs this and cannot derive it:
+    /// on macOS the kernel picks the `utun` unit, because choosing one would
+    /// race every other utun user on the machine.
+    ///
+    /// `None` in three cases, which a host should treat alike: the service is
+    /// not running; it is running on a descriptor the host supplied, so the
+    /// host already knows the name and shoes never saw it; or the platform
+    /// does not report one.
+    pub device_name: Option<String>,
 }
 
 #[cfg(test)]

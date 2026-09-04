@@ -64,6 +64,21 @@ pub fn active_connections() -> usize {
 #[cfg(all(test, feature = "control-stats"))]
 pub static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serialises every test that mutates the process-wide traffic counters.
+///
+/// They assert absolute values, so a reset from another test running at the
+/// same moment turns a real assertion into a flake. Anything that calls
+/// `reset_traffic_counters` -- including `control::reset_counters`, which a
+/// session start goes through -- has to take this first.
+///
+/// The lock is tokio's rather than std's for two reasons: it can be held
+/// across the awaits in the stream tests, and it does not poison, so one
+/// failing test reports its own failure instead of turning the others into
+/// "poisoned". It lives here, next to the state it guards, rather than in any
+/// one caller.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Zero the live-connection count.
 ///
 /// Called when the stack thread exits: whatever it was still holding is gone
@@ -240,14 +255,6 @@ pub fn get_traffic_counters() -> (u64, u64) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
-    use tokio::sync::Mutex;
-
-    /// These tests all mutate the same process-wide counters, so they take
-    /// turns. The lock is tokio's rather than std's for two reasons: it can be
-    /// held across the awaits in the stream tests, and it does not poison, so
-    /// one failing test reports its own failure instead of turning the other
-    /// five into "poisoned".
-    static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn test_add_and_reset_counters() {

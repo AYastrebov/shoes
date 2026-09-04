@@ -207,11 +207,21 @@ impl ServiceHandle {
         #[cfg(not(any(unix, windows)))]
         let (upload_bytes, download_bytes) = (0, 0);
 
+        // Gated on `running` like `uptime`, and for the same reason: the
+        // static outlives the session that set it, and reporting a stopped
+        // service's old interface is how a host ends up deleting routes from
+        // a device that no longer exists.
+        #[cfg(any(unix, windows))]
+        let device_name = running.then(crate::tun::device_name).flatten();
+        #[cfg(not(any(unix, windows)))]
+        let device_name = None;
+
         StatusSnapshot {
             status,
             uptime: running.then(|| self.started_at.elapsed()),
             upload_bytes,
             download_bytes,
+            device_name,
         }
     }
 }
@@ -299,6 +309,10 @@ fn reset_counters() {
     // start path; a Rust host had no equivalent.
     #[cfg(any(unix, windows))]
     crate::tun::traffic::reset_traffic_counters();
+    // Likewise: a start that fails before it creates a device must not leave
+    // the previous session's interface name readable.
+    #[cfg(any(unix, windows))]
+    crate::tun::clear_device_name();
 }
 
 /// Build the handle and the task, and hand back the task's spawn as a
@@ -700,12 +714,16 @@ mod tests {
     #[test]
     fn test_prepare_rejects_a_tun_without_a_descriptor() {
         // netmask included so the config passes per-platform validation on
-        // Windows and the failure under test — the missing descriptor — is
-        // the one that fires.
-        let err =
-            prepare("---\n- device_name: tun0\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n")
-                .map(|_| ())
-                .unwrap_err();
+        // Windows, and the device name taken from the platform so it passes
+        // on macOS, where only `utunN` is a device. Both are there so that
+        // the failure under test — the missing descriptor — is the one that
+        // fires.
+        let name = crate::config::tun::TEST_TUN_DEVICE_NAME;
+        let err = prepare(&format!(
+            "---\n- device_name: {name}\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n"
+        ))
+        .map(|_| ())
+        .unwrap_err();
         assert!(
             err.to_string().contains("device_fd"),
             "expected a device_fd complaint, got: {err}"
@@ -836,6 +854,84 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("boom"));
         assert!(!handle.running.load(Ordering::SeqCst));
         let _ = stop_handle(handle);
+    }
+
+    /// The interface name a host reads is the running session's, or nothing.
+    ///
+    /// It is a process-global static, like the byte counters beside it, so it
+    /// outlives the session that set it. A host that acts on a stopped
+    /// service's leftover name deletes routes from a device that no longer
+    /// exists -- or worse, from one the next session has not finished
+    /// creating. Gated on `running` for the same reason `uptime` is.
+    #[test]
+    fn the_device_name_is_reported_only_while_running() {
+        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        crate::tun::set_device_name("utun9".to_string());
+
+        let running = start_with(
+            test_runtime(),
+            |shutdown| async move {
+                let _ = shutdown.await;
+                Ok(())
+            },
+            |_| {},
+        );
+        assert_eq!(
+            running.status().device_name.as_deref(),
+            Some("utun9"),
+            "a running session reports the interface it created"
+        );
+        assert!(matches!(stop_handle(running), StopOutcome::Released));
+
+        // The other half, and the half that matters: the static still holds
+        // the name, and a service that has ended must not report it anyway.
+        let ended = start_with(test_runtime(), |_shutdown| async { Ok(()) }, |_| {});
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ended.is_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!ended.is_running(), "the stub service should have exited");
+        assert_eq!(
+            crate::tun::device_name().as_deref(),
+            Some("utun9"),
+            "the static outlives the session -- that is the hazard under test"
+        );
+        assert_eq!(
+            ended.status().device_name,
+            None,
+            "a stopped service must not name an interface a host could act on"
+        );
+
+        let _ = stop_handle(ended);
+        crate::tun::clear_device_name();
+    }
+
+    /// And a session start clears whatever the last one left behind, so a
+    /// start that fails before it creates a device cannot report the previous
+    /// interface as its own.
+    ///
+    /// `reset_counters` rather than `start`, because building a
+    /// `PreparedService` needs a device the test host does not have -- this is
+    /// the step `start` performs before it spawns anything, and the one under
+    /// test.
+    #[tokio::test]
+    async fn a_start_forgets_the_previous_sessions_interface() {
+        // `reset_counters` also zeroes the traffic counters, and the tests
+        // that assert absolute counter values would flake if this ran beside
+        // them. Taken before the std lock, which must not be held across the
+        // await.
+        let _counters = crate::tun::traffic::TEST_LOCK.lock().await;
+        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        crate::tun::set_device_name("utun9".to_string());
+        assert_eq!(crate::tun::device_name().as_deref(), Some("utun9"));
+
+        reset_counters();
+
+        assert_eq!(
+            crate::tun::device_name(),
+            None,
+            "a start must clear the static before anything can read it"
+        );
     }
 
     /// A stop the host asked for is a stop the host knows about: no call.

@@ -69,6 +69,68 @@ use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
 
+/// The name of the interface the current session is running on, once one
+/// exists.
+///
+/// A privileged host needs this and cannot derive it. On macOS the daemon asks
+/// the kernel for the next free `utun` unit rather than picking one -- picking
+/// races every other utun user on the machine -- so the name is not knowable
+/// until the device exists, and routes and DNS are addressed to it.
+///
+/// Process-global rather than threaded through `TunServerConfig`, for the same
+/// reason the byte counters in [`traffic`] are: `shoes::control` already
+/// documents one service per process as an invariant its `StatusSnapshot`
+/// depends on, this value has exactly that lifetime, and a host reads it
+/// through the same snapshot. Threading an `Arc` through five layers of
+/// FFI-shared signatures to sit beside three statics would be the
+/// inconsistent choice, not the safer one.
+///
+/// `None` whenever no session owns a device: before the first start, after a
+/// stop, and throughout a session whose descriptor came from the host, since
+/// there the host named the interface and shoes never sees it.
+static DEVICE_NAME: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+/// Serialises the tests that write [`DEVICE_NAME`]. Same reasoning as
+/// `traffic::TEST_LOCK`: the state is process-global, so tests that set it
+/// have to take turns or they read each other's writes.
+#[cfg(test)]
+#[allow(dead_code)] // The binary's test build has no test that takes it.
+pub(crate) static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The interface the running session created, if it created one.
+///
+/// Unused by the `shoes` binary, and permanently so: reading this is a
+/// privileged host's job, and `src/main.rs` is not one -- it runs a config and
+/// configures no routes. Its consumers are `shoes::control::StatusSnapshot`
+/// and the `shoesd` daemon, both of which reach it through the library crate,
+/// which `src/main.rs` does not use (it re-declares the module tree). Same
+/// shape as the permanent allow on `mod socket_protector` there: a property of
+/// the build, not something a later change removes.
+#[allow(dead_code)]
+pub fn device_name() -> Option<String> {
+    DEVICE_NAME.lock().clone()
+}
+
+/// Publish the interface name. Called once, immediately after creation.
+///
+/// `test` as well as `unix` so that the control tests can stage a name
+/// without a device; on a Windows test build that leaves it with no caller,
+/// hence the allow.
+#[cfg(any(unix, test))]
+#[allow(dead_code)]
+pub(crate) fn set_device_name(name: String) {
+    *DEVICE_NAME.lock() = Some(name);
+}
+
+/// Forget it. Called when a session starts, so a failed start cannot leave
+/// the previous session's interface visible, and when one ends.
+///
+/// Unused by the `shoes` binary -- see [`device_name`].
+#[allow(dead_code)]
+pub fn clear_device_name() {
+    *DEVICE_NAME.lock() = None;
+}
+
 /// Run the TUN server with the given configuration.
 ///
 /// This function:
@@ -96,6 +158,18 @@ pub async fn run_tun_server(
         fd
     } else {
         let tun_device = config.create_sync_device()?;
+        // Read before `into_raw_fd` consumes the device: the kernel picks the
+        // unit on macOS, and this is the only moment the name is available.
+        // A device that cannot name itself is not a failure -- it is the
+        // normal answer on a platform where the name was never in doubt --
+        // so this logs rather than propagates.
+        match tun::AbstractDevice::tun_name(&tun_device) {
+            Ok(name) => {
+                info!("Created TUN device {}", name);
+                set_device_name(name);
+            }
+            Err(e) => log::debug!("Created TUN device with no reportable name: {}", e),
+        }
         let fd = tun_device.into_raw_fd();
         info!("Created TUN device with FD: {}", fd);
         fd
@@ -612,6 +686,7 @@ fn build_session_selector(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::tun::TEST_TUN_DEVICE_NAME;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::pin::Pin;
@@ -794,7 +869,7 @@ mod tests {
 
         let yaml = format!(
             r#"
-- device_name: "tun0"
+- device_name: "{TEST_TUN_DEVICE_NAME}"
   address: "10.99.0.1"
   netmask: "255.255.255.0"
   dns:
