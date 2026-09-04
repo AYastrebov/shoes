@@ -82,6 +82,8 @@ daemon = [
     "dep:tokio-stream",
     "dep:tonic-prost-build",
     "dep:serde_json",
+    "dep:system-configuration",
+    "dep:core-foundation",
 ]
 
 [[bin]]
@@ -199,6 +201,11 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 # a crash-recovery record wants the format with the fewest ways to be
 # ambiguous.
 serde_json = { version = "*", optional = true }
+# DNS through SCDynamicStore, Mullvad's bindings. Not `networksetup`, which
+# addresses a service by display name and has been broken that way since macOS
+# 14.3 (libnyanpasu/nyanpasu-service#26); SCDynamicStore addresses it by id.
+system-configuration = { version = "0.8", optional = true }
+core-foundation = { version = "0.10", optional = true }
 
 # Only the daemon's own tests, to build a client that speaks to a real Unix
 # socket. tonic's client takes a URI, so reaching a socket path means handing
