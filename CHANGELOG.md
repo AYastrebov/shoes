@@ -1,8 +1,34 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
 
-### `shoesd`: a privileged macOS daemon, and a macOS TUN path that works
+The minor moves rather than the patch. `control::StatusSnapshot` gained a
+field, so anything constructing one no longer compiles; a macOS TUN config that
+was previously accepted and did nothing is now validated and may be rejected at
+startup; and there is a new shipped artifact. Under 0.x that is what a minor
+bump is for.
+
+### `shoesd` ships, and has never run
+
+`shoesd-macos-arm64.tar.gz` is published for the first time, and **no part of
+what it does to a host has executed yet** -- no `route`, no `netstat`, no
+`launchctl`, no `SCDynamicStore` write, and no `PF_ROUTE` notification against
+a real network change. Everything is unit-tested, and the gRPC surface is
+exercised over a real Unix socket against a recording double, which is not the
+same thing.
+
+It is shipped anyway because the live run needs an artifact to install, and
+withholding it would block the only thing that can verify it. Treat this
+release's daemon as a candidate for that run rather than as tested software.
+`docs/MACOS.md` and `docs/plans/2026-09-04-macos-privileged-daemon.md` carry
+the five checks it owes.
+
+The rest of the release -- the CLI, both mobile artifacts, the Apple
+XCFramework -- is unaffected: the daemon is behind a `daemon` feature whose
+dependencies sit under a macOS target section, so every other build compiles
+none of it.
+
+### A privileged macOS daemon, and a macOS TUN path that works
 
 The macOS TUN path had never run, and the reason was structural rather than
 incidental: everything that makes a device usable -- name, address, netmask,

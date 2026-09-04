@@ -2559,7 +2559,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shoes"
-version = "0.2.20"
+version = "0.3.0"
 dependencies = [
  "android_logger",
  "async-trait",
@@ -2601,7 +2601,7 @@ dependencies = [
  "prost",
  "quinn",
  "rand",
- "rand_core 0.10.1",
+ "rand_core 0.6.4",
  "rcgen",
  "regex-lite",
  "rust-argon2",
