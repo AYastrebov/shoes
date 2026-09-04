@@ -522,6 +522,11 @@ systemd-resolved or `netsh`. shoes moves packets; the host owns the network,
 and the daemon is a host — the same seat as `NEPacketTunnelProvider`, written
 in Rust and linking the library rather than crossing a C boundary.
 
+A `PF_ROUTE` monitor re-points the exclusion routes and rewrites the resolvers
+when the default gateway moves, which is the ordinary case on a laptop rather
+than an edge one. There is no `SCDynamicStore` watcher: a network change is
+what makes macOS revert DNS, and the routing table already reports that.
+
 **What is left.** The live run on Apple Silicon (step 8 of
 [the plan](./docs/plans/2026-09-04-macos-privileged-daemon.md)), and Windows and
 Linux. Linux is the awkward one — systemd-resolved, resolvconf, NetworkManager

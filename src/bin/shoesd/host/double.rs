@@ -27,6 +27,8 @@ pub enum Step {
 pub struct Recorder {
     steps: RefCell<Vec<Step>>,
     gateway: Option<IpAddr>,
+    /// The live version, so a test can move it mid-session.
+    gateway_now: std::sync::Mutex<Option<IpAddr>>,
     existing_dns: Vec<IpAddr>,
     /// Fail `add_route` once this many have succeeded.
     fail_add_after: Option<usize>,
@@ -42,6 +44,7 @@ impl Recorder {
         Self {
             steps: RefCell::new(Vec::new()),
             gateway: None,
+            gateway_now: std::sync::Mutex::new(None),
             existing_dns: Vec::new(),
             fail_add_after: None,
             fail_delete: false,
@@ -52,7 +55,18 @@ impl Recorder {
 
     pub fn with_gateway(mut self, gateway: Option<IpAddr>) -> Self {
         self.gateway = gateway;
+        self.gateway_now
+            .lock()
+            .map(|mut g| *g = gateway)
+            .unwrap_or(());
         self
+    }
+
+    /// Move the gateway, as a network change does.
+    pub fn set_gateway(&self, gateway: Option<IpAddr>) {
+        if let Ok(mut current) = self.gateway_now.lock() {
+            *current = gateway;
+        }
     }
 
     /// Resolvers the host already has, which are what a revert must put
@@ -120,7 +134,7 @@ impl Recorder {
 impl HostNetwork for Recorder {
     fn default_gateway(&self) -> std::io::Result<Option<IpAddr>> {
         self.record(Step::Gateway);
-        Ok(self.gateway)
+        Ok(self.gateway_now.lock().map(|g| *g).unwrap_or(self.gateway))
     }
 
     fn add_route(&self, route: &Route) -> std::io::Result<()> {

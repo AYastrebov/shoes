@@ -9,6 +9,24 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Where the daemon's own output goes.
+///
+/// Inside a directory rather than straight into `/var/log`, because launchd
+/// creates the file it is pointed at as 0644 and the directory is the only
+/// place the mode can be decided in advance. `WatchLogs` filters per
+/// subscriber and deliberately does not raise the global level; a log file
+/// every local user can read undoes exactly that care, and the two are the
+/// same decision.
+const LOG_DIR: &str = "/var/log/shoesd";
+const LOG_PATH: &str = "/var/log/shoesd/shoesd.log";
+
+/// Root reads and writes, the admin group reads, nobody else sees it.
+const LOG_DIR_MODE: u32 = 0o750;
+
+/// By absolute path: a root process must not resolve a program through a
+/// `PATH` it inherited from whoever ran `sudo`.
+const LAUNCHCTL: &str = "/bin/launchctl";
+
 /// Where the daemon runs from once installed. Apple's directory for exactly
 /// this: a helper that runs with more privilege than the app that ships it.
 pub const INSTALLED_BINARY: &str = "/Library/PrivilegedHelperTools/shoesd";
@@ -63,9 +81,9 @@ fn plist(socket_path: &Path, state_path: &Path, group: &str) -> String {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/shoesd.log</string>
+    <string>{LOG_PATH}</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/shoesd.log</string>
+    <string>{LOG_PATH}</string>
 </dict>
 </plist>
 "#,
@@ -123,19 +141,22 @@ pub fn install(socket_path: &Path, state_path: &Path, group: &str) -> std::io::R
 
     // Replaced rather than written over: overwriting a running binary in place
     // is how a copy that is half old and half new gets executed.
+    //
+    // Created at 0600 first, rather than copied and then tightened.
+    // `std::fs::copy` carries the source's permission bits across, so a source
+    // that is group- or world-writable -- a tarball unpacked with a loose
+    // umask -- would exist writable under a root-owned path for the window
+    // before the mode was fixed, and the rename below makes it the binary
+    // launchd runs as root.
     let staged = destination.with_extension("new");
-    std::fs::copy(&source, &staged).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!(
-                "could not copy {} to {}: {e}",
-                source.display(),
-                staged.display()
-            ),
-        )
-    })?;
+    stage(&source, &staged)?;
     set_root_owned(&staged, BINARY_MODE)?;
     std::fs::rename(&staged, destination)?;
+
+    // Before the plist that names it: launchd creates the log file itself, at
+    // 0644, and only the directory's mode keeps it from every local user.
+    std::fs::create_dir_all(LOG_DIR)?;
+    set_root_owned(Path::new(LOG_DIR), LOG_DIR_MODE)?;
 
     std::fs::write(PLIST_PATH, plist(socket_path, state_path, group))?;
     set_root_owned(Path::new(PLIST_PATH), PLIST_MODE)?;
@@ -144,9 +165,9 @@ pub fn install(socket_path: &Path, state_path: &Path, group: &str) -> std::io::R
     // before bootstrapping the new plist, or launchd refuses it as already
     // loaded. A first install has nothing to remove, so the failure is
     // ignored rather than reported.
-    let _ = run("launchctl", &["bootout".into(), format!("system/{LABEL}")]);
+    let _ = run(LAUNCHCTL, &["bootout".into(), format!("system/{LABEL}")]);
     run(
-        "launchctl",
+        LAUNCHCTL,
         &["bootstrap".into(), "system".into(), PLIST_PATH.into()],
     )?;
 
@@ -167,7 +188,7 @@ pub fn uninstall() -> std::io::Result<()> {
     // `bootout` sends the job SIGTERM, which is what makes the daemon revert
     // its routes and DNS before it exits -- so the session is torn down by
     // the same path a shutdown uses rather than a second one written here.
-    if let Err(e) = run("launchctl", &["bootout".into(), format!("system/{LABEL}")]) {
+    if let Err(e) = run(LAUNCHCTL, &["bootout".into(), format!("system/{LABEL}")]) {
         // Not loaded is the ordinary case for a partial install.
         log::debug!("bootout reported: {e}");
     }
@@ -188,6 +209,49 @@ pub fn uninstall() -> std::io::Result<()> {
         "could not fully uninstall: {}",
         failures.join("; ")
     )))
+}
+
+/// Copy `source` to `staged`, created writable by nobody else.
+fn stage(source: &Path, staged: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Removed first, because `create` on an existing file keeps the mode it
+    // already has -- which is the mode this exists to control.
+    match std::fs::remove_file(staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(staged)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not create {}: {e}", staged.display()),
+            )
+        })?;
+    let mut input = std::fs::File::open(source).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not read {}: {e}", source.display()),
+        )
+    })?;
+
+    std::io::copy(&mut input, &mut output).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not copy {} to {}: {e}",
+                source.display(),
+                staged.display()
+            ),
+        )
+    })?;
+    Ok(())
 }
 
 /// `root:wheel`, and the given mode.
@@ -357,6 +421,87 @@ mod tests {
         );
         // And nothing raw survives that would break the parse.
         assert!(!rendered.contains("a&b"), "{rendered}");
+    }
+
+    /// The log must not be world-readable.
+    ///
+    /// launchd creates the file it is pointed at as 0644, so the directory is
+    /// the only place the mode can be decided in advance. `WatchLogs` filters
+    /// per subscriber and does not raise the global level; a log every local
+    /// user can read undoes exactly that care.
+    #[test]
+    fn the_log_lives_in_a_directory_others_cannot_read() {
+        assert_eq!(
+            LOG_DIR_MODE & 0o007,
+            0,
+            "world has no access: {LOG_DIR_MODE:o}"
+        );
+        assert!(
+            LOG_PATH.starts_with(&format!("{LOG_DIR}/")),
+            "the log has to be inside the directory whose mode is set: {LOG_PATH}"
+        );
+        assert!(rendered().contains(&format!("<string>{LOG_PATH}</string>")));
+        assert!(
+            !rendered().contains("<string>/var/log/shoesd.log</string>"),
+            "not straight into /var/log, where only launchd decides the mode"
+        );
+    }
+
+    /// The staged copy is never writable by anyone but its owner, even for the
+    /// instant before its mode is set.
+    ///
+    /// `std::fs::copy` carries the source's permission bits across, so a
+    /// source unpacked with a loose umask would exist group- or
+    /// world-writable under a root-owned path -- and the next line renames it
+    /// into the binary launchd runs as root.
+    #[test]
+    fn the_staged_binary_is_never_writable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shoesd-source");
+        std::fs::write(&source, b"#!/bin/sh\ntrue\n").unwrap();
+        // Deliberately loose, which is what a tarball or a shared build
+        // directory can produce.
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let staged = dir.path().join("shoesd.new");
+        stage(&source, &staged).expect("staging works");
+
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+    }
+
+    /// And staging over a leftover file from an interrupted install still
+    /// gets the mode right, rather than inheriting whatever that file had.
+    #[test]
+    fn staging_replaces_a_leftover_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shoesd-source");
+        std::fs::write(&source, b"new").unwrap();
+
+        let staged = dir.path().join("shoesd.new");
+        std::fs::write(&staged, b"old").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        stage(&source, &staged).expect("a leftover must not block an install");
+
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+    }
+
+    /// Every tool is named by absolute path: a root process must not resolve a
+    /// program through a `PATH` it inherited from whoever ran `sudo`.
+    #[test]
+    fn launchctl_is_named_absolutely() {
+        assert!(LAUNCHCTL.starts_with('/'), "{LAUNCHCTL}");
     }
 
     /// Both refuse before touching anything when not root, with a sentence

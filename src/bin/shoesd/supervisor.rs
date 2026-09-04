@@ -20,8 +20,6 @@ use std::time::{Duration, Instant};
 use shoes::control::{self, DevicePolicy, ServiceHandle, StopOutcome};
 use tokio::sync::{broadcast, oneshot};
 
-#[cfg(test)]
-use crate::host::DnsBackup;
 use crate::host::{AppliedState, HostNetwork, Plan, Session};
 
 /// How long to wait for the engine to create its device.
@@ -92,6 +90,8 @@ enum Command {
     },
     /// From the engine's exit callback.
     EngineExited(Option<String>),
+    /// From the route monitor: something in the routing table moved.
+    NetworkChanged,
     Shutdown,
 }
 
@@ -156,6 +156,8 @@ impl Supervisor {
                     },
                     started_at: None,
                     interface: None,
+                    exclude: Vec::new(),
+                    dns: Vec::new(),
                     recovery_pending: false,
                 };
                 inner.run(rx);
@@ -214,6 +216,17 @@ impl Supervisor {
         self.transitions.subscribe()
     }
 
+    /// Tell the supervisor the routing table moved.
+    ///
+    /// Cheap and idempotent, so the monitor can be liberal about what it
+    /// reports: the handler re-reads the table and compares, rather than
+    /// trying to work out what changed from the notification. Posted as a
+    /// command so the re-apply is serialised with `Start` and `Stop` instead
+    /// of racing them.
+    pub fn network_changed(&self) {
+        self.send(Command::NetworkChanged);
+    }
+
     /// Stop the session and end the thread. For `SIGTERM`.
     pub fn shutdown(&self) {
         self.send(Command::Shutdown);
@@ -237,6 +250,12 @@ struct Inner<N: HostNetwork> {
     state: State,
     started_at: Option<Instant>,
     interface: Option<String>,
+    /// What the running session asked to keep outside the tunnel, and which
+    /// resolvers to advertise. Kept because a network change means recomputing
+    /// the exclusion routes from the *new* gateway, which needs the addresses
+    /// the plan named rather than the routes it produced.
+    exclude: Vec<IpAddr>,
+    dns: Vec<IpAddr>,
     /// A previous session's record is still on disk and could not be undone.
     ///
     /// Kept rather than forgotten, because `apply` writes a *fresh* record over
@@ -278,6 +297,7 @@ impl<N: HostNetwork> Inner<N> {
                     let _ = reply.send(self.status());
                 }
                 Command::EngineExited(reason) => self.engine_exited(reason),
+                Command::NetworkChanged => self.network_changed(),
                 Command::Shutdown => {
                     let _ = self.stop(StopReason::Requested);
                     return;
@@ -353,8 +373,8 @@ impl<N: HostNetwork> Inner<N> {
 
         let plan = Plan {
             interface: interface.clone(),
-            exclude,
-            dns,
+            exclude: exclude.clone(),
+            dns: dns.clone(),
         };
         let applied = match self.session().apply(&plan) {
             Ok(applied) => applied,
@@ -373,6 +393,8 @@ impl<N: HostNetwork> Inner<N> {
         self.applied = Some(applied);
         self.started_at = Some(Instant::now());
         self.interface = Some(interface);
+        self.exclude = exclude;
+        self.dns = dns;
         self.transition(State::Running);
         Ok(())
     }
@@ -463,6 +485,8 @@ impl<N: HostNetwork> Inner<N> {
 
         self.started_at = None;
         self.interface = None;
+        self.exclude = Vec::new();
+        self.dns = Vec::new();
 
         // A stop that timed out has not been confirmed to release the device,
         // so the record stays: a start after this one must still know there
@@ -473,6 +497,31 @@ impl<N: HostNetwork> Inner<N> {
         {
             log::warn!("could not remove {}: {e}", self.state_path.display());
         }
+    }
+
+    /// Re-point the exclusions at whatever the gateway is now.
+    ///
+    /// Only while running, and only with something applied: a change while
+    /// stopped has nothing to re-apply, and one mid-start is followed by the
+    /// apply itself reading the table.
+    fn network_changed(&mut self) {
+        if self.state != State::Running {
+            return;
+        }
+        let Some(mut applied) = self.applied.take() else {
+            return;
+        };
+
+        let session = Session::new(&self.net, self.state_path.clone());
+        match session.reapply(&mut applied, &self.exclude, &self.dns) {
+            Ok(true) => log::info!("re-applied the session's host configuration"),
+            Ok(false) => log::debug!("a routing change left the session's routes correct"),
+            // Logged rather than fatal: the session is still carrying traffic,
+            // and tearing it down because one re-apply failed would be a worse
+            // answer than a stale exclusion the next change may fix.
+            Err(e) => log::error!("could not re-apply after a network change: {e}"),
+        }
+        self.applied = Some(applied);
     }
 
     fn status(&self) -> Status {
@@ -707,6 +756,8 @@ mod tests {
             },
             started_at: None,
             interface: None,
+            exclude: Vec::new(),
+            dns: Vec::new(),
             recovery_pending: false,
         };
 
@@ -740,6 +791,8 @@ mod tests {
             state: State::Running,
             started_at: None,
             interface: None,
+            exclude: Vec::new(),
+            dns: Vec::new(),
             recovery_pending: false,
         };
 

@@ -21,7 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use super::state::{AppliedState, DnsBackup};
-use super::{HostNetwork, Route, Via};
+use super::{Destination, HostNetwork, Route, Via};
 
 /// What a session wants done to the host.
 #[derive(Debug, Clone)]
@@ -109,22 +109,19 @@ impl<'a, N: HostNetwork> Session<'a, N> {
     }
 
     fn apply_steps(&self, plan: &Plan, state: &mut AppliedState) -> std::io::Result<()> {
-        for route in tunnel_routes(&plan.interface) {
+        // Exclusions first, and the gateway read before any of this daemon's
+        // own routes exist. Installing the split default first would leave a
+        // window in which the proxy's address matches the tunnel and nothing
+        // else -- nothing is connected during it, so the practical cost is
+        // likely zero, but "likely zero" is not a reason to order it the
+        // dangerous way round.
+        let gateway = self.net.default_gateway()?;
+        for route in exclusion_routes(&plan.exclude, gateway) {
             self.add_recorded(route, state)?;
         }
 
-        // The gateway is read once here and again on every routing change
-        // while the session is up; the caller re-applies exclusions rather
-        // than this function caching an answer that expires.
-        let gateway = self.net.default_gateway()?;
-        for address in &plan.exclude {
-            let via = match gateway {
-                Some(gateway) if gateway.is_ipv4() == address.is_ipv4() => Via::Gateway(gateway),
-                // No usable gateway. Dropping the address is the only choice
-                // that is not a routing loop -- see `Via::Blackhole`.
-                _ => Via::Blackhole,
-            };
-            self.add_recorded(Route::host(*address, via), state)?;
+        for route in tunnel_routes(&plan.interface) {
+            self.add_recorded(route, state)?;
         }
 
         if !plan.dns.is_empty() {
@@ -132,6 +129,74 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         }
 
         Ok(())
+    }
+
+    /// Re-apply what a network change invalidates.
+    ///
+    /// The gateway an exclusion points at is the one that was in the table
+    /// when the session started. A laptop moving from Wi-Fi to Ethernet gets a
+    /// new one, and the old host route then points at a router that is not
+    /// there -- so the proxy connection dies while the tunnel stays nominally
+    /// up. macOS also reverts DNS asynchronously after a network change, which
+    /// is why the resolvers are written again here rather than only at start.
+    ///
+    /// Idempotent by construction: it re-reads the table and compares, rather
+    /// than trying to work out what changed from the notification. Returns
+    /// whether anything needed doing, for the log line.
+    pub fn reapply(
+        &self,
+        state: &mut AppliedState,
+        exclude: &[IpAddr],
+        dns: &[IpAddr],
+    ) -> std::io::Result<bool> {
+        let mut changed = false;
+
+        let gateway = self.net.default_gateway()?;
+        let wanted = exclusion_routes(exclude, gateway);
+        let current: Vec<Route> = state
+            .routes
+            .iter()
+            .filter(|route| is_exclusion(route, exclude))
+            .cloned()
+            .collect();
+
+        if current != wanted {
+            changed = true;
+            log::info!(
+                "the default gateway changed; re-pointing {} excluded address(es)",
+                wanted.len()
+            );
+
+            // Removed before the replacements go on, because a route for the
+            // same destination cannot be added twice -- the kernel refuses the
+            // second. The window between is the one the gateway change already
+            // created.
+            for route in &current {
+                self.net.delete_route(route)?;
+            }
+            state.routes.retain(|route| !is_exclusion(route, exclude));
+            state.save(&self.state_path)?;
+
+            // Record-before-apply still, so a crash mid-swap leaves every new
+            // route described.
+            for route in wanted {
+                self.add_recorded(route, state)?;
+            }
+        }
+
+        // Rewritten unconditionally when the session set them: this is cheap,
+        // and the failure it exists to undo -- macOS quietly restoring the
+        // host's own resolvers a moment after a network change -- leaves no
+        // signal to test for.
+        if let Some(backup) = &state.dns
+            && !dns.is_empty()
+        {
+            let service = backup.service.clone();
+            self.net.write_dns(&service, dns)?;
+            self.net.flush_dns_cache()?;
+        }
+
+        Ok(changed)
     }
 
     /// Record the route, then install it.
@@ -195,6 +260,33 @@ impl<'a, N: HostNetwork> Session<'a, N> {
     }
 }
 
+/// The host routes that keep the excluded addresses outside the tunnel.
+///
+/// One per address, through the gateway that was in the table before this
+/// daemon touched it. Where there is no usable gateway -- none at all, or one
+/// of the wrong family -- the address is blackholed instead: it would
+/// otherwise match nothing but the tunnel's own half-default, and the proxy's
+/// packets would enter the tunnel carrying them. Failing the connection is
+/// recoverable; that loop is not.
+fn exclusion_routes(exclude: &[IpAddr], gateway: Option<IpAddr>) -> Vec<Route> {
+    exclude
+        .iter()
+        .map(|address| {
+            let via = match gateway {
+                Some(gateway) if gateway.is_ipv4() == address.is_ipv4() => Via::Gateway(gateway),
+                _ => Via::Blackhole,
+            };
+            Route::host(*address, via)
+        })
+        .collect()
+}
+
+/// Whether a recorded route is one of the exclusions, rather than a tunnel
+/// route this session also installed.
+fn is_exclusion(route: &Route, exclude: &[IpAddr]) -> bool {
+    matches!(route.destination, Destination::Host(address) if exclude.contains(&address))
+}
+
 /// The routes that put traffic into the tunnel.
 ///
 /// The v4 default arrives as two halves rather than a replaced `default`:
@@ -225,7 +317,6 @@ fn tunnel_routes(interface: &str) -> Vec<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Destination;
     use crate::host::double::{Recorder, Step};
 
     fn ip(s: &str) -> IpAddr {
@@ -262,6 +353,15 @@ mod tests {
         assert_eq!(
             steps,
             vec![
+                // The gateway is read, and the exclusions installed, before
+                // any of this daemon's own routes exist: the other order
+                // leaves a window in which the proxy's address matches the
+                // tunnel and nothing else.
+                Step::Gateway,
+                Step::AddRoute(Route::host(
+                    ip("203.0.113.7"),
+                    Via::Gateway(ip("192.168.1.1"))
+                )),
                 Step::AddRoute(Route::net(ip("0.0.0.0"), 1, Via::Interface("utun4".into()))),
                 Step::AddRoute(Route::net(
                     ip("128.0.0.0"),
@@ -270,11 +370,6 @@ mod tests {
                 )),
                 Step::AddRoute(Route::net(ip("::"), 1, Via::Reject)),
                 Step::AddRoute(Route::net(ip("8000::"), 1, Via::Reject)),
-                Step::Gateway,
-                Step::AddRoute(Route::host(
-                    ip("203.0.113.7"),
-                    Via::Gateway(ip("192.168.1.1"))
-                )),
                 Step::PrimaryService,
                 Step::ReadDns("primary".into()),
                 Step::WriteDns("primary".into(), vec![ip("10.0.0.1")]),
@@ -357,12 +452,20 @@ mod tests {
             .collect();
         assert_eq!(deleted.len(), 5, "every added route comes back off");
 
-        // Reverse order, so the exclusion goes before the halves it depended
-        // on being more specific than.
+        // Reverse order: the v6 rejects went on last so they come off first,
+        // and the exclusion that went on before anything else comes off last.
         assert_eq!(
             deleted[0].destination,
-            Destination::Host(ip("203.0.113.7")),
+            Destination::Net {
+                addr: ip("8000::"),
+                prefix: 1
+            },
             "the last route added is the first removed"
+        );
+        assert_eq!(
+            deleted[4].destination,
+            Destination::Host(ip("203.0.113.7")),
+            "and the first added is the last removed"
         );
     }
 
@@ -493,6 +596,156 @@ mod tests {
         assert_eq!(
             on_disk.dns.as_ref().map(|d| d.service.as_str()),
             Some("primary")
+        );
+    }
+
+    /// The whole point of the monitor: a laptop moving from Wi-Fi to Ethernet
+    /// gets a new default gateway, and the exclusion host route installed at
+    /// start then points at a router that is not there. The proxy connection
+    /// dies while the tunnel stays nominally up.
+    #[test]
+    fn reapply_repoints_exclusions_at_the_new_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let mut state = session.apply(&plan()).unwrap();
+        net.set_gateway(Some(ip("10.0.0.1")));
+
+        let changed = session
+            .reapply(&mut state, &[ip("203.0.113.7")], &[ip("10.0.0.1")])
+            .expect("re-applying works");
+        assert!(changed, "the gateway moved, so something had to change");
+
+        // The old route comes off before the new one goes on: the kernel
+        // refuses a second route for the same destination.
+        let steps = net.steps();
+        let removed = steps
+            .iter()
+            .position(|s| {
+                *s == Step::DeleteRoute(Route::host(
+                    ip("203.0.113.7"),
+                    Via::Gateway(ip("192.168.1.1")),
+                ))
+            })
+            .expect("the stale exclusion is removed");
+        let added = steps
+            .iter()
+            .position(|s| {
+                *s == Step::AddRoute(Route::host(ip("203.0.113.7"), Via::Gateway(ip("10.0.0.1"))))
+            })
+            .expect("and replaced");
+        assert!(removed < added, "removed before added: {steps:#?}");
+
+        // And the record follows, or a revert would try to delete a route that
+        // is no longer the one installed.
+        assert!(
+            state.routes.contains(&Route::host(
+                ip("203.0.113.7"),
+                Via::Gateway(ip("10.0.0.1"))
+            )),
+            "{:#?}",
+            state.routes
+        );
+        assert!(
+            !state.routes.contains(&Route::host(
+                ip("203.0.113.7"),
+                Via::Gateway(ip("192.168.1.1"))
+            )),
+            "the stale one is gone from the record too"
+        );
+    }
+
+    /// A notification with nothing behind it must not churn the routing table.
+    /// The monitor is deliberately liberal about what it reports, which only
+    /// works if the handler is cheap when nothing moved.
+    #[test]
+    fn reapply_touches_no_routes_when_the_gateway_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let mut state = session.apply(&plan()).unwrap();
+        let before = net.count_added();
+
+        let changed = session
+            .reapply(&mut state, &[ip("203.0.113.7")], &[ip("10.0.0.1")])
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(net.count_deleted(), 0, "nothing is removed");
+        assert_eq!(net.count_added(), before, "and nothing is added");
+    }
+
+    /// The resolvers are written again on every change, not only when the
+    /// gateway moved. macOS restores the host's own a moment after a network
+    /// change, and that leaves no signal to compare against.
+    #[test]
+    fn reapply_writes_the_resolvers_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let mut state = session.apply(&plan()).unwrap();
+        session
+            .reapply(&mut state, &[ip("203.0.113.7")], &[ip("10.0.0.1")])
+            .unwrap();
+
+        let writes = net
+            .steps()
+            .into_iter()
+            .filter(|s| matches!(s, Step::WriteDns(_, servers) if servers == &vec![ip("10.0.0.1")]))
+            .count();
+        assert_eq!(writes, 2, "once at start, once after the change");
+    }
+
+    /// A session that never set resolvers must not start setting them because
+    /// the network moved.
+    #[test]
+    fn reapply_leaves_untouched_resolvers_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let mut state = session
+            .apply(&Plan {
+                dns: Vec::new(),
+                ..plan()
+            })
+            .unwrap();
+        session
+            .reapply(&mut state, &[ip("203.0.113.7")], &[])
+            .unwrap();
+
+        assert!(
+            !net.steps().iter().any(|s| matches!(s, Step::WriteDns(..))),
+            "{:#?}",
+            net.steps()
+        );
+    }
+
+    /// Losing the gateway entirely blackholes the exclusion rather than
+    /// leaving it pointed at a router that is gone -- which would otherwise
+    /// fall through to the tunnel's own half-default and loop.
+    #[test]
+    fn reapply_blackholes_when_the_gateway_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let mut state = session.apply(&plan()).unwrap();
+        net.set_gateway(None);
+
+        session
+            .reapply(&mut state, &[ip("203.0.113.7")], &[ip("10.0.0.1")])
+            .unwrap();
+
+        assert!(
+            state
+                .routes
+                .contains(&Route::host(ip("203.0.113.7"), Via::Blackhole)),
+            "{:#?}",
+            state.routes
         );
     }
 

@@ -395,8 +395,12 @@ questions, which is the part this kind of code usually gets wrong:
   exclusion exists to avoid. Matching the literal `default` destination cannot
   be fooled that way, and the parse is a pure function with tests.
 - *Has it changed?* A `PF_ROUTE` socket, used purely as a signal — the same
-  thing `route -n monitor` is underneath. The daemon does not parse the delta; it
-  re-reads the table and re-applies the exclusion routes if the gateway differs.
+  thing `route -n monitor` is underneath, and what wg-quick's `darwin.bash`
+  uses. The daemon does not parse the delta; it re-reads the table and
+  re-applies the exclusion routes if the gateway differs.
+  (`src/bin/shoesd/host/macos/monitor.rs`, feeding `Command::NetworkChanged`
+  so the re-apply is serialised with `Start` and `Stop` rather than racing
+  them.)
 
 Parsing routing messages to decide what changed is where the bugs live, and it
 is unnecessary — a signal plus an idempotent re-read gives the same answer and
@@ -431,18 +435,22 @@ wg-quick keeps its saved DNS state in shell variables, so a killed process can
 never restore it — a daemon that must survive `kill -9` needs the backup on
 disk regardless of which API writes it.
 
-**Two things about re-applying it.** macOS reverts DNS asynchronously a moment
-after a network change, which wg-quick works around by re-running `set_dns` and
-then kicking itself with `SIGALRM` two seconds later to do it again. The daemon
-does the same thing without the signal: on a store change it re-applies
-immediately and once more after a short delay.
+**Re-applying it.** macOS reverts DNS asynchronously a moment after a network
+change, which wg-quick works around by re-running `set_dns` and then kicking
+itself with `SIGALRM` two seconds later to do it again. The daemon does the same
+thing without the signal: the route monitor reports a change once it has
+settled, and again a couple of seconds later, and the supervisor writes the
+resolvers on both.
 
-And watching the store has a shape that does not fit the rest of the process.
+That reuses one mechanism for two jobs, and it is why there is no
+`SCDynamicStore` watcher. Watching the store would mean a dedicated thread
+running `CFRunLoop::run_current()`, because
 `SCDynamicStore::set_notification_keys` plus `create_run_loop_source` deliver
-callbacks on a **CFRunLoop**, which cannot be driven by a tokio worker. So DNS
-watching gets a dedicated thread that runs `CFRunLoop::run_current()` and whose
-callback does nothing but post a message to the supervisor's queue. The
-privileged work stays on the supervisor thread, where the ordering rules live.
+callbacks on a CFRunLoop that a tokio worker cannot drive — a second thread and
+a second notification path for the same event the routing table already
+reports. If a DNS change that is *not* accompanied by a routing change turns
+out to matter, that watcher is the thing to add, and it posts the same
+`Command::NetworkChanged`.
 
 Finally, `mDNSResponder` is flushed (`killall -HUP mDNSResponder`, argv, no
 shell).
@@ -646,6 +654,8 @@ Steps 1 and 2 are independent and can go in either order; 3 gates 4 and 5.
 | Interface name: daemon picks, or shoes reports? | shoes reports it, via `StatusSnapshot.device_name` | Picking races with any other utun user; `sc_unit = 0` cannot race |
 | How to read the gateway? | Parse `netstat -rn -f inet`, skipping `link#N` rows | `route get default` returns the tunnel once `0.0.0.0/1` is installed; a `sysctl` dump is untestable unsafe code. Revised during implementation — the spec first chose sysctl |
 | How to notice it changing? | `PF_ROUTE` only as a signal; re-read and re-apply | Never parse a routing delta; a signal plus an idempotent re-read cannot drift |
+| Watch `SCDynamicStore` for DNS changes too? | No — the route monitor's second look covers it | A network change is what makes macOS revert DNS, and the routing table already reports that. A CFRunLoop thread for a second notification of the same event is added only if a DNS change without a routing change proves to matter |
+| Exclusions before the tunnel routes, or after? | Before, and the gateway read before either | The other order leaves a window in which the proxy's address matches the tunnel and nothing else. Nothing is connected during it, so the cost is likely zero — which is not a reason to order it the dangerous way round |
 | IPv6: leak or drop? | Neither — `::/1` and `8000::/1` as reject routes | Fails fast so Happy Eyeballs falls back at once, instead of waiting out a timeout on a blackhole |
 | `IP_BOUND_IF` instead of exclusion routes? | Not in v1; recorded as the long-term answer | It needs a macOS arm where `socket_util` currently has an unreachable `panic!`, plus plumbing through every outbound constructor. The host route is needed for the gateway anyway |
 | Close `Status::Starting` now? | No | The daemon reports its own `STARTING` — device, routes, DNS, engine spawn — which is the interval a GUI can see. The library's own starting window is the microseconds before `start` returns, and widening `Status` reaches mobile |

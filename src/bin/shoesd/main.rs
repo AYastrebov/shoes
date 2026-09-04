@@ -199,6 +199,21 @@ fn run_daemon(args: RunArgs) -> ExitCode {
         }
     };
 
+    // The routing table is watched for the life of the process, not the
+    // session: a change that lands between sessions is answered by the next
+    // start reading the table anyway, and one thread is simpler to reason
+    // about than one that comes and goes with the tunnel. Its failure is not
+    // fatal -- the session still carries traffic, it just stops re-pointing
+    // its exclusions when the gateway moves.
+    {
+        let supervisor = supervisor.clone();
+        if let Err(e) = crate::host::macos::monitor::spawn(move || supervisor.network_changed()) {
+            log::error!(
+                "could not watch the routing table ({e}); exclusions will not follow a gateway change"
+            );
+        }
+    }
+
     let result = runtime.block_on(service::serve(
         &args.socket_path,
         &args.group,

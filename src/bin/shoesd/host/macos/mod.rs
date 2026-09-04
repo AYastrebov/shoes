@@ -12,11 +12,25 @@
 //! addresses in these arrays arrive over the control socket.
 
 mod dns;
+pub mod monitor;
 
 use std::net::IpAddr;
 use std::process::Command;
 
 use super::{Destination, HostNetwork, Route, Via};
+
+/// The tools, by absolute path.
+///
+/// A root process that resolves a program through `PATH` runs whatever the
+/// first writable directory on it happens to hold. launchd gives the daemon a
+/// sane `PATH`, but `shoesd install` and `shoesd run` under `sudo` inherit the
+/// invoker's environment -- and these are the same argv arrays the no-shell
+/// rule already protects. Naming the paths costs nothing and removes the
+/// question.
+const ROUTE: &str = "/sbin/route";
+const NETSTAT: &str = "/usr/sbin/netstat";
+const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
+const KILLALL: &str = "/usr/bin/killall";
 
 /// The real thing.
 pub struct MacosHost {
@@ -40,12 +54,12 @@ impl HostNetwork for MacosHost {
         // to avoid. Reading the table and matching the literal `default`
         // destination cannot be fooled that way, and it is what wg-quick's
         // darwin.bash does.
-        let output = run_capturing("netstat", &["-rn", "-f", "inet"])?;
+        let output = run_capturing(NETSTAT, &["-rn", "-f", "inet"])?;
         Ok(parse_default_gateway(&output))
     }
 
     fn add_route(&self, route: &Route) -> std::io::Result<()> {
-        run("route", &route_args("add", route))
+        run(ROUTE, &route_args("add", route))
     }
 
     fn delete_route(&self, route: &Route) -> std::io::Result<()> {
@@ -60,7 +74,7 @@ impl HostNetwork for MacosHost {
         // revert, delete the record, and leave the Mac with its default routed
         // into a utun that no longer exists -- the exact failure the record
         // exists to prevent.
-        match run("route", &route_args("delete", route)) {
+        match run(ROUTE, &route_args("delete", route)) {
             Ok(()) => Ok(()),
             Err(e) if is_absent_route(&e.to_string()) => {
                 log::debug!("{route:?} was already gone");
@@ -86,11 +100,8 @@ impl HostNetwork for MacosHost {
         // Both, in this order, which is what Apple's own guidance and every
         // other client does: the cache lives in mDNSResponder, and
         // dscacheutil is the older half that some releases still need.
-        let _ = run("dscacheutil", &["-flushcache".to_string()]);
-        run(
-            "killall",
-            &["-HUP".to_string(), "mDNSResponder".to_string()],
-        )
+        let _ = run(DSCACHEUTIL, &["-flushcache".to_string()]);
+        run(KILLALL, &["-HUP".to_string(), "mDNSResponder".to_string()])
     }
 }
 
