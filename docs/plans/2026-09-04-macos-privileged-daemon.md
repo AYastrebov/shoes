@@ -55,8 +55,8 @@ are behind a trait so the logic lands and is tested before the first live run.
    built for every command — asserted as a vector, with each address
    re-serialised from a parsed `IpAddr`. Prove each test can fail.
 
-4. **The macOS implementation** of that trait. Gateway from a `sysctl`
-   `NET_RT_DUMP` dump, skipping `link#N` pseudo-gateways. Routes through
+4. **The macOS implementation** of that trait. Gateway by parsing
+   `netstat -rn -f inet`, skipping `link#N` pseudo-gateways. Routes through
    `Command` with argv: the `0.0.0.0/1` + `128.0.0.0/1` pair by `-interface`,
    exclusions by `-gateway`, the no-gateway case as `-blackhole` via `127.0.0.1`,
    and `::/1` + `8000::/1` as reject routes. DNS through
@@ -167,7 +167,23 @@ which way it went here, with what was observed.
     default route would otherwise get a v4 host route through a v6 gateway,
     which the kernel rejects with an error that explains nothing; it blackholes
     instead.
-- [ ] 4. macOS implementation of `HostNetwork`
+- [x] 4. macOS implementation of `HostNetwork` (`HEAD`). Fourteen tests over
+  the pure halves — the routing-table parse and the argv for every command —
+  plus three that read the real `SCDynamicStore`. One decision reversed and one
+  test found to be worthless:
+  - **The gateway is read by parsing `netstat -rn`, not a `sysctl NET_RT_DUMP`
+    dump.** The spec chose sysctl to avoid a text round-trip. But walking
+    `rt_msghdr` and its sockaddr array is unsafe code that cannot be tested
+    without root, and the alternative the spec named — `route -n get default`
+    — is actively wrong here: `route get` does a longest-prefix lookup for
+    `0.0.0.0`, so once this daemon installs `0.0.0.0/1` it answers with the
+    tunnel, which is the interface the exclusion exists to avoid. Matching the
+    literal `default` destination in the table cannot be fooled that way, is a
+    pure function with tests, and is what wg-quick does.
+  - The first `link#`-filter test passed with the filter removed: the fixture
+    captured from this machine happens to list the real gateway before the
+    tunnel's row. A second fixture with the order reversed is what actually
+    pins the rule.
 - [ ] 5. Supervisor, service methods, streams
 - [ ] 6. `install`/`uninstall`/`SIGTERM`
 - [ ] 7. Docs, example, release job

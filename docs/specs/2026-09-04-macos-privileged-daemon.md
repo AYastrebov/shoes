@@ -384,11 +384,16 @@ instead, which is recoverable; the loop is not.
 **Finding the gateway, and noticing when it changes.** Two mechanisms for two
 questions, which is the part this kind of code usually gets wrong:
 
-- *What is the gateway?* A `sysctl` routing-table dump (`NET_RT_DUMP`), read
-  fresh each time it is needed. wg-quick parses `netstat -nr -f inet` for the
-  first `default` row whose gateway is not a `link#N` pseudo-gateway; the sysctl
-  is the same table without the text round-trip, and skipping `link#` entries is
-  a rule to keep.
+- *What is the gateway?* The first `default` row of `netstat -rn -f inet`
+  whose gateway is not a `link#N` pseudo-gateway, read fresh each time it is
+  needed. This is what wg-quick does, and both alternatives lose. A `sysctl`
+  `NET_RT_DUMP` dump avoids the text round-trip but means walking `rt_msghdr`
+  and its sockaddr array in unsafe code that cannot be tested without root.
+  And `route -n get default` is actively wrong: `route get` does a
+  longest-prefix lookup for the address `0.0.0.0`, so once this daemon has
+  installed `0.0.0.0/1` it answers with the tunnel — the very interface the
+  exclusion exists to avoid. Matching the literal `default` destination cannot
+  be fooled that way, and the parse is a pure function with tests.
 - *Has it changed?* A `PF_ROUTE` socket, used purely as a signal — the same
   thing `route -n monitor` is underneath. The daemon does not parse the delta; it
   re-reads the table and re-applies the exclusion routes if the gateway differs.
@@ -639,7 +644,8 @@ Steps 1 and 2 are independent and can go in either order; 3 gates 4 and 5.
 | Question | Decision | Why |
 | --- | --- | --- |
 | Interface name: daemon picks, or shoes reports? | shoes reports it, via `StatusSnapshot.device_name` | Picking races with any other utun user; `sc_unit = 0` cannot race |
-| `route` command or `PF_ROUTE` socket? | `sysctl` dump to read the gateway, `PF_ROUTE` only as a change signal | Never parse a routing delta; re-read and re-apply is idempotent |
+| How to read the gateway? | Parse `netstat -rn -f inet`, skipping `link#N` rows | `route get default` returns the tunnel once `0.0.0.0/1` is installed; a `sysctl` dump is untestable unsafe code. Revised during implementation — the spec first chose sysctl |
+| How to notice it changing? | `PF_ROUTE` only as a signal; re-read and re-apply | Never parse a routing delta; a signal plus an idempotent re-read cannot drift |
 | IPv6: leak or drop? | Neither — `::/1` and `8000::/1` as reject routes | Fails fast so Happy Eyeballs falls back at once, instead of waiting out a timeout on a blackhole |
 | `IP_BOUND_IF` instead of exclusion routes? | Not in v1; recorded as the long-term answer | It needs a macOS arm where `socket_util` currently has an unreachable `panic!`, plus plumbing through every outbound constructor. The host route is needed for the gateway anyway |
 | Close `Status::Starting` now? | No | The daemon reports its own `STARTING` — device, routes, DNS, engine spawn — which is the interval a GUI can see. The library's own starting window is the microseconds before `start` returns, and widening `Status` reaches mobile |

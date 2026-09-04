@@ -15,6 +15,9 @@
 mod plan;
 mod state;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[cfg(test)]
 mod double;
 
@@ -68,6 +71,16 @@ pub enum Destination {
     Net { addr: IpAddr, prefix: u8 },
     /// One address.
     Host(IpAddr),
+}
+
+impl Destination {
+    /// Which address family this belongs to, which decides `-inet` against
+    /// `-inet6` and which loopback a blackhole names.
+    pub fn is_ipv6(&self) -> bool {
+        match self {
+            Destination::Net { addr, .. } | Destination::Host(addr) => addr.is_ipv6(),
+        }
+    }
 }
 
 /// One route the daemon installs and must be able to remove again.
