@@ -36,7 +36,11 @@ mod supervisor;
 use std::process::ExitCode;
 
 /// Where the control socket lives. Root-owned, `0660`, group from `--group`.
-const DEFAULT_SOCKET_PATH: &str = "/var/run/shoesd.sock";
+///
+/// In its own directory, which `bind` creates `0750` root:group. That is what
+/// closes the instant between the socket being created and its mode being set
+/// -- reaching a socket needs search permission on every directory above it.
+const DEFAULT_SOCKET_PATH: &str = "/var/run/shoesd/shoesd.sock";
 
 /// Where the revert record lives. Root-only; see `host::AppliedState`.
 const DEFAULT_STATE_PATH: &str = "/var/db/shoesd/applied.json";

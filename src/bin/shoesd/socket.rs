@@ -14,40 +14,88 @@ use std::path::Path;
 /// `--group` named; see `auth`.
 const SOCKET_MODE: u32 = 0o660;
 
+/// And the directory: enter and list for root and that group, nothing for
+/// anyone else. See [`ensure_parent`].
+const SOCKET_DIR_MODE: u32 = 0o750;
+
 /// Bind the control socket at `path` with group `group_gid` and mode 0660.
 ///
 /// The owner is left as the creating process, which in production is root.
 ///
-/// The listener is returned only once the permissions are in place, so a
-/// caller cannot accidentally accept on a world-writable socket.
+/// The listener is returned only once the ownership and mode are in place,
+/// and the socket is never reachable by anyone else even for the instant
+/// before that -- see the umask note below.
 pub fn bind(path: &Path, group_gid: u32) -> std::io::Result<tokio::net::UnixListener> {
     remove_stale(path)?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("could not create {}: {e}", parent.display()),
-            )
-        })?;
-    }
+    ensure_parent(path, group_gid)?;
 
     let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
         std::io::Error::new(e.kind(), format!("could not bind {}: {e}", path.display()))
     })?;
 
-    // Order matters: narrow the mode first, then hand the group its access.
-    // The other way round leaves a window in which the socket is reachable by
-    // the group *and* whatever the umask left open.
+    // `chown` first, `chmod` second, and the order is the point: the group is
+    // given access only once the file is already theirs to reach. Widening the
+    // mode first would hand it to whatever group the socket was created under.
+    set_group(path, group_gid)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE)).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("could not set mode on {}: {e}", path.display()),
         )
     })?;
-    set_group(path, group_gid)?;
 
     Ok(listener)
+}
+
+/// Make sure the socket's directory exists and, where this created it, that
+/// only root and the group can enter it.
+///
+/// This is what closes the window between `bind` and the `chmod` above. `bind`
+/// takes no mode -- the kernel creates the socket with `0777 & ~umask` -- so
+/// for an instant the file exists at whatever the inherited umask allowed, and
+/// a connection made in that instant is queued on this same listener and
+/// survives the mode being corrected.
+///
+/// The obvious fix, narrowing the umask around `bind`, is wrong in this
+/// process: the umask is global to it, and while it is narrowed any other
+/// thread creating a file gets that mode too. The supervisor's record
+/// directory came out `0600` -- no execute, so nothing could be written inside
+/// it -- which is how this was found.
+///
+/// A directory nobody else can traverse closes the same window with no global
+/// state: reaching a socket requires search permission on every directory
+/// above it, so during that instant the only processes that can connect are
+/// the ones already entitled to.
+///
+/// Only a directory this created is tightened. `--socket /tmp/x.sock` must not
+/// silently chmod `/tmp`, and there the umask -- 022 on every runner and login
+/// shell, giving `0755`, which denies the write that `connect` needs -- is
+/// what is left. The shipped default lives in its own directory for exactly
+/// this reason.
+fn ensure_parent(path: &Path, group_gid: u32) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.exists() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(parent).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not create {}: {e}", parent.display()),
+        )
+    })?;
+    set_group(parent, group_gid)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(SOCKET_DIR_MODE)).map_err(
+        |e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not set mode on {}: {e}", parent.display()),
+            )
+        },
+    )
 }
 
 /// Remove a socket file left behind by a crash.
@@ -144,6 +192,51 @@ mod tests {
 
         drop(listener);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The window between `bind` and the `chmod` is closed by the directory,
+    /// not by the socket's own mode -- reaching a socket needs search
+    /// permission on every directory above it.
+    #[tokio::test]
+    async fn bind_creates_a_directory_others_cannot_enter() {
+        let gid = unsafe { libc::getgid() } as u32;
+        let dir = std::env::temp_dir().join(format!("shoesd-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("shoesd.sock");
+
+        let listener = bind(&path, gid).expect("bind creates the directory it needs");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, SOCKET_DIR_MODE, "got {mode:o}");
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "nobody outside the group may even enter it"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that already exists is left exactly as it is.
+    ///
+    /// `--socket /tmp/x.sock` must not silently chmod `/tmp`, which would be a
+    /// root process tightening a directory the whole system shares.
+    #[tokio::test]
+    async fn bind_does_not_touch_a_directory_it_did_not_create() {
+        let gid = unsafe { libc::getgid() } as u32;
+        let dir = std::env::temp_dir().join(format!("shoesd-existing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("shoesd.sock");
+
+        let listener = bind(&path, gid).expect("an existing directory is fine");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "left alone, not tightened: {mode:o}");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A crash leaves the socket file behind, and launchd restarts the daemon
