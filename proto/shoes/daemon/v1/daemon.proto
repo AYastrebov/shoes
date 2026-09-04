@@ -46,9 +46,14 @@ message HelloReply {
 }
 
 message StartRequest {
-  // Verbatim from the client. Its TUN entry still carries `device_fd: 0` as a
-  // stand-in; the daemon replaces that section with its own per-OS device
-  // policy, so the client has no platform branches.
+  // Verbatim from the client. Its TUN entry may carry `device_fd: 0` as a
+  // stand-in, and any `device_name`, `address` or `netmask`: the daemon
+  // replaces that whole section with its own per-OS device policy, so the
+  // client has no platform branches. On macOS that is 10.0.0.2 peer 10.0.0.1,
+  // netmask 255.255.255.0 -- the same values the iOS provider uses.
+  //
+  // `mtu` is the exception and stays the client's: it is a property of the
+  // path rather than of the host.
   //
   // This carries the user's credentials. The daemon never writes it to disk
   // and never logs it.
@@ -57,6 +62,10 @@ message StartRequest {
   // which the client resolves before sending. Each gets a host route via the
   // pre-tunnel default gateway; without them the proxy's own connection
   // routes into the tunnel it is carrying.
+  //
+  // IPv4 only in v1, and an IPv6 address here is INVALID_ARGUMENT rather than
+  // silently ignored: the daemon rejects ::/1 and 8000::/1, so a v6 exclusion
+  // would be unreachable behind a session that otherwise looked healthy.
   repeated string exclude = 2;
   // Resolvers to advertise to the host. Inside the tunnel by design.
   repeated string dns = 3;

@@ -115,7 +115,15 @@ impl DnsStore {
                 // ServerAddresses list is a service configured to have no
                 // resolvers, which resolves nothing. Removing the key is what
                 // hands the question back to DHCP.
-                self.store.remove(key.as_str())
+                //
+                // A key that is not there is success, not failure. `remove`
+                // answers `false` for both, and revert has to be idempotent --
+                // `recover()` re-runs against a record whose revert may
+                // already have partly succeeded. Treating "already gone" as an
+                // error would leave a machine that had no explicit resolvers
+                // permanently unable to start: every retry would fail on the
+                // same absent key.
+                self.store.get(key.as_str()).is_none() || self.store.remove(key.as_str())
             } else {
                 self.store.set(key.as_str(), dns_dictionary(servers))
             };

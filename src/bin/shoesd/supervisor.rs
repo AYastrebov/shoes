@@ -17,10 +17,27 @@ use std::net::IpAddr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use shoes::control::{self, DevicePolicy, ServiceHandle, StopOutcome};
+use shoes::control::{self, DeviceOverride, ServiceHandle, StopOutcome};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::host::{AppliedState, HostNetwork, Plan, Session};
+
+/// The interface this daemon gives the tunnel, whatever the client's document
+/// said.
+///
+/// The client sends one document for every platform, with `device_fd: 0` in
+/// the TUN entry as a stand-in, and the daemon replaces that section -- which
+/// is what keeps platform branching out of the GUI. These are the values the
+/// iOS provider uses, kept identical so a config behaves the same on both.
+///
+/// The MTU is deliberately not overridden: it is a property of the path rather
+/// than of the host, and the client is the one that knows what it wants.
+const DEVICE_POLICY: DeviceOverride = DeviceOverride {
+    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+    netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+    destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
+    mtu: None,
+};
 
 /// How long to wait for the engine to create its device.
 ///
@@ -339,13 +356,28 @@ impl<N: HostNetwork> Inner<N> {
 
         // The engine's runtime, built here so that `prepare` runs on it and
         // `start` takes it. The supervisor thread itself stays synchronous.
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| StartError::Device(format!("could not start a runtime: {e}")))?;
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                // Back to Stopped, like every other failure below. Left in
+                // Starting, the session would refuse every later Start as
+                // AlreadyRunning and report STARTING forever.
+                self.transition(State::Stopped {
+                    reason: StopReason::Requested,
+                });
+                return Err(StartError::Device(format!(
+                    "could not start a runtime: {e}"
+                )));
+            }
+        };
 
         // Every failure a bad config can produce happens here, in front of the
         // caller, with nothing started and nothing applied.
         let prepared = runtime
-            .block_on(control::prepare_from_config(&yaml, DevicePolicy::Owned))
+            .block_on(control::prepare_from_config_owning_device(
+                &yaml,
+                DEVICE_POLICY,
+            ))
             .map_err(|e| {
                 self.transition(State::Stopped {
                     reason: StopReason::Requested,
@@ -382,6 +414,17 @@ impl<N: HostNetwork> Inner<N> {
                 // `apply` has already undone whatever it managed, so the only
                 // thing left holding the machine is the engine.
                 let _ = control::stop_handle(handle);
+
+                // Unless its own revert failed, in which case it deliberately
+                // left the record behind and something is still applied. The
+                // file's presence is the signal -- `apply` clears it when it
+                // unwound cleanly -- and without this the next start would
+                // walk straight past `recover()` and overwrite it on its first
+                // route, destroying the only copy of the host's resolvers.
+                if matches!(AppliedState::load(&self.state_path), Ok(Some(_))) {
+                    self.recovery_pending = true;
+                }
+
                 self.transition(State::Stopped {
                     reason: StopReason::Requested,
                 });
@@ -477,10 +520,12 @@ impl<N: HostNetwork> Inner<N> {
 
     /// Undo the host changes and forget the record.
     fn revert(&mut self, outcome: &StopOutcome) {
+        let mut undone = true;
         if let Some(applied) = self.applied.take()
             && let Err(e) = self.session().revert(&applied)
         {
             log::error!("could not fully undo the session's host configuration: {e}");
+            undone = false;
         }
 
         self.started_at = None;
@@ -488,14 +533,28 @@ impl<N: HostNetwork> Inner<N> {
         self.exclude = Vec::new();
         self.dns = Vec::new();
 
-        // A stop that timed out has not been confirmed to release the device,
-        // so the record stays: a start after this one must still know there
-        // may be something to undo. `StopOutcome` exists to force exactly this
-        // decision rather than let it be discarded.
-        if outcome.device_released()
-            && let Err(e) = AppliedState::clear(&self.state_path)
-        {
+        // The record is forgotten only when there is nothing left for it to
+        // describe. Two ways there can be:
+        //
+        // - the revert itself failed, so some of it is still applied. Deleting
+        //   the record then is the worst outcome in this design: routes into a
+        //   utun that is about to disappear, and nothing on disk for the next
+        //   start to undo them from. `delete_route` propagates a real failure
+        //   precisely so this branch can see it.
+        // - the stop timed out, so the engine never confirmed it released the
+        //   device. `StopOutcome` exists to force this decision rather than
+        //   let it be discarded.
+        //
+        // Either way the next start has to finish the job before it may
+        // overwrite the record, which is what `recovery_pending` enforces.
+        if !undone || !outcome.device_released() {
+            self.recovery_pending = true;
+            return;
+        }
+
+        if let Err(e) = AppliedState::clear(&self.state_path) {
             log::warn!("could not remove {}: {e}", self.state_path.display());
+            self.recovery_pending = true;
         }
     }
 
@@ -547,8 +606,8 @@ impl<N: HostNetwork> Inner<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::DnsBackup;
     use crate::host::double::Recorder;
+    use crate::host::{DnsBackup, Route, Via};
 
     /// The supervisor over a double, with no engine: enough to pin the state
     /// machine and the refusals, which is what the gRPC layer switches on.
@@ -853,6 +912,135 @@ mod tests {
             matches!(unblocked, Err(StartError::Config(_))),
             "got {unblocked:?}"
         );
+    }
+
+    /// A revert that failed must keep the record, not delete it.
+    ///
+    /// This is the worst outcome the design has: routes still pointing into a
+    /// utun that is about to disappear, and nothing on disk for the next start
+    /// to undo them from. `delete_route` propagates a real failure -- as
+    /// opposed to "not in table" -- precisely so this branch can see it.
+    #[test]
+    fn a_failed_revert_keeps_the_record_and_blocks_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.json");
+        let (commands, _rx) = mpsc::channel();
+        let (transitions, _) = broadcast::channel(8);
+
+        let applied = AppliedState {
+            interface: Some("utun4".into()),
+            routes: vec![Route::net(
+                "0.0.0.0".parse().unwrap(),
+                1,
+                Via::Interface("utun4".into()),
+            )],
+            dns: None,
+        };
+        applied.save(&path).unwrap();
+
+        let mut inner = Inner {
+            net: Recorder::new().failing_delete_route(),
+            state_path: path.clone(),
+            exit_channel: commands,
+            transitions,
+            handle: None,
+            applied: Some(applied),
+            state: State::Running,
+            started_at: None,
+            interface: Some("utun4".into()),
+            exclude: Vec::new(),
+            dns: Vec::new(),
+            recovery_pending: false,
+        };
+
+        inner.revert(&StopOutcome::Released);
+
+        assert!(
+            path.exists(),
+            "the record must survive a revert that could not finish"
+        );
+        assert!(
+            inner.recovery_pending,
+            "and the next start must finish the job before overwriting it"
+        );
+    }
+
+    /// A stop that timed out is the same shape: the engine never confirmed it
+    /// released the device, so the record stays.
+    #[test]
+    fn a_timed_out_stop_keeps_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.json");
+        let (commands, _rx) = mpsc::channel();
+        let (transitions, _) = broadcast::channel(8);
+
+        AppliedState {
+            interface: Some("utun4".into()),
+            routes: Vec::new(),
+            dns: None,
+        }
+        .save(&path)
+        .unwrap();
+
+        let mut inner = Inner {
+            net: Recorder::new(),
+            state_path: path.clone(),
+            exit_channel: commands,
+            transitions,
+            handle: None,
+            applied: None,
+            state: State::Running,
+            started_at: None,
+            interface: None,
+            exclude: Vec::new(),
+            dns: Vec::new(),
+            recovery_pending: false,
+        };
+
+        inner.revert(&StopOutcome::TimedOut {
+            waited: Duration::from_secs(5),
+        });
+
+        assert!(path.exists());
+        assert!(inner.recovery_pending);
+    }
+
+    /// And a clean revert does forget it, or the daemon would refuse to start
+    /// after every successful stop.
+    #[test]
+    fn a_clean_revert_forgets_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.json");
+        let (commands, _rx) = mpsc::channel();
+        let (transitions, _) = broadcast::channel(8);
+
+        AppliedState {
+            interface: Some("utun4".into()),
+            routes: Vec::new(),
+            dns: None,
+        }
+        .save(&path)
+        .unwrap();
+
+        let mut inner = Inner {
+            net: Recorder::new(),
+            state_path: path.clone(),
+            exit_channel: commands,
+            transitions,
+            handle: None,
+            applied: None,
+            state: State::Running,
+            started_at: None,
+            interface: None,
+            exclude: Vec::new(),
+            dns: Vec::new(),
+            recovery_pending: false,
+        };
+
+        inner.revert(&StopOutcome::Released);
+
+        assert!(!path.exists());
+        assert!(!inner.recovery_pending);
     }
 
     /// The record from a previous run is undone before the supervisor accepts
