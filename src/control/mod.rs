@@ -456,7 +456,7 @@ pub async fn prepare_from_config(
     config_yaml: &str,
     policy: DevicePolicy,
 ) -> std::io::Result<PreparedService> {
-    prepare_configs(config_yaml, policy, None).await
+    prepare_configs(config_yaml, policy, None, None).await
 }
 
 /// [`prepare_from_config`] under [`DevicePolicy::BorrowedFd`], with the
@@ -472,13 +472,49 @@ pub async fn prepare_from_config_with_fd(
     config_yaml: &str,
     device_fd: i32,
 ) -> std::io::Result<PreparedService> {
-    prepare_configs(config_yaml, DevicePolicy::BorrowedFd, Some(device_fd)).await
+    prepare_configs(config_yaml, DevicePolicy::BorrowedFd, Some(device_fd), None).await
+}
+
+/// The device fields a host that creates its own device imposes on whatever
+/// config it was handed.
+///
+/// The mirror of [`prepare_from_config_with_fd`], for the other kind of host.
+/// A GUI generates one document for every platform and cannot know what a
+/// privileged helper will do with the interface -- the daemon addresses
+/// `10.0.0.2` peer `10.0.0.1` on macOS, a Linux one may not -- so the host
+/// replaces that section rather than asking the client to guess it. The
+/// generator writes `device_fd: 0` as a stand-in, and this is what makes that
+/// stand-in true.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceOverride {
+    pub address: std::net::IpAddr,
+    pub netmask: std::net::IpAddr,
+    /// The point-to-point peer. `None` leaves whatever the document said.
+    pub destination: Option<std::net::IpAddr>,
+    /// `None` leaves the document's MTU, which is where a client's own
+    /// preference belongs.
+    pub mtu: Option<u16>,
+}
+
+/// [`prepare_from_config`] under [`DevicePolicy::Owned`], with the device
+/// section replaced by the host's own policy.
+///
+/// The descriptor and the device name are cleared: a document written for a
+/// host that is handed a descriptor carries one, and it is meaningless here --
+/// refusing it would make every client maintain a per-platform document, which
+/// is the branching this exists to remove.
+pub async fn prepare_from_config_owning_device(
+    config_yaml: &str,
+    device: DeviceOverride,
+) -> std::io::Result<PreparedService> {
+    prepare_configs(config_yaml, DevicePolicy::Owned, None, Some(device)).await
 }
 
 async fn prepare_configs(
     config_yaml: &str,
     policy: DevicePolicy,
     device_fd: Option<i32>,
+    device: Option<DeviceOverride>,
 ) -> std::io::Result<PreparedService> {
     info!("Parsing config for TUN server");
 
@@ -516,6 +552,21 @@ async fn prepare_configs(
                 // an error, and the parameter is how this host supplies it.
                 if let Some(fd) = device_fd {
                     tc.device_fd = Some(fd);
+                }
+                // Likewise, and in the other direction: a host that creates
+                // the device owns this section, so whatever the document said
+                // about it is replaced rather than validated.
+                if let Some(device) = device {
+                    tc.device_fd = None;
+                    tc.device_name = None;
+                    tc.address = Some(device.address);
+                    tc.netmask = Some(device.netmask);
+                    if let Some(destination) = device.destination {
+                        tc.destination = Some(destination);
+                    }
+                    if let Some(mtu) = device.mtu {
+                        tc.mtu = mtu;
+                    }
                 }
                 device::validate(&tc, policy)?;
                 // unwrap_or(-1) rather than {:?} on the Option: an Owned host
@@ -706,6 +757,61 @@ mod tests {
     fn prepare(yaml: &str) -> std::io::Result<PreparedService> {
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         current_thread_runtime().block_on(prepare_from_config(yaml, DevicePolicy::BorrowedFd))
+    }
+
+    /// The shape the consumer's brief specifies, and the one the proto tells
+    /// vendoring clients to send: a document carrying `device_fd: 0` as a
+    /// stand-in, which a host that creates its own device replaces.
+    ///
+    /// Without the override this is rejected outright -- `DevicePolicy::Owned`
+    /// refuses a config that sets `device_fd` -- so a client written against
+    /// the published contract got `INVALID_ARGUMENT` on every start.
+    #[test]
+    fn a_host_that_owns_the_device_replaces_the_documents_section() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let prepared = current_thread_runtime()
+            .block_on(prepare_from_config_owning_device(
+                "---\n- device_fd: 0\n  device_name: tun0\n  mtu: 1400\n",
+                DeviceOverride {
+                    address: "10.0.0.2".parse().unwrap(),
+                    netmask: "255.255.255.0".parse().unwrap(),
+                    destination: Some("10.0.0.1".parse().unwrap()),
+                    mtu: None,
+                },
+            ))
+            .expect("the stand-in descriptor is replaced, not refused");
+
+        let tun = &prepared.tun_config;
+        assert_eq!(tun.device_fd, None, "the stand-in is cleared");
+        assert_eq!(
+            tun.device_name, None,
+            "and the name, which means nothing to a host that lets the kernel pick"
+        );
+        assert_eq!(tun.address, Some("10.0.0.2".parse().unwrap()));
+        assert_eq!(tun.netmask, Some("255.255.255.0".parse().unwrap()));
+        assert_eq!(tun.destination, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(
+            tun.mtu, 1400,
+            "an MTU the host did not override stays the client's"
+        );
+    }
+
+    /// And the host may impose an MTU when it has a reason to.
+    #[test]
+    fn a_device_override_can_take_the_mtu_too() {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let prepared = current_thread_runtime()
+            .block_on(prepare_from_config_owning_device(
+                "---\n- device_fd: 0\n  mtu: 1400\n",
+                DeviceOverride {
+                    address: "10.0.0.2".parse().unwrap(),
+                    netmask: "255.255.255.0".parse().unwrap(),
+                    destination: None,
+                    mtu: Some(1280),
+                },
+            ))
+            .expect("prepared");
+        assert_eq!(prepared.tun_config.mtu, 1280);
     }
 
     /// A config with no TUN section must fail before anything is spawned, so

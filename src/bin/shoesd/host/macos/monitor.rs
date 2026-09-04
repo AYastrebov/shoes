@@ -57,7 +57,16 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
 
                 if read < 0 {
                     let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
+                    if recoverable(&error) {
+                        // Notably ENOBUFS. This thread sleeps for over two
+                        // seconds per event without reading, so a burst on a
+                        // busy network overflows the socket buffer -- and
+                        // treating that as fatal would end the monitor after
+                        // the first Wi-Fi-to-Ethernet move, which is the exact
+                        // event it exists for. The messages are lost either
+                        // way and it does not matter: nothing here parses
+                        // them, and the re-apply that follows re-reads the
+                        // table.
                         continue;
                     }
                     // The socket is gone and reopening it is the job of the
@@ -87,6 +96,16 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
         })?;
 
     Ok(())
+}
+
+/// Whether a read error is one to carry on from.
+///
+/// `ENOBUFS` has no `ErrorKind` of its own, so it is matched by errno.
+fn recoverable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    ) || error.raw_os_error() == Some(libc::ENOBUFS)
 }
 
 /// Read and discard whatever is queued, without blocking.

@@ -176,6 +176,43 @@ The consumer reviewed at `7404581` and accepted the contract. Four findings.
 - **Every tool is named by absolute path.** `shoesd install` and `shoesd run`
   under `sudo` inherit the invoker's `PATH`.
 
+## Second review pass, addressed
+
+A `/code-review high` over the branch found ten. One was already fixed
+(`clear_device_name`, `d3c950f`); two were wrong (`crate::config::tun` resolves
+through `pub use types::*`, which CI proves on five runners). The rest:
+
+- **The revert record was deleted even when the revert failed** — clearing was
+  gated on `StopOutcome::device_released()` alone, contradicting the invariant
+  `delete_route`'s own comment states. A `route delete` blocked by EPERM would
+  have erased the only record of routes still pointing into a utun about to
+  disappear. Now the record survives, and `recovery_pending` blocks the next
+  start until it can be finished.
+- **A failed `apply` whose own revert also failed left an orphan record** that
+  the next start would overwrite on its first route, destroying the DNS backup.
+  The file's presence after a failed apply is now the signal to set
+  `recovery_pending`.
+- **The daemon never owned the TUN section**, though the consumer's brief
+  requires it and the proto promised it: a client sending `device_fd: 0` as the
+  documented stand-in got `INVALID_ARGUMENT` on every `Start`. Added
+  `control::prepare_from_config_owning_device`, mirroring the existing
+  `_with_fd` entry point for the other kind of host.
+- **`WatchStats` leaked a task per connection** opened against an idle daemon:
+  the only thing that observed a closed channel was a send the not-running
+  branch skips.
+- **Restoring "no resolvers" was not idempotent** — `SCDynamicStore::remove`
+  answers `false` for an absent key as well as a failure, which would have left
+  a DHCP machine permanently unable to start after a partial revert.
+- **An IPv6 exclusion was silently blackholed**, since the gateway lookup reads
+  `-f inet` only. Refused at `Start` instead; carrying v6 is what would change
+  that.
+- **A `Runtime::new()` failure wedged the state machine in `Starting`**, so
+  every later `Start` answered `ALREADY_EXISTS`.
+- **The route monitor died permanently on `ENOBUFS`**, which is exactly what a
+  burst produces while it sleeps between its two looks.
+- **`install`/`uninstall` exited 0 in silence**, because only `run` installs a
+  logger.
+
 ## Status
 
 - [x] 1. IPC stack answering on the socket, peer check enforced (`HEAD`).

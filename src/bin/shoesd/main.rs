@@ -132,17 +132,23 @@ fn main() -> ExitCode {
         // it writes into the plist -- the job launchd starts must be the one
         // the operator asked for.
         Some("install") => match parse_run_args(&args[1..]) {
-            Ok(run) => report(install::install(
-                &run.socket_path,
-                &run.state_path,
-                &run.group,
-            )),
+            Ok(run) => report(
+                &format!(
+                    "installed {} and bootstrapped {}",
+                    install::INSTALLED_BINARY,
+                    install::LABEL
+                ),
+                install::install(&run.socket_path, &run.state_path, &run.group),
+            ),
             Err(e) => {
                 eprintln!("shoesd: {e}\n\n{}", usage());
                 ExitCode::FAILURE
             }
         },
-        Some("uninstall") => report(install::uninstall()),
+        Some("uninstall") => report(
+            &format!("removed {} and its job", install::INSTALLED_BINARY),
+            install::uninstall(),
+        ),
         Some("-V" | "--version") => {
             println!("shoesd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -154,9 +160,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn report(result: std::io::Result<()>) -> ExitCode {
+fn report(what: &str, result: std::io::Result<()>) -> ExitCode {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        // Said out loud. Only `run` installs a logger, so the `log::info!`
+        // lines inside install/uninstall reach nothing, and a command that
+        // printed only on failure would exit 0 in silence -- which reads as
+        // "nothing happened" for the two subcommands a person runs by hand and
+        // watches.
+        Ok(()) => {
+            println!("shoesd: {what}");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("shoesd: {e}");
             ExitCode::FAILURE

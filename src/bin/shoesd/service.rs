@@ -88,6 +88,7 @@ impl Daemon for DaemonService {
         // A name is refused rather than resolved -- that lookup's answer would
         // decide what bypasses the tunnel.
         let exclude = parse_addresses(&request.exclude, "exclude")?;
+        refuse_ipv6(&exclude, "exclude")?;
         let dns = parse_addresses(&request.dns, "dns")?;
 
         let supervisor = self.supervisor.clone();
@@ -200,7 +201,17 @@ impl Daemon for DaemonService {
                 // Only while running. Counters from a stopped session are the
                 // last one's totals against no uptime, which a client would
                 // draw as a flat line rather than as nothing.
+                //
+                // Checked explicitly rather than left to the next `send`: a
+                // client that opens this against an idle daemon and then
+                // disconnects would otherwise never be noticed, because the
+                // only thing that observes a closed channel is a send this
+                // branch skips. One task per such connection, ticking for the
+                // life of the process.
                 if status.state != State::Running {
+                    if tx.is_closed() {
+                        return;
+                    }
                     continue;
                 }
 
@@ -338,6 +349,25 @@ fn parse_addresses(values: &[String], field: &str) -> Result<Vec<IpAddr>, Status
             })
         })
         .collect()
+}
+
+/// Refuse an IPv6 address where the daemon cannot carry one.
+///
+/// v1 has no IPv6 inside the tunnel and installs `::/1` and `8000::/1` as
+/// reject routes. An excluded v6 address would need a v6 gateway to escape
+/// past them, and the gateway lookup reads `netstat -rn -f inet` -- so it
+/// would be blackholed instead, and the session would come up with a proxy it
+/// cannot reach and no error to say why. Refusing at the door is the honest
+/// answer until v6 is carried.
+fn refuse_ipv6(addresses: &[IpAddr], field: &str) -> Result<(), Status> {
+    if let Some(address) = addresses.iter().find(|address| address.is_ipv6()) {
+        return Err(Status::invalid_argument(format!(
+            "{field}: {address} is IPv6, which this daemon does not carry in v1 -- \
+             it installs ::/1 and 8000::/1 as reject routes, so an excluded v6 \
+             address would be unreachable rather than bypassed"
+        )));
+    }
+    Ok(())
 }
 
 fn to_proto_status(status: crate::supervisor::Status) -> proto::Status {
@@ -551,6 +581,36 @@ mod tests {
             "the message names it: {}",
             status.message()
         );
+    }
+
+    /// A v6 exclusion is refused rather than silently blackholed.
+    ///
+    /// The gateway lookup reads `netstat -rn -f inet`, so it can only return a
+    /// v4 address; a v6 exclusion would fail the family check and be
+    /// blackholed, and with `::/1` and `8000::/1` rejected the proxy would be
+    /// unreachable. The session would come up looking healthy and carrying
+    /// nothing.
+    #[test]
+    fn an_ipv6_exclusion_is_refused_rather_than_blackholed() {
+        let status = refuse_ipv6(&["2001:db8::1".parse().unwrap()], "exclude")
+            .expect_err("v6 is not carried in v1");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("2001:db8::1"),
+            "the message names it: {}",
+            status.message()
+        );
+
+        refuse_ipv6(&["203.0.113.7".parse().unwrap()], "exclude").expect("v4 is fine");
+    }
+
+    /// `dns` is not subject to that rule: resolvers live *inside* the tunnel,
+    /// which carries v4, and their addresses are advertised rather than
+    /// routed around it.
+    #[test]
+    fn a_v6_resolver_is_not_refused() {
+        let parsed = parse_addresses(&["2001:db8::1".to_string()], "dns").expect("parses");
+        assert_eq!(parsed.len(), 1);
     }
 
     #[test]
