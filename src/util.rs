@@ -46,24 +46,6 @@ pub async fn write_all<T: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Seconds, not milliseconds. Protocols compare this against a peer's
-    /// stamp within a window of tens of seconds, so the wrong unit would put
-    /// every handshake outside it - and the unit is invisible in a u64.
-    #[test]
-    fn test_unix_time_secs_is_in_seconds() {
-        let now = unix_time_secs().expect("this machine's clock is after 1970");
-        // 2020-01-01 and 2100-01-01.
-        assert!(
-            (1_577_836_800..4_102_444_800).contains(&now),
-            "{now} is not a plausible time in seconds"
-        );
-    }
-}
-
 /// smoltcp time from the monotonic clock.
 ///
 /// `smoltcp::time::Instant::now()` reads the wall clock, and both virtual
@@ -150,3 +132,21 @@ pub fn connection_end_level(e: &std::io::Error) -> log::Level {
 /// RLIMIT_NOFILE in aggregate. A process-wide budget derived from the
 /// rlimit is the recorded follow-up in the roadmap.
 pub const MAX_INFLIGHT_PER_LISTENER: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seconds, not milliseconds. Protocols compare this against a peer's
+    /// stamp within a window of tens of seconds, so the wrong unit would put
+    /// every handshake outside it - and the unit is invisible in a u64.
+    #[test]
+    fn test_unix_time_secs_is_in_seconds() {
+        let now = unix_time_secs().expect("this machine's clock is after 1970");
+        // 2020-01-01 and 2100-01-01.
+        assert!(
+            (1_577_836_800..4_102_444_800).contains(&now),
+            "{now} is not a plausible time in seconds"
+        );
+    }
+}
