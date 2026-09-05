@@ -514,8 +514,9 @@ fn check_file_service(service: &str, path: &Path) -> std::io::Result<()> {
     let expected = format!("{FILE_SENTINEL_PREFIX}{}", path.display());
     if service != expected {
         return Err(std::io::Error::other(format!(
-            "the recorded DNS service {service:?} was not written by the {} backend, so \
-             it says nothing about what {expected:?} should contain",
+            "the recorded DNS service {service:?} was not written by the resolv.conf \
+             backend, which records {expected:?} -- so it says nothing about what {} \
+             should contain",
             path.display()
         )));
     }
@@ -627,6 +628,19 @@ fn replace_with_regular_file(path: &Path, contents: &str) -> std::io::Result<()>
         && metadata.file_type().is_file()
         && std::fs::read_to_string(path).is_ok_and(|current| current == contents)
     {
+        // The bytes are right; the mode still has to be. Skipping this would
+        // leave a `/etc/resolv.conf` that another writer, or an earlier run
+        // under a restrictive umask, left at 0600 -- unreadable to every
+        // non-root resolver on the machine, and invisible here precisely
+        // because the contents already match.
+        //
+        // Fixed in place rather than by falling through to the rewrite below:
+        // a rename would be seen by this backend's own watcher and start the
+        // feedback loop this early return exists to prevent. `set_permissions`
+        // is not a directory change and wakes nothing.
+        if metadata.permissions().mode() & 0o777 != RESOLV_CONF_MODE {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(RESOLV_CONF_MODE))?;
+        }
         return Ok(());
     }
 
@@ -1425,6 +1439,49 @@ Link 5 (tailscale0): ~. tailf8307c.ts.net
         // And a real change still lands.
         write_file_state(&path, &DnsState::servers(&[ip("10.0.0.2")])).unwrap();
         assert_ne!(fs::metadata(&path).unwrap().ino(), first);
+    }
+
+    /// The mode is repaired even when the contents already match.
+    ///
+    /// The two guards in `replace_with_regular_file` interact, and this is
+    /// where they meet. The early return exists to break the watcher feedback
+    /// loop, so it must not rename -- but skipping the whole function also
+    /// skips enforcing the mode, and a `/etc/resolv.conf` left at 0600 by
+    /// another writer or by an earlier run under a restrictive umask is
+    /// unreadable to every non-root resolver on the machine. Invisible from the
+    /// contents, which are exactly right.
+    ///
+    /// So the mode is repaired in place, without a rename, which wakes no
+    /// watcher. Both halves are asserted: falling through to the rewrite would
+    /// fix the mode and bring the loop back. Reported by Copilot on PR #21.
+    #[test]
+    fn a_wrong_mode_is_repaired_even_when_the_contents_already_match() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        let wanted = DnsState::servers(&[ip("10.0.0.1")]);
+
+        write_file_state(&path, &wanted).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        // Somebody else tightens it, leaving the contents alone.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_file_state(&path, &wanted).unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o644,
+            "the mode is repaired"
+        );
+        assert_eq!(
+            after.ino(),
+            inode,
+            "and repaired in place -- a rename here would wake this backend's own watcher"
+        );
     }
 
     /// The exception the guard must not swallow: replacing a *symlink* with a
