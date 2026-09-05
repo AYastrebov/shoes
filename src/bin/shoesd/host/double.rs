@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::net::IpAddr;
 
-use super::{HostNetwork, Route};
+use super::{DnsState, HostNetwork, Route};
 
 /// One thing the daemon asked the host to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum Step {
     Gateway,
     AddRoute(Route),
     DeleteRoute(Route),
-    PrimaryService,
+    PrimaryService(String),
     ReadDns(String),
     WriteDns(String, Vec<IpAddr>),
     FlushDns,
@@ -162,24 +162,24 @@ impl HostNetwork for Recorder {
         Ok(())
     }
 
-    fn primary_dns_service(&self) -> std::io::Result<String> {
-        self.record(Step::PrimaryService);
+    fn primary_dns_service(&self, interface: &str) -> std::io::Result<String> {
+        self.record(Step::PrimaryService(interface.to_string()));
         Ok("primary".to_string())
     }
 
-    fn read_dns(&self, service: &str) -> std::io::Result<Vec<IpAddr>> {
+    fn read_dns(&self, service: &str) -> std::io::Result<DnsState> {
         self.record(Step::ReadDns(service.to_string()));
-        Ok(self.existing_dns.clone())
+        Ok(DnsState::servers(&self.existing_dns))
     }
 
-    fn write_dns(&self, service: &str, servers: &[IpAddr]) -> std::io::Result<()> {
+    fn write_dns(&self, service: &str, state: &DnsState) -> std::io::Result<()> {
         if self
             .fail_write_dns_now
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(std::io::Error::other("write_dns refused by the test"));
         }
-        self.record(Step::WriteDns(service.to_string(), servers.to_vec()));
+        self.record(Step::WriteDns(service.to_string(), state.servers.clone()));
         Ok(())
     }
 

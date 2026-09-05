@@ -21,7 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use super::state::{AppliedState, DnsBackup};
-use super::{Destination, HostNetwork, Route, Via};
+use super::{Destination, DnsState, HostNetwork, Route, Via};
 
 /// What a session wants done to the host.
 #[derive(Debug, Clone)]
@@ -125,7 +125,7 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         }
 
         if !plan.dns.is_empty() {
-            self.apply_dns(&plan.dns, state)?;
+            self.apply_dns(&plan.interface, &plan.dns, state)?;
         }
 
         Ok(())
@@ -192,7 +192,7 @@ impl<'a, N: HostNetwork> Session<'a, N> {
             && !dns.is_empty()
         {
             let service = backup.service.clone();
-            self.net.write_dns(&service, dns)?;
+            self.net.write_dns(&service, &DnsState::servers(dns))?;
             self.net.flush_dns_cache()?;
         }
 
@@ -211,19 +211,24 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         self.net.add_route(&route)
     }
 
-    fn apply_dns(&self, servers: &[IpAddr], state: &mut AppliedState) -> std::io::Result<()> {
-        let service = self.net.primary_dns_service()?;
+    fn apply_dns(
+        &self,
+        interface: &str,
+        servers: &[IpAddr],
+        state: &mut AppliedState,
+    ) -> std::io::Result<()> {
+        let service = self.net.primary_dns_service(interface)?;
         let previous = self.net.read_dns(&service)?;
 
         // Recorded before the write, and only after the read: a backup written
         // any earlier would not know what to restore.
         state.dns = Some(DnsBackup {
             service: service.clone(),
-            servers: previous,
+            state: previous,
         });
         state.save(&self.state_path)?;
 
-        self.net.write_dns(&service, servers)?;
+        self.net.write_dns(&service, &DnsState::servers(servers))?;
         self.net.flush_dns_cache()
     }
 
@@ -236,7 +241,7 @@ impl<'a, N: HostNetwork> Session<'a, N> {
 
         // DNS first, because it went on last.
         if let Some(backup) = &state.dns {
-            if let Err(e) = self.net.write_dns(&backup.service, &backup.servers) {
+            if let Err(e) = self.net.write_dns(&backup.service, &backup.state) {
                 failures.push(format!("restoring DNS on {}: {e}", backup.service));
             }
             if let Err(e) = self.net.flush_dns_cache() {
@@ -370,7 +375,7 @@ mod tests {
                 )),
                 Step::AddRoute(Route::net(ip("::"), 1, Via::Reject)),
                 Step::AddRoute(Route::net(ip("8000::"), 1, Via::Reject)),
-                Step::PrimaryService,
+                Step::PrimaryService("utun4".into()),
                 Step::ReadDns("primary".into()),
                 Step::WriteDns("primary".into(), vec![ip("10.0.0.1")]),
                 Step::FlushDns,
@@ -551,7 +556,7 @@ mod tests {
             routes: vec![Route::net(ip("0.0.0.0"), 1, Via::Interface("utun4".into()))],
             dns: Some(DnsBackup {
                 service: "primary".into(),
-                servers: vec![ip("192.168.1.1")],
+                state: DnsState::servers(&[ip("192.168.1.1")]),
             }),
         };
         left_behind.save(&path).unwrap();
@@ -763,7 +768,7 @@ mod tests {
 
         let state = session.apply(&plan()).unwrap();
         assert_eq!(
-            state.dns.as_ref().map(|d| d.servers.clone()),
+            state.dns.as_ref().map(|d| d.state.servers.clone()),
             Some(existing.clone()),
             "the backup holds what the host had before"
         );

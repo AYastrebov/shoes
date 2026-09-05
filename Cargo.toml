@@ -62,18 +62,24 @@ desktop = ["control-logs", "control-stats"]
 # ShoesPacketTunnelProvider and the desktop binary, and only the first is
 # under a cap. scripts/build-apple.sh sets this; no desktop build does.
 network-extension = []
-# The macOS privileged daemon (`shoesd`), its gRPC stack and its generated
+# The privileged desktop daemon (`shoesd`), its gRPC stack and its generated
 # protocol code. Off by default and additive: a library consumer, the CLI and
-# both mobile artifacts pay nothing for it, and no other platform can build it
-# at all -- the dependencies live under a macOS target section, and the arms
-# that touch routes and DNS are macOS-only.
+# both mobile artifacts pay nothing for it, and a platform with no `HostNetwork`
+# arm cannot build it at all -- `main.rs` refuses with a message rather than a
+# pile of unresolved crates.
+#
+# `dep:system-configuration` and `dep:core-foundation` name dependencies
+# declared only under a macOS target section. That is legal and deliberate:
+# enabling a target-specific optional dependency from a portable feature is a
+# no-op off that target, which is what lets one feature name serve both hosts.
 #
 # Separate from `desktop` even though the daemon always implies it, because
 # `desktop` is about what the engine keeps in memory and this is about what
 # the process is. A Tauri host wanting the log stream should not have to
 # compile tonic.
 #
-# See docs/specs/2026-09-04-macos-privileged-daemon.md.
+# See docs/specs/2026-09-04-macos-privileged-daemon.md and
+# docs/specs/2026-09-04-linux-privileged-daemon.md.
 daemon = [
     "desktop",
     "dep:tonic",
@@ -184,12 +190,16 @@ tokio-rustls = "*"
 [target.'cfg(unix)'.dependencies]
 tun = { version = "*", features = ["async"] }
 
-# The daemon's gRPC stack. Optional and macOS-only, so nothing else resolves
-# them -- see the `daemon` feature. Pinned to a major rather than "*": tonic's
-# server API moved across 0.13 and 0.14 (the codec split into `tonic-prost`,
-# and `UdsConnectInfo::peer_addr` gained an Arc), and a silent jump would land
-# in the peer-credential check, which is the daemon's whole authentication.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The daemon's gRPC stack. Optional, and gated to the platforms that have a
+# `HostNetwork` arm rather than to macOS -- these five are portable, and the
+# only reason they sat under a macOS section was that macOS was the only host.
+# Nothing else resolves them; see the `daemon` feature.
+#
+# Pinned to a major rather than "*": tonic's server API moved across 0.13 and
+# 0.14 (the codec split into `tonic-prost`, and `UdsConnectInfo::peer_addr`
+# gained an Arc), and a silent jump would land in the peer-credential check,
+# which is the daemon's whole authentication.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 tonic = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
@@ -199,11 +209,15 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 # The revert state file. JSON rather than the YAML this crate already parses:
 # it is written by a program and read by a program, never edited by hand, and
 # a crash-recovery record wants the format with the fewest ways to be
-# ambiguous.
+# ambiguous. Also what parses `ip -j route show default` on Linux.
 serde_json = { version = "*", optional = true }
-# DNS through SCDynamicStore, Mullvad's bindings. Not `networksetup`, which
-# addresses a service by display name and has been broken that way since macOS
-# 14.3 (libnyanpasu/nyanpasu-service#26); SCDynamicStore addresses it by id.
+
+# The two that genuinely are macOS-only: DNS through SCDynamicStore, Mullvad's
+# bindings. Not `networksetup`, which addresses a service by display name and
+# has been broken that way since macOS 14.3 (libnyanpasu/nyanpasu-service#26);
+# SCDynamicStore addresses it by id. Linux needs no counterpart here -- its DNS
+# backends are `resolvectl` and a file, both reached with argv.
+[target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = { version = "0.8", optional = true }
 core-foundation = { version = "0.10", optional = true }
 
@@ -211,7 +225,7 @@ core-foundation = { version = "0.10", optional = true }
 # socket. tonic's client takes a URI, so reaching a socket path means handing
 # it a connector, and `service_fn` is how that is expressed. Already in the
 # graph via tonic; this makes it nameable.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]

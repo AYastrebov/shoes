@@ -14,12 +14,11 @@
 //! cost is that the file can describe a change that never happened. That is
 //! the safe direction, and it is why every revert step has to be idempotent.
 
-use std::net::IpAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::Route;
+use super::{DnsState, Route};
 
 /// What was applied, in the order it was applied.
 ///
@@ -48,9 +47,16 @@ pub struct DnsBackup {
     /// is what moving from Wi-Fi to Ethernet does -- and restoring to whatever
     /// is primary *then* would write one service's resolvers onto another.
     pub service: String,
-    /// What was there. Empty means the service had none configured, and
-    /// restoring empty is how it gets back to that.
-    pub servers: Vec<IpAddr>,
+    /// What was there, and anything else putting it back needs.
+    ///
+    /// Flattened, so the record on disk is `{ service, servers }` exactly as
+    /// it was before `symlink_target` existed -- a field with a default that
+    /// serialises away when absent, rather than a nested object that would
+    /// make every record written by an older build unreadable. `load` reports
+    /// a parse failure rather than ignoring one, so that is not a cosmetic
+    /// concern.
+    #[serde(flatten)]
+    pub state: DnsState,
 }
 
 impl AppliedState {
@@ -127,7 +133,8 @@ impl AppliedState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{Via, route_for_test};
+    use crate::host::{DnsState, Via, route_for_test};
+    use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -142,7 +149,7 @@ mod tests {
             ],
             dns: Some(DnsBackup {
                 service: "ABC-123".to_string(),
-                servers: vec![ip("192.168.1.1")],
+                state: DnsState::servers(&[ip("192.168.1.1")]),
             }),
         }
     }
