@@ -283,18 +283,12 @@ do it in this order, and the reason step 8 is nine items rather than five.
 
 ## Open decisions, to be settled before step 7 ships
 
-**The arm64 asset name conflicts with the repository's own convention.** KVN's
-brief and design both name `shoesd-linux-aarch64.tar.gz`, and their
-`DownloadShoesAssetTask` fetches by asset name and verifies the published
-SHA-256 — so the string has to be exactly right or their build breaks. But
-`build.yml`'s matrix calls that leg `linux-arm64`, the macOS daemon artifact is
-`shoesd-macos-arm64.tar.gz`, and KVN already consumes *that* name happily.
-Following the existing pattern gives `shoesd-linux-arm64.tar.gz`.
-
-Recommendation: `linux-arm64`, for consistency with the macOS artifact the same
-Gradle task already fetches, and confirm it with KVN before the release job
-lands. Whichever way it goes, one string changes and it changes in one place.
-Record the answer here.
+**The arm64 asset name — settled as `arm64`.** The brief said
+`shoesd-linux-aarch64.tar.gz`; this plan recommended `linux-arm64` for
+consistency with the `shoesd-macos-arm64.tar.gz` KVN's Gradle task already
+fetches. KVN's review agreed and is updating their side. The release job uses
+`matrix.asset_name`, so it produces `shoesd-linux-x86_64.tar.gz` and
+`shoesd-linux-arm64.tar.gz` with no special-casing.
 
 **Whether the first live bring-up needs `create_sync_device` touched at all.**
 The spec claims nothing under `src/` changes, on the strength of

@@ -546,6 +546,17 @@ Note finding 3 of `shoes-agent-prompt-daemon-review-2.md`: the macOS monitor's
 test leaks a detached thread. The Linux test tests `open_route_socket`'s twin
 and never calls `spawn`, which is the shape that avoids it.
 
+**Where the DNS feedback loop is damped, and where it is not.** The direct
+backend's watcher and `Session::reapply` form a cycle — reapply rewrites DNS
+unconditionally on every `NetworkChanged`, and on that backend the rewrite is a
+rename over the watched file. Nothing in the monitor or in the plan breaks it.
+The only thing that does is the identical-contents early return in
+`replace_with_regular_file`, which is in `dns.rs`, two modules away from either
+end of the loop. That is worth pinning here because it is invisible from both:
+a future DNS backend whose write skips that comparison re-opens the cycle, and
+the symptom — `/etc/resolv.conf` rewritten several times a second forever — has
+no log line attached to it. Raised by KVN's review.
+
 ## Crash recovery
 
 **Simpler on Linux, and the record gets smaller.** The kernel deletes a link's
@@ -832,14 +843,12 @@ features are additive per build and folding them into the existing job would
 compile `control-stats` and `control-logs` into the `shoes` CLI. `--features
 desktop` will not do: `[[bin]] shoesd` carries `required-features = ["daemon"]`.
 
-**The x86-64 name is `shoesd-linux-x86_64.tar.gz`; the arm64 one is unsettled.**
-KVN's brief and design both say `shoesd-linux-aarch64.tar.gz`, and their Gradle
-task fetches by exact name, so this is the consumer's to decide. But
-`build.yml`'s matrix calls that leg `linux-arm64`, the macOS daemon artifact is
-`shoesd-macos-arm64.tar.gz`, and KVN already consumes that name — so their own
-two platforms would disagree. Recommendation is `shoesd-linux-arm64.tar.gz`,
-confirmed with KVN before the release job lands. It is one string in one place
-whichever way it goes; the plan tracks it.
+**`shoesd-linux-x86_64.tar.gz` and `shoesd-linux-arm64.tar.gz`** — settled.
+The brief asked for `aarch64`; this spec argued for `arm64` on the grounds that
+`shoesd-macos-arm64.tar.gz` already exists and KVN already fetches it, so the
+alternative had their own two platforms disagreeing on the suffix. KVN's review
+agreed and is updating their Gradle task and design docs to match. Nothing waits
+on either side.
 
 **The gnu legs only, and not musl.** A statically linked musl build uses musl's
 own `getpwuid_r` and `getgrnam`, which read `/etc/passwd` and `/etc/group`

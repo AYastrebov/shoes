@@ -208,7 +208,7 @@ jobs:
           path: artifacts/*.tar.gz
           if-no-files-found: error
 
-      # The privileged daemon, macOS only and its own artifact.
+      # The privileged daemon, macOS and Linux, and its own artifact.
       #
       # Its own cargo invocation because features are additive per build:
       # folding `--features daemon` into the step above would compile
@@ -220,12 +220,22 @@ jobs:
       #
       # protoc is an install step rather than a crate: prost-build stopped
       # vendoring one.
-      - name: Install protoc
+      # gnu only, never musl. A statically linked musl build uses musl's own
+      # `getpwuid_r` and `getgrnam`, which read /etc/passwd and /etc/group
+      # directly and know nothing of NSS plugins -- so on a host with SSSD- or
+      # LDAP-backed accounts both the peer-credential check and install-time
+      # group detection would fail to resolve a real user, giving a daemon that
+      # refuses everyone with nothing in the error saying why.
+      - name: Install protoc (macOS)
         if: matrix.target == 'aarch64-apple-darwin'
         run: brew install protobuf
 
+      - name: Install protoc (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Build and package shoesd
-        if: matrix.target == 'aarch64-apple-darwin'
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
@@ -240,7 +250,7 @@ jobs:
           ls -la daemon-artifacts/
 
       - name: Upload shoesd
-        if: matrix.target == 'aarch64-apple-darwin'
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
         uses: actions/upload-artifact@v4
         with:
           name: shoesd-${{ matrix.asset_name }}
