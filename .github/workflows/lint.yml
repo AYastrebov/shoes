@@ -79,12 +79,24 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked -- -D warnings
 
-  # macOS only, because that is the only platform the daemon builds on. The
-  # host job above runs on ubuntu and so compiles none of `src/bin/shoesd/`,
-  # nor the macOS arms in `src/tun/` and `src/config/validate.rs`.
+  # Both platforms the daemon builds on, because the two `HostNetwork` arms
+  # share a trait and a sequencer but no code -- a change that satisfies one
+  # compiles perfectly while breaking the other, and only the arm that is built
+  # says so. The host job above runs on ubuntu with default features and so
+  # compiles none of `src/bin/shoesd/`, nor the macOS arms in `src/tun/` and
+  # `src/config/validate.rs`.
   clippy-daemon:
-    name: Clippy (macOS daemon)
-    runs-on: macos-latest
+    name: Clippy (${{ matrix.label }} daemon)
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            label: macOS
+          - runner: ubuntu-latest
+            label: Linux
 
     steps:
       - uses: actions/checkout@v4
@@ -95,15 +107,23 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: clippy-daemon
+          key: clippy-daemon-${{ matrix.runner }}
           cache-on-failure: true
 
       # prost-build stopped vendoring protoc.
-      - name: Install protoc
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # `--tests` as well as `--bins`: the daemon's own tests are where the
+      # revert sequencing and the argv construction are pinned, and a lint that
+      # skips them is a lint that never reads the half most likely to rot.
       - name: Run clippy for the daemon
-        run: cargo clippy --locked --features daemon --bins -- -D warnings
+        run: cargo clippy --locked --features daemon --bins --tests -- -D warnings
 
   clippy-android:
     name: Clippy (aarch64-linux-android)

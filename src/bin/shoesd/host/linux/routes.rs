@@ -177,15 +177,48 @@ fn route_args(verb: &str, route: &Route) -> Vec<String> {
 /// an upgrade of a package it only reads from.
 #[derive(Deserialize)]
 struct DefaultRoute {
-    /// Absent for a default through a point-to-point interface, and for a
-    /// non-unicast one such as `{"type":"blackhole",...}`.
+    /// Absent for a default through a point-to-point interface, for a
+    /// non-unicast one such as `{"type":"blackhole",...}`, and -- the case
+    /// that is not a skip -- for a **multipath** default, whose gateways live
+    /// in `nexthops` instead.
     gateway: Option<IpAddr>,
+    /// The legs of a multipath default.
+    ///
+    /// `ip -j` emits `default nexthop via A dev eth0 nexthop via B dev eth1`
+    /// as one entry with no top-level `gateway` and this array carrying the
+    /// real ones (captured on a bonded host). Reading only the top-level key
+    /// would skip it as gateway-less, `default_gateway` would answer `None`,
+    /// and `exclusion_routes` would blackhole the proxy -- so every session on
+    /// a bonded or dual-uplink host would start with its own proxy
+    /// unreachable, reported no louder than a debug line.
+    #[serde(default)]
+    nexthops: Vec<NextHop>,
     /// **Absent means zero.** `ip -j` omits the key entirely at metric 0
     /// (measured), so treating absence as "unknown, therefore last" would
     /// invert the ordering for exactly the route most likely to be the real
     /// default.
     #[serde(default)]
     metric: u32,
+}
+
+/// One leg of a multipath default.
+#[derive(Deserialize)]
+struct NextHop {
+    gateway: Option<IpAddr>,
+}
+
+impl DefaultRoute {
+    /// The next hop to send an excluded address through, wherever `ip` put it.
+    ///
+    /// The first leg of a multipath default rather than a choice among them:
+    /// the kernel load-balances across the legs and any of them reaches the
+    /// proxy, so picking one is enough -- and picking the first keeps the
+    /// answer stable across calls, which matters because `reapply` compares
+    /// this against what it recorded and swaps the route when it differs.
+    fn gateway(&self) -> Option<IpAddr> {
+        self.gateway
+            .or_else(|| self.nexthops.iter().find_map(|hop| hop.gateway))
+    }
 }
 
 /// The default gateway from `ip -j route show default`.
@@ -219,9 +252,9 @@ fn parse_default_gateway(table: &str) -> std::io::Result<Option<IpAddr>> {
     // `min_by_key` keeps the first of an equal run, which is the tie-break.
     Ok(routes
         .iter()
-        .filter(|route| route.gateway.is_some())
+        .filter(|route| route.gateway().is_some())
         .min_by_key(|route| route.metric)
-        .and_then(|route| route.gateway))
+        .and_then(|route| route.gateway()))
 }
 
 /// Whether an `ip route del` failure means the route was simply not there.
@@ -238,12 +271,27 @@ fn is_absent_route(message: &str) -> bool {
 
 /// Run a command, failing if it does.
 fn run(program: &Path, args: &[String]) -> std::io::Result<()> {
-    let output = Command::new(program).args(args).output().map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("could not run {} {args:?}: {e}", program.display()),
-        )
-    })?;
+    // `LC_ALL=C`, because this daemon *parses* what the command says. Both
+    // halves of `RTNETLINK answers: No such process` come from glibc's
+    // `strerror`, which is translated -- the French catalog on the development
+    // host renders ESRCH as `Aucun processus ayant ce numéro`. Under a
+    // localized login the absent-route match would fail, and a crash-recovery
+    // revert -- which routinely deletes routes that were never added -- would
+    // report a failure on a perfectly healthy host, keep the record, and block
+    // the next start.
+    //
+    // The environment is inherited from whoever ran `sudo`, so this is not
+    // hypothetical on a desktop.
+    let output = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not run {} {args:?}: {e}", program.display()),
+            )
+        })?;
 
     if output.status.success() {
         return Ok(());
@@ -258,12 +306,17 @@ fn run(program: &Path, args: &[String]) -> std::io::Result<()> {
 
 /// Run a command and return its stdout.
 fn run_capturing(program: &Path, args: &[&str]) -> std::io::Result<String> {
-    let output = Command::new(program).args(args).output().map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("could not run {} {args:?}: {e}", program.display()),
-        )
-    })?;
+    // As in `run`: the output is parsed, so the locale is pinned.
+    let output = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not run {} {args:?}: {e}", program.display()),
+            )
+        })?;
 
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
@@ -420,6 +473,36 @@ mod tests {
     /// because a fixture has no business carrying the topology of whichever
     /// machine it was captured on. The macOS `netstat` fixture says the same.
     const REAL_CAPTURE: &str = r#"[{"dst":"default","gateway":"198.51.100.1","dev":"eno1","protocol":"dhcp","prefsrc":"198.51.100.23","metric":100,"flags":[]}]"#;
+
+    /// A **multipath** default carries its gateways in `nexthops`, with no
+    /// top-level `gateway` at all -- captured from a real two-leg default.
+    ///
+    /// Skipping it as gateway-less, which the point-to-point filter does by
+    /// construction, makes `default_gateway` answer `None` on a bonded or
+    /// dual-uplink host. `exclusion_routes` then blackholes the proxy, so
+    /// every session there starts with its own proxy unreachable and nothing
+    /// louder than a debug line to say why. Reported by KVN's review.
+    const MULTIPATH: &str = r#"[{"dst":"default","flags":[],"nexthops":[{"gateway":"198.51.100.1","dev":"eno1","weight":1,"flags":[]},{"gateway":"198.51.100.2","dev":"eno2","weight":1,"flags":[]}]}]"#;
+
+    #[test]
+    fn a_multipath_default_yields_its_first_next_hop() {
+        assert_eq!(
+            parse_default_gateway(MULTIPATH).unwrap(),
+            Some(ip("198.51.100.1"))
+        );
+    }
+
+    /// And a multipath entry whose legs somehow carry no gateway is still a
+    /// skip, not a panic -- the `nexthops` array is not a promise of one.
+    #[test]
+    fn a_multipath_default_with_no_usable_leg_is_skipped() {
+        let table = r#"[{"dst":"default","flags":[],"nexthops":[{"dev":"tun0","weight":1,"flags":[]}]},{"dst":"default","gateway":"198.51.100.9","dev":"eno1","metric":100,"flags":[]}]"#;
+        assert_eq!(
+            parse_default_gateway(table).unwrap(),
+            Some(ip("198.51.100.9")),
+            "the unusable multipath entry is skipped and the ordinary one wins"
+        );
+    }
 
     #[test]
     fn the_real_capture_yields_its_gateway() {

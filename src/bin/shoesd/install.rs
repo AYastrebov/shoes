@@ -187,8 +187,11 @@ pub fn install(socket_path: &Path, state_path: &Path, group: Option<&str>) -> st
     std::fs::create_dir_all(LOG_DIR)?;
     set_root_owned(Path::new(LOG_DIR), LOG_DIR_MODE)?;
 
-    std::fs::write(PLIST_PATH, plist(socket_path, state_path, group))?;
-    set_root_owned(Path::new(PLIST_PATH), PLIST_MODE)?;
+    write_root_owned(
+        Path::new(PLIST_PATH),
+        &plist(socket_path, state_path, group),
+        PLIST_MODE,
+    )?;
 
     // Idempotent: an install over an existing one has to remove the old job
     // before bootstrapping the new plist, or launchd refuses it as already
@@ -688,8 +691,11 @@ pub fn install(socket_path: &Path, state_path: &Path, group: Option<&str>) -> st
     // No `StandardOutPath`: systemd gives the unit's stdout and stderr to the
     // journal, so there is no file whose mode this has to decide in advance --
     // which is the whole reason the macOS arm owns a log directory.
-    std::fs::write(UNIT_PATH, unit(socket_path, state_path, &group))?;
-    set_root_owned(Path::new(UNIT_PATH), UNIT_MODE)?;
+    write_root_owned(
+        Path::new(UNIT_PATH),
+        &unit(socket_path, state_path, &group),
+        UNIT_MODE,
+    )?;
 
     // systemd caches unit files. Without this, a first install fails with
     // "unit not found" and a second silently keeps running the previous
@@ -770,6 +776,48 @@ pub fn uninstall() -> std::io::Result<()> {
         "could not fully uninstall: {}",
         failures.join("; ")
     )))
+}
+
+/// Write a root-owned configuration file with its mode decided in advance.
+///
+/// `std::fs::write` is `create`, and `create` on an existing file keeps
+/// whatever mode that file already has -- so a leftover from an interrupted
+/// install, or a first write under a loose umask, leaves the file at the wrong
+/// mode for the window before `set_root_owned` corrects it. `stage()` removes
+/// the target first for exactly this reason, and a previous review called that
+/// the better half of the fix it was asked for; this is the same discipline for
+/// the other two privileged writes.
+///
+/// Near-untriggerable in practice, because `/etc/systemd/system` and
+/// `/Library/LaunchDaemons` are root-writable and nothing else puts a file
+/// there. Applied anyway: the same reasoning cleared `stage()`, and one rule
+/// for every privileged write is easier to keep than a rule with an exception
+/// whose justification has to be re-derived. Both platforms, so neither is the
+/// odd one out.
+fn write_root_owned(path: &Path, contents: &str, mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not create {}: {e}", path.display()),
+            )
+        })?;
+    file.write_all(contents.as_bytes())?;
+
+    set_root_owned(path, mode)
 }
 
 /// Copy `source` to `staged`, created writable by nobody else.
@@ -884,6 +932,50 @@ fn run(program: &str, args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configuration file gets its mode decided in advance, even over a
+    /// leftover from an interrupted install.
+    ///
+    /// `std::fs::write` is `create`, and `create` on an existing file keeps
+    /// the mode that file already has -- so writing over a leftover left the
+    /// unit or the plist at the old mode for the window before
+    /// `set_root_owned` corrected it. `stage()` has removed its target first
+    /// for exactly this reason since the macOS branch; this is the same rule
+    /// applied to the other two privileged writes. Reported by KVN's review.
+    #[test]
+    fn a_configuration_file_is_replaced_rather_than_written_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoesd.conf");
+
+        // A leftover, group- and world-writable.
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        // Not `write_root_owned`, whose `chown(0,0)` needs root: the mode half
+        // is what this pins, and it is the half that was wrong.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("{e}"),
+        }
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"fresh").unwrap();
+        }
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o022, 0, "never group- or world-writable: {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+    }
 
     /// The staged copy is never writable by anyone but its owner, even for the
     /// instant before its mode is set.

@@ -114,11 +114,18 @@ impl Dns {
         // and it would start a service the administrator turned off, as a side
         // effect of this daemon booting.
         //
-        // Reading `/etc/resolv.conf` first removes that: on any host where
-        // resolved is not already the resolver, this condition fails and the
-        // D-Bus call is never made. It is also the cheaper of the two, so the
-        // common direct-backend case costs one file read rather than a
-        // subprocess.
+        // Reading `/etc/resolv.conf` first removes that in the case that
+        // matters -- a host that never used resolved never reaches the call --
+        // and it is the cheaper of the two, so the common direct-backend case
+        // costs one file read rather than a subprocess.
+        //
+        // It is a narrowing, not a guarantee, and the gap is worth naming: a
+        // host whose stub symlink outlived `systemctl disable --now
+        // systemd-resolved` still reads `127.0.0.53` here, so the call still
+        // runs and may wake the service. DNS on such a host is already broken
+        // -- the stub it points at answers nothing -- so this costs nothing
+        // that was working, but it is not the clean guarantee the earlier
+        // wording implied.
         match std::fs::read_to_string(RESOLV_CONF) {
             Ok(contents) if stub_resolver_in_use(&contents) => {
                 // Only now, and `resolvectl status` rather than `systemctl
@@ -494,7 +501,18 @@ fn link_arg(service: &str) -> std::io::Result<String> {
     let acceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
     // `IFNAMSIZ` is 16 including the terminator, so 15 characters is the
     // kernel's own limit and nothing longer can name a link.
-    if service.is_empty() || service.len() > 15 || !service.chars().all(acceptable) {
+    //
+    // A **leading** dash is refused separately, and the comment above claimed
+    // this before the code did. The kernel accepts `-4` as a link name -- it
+    // rejects only `/` and whitespace -- but `resolvectl revert -4` parses it
+    // as a flag, exits 0, and `forgiving` reports a clean revert that reverted
+    // nothing, after which the record is deleted. Passing `--` first would work
+    // too; refusing is narrower and needs no argument.
+    if service.starts_with('-')
+        || service.is_empty()
+        || service.len() > 15
+        || !service.chars().all(acceptable)
+    {
         return Err(std::io::Error::other(format!(
             "{service:?} is not a network link name, so nothing here will be run against it"
         )));
@@ -885,6 +903,23 @@ fn names_the_file(buffer: &[u8], name: &OsStr) -> bool {
         let event: libc::inotify_event =
             unsafe { std::ptr::read_unaligned(buffer[offset..].as_ptr().cast()) };
 
+        // An overflow record means the kernel dropped events it could not
+        // queue, and it carries no name (`len == 0`), so the filter below
+        // would step straight past it. That is the wrong answer: the whole
+        // point of the queue overflowing is that something we would have acted
+        // on is gone, and continuing without looking leaves DNS reverted until
+        // some later event happens to name the file -- the silent window this
+        // watcher exists to close.
+        //
+        // The comment on `recoverable` argued overflow needs no handling
+        // because the handler re-reads rather than tracking a delta. The
+        // premise is right and the conclusion did not follow: re-reading only
+        // happens if something says to look. Saying to look is exactly what
+        // this does, and it is cheap and idempotent.
+        if event.mask & libc::IN_Q_OVERFLOW != 0 {
+            return true;
+        }
+
         let start = offset + header;
         let Some(end) = start
             .checked_add(event.len as usize)
@@ -1030,12 +1065,23 @@ impl Drop for FdGuard {
 
 /// Run a command, failing if it does.
 fn run(program: &Path, args: &[String]) -> std::io::Result<()> {
-    let output = Command::new(program).args(args).output().map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("could not run {} {args:?}: {e}", program.display()),
-        )
-    })?;
+    // `LC_ALL=C`, because `is_absent_link` parses what this says. "No such
+    // device" is glibc's `strerror(ENODEV)` and is translated -- the French
+    // catalog installed on the development host renders it `Aucun
+    // périphérique de ce type`. Under a localized login the absent-link match
+    // would fail and a revert after the tunnel is gone -- the ordinary case,
+    // not an edge one -- would report a failure, keep the record, and block
+    // the next start. The environment is inherited from whoever ran `sudo`.
+    let output = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("could not run {} {args:?}: {e}", program.display()),
+            )
+        })?;
 
     if output.status.success() {
         return Ok(());
@@ -1227,10 +1273,27 @@ nameserver 1.1.1.1
     /// sentinel is a record that does not describe a link.
     #[test]
     fn a_link_name_that_could_become_a_second_argument_is_refused() {
-        for bad in ["", "shoes0 --set-dns", "file:/etc/resolv.conf", "a/b"] {
+        for bad in [
+            "",
+            "shoes0 --set-dns",
+            "file:/etc/resolv.conf",
+            "a/b",
+            // Option-shaped, and the kernel would accept both as link names --
+            // it refuses only `/` and whitespace. `resolvectl revert -4`
+            // parses this as a flag, exits 0, and `forgiving` then reports a
+            // clean revert that reverted nothing, after which the record is
+            // deleted. The doc comment claimed this was refused before the
+            // code did; KVN's review found the gap.
+            "-4",
+            "--help",
+            "-",
+        ] {
             assert!(link_arg(bad).is_err(), "{bad:?}");
         }
         assert_eq!(link_arg("shoes0").ok(), Some("shoes0".to_string()));
+        // A dash inside the name is still a link name; only a leading one is
+        // an option.
+        assert_eq!(link_arg("wg-home").ok(), Some("wg-home".to_string()));
     }
 
     /// Only "the link is gone" is success, and that case is the ordinary one:
@@ -1510,6 +1573,69 @@ Link 5 (tailscale0): ~. tailf8307c.ts.net
         );
     }
 
+    /// A **relative** symlink target survives the round trip.
+    ///
+    /// The exact case the brief flagged, and every other test here uses an
+    /// absolute target. It works by construction -- `read_link` gives back
+    /// whatever the link holds and `symlink` writes it back verbatim, neither
+    /// resolving anything -- but "works by construction" is the claim a test
+    /// is for. `/etc/resolv.conf` really is relative on this host:
+    /// `../run/systemd/resolve/stub-resolv.conf`.
+    #[test]
+    fn a_relative_symlink_target_is_restored_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("stub-resolv.conf");
+        let path = dir.path().join("resolv.conf");
+        fs::write(&target, STUB_MODE).unwrap();
+        // Relative, as the real one is.
+        symlink("stub-resolv.conf", &path).unwrap();
+
+        let recorded = read_file_state(&path).unwrap();
+        assert_eq!(
+            recorded.symlink_target.as_deref(),
+            Some(Path::new("stub-resolv.conf")),
+            "the target is recorded as written, not resolved to an absolute path"
+        );
+
+        write_file_state(&path, &DnsState::servers(&[ip("10.0.0.1")])).unwrap();
+        write_file_state(&path, &recorded).unwrap();
+
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("stub-resolv.conf"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), STUB_MODE);
+    }
+
+    /// A dangling symlink is a state to record, not an error.
+    ///
+    /// `/etc/resolv.conf` pointing into `/run` before the manager that fills
+    /// it has started is exactly this, and it is reachable at boot. The read
+    /// must not fail -- a failed read fails the session -- and the restore must
+    /// put the dangling link back rather than materialising a file where the
+    /// host had none.
+    #[test]
+    fn a_dangling_symlink_reads_and_restores_as_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        let missing = dir.path().join("not-here.conf");
+        symlink(&missing, &path).unwrap();
+
+        let recorded = read_file_state(&path).expect("a dangling link is a state, not a failure");
+        assert_eq!(recorded.symlink_target.as_deref(), Some(missing.as_path()));
+        assert!(recorded.servers.is_empty());
+        assert_eq!(recorded.verbatim, None, "there were no bytes to replay");
+
+        write_file_state(&path, &DnsState::servers(&[ip("10.0.0.1")])).unwrap();
+        write_file_state(&path, &recorded).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists(), "and the target is still not created");
+    }
+
     /// A path that did not exist is not the same record as one holding an
     /// empty file, even though restoring either gives glibc the same answer.
     ///
@@ -1770,18 +1896,45 @@ Link 5 (tailscale0): ~. tailf8307c.ts.net
         ));
     }
 
-    /// A record with `len` 0 carries no name at all: it is about the watched
-    /// directory itself, and `IN_Q_OVERFLOW` arrives this way too. Reading a
-    /// name out of it means reading the next record's header as a filename.
+    /// A nameless record that is *not* an overflow says nothing about the
+    /// file: it is about the watched directory itself. Reading a name out of
+    /// it means reading the next record's header as a filename.
     #[test]
     fn a_record_with_no_name_is_not_the_watched_file() {
-        let buffer = event(libc::IN_Q_OVERFLOW, "");
+        let buffer = event(libc::IN_ATTRIB, "");
         assert_eq!(buffer.len(), HEADER);
         assert!(!names_the_file(&buffer, &watched("resolv.conf")));
 
         // And it does not derail the walk: the record after it still counts.
         let mut queue = buffer.clone();
         queue.extend(event(libc::IN_MOVED_TO, "resolv.conf"));
+        assert!(names_the_file(&queue, &watched("resolv.conf")));
+    }
+
+    /// An overflow is a reason to look, not a record to skip.
+    ///
+    /// This test asserted the opposite until KVN's review. `IN_Q_OVERFLOW`
+    /// carries no name, so the filename filter steps straight past it -- and
+    /// the reasoning that overflow needs no handling, because the handler
+    /// re-reads the file rather than tracking a delta, quietly assumed
+    /// something would tell it to re-read. Nothing would: a NetworkManager
+    /// rewrite lost in the overflow stays lost, and DNS sits reverted until
+    /// some later event happens to name the file. That silent window is the
+    /// one the watcher exists to close.
+    ///
+    /// The re-read is cheap and idempotent, so answering "the file may have
+    /// changed" costs a comparison and cannot be wrong in a way that matters.
+    #[test]
+    fn a_queue_overflow_is_a_reason_to_look() {
+        let buffer = event(libc::IN_Q_OVERFLOW, "");
+        assert!(
+            names_the_file(&buffer, &watched("resolv.conf")),
+            "an overflow means events were dropped -- possibly ours"
+        );
+
+        // Even when the events around it are about somebody else's file.
+        let mut queue = event(libc::IN_MOVED_TO, "hostname");
+        queue.extend(event(libc::IN_Q_OVERFLOW, ""));
         assert!(names_the_file(&queue, &watched("resolv.conf")));
     }
 

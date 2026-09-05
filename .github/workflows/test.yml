@@ -88,17 +88,26 @@ jobs:
       - name: Run tests with the desktop control surface enabled
         run: cargo test --locked --features desktop
 
-      # The privileged daemon, which exists only on macOS: its dependencies
-      # sit under a macOS target section and its host-network arms have no
-      # implementation elsewhere. Without this its tests — the revert
-      # sequencing, the peer check, the plist — run nowhere.
+      # The privileged daemon, which exists on macOS and Linux: its
+      # dependencies sit under a target section naming both, and Windows has no
+      # host-network arm. Without this its tests -- the revert sequencing, the
+      # peer check, the unit and plist rendering -- run nowhere.
       #
       # protoc is an install step rather than a crate: prost-build stopped
       # vendoring one.
-      - name: Install protoc
+      # The daemon builds on macOS and Linux, and both arms need running: the
+      # `HostNetwork` implementations share a trait and a sequencer but no
+      # code, so a change to one compiles perfectly while breaking the other.
+      # Gating this to macOS meant the Linux arm -- five thousand lines of it --
+      # compiled in no CI job at all.
+      - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Run tests with the privileged daemon enabled
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' || runner.os == 'Linux'
         run: cargo test --locked --features daemon
