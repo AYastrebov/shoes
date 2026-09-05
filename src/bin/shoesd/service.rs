@@ -42,6 +42,13 @@ pub struct DaemonService {
     authorizer: Authorizer,
     supervisor: Supervisor,
     logs: Arc<BroadcastLogWriter>,
+    /// What this daemon told the client it can do.
+    ///
+    /// Carried rather than recomputed per call, because part of it is not a
+    /// property of the build: on Linux the DNS backend is *probed* once at
+    /// startup, and asking again per `Hello` would both cost a subprocess and
+    /// risk two clients being told different things about one running session.
+    capabilities: Vec<String>,
 }
 
 /// What this build can do to the host.
@@ -49,12 +56,20 @@ pub struct DaemonService {
 /// Reported rather than inferred: a client must not decide from the operating
 /// system what the daemon is capable of, because a build can be missing an arm
 /// the platform could in principle support.
-fn capabilities() -> Vec<String> {
-    if cfg!(target_os = "macos") {
+///
+/// `extra` is whatever the host learned at startup that the build alone does
+/// not say. Today that is Linux's `dns-backend:` line, which no client branches
+/// on -- it is for whoever reads the bug report, and it is the first question a
+/// Linux DNS problem needs answered. `capabilities` is a repeated string and
+/// unknown values are ignored, so adding one costs no protocol change.
+fn capabilities(extra: Vec<String>) -> Vec<String> {
+    let mut capabilities = if cfg!(any(target_os = "macos", target_os = "linux")) {
         vec!["routes".to_string(), "dns".to_string()]
     } else {
         Vec::new()
-    }
+    };
+    capabilities.extend(extra);
+    capabilities
 }
 
 #[tonic::async_trait]
@@ -72,7 +87,7 @@ impl Daemon for DaemonService {
             protocol: PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: capabilities(),
+            capabilities: self.capabilities.clone(),
         }))
     }
 
@@ -440,6 +455,7 @@ pub async fn serve(
     group: &str,
     supervisor: Supervisor,
     logs: Arc<BroadcastLogWriter>,
+    host_capabilities: Vec<String>,
 ) -> std::io::Result<()> {
     let authorizer = Authorizer::for_group(group)?;
     let listener = crate::socket::bind(socket_path, authorizer.group_gid())?;
@@ -455,6 +471,7 @@ pub async fn serve(
         authorizer,
         supervisor,
         logs,
+        capabilities: capabilities(host_capabilities),
     };
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
 
@@ -533,16 +550,22 @@ mod tests {
             authorizer,
             supervisor,
             logs: Arc::new(BroadcastLogWriter::new(8)),
+            capabilities: capabilities(Vec::new()),
         }
     }
 
     /// A client asks what the daemon can do rather than inferring it from the
     /// operating system, so the answer has to be non-empty where the arms
-    /// exist.
+    /// exist -- and empty where they do not, because a capability this build
+    /// cannot honour is a promise a client writes a branch for.
+    ///
+    /// The list is keyed on which platforms have a `HostNetwork`
+    /// implementation, so it moves when one is added. It said macOS alone
+    /// until the Linux arm landed.
     #[test]
-    fn macos_reports_the_host_capabilities_it_implements() {
-        let caps = capabilities();
-        if cfg!(target_os = "macos") {
+    fn a_build_reports_the_host_capabilities_it_implements() {
+        let caps = capabilities(Vec::new());
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(caps.contains(&"routes".to_string()), "{caps:?}");
             assert!(caps.contains(&"dns".to_string()), "{caps:?}");
         } else {
@@ -831,7 +854,7 @@ mod tests {
 
         assert_eq!(reply.protocol, PROTOCOL_VERSION);
         assert_eq!(reply.daemon_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(reply.capabilities, capabilities());
+        assert_eq!(reply.capabilities, capabilities(Vec::new()));
 
         let _ = shutdown.send(());
     }

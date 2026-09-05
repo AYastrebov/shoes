@@ -17,7 +17,7 @@ pub mod monitor;
 use std::net::IpAddr;
 use std::process::Command;
 
-use super::{Destination, HostNetwork, Route, Via};
+use super::{Destination, DnsState, HostNetwork, Route, Via};
 
 /// The tools, by absolute path.
 ///
@@ -84,16 +84,21 @@ impl HostNetwork for MacosHost {
         }
     }
 
-    fn primary_dns_service(&self) -> std::io::Result<String> {
+    fn primary_dns_service(&self, _interface: &str) -> std::io::Result<String> {
+        // Ignored: macOS sets resolvers on the primary *physical* service, not
+        // on the tunnel. Linux is the arm the argument exists for.
         self.dns.primary_service()
     }
 
-    fn read_dns(&self, service: &str) -> std::io::Result<Vec<IpAddr>> {
-        self.dns.read(service)
+    fn read_dns(&self, service: &str) -> std::io::Result<DnsState> {
+        // No symlink to remember: SCDynamicStore is a store, not a file.
+        self.dns
+            .read(service)
+            .map(|servers| DnsState::servers(&servers))
     }
 
-    fn write_dns(&self, service: &str, servers: &[IpAddr]) -> std::io::Result<()> {
-        self.dns.write(service, servers)
+    fn write_dns(&self, service: &str, state: &DnsState) -> std::io::Result<()> {
+        self.dns.write(service, &state.servers)
     }
 
     fn flush_dns_cache(&self) -> std::io::Result<()> {

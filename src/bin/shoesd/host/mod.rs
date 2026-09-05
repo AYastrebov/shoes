@@ -18,6 +18,9 @@ mod state;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 #[cfg(test)]
 pub mod double;
 
@@ -29,8 +32,61 @@ pub use state::AppliedState;
 pub use state::DnsBackup;
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// Everything restoring a service's DNS needs, beyond the service's name.
+///
+/// A resolver list alone is enough on macOS, and was enough when this trait
+/// had one implementation. The direct `/etc/resolv.conf` backend needs one
+/// thing more: whether the path was a **symlink**, and to what. On a
+/// resolved host it points at `stub-resolv.conf`; elsewhere it may point into
+/// `/run`. Restoring a flattened regular file where a symlink was is how this
+/// class of tool breaks a host permanently -- the real manager keeps rewriting
+/// a target nothing follows any more -- so the target travels with the backup
+/// rather than being re-derived at revert time, when the answer would already
+/// be wrong.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsState {
+    /// The resolvers. Empty means the service had none configured, and
+    /// restoring empty is how it gets back to that.
+    #[serde(default)]
+    pub servers: Vec<IpAddr>,
+    /// Where the path pointed, when it was a symlink. `None` for a regular
+    /// file and for every backend that is not a file at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<PathBuf>,
+    /// The bytes the path held, when the backend replaces a regular file.
+    ///
+    /// `servers` is the *parsed* view -- what the resolvers were -- and it is
+    /// what logs and diagnostics read. It is not enough to restore from.
+    /// `/etc/resolv.conf` also carries `search`, `options` and `sortlist`
+    /// lines, and a revert that wrote back only `nameserver` lines would
+    /// silently drop the host's search domain until whatever manages the file
+    /// happened to rewrite it -- which on a `netconfig` host is its own
+    /// schedule, not ours. So the restore replays these bytes and ignores
+    /// `servers` entirely.
+    ///
+    /// `None` for a symlinked original, where the link is restored instead and
+    /// its target was never ours to rewrite; `None` for every backend that is
+    /// not a file; and `None` in the apply direction, which has nothing to
+    /// restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim: Option<String>,
+}
+
+impl DnsState {
+    /// The resolvers a session wants advertised, with no restore information --
+    /// which is what applying, as opposed to reverting, always is.
+    pub fn servers(servers: &[IpAddr]) -> Self {
+        Self {
+            servers: servers.to_vec(),
+            symlink_target: None,
+            verbatim: None,
+        }
+    }
+}
 
 /// Where a route sends what matches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +129,11 @@ pub enum Destination {
 impl Destination {
     /// Which address family this belongs to, which decides `-inet` against
     /// `-inet6` and which loopback a blackhole names.
+    ///
+    /// macOS only, because only `route` needs telling. `ip` infers the family
+    /// from the destination literal and has native `blackhole`/`unreachable`
+    /// route types, so the Linux arm has nothing to ask.
+    #[cfg(target_os = "macos")]
     pub fn is_ipv6(&self) -> bool {
         match self {
             Destination::Net { addr, .. } | Destination::Host(addr) => addr.is_ipv6(),
@@ -128,15 +189,38 @@ pub trait HostNetwork {
     /// the revert partway and leave the rest installed.
     fn delete_route(&self, route: &Route) -> std::io::Result<()>;
 
-    /// The id of the network service DNS should be set on.
-    fn primary_dns_service(&self) -> std::io::Result<String>;
+    /// The id of the network service DNS should be set on, for a session on
+    /// `interface`.
+    ///
+    /// The argument exists because the two platforms answer with different
+    /// things. macOS wants the primary *physical* service -- you override its
+    /// resolvers and restore them later -- and ignores it. Linux wants the
+    /// tunnel's own link, because putting our resolvers on the physical one
+    /// means NetworkManager clobbers them on the next DHCP renew, which is the
+    /// contention the macOS arm needed a watchdog for.
+    fn primary_dns_service(&self, interface: &str) -> std::io::Result<String>;
 
-    /// The resolvers currently configured on a service, for restoring later.
-    fn read_dns(&self, service: &str) -> std::io::Result<Vec<IpAddr>>;
+    /// What the service looks like now, so it can be put back later.
+    fn read_dns(&self, service: &str) -> std::io::Result<DnsState>;
 
     /// Set the resolvers on a service. An empty list restores the default,
     /// which is what reverting to a service that had none means.
-    fn write_dns(&self, service: &str, servers: &[IpAddr]) -> std::io::Result<()>;
+    ///
+    /// `state.symlink_target` is meaningful only on a revert, and only for the
+    /// direct file backend; applying passes [`DnsState::servers`], which
+    /// carries none.
+    ///
+    /// Must treat a service that is not there as success, for the reason
+    /// [`HostNetwork::delete_route`] gives about routes. Revert runs after the
+    /// tunnel link is gone, and on Linux the resolvers were configured *on*
+    /// that link -- so the restore is routinely asked to write to something
+    /// that has already disappeared. One that returned an error there would
+    /// abort the revert partway and leave the exclusion routes installed.
+    ///
+    /// Only that. A refusal, a missing tool or a permission error has to
+    /// propagate: swallowing one would report a clean revert, delete the
+    /// record, and leave the host's DNS pointed into a tunnel that is gone.
+    fn write_dns(&self, service: &str, state: &DnsState) -> std::io::Result<()>;
 
     /// Drop cached answers, so the change takes effect for things that already
     /// resolved.

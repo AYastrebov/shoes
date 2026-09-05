@@ -104,8 +104,10 @@ fn authorize(
 /// `basegid` is the peer's real primary gid, and passing anything else is a
 /// hole rather than a detail: `getgrouplist` echoes the base gid back in the
 /// list it fills, so passing a fixed `0` would report every caller as a member
-/// of gid 0 -- and gid 0 is `wheel`, a plausible thing to configure `--group`
-/// as. The daemon would then admit every user on the machine.
+/// of gid 0 -- which is `wheel` on Darwin and `root` on Linux, and either is a
+/// plausible thing to configure `--group` as. The daemon would then admit every
+/// user on the machine. The hole is the echo, not the particular gid, so this
+/// holds on both platforms.
 ///
 /// An empty vector on any failure. That is the safe direction: it can only
 /// deny, never grant.
@@ -127,15 +129,16 @@ fn groups_of(uid: u32, basegid: u32) -> Vec<u32> {
     let mut capacity: libc::c_int = 32;
     loop {
         let mut count = capacity;
-        let mut gids: Vec<libc::c_int> = vec![0; capacity as usize];
+        let mut gids: Vec<GroupListGid> = vec![0; capacity as usize];
 
         // SAFETY: `name` is a valid NUL-terminated string, and `gids` has
         // `capacity` writable elements with `count` saying so. `getgrouplist`
-        // writes at most that many.
+        // writes at most that many. `ngroups` is `*mut c_int` on both
+        // platforms even where the array element type differs.
         let rc = unsafe {
             libc::getgrouplist(
                 name.as_ptr(),
-                basegid as libc::c_int,
+                as_group_list_gid(basegid),
                 gids.as_mut_ptr(),
                 &mut count,
             )
@@ -143,7 +146,7 @@ fn groups_of(uid: u32, basegid: u32) -> Vec<u32> {
 
         if rc != -1 {
             gids.truncate(count.clamp(0, capacity) as usize);
-            return gids.into_iter().map(|gid| gid as u32).collect();
+            return gids.into_iter().map(from_group_list_gid).collect();
         }
 
         if capacity >= MAX_GROUPS {
@@ -154,6 +157,47 @@ fn groups_of(uid: u32, basegid: u32) -> Vec<u32> {
         }
         capacity = (capacity * 2).min(MAX_GROUPS);
     }
+}
+
+/// The integer type `getgrouplist` reads its base gid as and fills its array
+/// with.
+///
+/// Darwin declares both as `c_int`; glibc declares both as `gid_t`, which is
+/// unsigned. The values are identical and the difference is pure signedness,
+/// but it is a hard type error at the call site rather than something a cast
+/// can paper over -- the array is passed as a raw pointer, so a mismatch would
+/// have `getgrouplist` write `u32`s into an `i32` buffer if the compiler
+/// allowed it. An alias keeps one code path with the platform difference
+/// stated once.
+#[cfg(target_os = "macos")]
+type GroupListGid = libc::c_int;
+#[cfg(not(target_os = "macos"))]
+type GroupListGid = libc::gid_t;
+
+/// A gid in the form `getgrouplist` wants it, and back again.
+///
+/// Functions per platform rather than a bare `as`, because on glibc the two
+/// types are the same and the cast is a no-op that clippy rightly refuses --
+/// while on Darwin it is a real reinterpretation. Writing it once here is what
+/// keeps `groups_of` a single code path.
+#[cfg(target_os = "macos")]
+fn as_group_list_gid(gid: u32) -> GroupListGid {
+    gid as GroupListGid
+}
+
+#[cfg(not(target_os = "macos"))]
+fn as_group_list_gid(gid: u32) -> GroupListGid {
+    gid
+}
+
+#[cfg(target_os = "macos")]
+fn from_group_list_gid(gid: GroupListGid) -> u32 {
+    gid as u32
+}
+
+#[cfg(not(target_os = "macos"))]
+fn from_group_list_gid(gid: GroupListGid) -> u32 {
+    gid
 }
 
 /// Ceiling on the group list one uid can have.
@@ -282,11 +326,28 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// `wheel` is gid 0 on every Unix this runs on, so it is a name the test
-    /// host is guaranteed to have.
+    /// A group the machine really has resolves to the gid the machine really
+    /// reports for it.
+    ///
+    /// `wheel` is the name, because both Darwin and every distribution in
+    /// scope have it. Its *gid* is not portable and was asserted as 0 here
+    /// until this ran on Linux: that is true on Darwin and false on Fedora,
+    /// where `wheel` is gid 10. Asserting a constant tested the test host
+    /// rather than the lookup, so the expected value now comes from the same
+    /// place a user's would -- `getgrnam` through a second, independent call.
     #[test]
     fn a_known_group_resolves() {
         let wheel = Authorizer::for_group("wheel").expect("wheel exists on Unix");
-        assert_eq!(wheel.group_gid(), 0);
+
+        // SAFETY: a valid NUL-terminated literal; the returned pointer is to a
+        // static buffer read before anything else can call into the group
+        // database on this thread.
+        let expected = unsafe {
+            let entry = libc::getgrnam(c"wheel".as_ptr());
+            assert!(!entry.is_null(), "wheel exists on Unix");
+            (*entry).gr_gid
+        };
+
+        assert_eq!(wheel.group_gid(), expected);
     }
 }

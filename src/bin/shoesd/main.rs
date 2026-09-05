@@ -11,19 +11,17 @@
 //! tree the way `src/main.rs` does, so what it can reach is exactly what
 //! `shoes` exports.
 
-// The daemon's dependencies live under a macOS target section, so building it
-// anywhere else fails with a pile of unresolved crates. Say why instead.
+// The daemon's dependencies live under target sections, so building it on a
+// platform with no arm fails with a pile of unresolved crates. Say why instead.
 //
 // Not a placeholder for a port: the protocol and the daemon's structure leave
-// room for Linux and Windows -- `capabilities` is reported rather than
-// inferred precisely so a client can ask -- but routes and DNS on those
-// platforms are their own design, and Linux alone has four mechanisms
-// (systemd-resolved, resolvconf, NetworkManager, a bare /etc/resolv.conf).
-#[cfg(not(target_os = "macos"))]
+// room for Windows -- `capabilities` is reported rather than inferred precisely
+// so a client can ask -- but routes and DNS there are their own design.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!(
-    "the `daemon` feature builds shoesd, which is macOS-only in v1: its host \
-     network configuration (routes, DNS) has no arm for this platform yet. \
-     Build without `--features daemon`."
+    "the `daemon` feature builds shoesd, which is macOS and Linux only: its \
+     host network configuration (routes, DNS) has no arm for this platform \
+     yet. Build without `--features daemon`."
 );
 
 mod auth;
@@ -49,10 +47,22 @@ const DEFAULT_STATE_PATH: &str = "/var/db/shoesd/applied.json";
 /// A GUI started after a failed tunnel still needs to see why it failed.
 const LOG_BACKLOG: usize = 512;
 
-/// The group whose members may talk to the daemon. Admins by default: on
-/// macOS that is the set of users who could install the daemon in the first
-/// place, so it grants nothing that was not already available.
+/// The group whose members may talk to the daemon.
+///
+/// The set of users who could have installed the daemon in the first place, so
+/// it grants nothing that was not already available -- but the *name* of that
+/// set is not portable. macOS has `admin`; Linux has `wheel` on Fedora, Arch
+/// and openSUSE and `sudo` on Debian and Ubuntu, which is why `install` detects
+/// it there rather than trusting this constant. See `install::resolve_group`.
+///
+/// This is the default for `run`, which only needs a name to resolve. `install`
+/// never sees it: it takes `RunArgs::group` as the `Option` it is, so that
+/// "the operator named a group" stays distinguishable from "the operator named
+/// nothing".
+#[cfg(target_os = "macos")]
 const DEFAULT_GROUP: &str = "admin";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_GROUP: &str = "wheel";
 
 fn usage() -> String {
     format!(
@@ -66,7 +76,9 @@ fn usage() -> String {
          OPTIONS:\n    \
              --socket <path>  Control socket path (default: {DEFAULT_SOCKET_PATH})\n    \
              --state <path>   Revert record (default: {DEFAULT_STATE_PATH})\n    \
-             --group <name>   Group allowed to connect (default: {DEFAULT_GROUP})\n    \
+             --group <name>   Group allowed to connect\n                     \
+                              (run: default {DEFAULT_GROUP}; install: detected\n                     \
+                              from wheel/sudo/adm unless given)\n    \
              -V, --version    Print version and exit\n",
         env!("CARGO_PKG_VERSION"),
     )
@@ -77,13 +89,21 @@ fn usage() -> String {
 struct RunArgs {
     socket_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
-    group: String,
+    /// `None` when `--group` was not given.
+    ///
+    /// Deliberately not defaulted here. `install` has to tell "the operator
+    /// named a group" from "the operator named nothing", because on Linux the
+    /// second is what turns on detection -- and if this substituted the default
+    /// first, an explicit `--group wheel` would be indistinguishable from no
+    /// flag at all, so the one value a Fedora administrator is most likely to
+    /// type would be the one silently re-derived.
+    group: Option<String>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut socket_path = std::path::PathBuf::from(DEFAULT_SOCKET_PATH);
     let mut state_path = std::path::PathBuf::from(DEFAULT_STATE_PATH);
-    let mut group = DEFAULT_GROUP.to_string();
+    let mut group: Option<String> = None;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -101,10 +121,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     .into();
             }
             "--group" => {
-                group = rest
-                    .next()
-                    .ok_or_else(|| "--group needs a name".to_string())?
-                    .clone();
+                group = Some(
+                    rest.next()
+                        .ok_or_else(|| "--group needs a name".to_string())?
+                        .clone(),
+                );
             }
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -138,7 +159,7 @@ fn main() -> ExitCode {
                     install::INSTALLED_BINARY,
                     install::LABEL
                 ),
-                install::install(&run.socket_path, &run.state_path, &run.group),
+                install::install(&run.socket_path, &run.state_path, run.group.as_deref()),
             ),
             Err(e) => {
                 eprintln!("shoesd: {e}\n\n{}", usage());
@@ -206,16 +227,20 @@ fn run_daemon(args: RunArgs) -> ExitCode {
         }],
     );
 
-    let (supervisor, supervisor_thread) = match supervisor::Supervisor::spawn(
-        crate::host::macos::MacosHost::new,
-        args.state_path.clone(),
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("shoesd: could not start the supervisor: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // Probed before the supervisor, because its answer decides both what the
+    // supervisor is handed and what every client is told.
+    let setup = HostSetup::probe();
+    let host_capabilities = setup.capabilities();
+    let watched_file = setup.watched_file();
+
+    let (supervisor, supervisor_thread) =
+        match supervisor::Supervisor::spawn(setup.into_factory(), args.state_path.clone()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("shoesd: could not start the supervisor: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // The routing table is watched for the life of the process, not the
     // session: a change that lands between sessions is answered by the next
@@ -225,18 +250,50 @@ fn run_daemon(args: RunArgs) -> ExitCode {
     // its exclusions when the gateway moves.
     {
         let supervisor = supervisor.clone();
-        if let Err(e) = crate::host::macos::monitor::spawn(move || supervisor.network_changed()) {
+        if let Err(e) = monitor_spawn(move || supervisor.network_changed()) {
             log::error!(
                 "could not watch the routing table ({e}); exclusions will not follow a gateway change"
             );
         }
     }
 
+    // And the DNS file, when the chosen backend manages one. `None` under
+    // systemd-resolved, whose per-link configuration has no other writer, and
+    // `None` on macOS -- so the `if let` is the whole platform branch and no
+    // `cfg` is needed here.
+    //
+    // The file the direct backend owns is contended in a way that link is not:
+    // NetworkManager rewrites it on every reconnect and openSUSE's `netconfig`
+    // on its own schedule, and either one reverts the session's resolvers to
+    // the host's while the tunnel stays up and this daemon still reports
+    // RUNNING. Its failure is not fatal, on the route monitor's precedent: the
+    // session still carries traffic, it just stops re-applying DNS if something
+    // else rewrites the file.
+    if let Some(file) = watched_file {
+        let supervisor = supervisor.clone();
+        if let Err(e) = watch_dns_file(&file, move || supervisor.network_changed()) {
+            log::error!(
+                "could not watch {} ({e}); DNS will not be re-applied if something else \
+                 rewrites it mid-session",
+                file.display()
+            );
+        }
+    }
+
+    // `run` takes the default when nothing was asked for: by then the group is
+    // just a name to resolve, and the unit `install` wrote always passes one
+    // explicitly.
+    let group = args
+        .group
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GROUP.to_string());
+
     let result = runtime.block_on(service::serve(
         &args.socket_path,
-        &args.group,
+        &group,
         supervisor.clone(),
         logs,
+        host_capabilities,
     ));
 
     // Unconditionally, and before the join: `serve` can fail during setup --
@@ -259,6 +316,120 @@ fn run_daemon(args: RunArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// What this platform needs decided before the supervisor starts.
+///
+/// Probed once, here, rather than inside the host factory -- because on Linux
+/// the answer is wanted in three places: the host itself, the `capabilities`
+/// every client is told, and whether the direct DNS backend's file needs
+/// watching. Probing three times could give three answers, and a session whose
+/// `Hello` names one backend while its revert path uses another is a bug with
+/// no symptom until the revert.
+///
+/// The macOS arm carries nothing, which is why this is a struct per platform
+/// rather than a shared one with an `Option` in it.
+#[cfg(target_os = "linux")]
+struct HostSetup {
+    dns: crate::host::linux::dns::Dns,
+}
+
+#[cfg(target_os = "linux")]
+impl HostSetup {
+    fn probe() -> Self {
+        Self {
+            dns: crate::host::linux::dns::Dns::probe(),
+        }
+    }
+
+    /// The `dns-backend:` line. No client branches on it; it is for whoever
+    /// reads the bug report, and it is the first question a Linux DNS problem
+    /// needs answered.
+    fn capabilities(&self) -> Vec<String> {
+        vec![format!("dns-backend:{}", self.dns.backend_name())]
+    }
+
+    /// The file the direct backend manages, when that is the chosen one.
+    ///
+    /// `None` under systemd-resolved: nothing else on the host touches the
+    /// tunnel link's own configuration, so there is nothing to contend with.
+    fn watched_file(&self) -> Option<std::path::PathBuf> {
+        self.dns.watched_file().map(std::path::Path::to_path_buf)
+    }
+
+    /// The factory the supervisor runs on its own thread.
+    ///
+    /// A factory rather than a built host because the macOS twin owns an
+    /// `SCDynamicStore`, which is not `Send`; the Linux one would move fine and
+    /// keeps the same shape so `run_daemon` stays free of platform branches.
+    fn into_factory(
+        self,
+    ) -> impl FnOnce() -> std::io::Result<crate::host::linux::LinuxHost> + Send + 'static {
+        move || crate::host::linux::LinuxHost::with_dns(self.dns)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct HostSetup;
+
+#[cfg(target_os = "macos")]
+impl HostSetup {
+    fn probe() -> Self {
+        Self
+    }
+
+    /// Nothing beyond what the build already says: the one DNS mechanism macOS
+    /// has is the one this daemon uses.
+    fn capabilities(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `SCDynamicStore` is not a file, and the route monitor's second look
+    /// already covers the system putting resolvers back on its own schedule.
+    fn watched_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn into_factory(
+        self,
+    ) -> impl FnOnce() -> std::io::Result<crate::host::macos::MacosHost> + Send + 'static {
+        crate::host::macos::MacosHost::new
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn monitor_spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
+    crate::host::macos::monitor::spawn(on_change)
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
+    crate::host::linux::monitor::spawn(on_change)
+}
+
+#[cfg(target_os = "linux")]
+fn watch_dns_file(
+    path: &std::path::Path,
+    on_change: impl Fn() + Send + 'static,
+) -> std::io::Result<()> {
+    crate::host::linux::dns::watch(path, on_change)
+}
+
+/// Unreachable, and an error rather than a silent `Ok`.
+///
+/// `HostSetup::watched_file` answers `None` on macOS -- DNS there lives in the
+/// `SCDynamicStore`, which is not a file -- so nothing calls this. It exists so
+/// the call site needs no `cfg` of its own, and it says so out loud rather than
+/// reporting a watch that was never installed.
+#[cfg(target_os = "macos")]
+fn watch_dns_file(
+    path: &std::path::Path,
+    _on_change: impl Fn() + Send + 'static,
+) -> std::io::Result<()> {
+    Err(std::io::Error::other(format!(
+        "{} is not a file this platform's DNS lives in",
+        path.display()
+    )))
 }
 
 /// A `LogWriter` the daemon can keep a handle on.
@@ -286,7 +457,9 @@ mod tests {
         let args = parse_run_args(&[]).expect("no arguments is the launchd shape");
         assert_eq!(args.socket_path, std::path::Path::new(DEFAULT_SOCKET_PATH));
         assert_eq!(args.state_path, std::path::Path::new(DEFAULT_STATE_PATH));
-        assert_eq!(args.group, DEFAULT_GROUP);
+        // Not the default: *absent*. `install` needs to tell the two apart,
+        // and substituting here is exactly what would stop it.
+        assert_eq!(args.group, None);
     }
 
     #[test]
@@ -299,7 +472,7 @@ mod tests {
         ])
         .expect("both flags are supported");
         assert_eq!(args.socket_path, std::path::Path::new("/tmp/x.sock"));
-        assert_eq!(args.group, "staff");
+        assert_eq!(args.group.as_deref(), Some("staff"));
     }
 
     /// A flag whose value is missing must not silently take the default: the

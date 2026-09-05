@@ -612,6 +612,7 @@ impl<N: HostNetwork> Inner<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::DnsState;
     use crate::host::double::Recorder;
     use crate::host::{DnsBackup, Route, Via};
 
@@ -767,7 +768,7 @@ mod tests {
             routes: Vec::new(),
             dns: Some(DnsBackup {
                 service: "primary".into(),
-                servers: vec!["192.168.1.1".parse().unwrap()],
+                state: DnsState::servers(&["192.168.1.1".parse().unwrap()]),
             }),
         }
         .save(&path)
@@ -882,7 +883,7 @@ mod tests {
             routes: Vec::new(),
             dns: Some(DnsBackup {
                 service: "primary".into(),
-                servers: vec!["192.168.1.1".parse().unwrap()],
+                state: DnsState::servers(&["192.168.1.1".parse().unwrap()]),
             }),
         }
         .save(&path)
