@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.4.0
+
+`shoesd` gains a Linux arm. Nothing in the library's public surface changed --
+`src/` is untouched apart from moving a test module -- so a library consumer,
+the CLI and both mobile artifacts are unaffected. The minor moves because there
+are two new shipped artifacts and a second platform the daemon configures a host
+on, which is what a minor is for under 0.x.
+
+### The daemon still has not run, on either platform
+
+`shoesd-linux-x86_64.tar.gz` and `shoesd-linux-arm64.tar.gz` are published for
+the first time, and as with the macOS artifact in 0.3.0, **no part of what they
+do to a host has executed against a real session** -- no `ip route`, no
+`resolvectl`, no `systemctl`, and no netlink notification from a real network
+change. Everything is unit-tested. Treat it as a candidate for the live run
+rather than as tested software; [docs/LINUX.md](docs/LINUX.md) and
+[the plan](docs/plans/2026-09-04-linux-privileged-daemon.md) carry the nine
+checks it owes.
+
+What *is* verified, and was not last release: the Linux arm now compiles and
+runs its tests in CI. Both daemon jobs were gated to macOS, so until this
+release the Linux half of `src/bin/shoesd/` was built by nothing. That gate
+came off, and the first run of the new job immediately found a test asserting a
+group name that does not exist on Ubuntu.
+
+### A Linux `HostNetwork`: routes, DNS, and a netlink monitor
+
+Routes go through `ip` by absolute path, with native `blackhole` and
+`unreachable` types rather than the loopback-and-flag shape macOS needs. The
+default gateway is read from `ip -j route show default` as JSON, skipping
+gateway-less entries -- a point-to-point default has none, and taking it would
+send an excluded address into the tunnel it is excluded from -- while reading a
+**multipath** default's gateways out of its `nexthops` array, because that entry
+also has no top-level `gateway` and skipping it would blackhole the proxy on
+every bonded host.
+
+DNS is two backends chosen by a probe at startup and reported to clients as
+`dns-backend:` in `Hello`'s `capabilities`. Where systemd-resolved is genuinely
+in the path, the resolvers go on the **tunnel's own link**, where nothing
+competes for them and the configuration dies with the link. Otherwise
+`/etc/resolv.conf` is managed directly, with an inotify watcher because
+NetworkManager and `netconfig` both rewrite it on their own schedule.
+
+**"systemd-resolved, where it is running" is not the test**, and getting that
+wrong leaks DNS silently: in resolved's `uplink` and `foreign` modes it is
+running, `resolvectl dns <link>` succeeds, and `/etc/resolv.conf` still lists
+the real upstream servers that every glibc client reads. The probe requires the
+stub to actually be in that file -- every nameserver, not merely one, since a
+file listing it beside an upstream server is one glibc falls back from under
+load.
+
+The direct backend's backup records whether the path was a symlink and where it
+pointed, and the original bytes when it was a regular file. Restoring a
+flattened regular file where a symlink was breaks a host permanently, and
+rebuilding from the parsed resolver list drops `search`, `options` and
+`sortlist` -- a host whose short names stop resolving after a session ends,
+with nothing connecting it to the VPN.
+
+### Coexisting with another VPN, answered rather than deferred
+
+Two links each claiming a `~.` routing domain is a resolved priority contest.
+Tailscale in its default configuration sets no `~.`, so MagicDNS keeps working
+and everything else comes to the tunnel with no interference either way. As an
+exit node it does, and then resolved queries both links in parallel and takes
+the first answer -- which nothing on our side can resolve, so the daemon logs a
+warning naming the other link rather than producing a tunnel whose DNS is
+nondeterministic.
+
+### Install: a systemd unit, and two Linux-shaped hazards
+
+The administrators' group is not portable -- `wheel` on Fedora, Arch and
+openSUSE, `sudo` on Debian and Ubuntu, and `admin` nowhere -- so `install`
+detects it, requiring that the group both exist *and* contain the invoking
+user. `adm` exists on Fedora and is empty, so a rule stopping at "exists" would
+install a socket the administrator cannot reach.
+
+Two things that would have been silent. `ExecStart` expands `%` specifiers at
+unit **load** time, inside double quotes, and `$` at exec time, so a socket path
+containing `%h` would have become a different path in a job running as root;
+both are escaped. And `Restart=always` is not `KeepAlive`: systemd *stops*
+restarting a unit that fails five times in ten seconds, where launchd throttles
+and keeps trying -- which would have abandoned a crash-looping daemon with its
+routes and `resolv.conf` still applied, on a machine whose network is down. The
+unit sets `StartLimitIntervalSec=0`.
+
+### glibc only
+
+The Linux daemon artifacts are built from the gnu targets and there is no musl
+build. A statically linked musl `shoesd` uses musl's own `getpwuid_r` and
+`getgrnam`, which read `/etc/passwd` and `/etc/group` directly and know nothing
+of NSS -- so on an SSSD- or LDAP-backed host the peer-credential check and the
+install-time group detection would both fail to resolve a real user, giving a
+daemon that refuses everyone with nothing in the error saying why. The `shoes`
+CLI's musl artifacts are unaffected.
+
 ## v0.3.0
 
 The minor moves rather than the patch. `control::StatusSnapshot` gained a

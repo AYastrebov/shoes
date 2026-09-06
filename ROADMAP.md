@@ -83,11 +83,12 @@ obfuscation and Hysteria2 port hopping.
 
 TUN mode with a Fake IP pool, on Linux, Android, iOS, Windows 11 and macOS.
 macOS has two hosts: the Network Extension system extension, and `shoesd`, a
-root launchd daemon that also configures routes and DNS. Neither has been run
-end to end yet — the extension needs an entitlement a Personal Team cannot
-hold, and the daemon's live run is outstanding. See
-[docs/MACOS.md](./docs/MACOS.md). The device-creation and validation arms that
-were missing on macOS now exist.
+root launchd daemon that also configures routes and DNS. `shoesd` now has a
+Linux arm too — a systemd service over `ip` and systemd-resolved. None of the
+three has been run end to end yet: the extension needs an entitlement a
+Personal Team cannot hold, and both daemons' live runs are outstanding. See
+[docs/MACOS.md](./docs/MACOS.md) and [docs/LINUX.md](./docs/LINUX.md). The
+device-creation and validation arms that were missing on macOS now exist.
 
 Three things worth naming because the table below has no row for them and they
 are real work: a DNS subsystem with `system`, UDP, TCP, DoT, DoH and DoH3
@@ -500,10 +501,10 @@ executable per product for the simulator and asserts with `nm` that the
 host has no engine symbol and the extension does. Design:
 [docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md](./docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md).
 
-### 4. Privileged helper and IPC contract — macOS done, pending its live run
+### 4. Privileged helper and IPC contract — macOS and Linux done, pending their live runs
 
-`shoesd` (`src/bin/shoesd/`, `--features daemon`) is a root launchd daemon
-serving gRPC over a Unix domain socket, with the `.proto` owned here in
+`shoesd` (`src/bin/shoesd/`, `--features daemon`) is a root daemon -- launchd
+on macOS, systemd on Linux -- serving gRPC over a Unix domain socket, with the `.proto` owned here in
 `proto/shoes/daemon/v1/`. It hosts `shoes::control` in-process and configures
 the host around it: the split default route, a host route per excluded address,
 IPv6 rejects, and DNS through `SCDynamicStore` — reverted on stop, and after a
@@ -527,12 +528,29 @@ when the default gateway moves, which is the ordinary case on a laptop rather
 than an edge one. There is no `SCDynamicStore` watcher: a network change is
 what makes macOS revert DNS, and the routing table already reports that.
 
-**What is left.** The live run on Apple Silicon (step 8 of
-[the plan](./docs/plans/2026-09-04-macos-privileged-daemon.md)), and Windows and
-Linux. Linux is the awkward one — systemd-resolved, resolvconf, NetworkManager
-and a bare `/etc/resolv.conf` are four different mechanisms — and both are left
-as `unimplemented` arms behind the same protocol, with `capabilities` there so
-a client asks rather than infers.
+**Linux is the second arm**, and the same trait and the same revert sequencer
+carry it: routes through `ip`, DNS through either systemd-resolved on the
+tunnel's own link or a managed `/etc/resolv.conf`, chosen by a probe at
+startup, and the route monitor ported to `AF_NETLINK`. Which backend was chosen
+is reported in `capabilities`, because it is the first question any Linux DNS
+bug report needs answered. Design:
+[docs/specs/2026-09-04-linux-privileged-daemon.md](./docs/specs/2026-09-04-linux-privileged-daemon.md);
+what it does to a host and what is still unverified:
+[docs/LINUX.md](./docs/LINUX.md).
+
+**What is left.** Both live runs — on Apple Silicon (step 8 of
+[the macOS plan](./docs/plans/2026-09-04-macos-privileged-daemon.md)) and on
+Linux (step 8 of
+[its own](./docs/plans/2026-09-04-linux-privileged-daemon.md), nine items,
+against a Fedora host with systemd-resolved and Tailscale up) — and Windows.
+
+Linux was expected to be the awkward one, and the four mechanisms are real:
+the answer is two backends chosen by a probe at startup, not four arms. What
+made it awkward was not the count but that "systemd-resolved, where it is
+running" is not a sufficient test — in resolved's `uplink` and `foreign` modes
+every glibc client bypasses it, so per-link configuration succeeds and DNS
+leaks with nothing saying so. Windows remains an `unimplemented` arm behind the
+same protocol, with `capabilities` there so a client asks rather than infers.
 
 ### 5. The Tauri GUI
 
