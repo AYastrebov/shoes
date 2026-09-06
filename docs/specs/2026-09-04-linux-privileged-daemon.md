@@ -98,11 +98,19 @@ That arm predates the macOS one.
 both said needed nothing. Both were found by building, not by reading, and the
 second contradicts "the peer-credential check is already OS-agnostic" outright.
 
-*The test asserts a Darwin gid.* Ungating makes `cargo test --features daemon`
-run `auth.rs`'s tests on Linux for the first time, and `a_known_group_resolves`
-asserts that `wheel` resolves to **gid 0**. That is a Darwin fact: on Fedora 44
-`getent group wheel` reports gid **10**. Asserting a constant tested the host
-rather than the lookup; the expected value now comes from an
+*The test asserts a Darwin gid — and then a Darwin group name.* Ungating makes
+`cargo test --features daemon` run `auth.rs`'s tests on Linux for the first
+time, and `a_known_group_resolves` asserts that `wheel` resolves to **gid 0**.
+That is a Darwin fact: on Fedora 44 `getent group wheel` reports gid **10**.
+
+The first correction kept the *name* and looked its gid up, which was still
+wrong and took a second round to see: **`wheel` does not exist on Debian or
+Ubuntu at all** — precisely the distribution split this daemon's group
+detection exists for. It went unnoticed because the development host is Fedora,
+and it was caught the first time the Linux CI leg ran. The test now takes the
+name from the process's own primary group, so nothing about the host is
+assumed and what is under test is that `for_group` agrees with `getgrgid`.
+Asserting a constant tested the host rather than the lookup; the expected value now comes from an
 independent `getgrnam` call, which is where a user's would come from too. The
 doc comment on `groups_of` carried the same mistake in prose — "gid 0 is
 `wheel`" — and now names both platforms. The security reasoning there is

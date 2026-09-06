@@ -329,25 +329,40 @@ mod tests {
     /// A group the machine really has resolves to the gid the machine really
     /// reports for it.
     ///
-    /// `wheel` is the name, because both Darwin and every distribution in
-    /// scope have it. Its *gid* is not portable and was asserted as 0 here
-    /// until this ran on Linux: that is true on Darwin and false on Fedora,
-    /// where `wheel` is gid 10. Asserting a constant tested the test host
-    /// rather than the lookup, so the expected value now comes from the same
-    /// place a user's would -- `getgrnam` through a second, independent call.
+    /// **No group name is hardcoded**, and it took two goes to get that right.
+    /// This asserted `wheel` is gid 0, which is a Darwin fact and false on
+    /// Fedora, where it is 10. The correction kept the *name* and looked its
+    /// gid up -- and `wheel` does not exist on Debian or Ubuntu at all, which
+    /// is precisely the distribution split this daemon's group detection is
+    /// about. CI on ubuntu caught it the first time that job existed.
+    ///
+    /// So the name comes from the machine too: the process's own primary
+    /// group, which every process has. What is under test is that
+    /// `for_group` agrees with `getgrgid` about the same group -- the lookup,
+    /// not the host it runs on.
     #[test]
     fn a_known_group_resolves() {
-        let wheel = Authorizer::for_group("wheel").expect("wheel exists on Unix");
-
-        // SAFETY: a valid NUL-terminated literal; the returned pointer is to a
-        // static buffer read before anything else can call into the group
-        // database on this thread.
-        let expected = unsafe {
-            let entry = libc::getgrnam(c"wheel".as_ptr());
-            assert!(!entry.is_null(), "wheel exists on Unix");
-            (*entry).gr_gid
+        // SAFETY: `getgid` takes no arguments and cannot fail. `getgrgid`
+        // returns a pointer into a static buffer, read here before anything
+        // else on this thread can call into the group database again.
+        let (name, gid) = unsafe {
+            let gid = libc::getgid();
+            let entry = libc::getgrgid(gid);
+            if entry.is_null() {
+                // A gid with no name in the database. Nothing to look up by
+                // name, so there is nothing to compare; this is not a failure
+                // of the code under test.
+                return;
+            }
+            (CStr::from_ptr((*entry).gr_name).to_owned(), gid)
         };
 
-        assert_eq!(wheel.group_gid(), expected);
+        let Ok(name) = name.into_string() else {
+            return;
+        };
+        let resolved = Authorizer::for_group(&name)
+            .unwrap_or_else(|e| panic!("the process's own group {name:?} must resolve: {e}"));
+
+        assert_eq!(resolved.group_gid(), gid);
     }
 }
