@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.4.1
+
+`awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no
+shoes source changed, and every test configuration is unchanged and green.
+
+Two things in that release matter to an AmneziaWG tunnel, and both are
+behavioural rather than API:
+
+- **`DisableCookies` now gates the whole under-load path** rather than only
+  suppressing the cookie reply, following upstream boringtun. Previously the
+  rate limiter still demanded a valid MAC2 while the peer never received the
+  cookie needed to build one, so every handshake against a busy device died in
+  silence -- worse than not having the switch. shoes drives `Tunn` with no rate
+  limiter, so this reaches shoes only through what a *peer* will now accept.
+- **AWG 3.0 content padding is bounded by the sliding UDP window rather than
+  the MTU**, following amneziawg-go `da11c9f` and the kernel module `7fc0145`,
+  with the MTU kept as a second bound. A padded packet now grows towards the
+  sizes the tunnel has actually carried instead of towards the link size. This
+  is the same mechanism behind the ~8x ACK-stream inflation recorded in
+  `docs/awg-throughput-findings-2026-09-01.md`, so a 3.0 tunnel's upload
+  overhead changes shape; `content_padding_addition` is still the setting that
+  controls it.
+
+`awgtun` 0.10.0 also makes `RateLimiter::verify_packet` take a
+`disable_cookies` argument, which is a breaking change in that crate and not
+one shoes can see: shoes uses the `Tunn` path and constructs no rate limiter.
+The new `Tunn::set_mtu` is likewise for awgtun's own device loop, which polls a
+live interface -- shoes passes its MTU in `Amnezia3Config` at construction and
+has nothing to poll.
+
 ## v0.4.0
 
 `shoesd` gains a Linux arm. Nothing in the library's public surface changed --
