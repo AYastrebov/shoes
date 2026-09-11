@@ -12,9 +12,12 @@
 //! mounts the listener the renderers here have no caller in one of them.
 #![allow(dead_code)]
 
+pub mod logs;
 pub mod memory;
 pub mod metrics;
 pub mod render;
+pub mod streams;
+pub mod ws;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -157,6 +160,12 @@ fn authorized(req: &Request<Incoming>, secret: &str) -> bool {
     bearer.as_bytes().ct_eq(secret.as_bytes()).into()
 }
 
+/// mihomo streams `/connections` on a plain GET only when asked for an
+/// interval; the one-shot is the default.
+fn wants_stream(req: &Request<Incoming>) -> bool {
+    query_param(req.uri().query(), "interval").is_some()
+}
+
 pub(crate) fn query_param(query: Option<&str>, name: &str) -> Option<String> {
     query?
         .split('&')
@@ -295,6 +304,40 @@ async fn dispatch(
 
         (Method::GET, ["rules"]) => json(StatusCode::OK, render::rules()),
 
+        // The streaming routes come first: a dashboard opens them as
+        // WebSockets, and mihomo also serves them as chunked JSON lines on a
+        // plain GET. Two arms each, because the two sinks are different
+        // types and a producer is generic over them.
+        (Method::GET, ["traffic"]) if ws::is_upgrade(&req) => ws::upgrade(req, streams::traffic),
+        (Method::GET, ["traffic"]) => streams::chunked(streams::traffic),
+
+        (Method::GET, ["memory"]) if ws::is_upgrade(&req) => ws::upgrade(req, streams::memory),
+        (Method::GET, ["memory"]) => streams::chunked(streams::memory),
+
+        (Method::GET, ["logs"]) => {
+            let Some(filter) = streams::parse_level(req.uri().query()) else {
+                return error(StatusCode::BAD_REQUEST, "unknown level");
+            };
+            let state = state.clone();
+            if ws::is_upgrade(&req) {
+                ws::upgrade(req, move |sink| streams::logs(state, filter, sink))
+            } else {
+                streams::chunked(move |sink| streams::logs(state, filter, sink))
+            }
+        }
+
+        // `/connections` is a snapshot unless asked to stream: a dashboard's
+        // list fetch must not become a subscription.
+        (Method::GET, ["connections"]) if ws::is_upgrade(&req) || wants_stream(&req) => {
+            let interval = query_param(req.uri().query(), "interval")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            if ws::is_upgrade(&req) {
+                ws::upgrade(req, move |sink| streams::connections(sink, interval))
+            } else {
+                streams::chunked(move |sink| streams::connections(sink, interval))
+            }
+        }
         (Method::GET, ["connections"]) => json(StatusCode::OK, render::connections()),
         (Method::DELETE, ["connections"]) => {
             crate::connection_registry::close_all();
@@ -316,6 +359,9 @@ async fn dispatch(
         // than retry.
         (_, [])
         | (_, ["version"])
+        | (_, ["traffic"])
+        | (_, ["memory"])
+        | (_, ["logs"])
         | (_, ["configs"])
         | (_, ["proxies", ..])
         | (_, ["group", ..])

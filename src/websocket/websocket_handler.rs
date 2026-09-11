@@ -254,7 +254,7 @@ fn create_websocket_key() -> String {
     BASE64.encode(key)
 }
 
-fn create_websocket_key_response(key: String) -> String {
+pub(crate) fn create_websocket_key_response(key: String) -> String {
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     let mut input = key.into_bytes();
     input.extend_from_slice(WS_GUID);

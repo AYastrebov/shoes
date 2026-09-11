@@ -108,8 +108,235 @@ pub async fn get(addr: SocketAddr, path: &str, secret: Option<&str>) -> Reply {
     request(addr, "GET", path, &headers, "").await
 }
 
+/// Write one line into a ring the way the global logger would.
+fn push(
+    ring: &shoes::control::logs::BroadcastLogWriter,
+    level: log::Level,
+    target: &str,
+    message: &str,
+) {
+    use shoes::logging::LogWriter as _;
+    // Built and used in one statement: `format_args!` borrows a temporary.
+    ring.write_log(
+        &log::Record::builder()
+            .level(level)
+            .target(target)
+            .args(format_args!("{message}"))
+            .build(),
+        message,
+    );
+}
+
 fn json(reply: &Reply) -> serde_json::Value {
     serde_json::from_str(&reply.body).unwrap_or_else(|e| panic!("{e}: {}", reply.body))
+}
+
+/// A WebSocket handshake, checked against RFC 6455's example accept key.
+pub async fn ws_open(addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="),
+        "the accept key must be the RFC's: {head}"
+    );
+    stream
+}
+
+/// One server text frame. Server frames are unmasked, and these payloads
+/// are well under 64 KiB.
+pub async fn ws_read_text(stream: &mut tokio::net::TcpStream) -> String {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0] & 0x0f, 0x1, "expected a text frame");
+    assert_eq!(header[1] & 0x80, 0, "a server must not mask");
+
+    let len = match header[1] & 0x7f {
+        126 => {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await.unwrap();
+            u16::from_be_bytes(extended) as usize
+        }
+        n => n as usize,
+    };
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await.unwrap();
+    String::from_utf8(payload).unwrap()
+}
+
+#[tokio::test]
+async fn traffic_streams_and_a_token_query_authorises_a_socket() {
+    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+
+    // A browser cannot set a header on a handshake, so the secret rides on
+    // the query string.
+    let mut ws = ws_open(addr, "/traffic?token=s").await;
+    let frame: serde_json::Value = serde_json::from_str(&ws_read_text(&mut ws).await).unwrap();
+    assert!(
+        frame.get("up").is_some() && frame.get("down").is_some(),
+        "{frame}"
+    );
+}
+
+#[tokio::test]
+async fn a_socket_without_the_token_is_refused() {
+    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /traffic HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    // The status line only: a refused upgrade is answered on a connection
+    // that stays open, so reading to EOF would wait for a close that a
+    // keep-alive response never sends.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n") {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut byte),
+        )
+        .await
+        .expect("a status line within five seconds")
+        .unwrap();
+        head.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("HTTP/1.1 401"),
+        "an unauthorised upgrade must not become a socket: {}",
+        String::from_utf8_lossy(&head)
+    );
+}
+
+#[tokio::test]
+async fn memory_and_connections_stream_over_a_socket() {
+    let (addr, _stop) = spawn(None, vec![]).await;
+
+    let mut ws = ws_open(addr, "/memory").await;
+    let frame: serde_json::Value = serde_json::from_str(&ws_read_text(&mut ws).await).unwrap();
+    assert!(frame["inuse"].is_number(), "{frame}");
+
+    let mut ws = ws_open(addr, "/connections?interval=100").await;
+    let frame: serde_json::Value = serde_json::from_str(&ws_read_text(&mut ws).await).unwrap();
+    assert!(frame["connections"].is_array(), "{frame}");
+}
+
+/// mihomo serves these to a plain GET as well, and scripts use that.
+#[tokio::test]
+async fn a_plain_get_streams_json_lines() {
+    let (addr, _stop) = spawn(None, vec![]).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /traffic HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let mut text = String::new();
+    for _ in 0..5 {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("a frame within three seconds")
+            .unwrap();
+        text.push_str(&String::from_utf8_lossy(&buf[..n]));
+        if text.contains("\"up\"") {
+            break;
+        }
+    }
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("\"up\""), "{text}");
+}
+
+/// A snapshot fetch must stay a snapshot: `/connections` without an
+/// interval is one body that ends.
+#[tokio::test]
+async fn connections_without_an_interval_is_a_snapshot() {
+    let (addr, _stop) = spawn(None, vec![]).await;
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        get(addr, "/connections", None),
+    )
+    .await
+    .expect("the body ends rather than streaming");
+    assert_eq!(reply.code, 200);
+    assert!(json(&reply)["connections"].is_array());
+}
+
+/// The backlog first, then live lines, in the payload shape a sing-box
+/// client's classifier splits on.
+#[tokio::test]
+async fn logs_replay_the_backlog_then_stream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ring = shoes::clash_api::logs::install_ring(16);
+    let state = Arc::new(ApiState {
+        config: ClashApiConfig {
+            listen: addr,
+            secret: None,
+            allow_origins: vec![],
+            max_tracked_connections: 4096,
+            state_file: None,
+        },
+        ports: Ports::default(),
+        started: std::time::Instant::now(),
+        log: Some(ring.clone()),
+    });
+    let (_stop, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(serve_on(listener, state, rx));
+
+    // Through the public writer rather than the global logger: that one is
+    // process-wide and initialised once, so a test that installed one would
+    // fight every other test in the binary.
+    push(
+        &ring,
+        log::Level::Info,
+        "shoes::tcp::tcp_server",
+        "before-subscribe",
+    );
+
+    let mut ws = ws_open(addr, "/logs?level=trace").await;
+    let first: serde_json::Value = serde_json::from_str(&ws_read_text(&mut ws).await).unwrap();
+    assert_eq!(first["type"], "info");
+    let payload = first["payload"].as_str().unwrap();
+    assert!(payload.contains("before-subscribe"), "{payload}");
+    assert!(
+        payload.starts_with("inbound[]: "),
+        "a sing-box classifier splits on category[tag]: {payload}"
+    );
+
+    push(&ring, log::Level::Warn, "shoes", "live");
+    let second: serde_json::Value = serde_json::from_str(&ws_read_text(&mut ws).await).unwrap();
+    assert_eq!(second["type"], "warning");
+    assert!(
+        second["payload"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime[shoes]: "),
+        "{second}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_log_level_is_refused() {
+    let (addr, _stop) = spawn(None, vec![]).await;
+    assert_eq!(get(addr, "/logs?level=shouting", None).await.code, 400);
 }
 
 #[tokio::test]

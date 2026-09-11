@@ -62,7 +62,12 @@ control-connections = ["control-stats"]
 # the CLI. Reads the registry above, the outbound registry and the log ring;
 # serves none of it without a `clash_api:` block in the config. See
 # docs/specs/2026-09-09-clash-api.md.
-clash-api = ["control-logs", "control-connections", "dep:serde_json"]
+clash-api = [
+    "control-logs",
+    "control-connections",
+    "dep:serde_json",
+    "dep:tokio-stream",
+]
 # This build is linked into an Apple Network Extension, so the system kills it
 # at a memory cap rather than warning it, and src/buffer_sizing.rs picks the
 # constrained per-connection budget.
@@ -117,6 +122,11 @@ async-trait = "*"
 # a target-gated optional is a no-op off that target, which would leave the
 # controller without a serializer on Windows.
 serde_json = { version = "*", optional = true }
+# Optional, and enabled by two features on different platforms, for the same
+# reason as serde_json above: `net` carries the UnixListenerStream the daemon
+# hands to tonic, and `ReceiverStream` carries the controller's chunked
+# bodies.
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
 awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "b6b4bcb4372858fdf77c1184c86170d1732b3de1", default-features = false }
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -221,9 +231,6 @@ tun = { version = "*", features = ["async"] }
 tonic = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
-# `net` is what carries UnixListenerStream, which is how the listener reaches
-# `serve_with_incoming_shutdown`.
-tokio-stream = { version = "0.1", features = ["net"], optional = true }
 # The two that genuinely are macOS-only: DNS through SCDynamicStore, Mullvad's
 # bindings. Not `networksetup`, which addresses a service by display name and
 # has been broken that way since macOS 14.3 (libnyanpasu/nyanpasu-service#26);

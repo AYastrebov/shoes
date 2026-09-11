@@ -765,7 +765,7 @@ impl AsyncPing for WebsocketStream {
 impl AsyncStream for WebsocketStream {}
 
 #[inline]
-fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> usize {
+pub(crate) fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> usize {
     let input_len = input.len();
 
     // 0x80 is final
