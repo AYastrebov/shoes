@@ -160,6 +160,12 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!(
         "    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)"
     );
+    eprintln!(
+        "    check <config.yaml> [config.yaml...]           Parse the config and exit (same as --dry-run)"
+    );
+    eprintln!(
+        "    version                                        Print version information and exit"
+    );
     std::process::exit(1);
 }
 
@@ -505,7 +511,19 @@ fn main() {
                     outcome = async {
                         if debounce {
                             println!("Configs changed, reloading in 3 seconds..");
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            // The signal cuts the debounce short. In the
+                            // usual "write, then signal" the watcher's event
+                            // arrives first, in milliseconds, and wins the
+                            // select above; a SIGHUP that then sat behind the
+                            // full debounce would be the delay it exists to
+                            // skip. It is consumed here, and so cannot fire a
+                            // second reload after this one.
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                                () = reload.recv() => {
+                                    println!("Received SIGHUP, reloading now..");
+                                }
+                            }
                         } else {
                             println!("Received SIGHUP, reloading..");
                         }

@@ -75,6 +75,70 @@ fn sighup(child: &Child) {
     unsafe { libc::kill(child.0.id() as i32, libc::SIGHUP) };
 }
 
+/// The child's stdout, line by line, read on its own thread so the pipe
+/// never fills and the test can wait for the process to announce a state
+/// instead of guessing how long it takes to reach it.
+#[cfg(unix)]
+struct Stdout {
+    rx: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Stdout {
+    fn tap(child: &mut Child) -> Self {
+        use std::io::BufRead;
+        let stdout = child.0.stdout.take().expect("spawned with a piped stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            rx,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Block until a line containing `needle` is printed; fail if none is.
+    fn wait_for(&mut self, needle: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(line) => {
+                    let hit = line.contains(needle);
+                    self.seen.push(line);
+                    if hit {
+                        return;
+                    }
+                }
+                Err(_) => panic!(
+                    "the process never printed {needle:?}; stdout so far:\n{}",
+                    self.seen.join("\n")
+                ),
+            }
+        }
+    }
+
+    /// Every line printed so far, plus whatever arrives until the pipe
+    /// closes (the child is dead) or a few seconds pass.
+    fn rest(mut self) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(line) => self.seen.push(line),
+                Err(_) => break self.seen,
+            }
+        }
+    }
+}
+
 #[test]
 fn check_exits_zero_on_a_valid_config_and_one_with_the_error_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,26 +248,28 @@ async fn sighup_reloads_immediately_even_with_no_reload() {
     drop(child);
 }
 
-/// A `SIGHUP` that lands while the process is still starting -- arguments
-/// parsed, handler installed, listeners not yet bound -- is held until the
-/// serve loop can act on it, not fatal.
+/// A `SIGHUP` that lands while the process is still starting -- config
+/// read, handler installed, listeners not yet bound -- is held until the
+/// serve loop can act on it, and then honoured. The config is rewritten
+/// before the burst, so a signal that was merely swallowed (the "ignore"
+/// disposition `main` starts with) would leave the first listener up and
+/// this test waiting for the second one.
 ///
 /// The burst starts on the first line the process prints, which comes after
-/// the handler is installed and before any listener is bound. It cannot
-/// start earlier: a signal that arrives before the loader has reached
-/// `main` kills any process, and nothing in `main.rs` can close that window.
-/// From the first instruction of `main` the disposition is "ignore" until
-/// the handler takes over, so the rest of start-up is covered by this one
-/// synchronisation point rather than by a guess at the timing.
+/// the handler is installed and the first config is read, and before any
+/// listener is bound. It cannot start earlier: a signal that arrives before
+/// the loader has reached `main` kills any process, and nothing in `main.rs`
+/// can close that window. From the first instruction of `main` the
+/// disposition is "ignore" until the handler takes over, so the rest of
+/// start-up is covered by this one synchronisation point rather than by a
+/// guess at the timing.
 #[cfg(unix)]
 #[tokio::test]
 async fn sighup_during_startup_is_buffered_not_fatal() {
-    use std::io::BufRead;
-
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
-    let [port] = free_ports::<1>();
-    std::fs::write(&config, socks_config(port)).unwrap();
+    let [first, second] = free_ports::<2>();
+    std::fs::write(&config, socks_config(first)).unwrap();
     let mut child = Child(
         std::process::Command::new(shoes_bin())
             .arg("--no-reload")
@@ -213,19 +279,12 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
             .spawn()
             .unwrap(),
     );
-    let stdout = child.0.stdout.take().unwrap();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if line.contains("Starting") {
-                let _ = started_tx.send(());
-            }
-        }
-    });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the process never announced start-up");
+    let mut stdout = Stdout::tap(&mut child);
+    stdout.wait_for("Starting");
+
+    // The first config is already read; the reload the buffered signal
+    // triggers must pick up this one.
+    std::fs::write(&config, socks_config(second)).unwrap();
 
     // A burst rather than one signal, so that some land before the first
     // bind and some after it, whichever way the scheduler leans on this run.
@@ -234,8 +293,10 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    wait_until(addr, true).await;
+    let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
+    let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
+    wait_until(second_addr, true).await;
+    wait_until(first_addr, false).await;
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "the process must still be running after SIGHUPs through start-up"
@@ -244,8 +305,15 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
 }
 
 /// The operator's usual sequence is "write the file, then signal", and with
-/// the watcher on both announce the same edit. That must be one reload, not
-/// an immediate one followed by a debounced one three seconds later.
+/// the watcher on both announce the same edit. The watcher's event arrives
+/// first, in milliseconds, and starts the three-second debounce; the signal
+/// must cut that short rather than wait it out, and the pair must be one
+/// reload, not an immediate one followed by a debounced one.
+///
+/// Synchronised on the process's own announcement of the debounce rather
+/// than on a guessed sleep: that is the state the signal has to interrupt,
+/// and it also proves the watcher's event was consumed before the signal
+/// was sent, which is the case the coalescing is for.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_write_then_a_sighup_is_one_reload_not_two() {
@@ -262,25 +330,36 @@ async fn a_write_then_a_sighup_is_one_reload_not_two() {
             .spawn()
             .unwrap(),
     );
+    let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
     let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
     wait_until(first_addr, true).await;
 
     std::fs::write(&config, socks_config(second)).unwrap();
-    // Let the watcher deliver its event so both announcements are pending
-    // together, which is the case the coalescing is for.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    stdout.wait_for("Configs changed");
+    let signalled = std::time::Instant::now();
     sighup(&child);
     wait_until(second_addr, true).await;
+    wait_until(first_addr, false).await;
+    assert!(
+        signalled.elapsed() < std::time::Duration::from_secs(2),
+        "a SIGHUP during the watcher's debounce must cut it short, not wait out the 3 s"
+    );
 
     // Past the debounce: a stale event would have fired by now.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     let _ = child.0.kill();
-    let stdout = child.0.stdout.take().unwrap();
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut std::io::BufReader::new(stdout), &mut text).unwrap();
-    let restarts = text.matches("Restarting servers..").count();
-    assert_eq!(restarts, 1, "one edit, one reload; stdout was:\n{text}");
+    let lines = stdout.rest();
+    let restarts = lines
+        .iter()
+        .filter(|l| l.contains("Restarting servers.."))
+        .count();
+    assert_eq!(
+        restarts,
+        1,
+        "one edit, one reload; stdout was:\n{}",
+        lines.join("\n")
+    );
     drop(child);
 }

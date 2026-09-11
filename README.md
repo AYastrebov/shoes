@@ -80,13 +80,22 @@ shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
     -t, --threads NUM    Set the number of worker threads (default: CPU count)
+    -l, --log-file PATH  Log to file (repeatable; "-" means stderr; default: stderr)
     -d, --dry-run        Parse the config and exit
     --no-reload          Disable automatic config reloading on file changes
+    -V, --version        Print version information and exit
 
 COMMANDS:
-    generate-reality-keypair                  Generate a new Reality X25519 keypair
+    generate-reality-keypair                       Generate a new Reality X25519 keypair
     generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
+    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)
+    check <config.yaml> [config.yaml...]           Parse the config and exit (same as --dry-run)
+    version                                        Print version information and exit
 ```
+
+A running process reloads its config on `SIGHUP` immediately, with or without
+`--no-reload`; the file watcher's three-second debounce applies only to edits
+it notices on its own.
 
 ### Examples
 ```bash
@@ -101,6 +110,13 @@ shoes --threads 8 config.yaml
 
 # Validate configuration without starting
 shoes --dry-run config.yaml
+shoes check config.yaml
+
+# Print the version
+shoes version
+
+# Reload a running process right away (no debounce)
+kill -HUP <pid>
 
 # Run without hot-reloading
 shoes --no-reload config.yaml
