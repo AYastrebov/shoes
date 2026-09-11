@@ -7,6 +7,7 @@ mod buffer_sizing;
 mod client_proxy_chain;
 mod client_proxy_selector;
 mod config;
+mod connection_registry;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
