@@ -848,6 +848,39 @@ mod tests {
         );
     }
 
+    /// The same, through the cache.
+    ///
+    /// Caching turns on past sixteen rules, and a cached decision is rebuilt
+    /// from the stored index rather than by matching again -- a separate
+    /// path, and one a test of the uncached path says nothing about.
+    #[tokio::test]
+    async fn a_cached_decision_carries_the_same_rule_index() {
+        let resolver = mock_resolver();
+        let mut rules = Vec::new();
+        // Sixteen that cannot match, then the one that does: over the
+        // threshold, so the selector caches.
+        for i in 0..16u8 {
+            rules.push(allow_rule(vec![&format!("10.{i}.0.0/16")], "filler"));
+        }
+        rules.push(allow_rule(vec!["192.168.0.0/16"], "lan"));
+        let selector = ClientProxySelector::new(rules);
+        assert!(selector.is_cache_enabled(), "the threshold must be crossed");
+
+        let judged = async || {
+            let loc: ResolvedLocation = NetLocation::from_str("192.168.1.1:80", Some(80))
+                .unwrap()
+                .into();
+            match selector.judge(loc, &resolver).await.unwrap() {
+                ConnectDecision::Allow { rule_index, .. } => Some(rule_index),
+                ConnectDecision::Block => None,
+            }
+        };
+
+        assert_eq!(judged().await, Some(16), "the miss");
+        assert_eq!(selector.cache_size(), 1, "and it was cached");
+        assert_eq!(judged().await, Some(16), "the hit reports the same rule");
+    }
+
     /// A shoes rule is a list; a Clash rule is one condition. The rendering
     /// is a summary, and the cases that must not be confused are the
     /// catch-all, a single mask, and anything larger.

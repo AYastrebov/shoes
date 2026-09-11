@@ -88,6 +88,15 @@ jobs:
       - name: Run tests with the desktop control surface enabled
         run: cargo test --locked --features desktop
 
+      # The controller and the connection registry. Both feature states of
+      # the registry are exercised: the shim by the default run above, the
+      # real one here, and only one of them is what mobile compiles.
+      - name: Run tests with the Clash API enabled
+        run: cargo test --locked --features clash-api
+
+      - name: Guard the mobile builds against the controller
+        run: scripts/check-mobile-features.sh
+
       # The privileged daemon, which exists on macOS and Linux: its
       # dependencies sit under a target section naming both, and Windows has no
       # host-network arm. Without this its tests -- the revert sequencing, the
