@@ -52,11 +52,15 @@ reproduces it:
    router with 128-256 MiB is the wrong place for its arenas anyway.
    (`Cargo.toml`, `src/main.rs`)
 3. **`portable-atomic` for the 64-bit counters.** The target has no 64-bit
-   atomics (`max-atomic-width` 32). Five files used `AtomicU64`; they use
-   `portable_atomic::AtomicU64` now, which is the std type on every other
-   target and a lock-backed fallback here.
+   atomics (`max-atomic-width` 32). Five files used `AtomicU64`; they take
+   it from `util::AtomicU64` now, which is std's type on every target that
+   has one and `portable_atomic`'s lock-backed fallback here. The crate is
+   a dependency only on such targets.
 4. **`build-std` on nightly.** `mipsel-unknown-linux-musl` is tier 3: no
-   prebuilt std. (`Cross.toml`)
+   prebuilt std. Pinned to `nightly-2026-09-11` (rustc 1.100.0-nightly,
+   67eda617e), and the cross images are pinned by digest, so the script
+   reproduces these numbers rather than whatever the tags point at later.
+   (`Cross.toml`, `scripts/build-keenetic.sh`)
 5. **The toolchain's own C runtime files.** Rust's musl targets link the
    start files and `libunwind` that ship with the prebuilt std, which a
    `build-std` target lacks: `-C link-self-contained=no` for the start

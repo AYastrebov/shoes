@@ -1,4 +1,4 @@
-use portable_atomic::AtomicU64;
+use crate::util::atomic::AtomicU64;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use std::str;

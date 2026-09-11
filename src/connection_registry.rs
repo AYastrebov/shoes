@@ -27,10 +27,8 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-// `portable_atomic` rather than std: the Keenetic mipsel target has no
-// 64-bit atomics, and this is a lock-backed fallback there and the std
-// type everywhere else.
-use portable_atomic::AtomicU64;
+// Std's on every target that has one; see `util::AtomicU64`.
+use crate::util::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 

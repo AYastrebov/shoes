@@ -198,7 +198,6 @@ tokio-util = { version = "*", features = ["time"] }
 url = "*"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
-portable-atomic = "1.15.0"
 
 # Optional so that only a `--features daemon` build compiles it: a build
 # dependency costs build time on every target otherwise, including the mobile
@@ -259,6 +258,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+
+# 64-bit atomics for targets without them (Keenetic mipsel); see util::AtomicU64.
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = "1.15.0"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS,
 # or Android). Not on MIPS either: the Keenetic mipsel routers are 32-bit

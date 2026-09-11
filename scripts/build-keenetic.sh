@@ -10,7 +10,7 @@
 # Prerequisites:
 #   cargo install cross --locked
 #   rustup target add aarch64-unknown-linux-musl
-#   rustup toolchain install nightly --profile minimal --component rust-src
+#   rustup toolchain install nightly-2026-09-11 --profile minimal --component rust-src
 #
 # Usage: scripts/build-keenetic.sh [profile] [features]
 #   profile   release (default) or release-mobile (opt-level s, panic abort)
@@ -19,6 +19,11 @@
 # Output: dist/keenetic/shoes-<profile>-<entware arch>
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# The nightly the measurements were taken with (rustc 1.100.0-nightly,
+# 67eda617e 2026-09-10); the cross images are pinned by digest in Cross.toml
+# for the same reason. Override with NIGHTLY=nightly to try a newer one.
+NIGHTLY=${NIGHTLY:-nightly-2026-09-11}
 
 profile=${1:-release}
 features=${2:-clash-api}
@@ -32,7 +37,7 @@ build() {
     # LLVM's scheduler); a resumed build keeps everything that compiled.
     local attempt
     for attempt in 1 2 3; do
-        if cross $toolchain build --profile "$profile" --target "$triple" \
+        if cross $toolchain build --locked --profile "$profile" --target "$triple" \
             --features "$features$extra"; then
             break
         fi
@@ -46,6 +51,6 @@ build aarch64-unknown-linux-musl aarch64-3.10 "" ""
 
 # aws-lc-sys has no prebuilt bindings for MIPS (hence bindgen), and its
 # prefixed bindings hit an LLVM MIPS bug (see Cross.toml), hence no prefix.
-AWS_LC_SYS_NO_PREFIX=1 build mipsel-unknown-linux-musl mipsel-3.4 +nightly ",aws-lc-rs/bindgen"
+AWS_LC_SYS_NO_PREFIX=1 build mipsel-unknown-linux-musl mipsel-3.4 "+$NIGHTLY" ",aws-lc-rs/bindgen"
 
 ls -l dist/keenetic/

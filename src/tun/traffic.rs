@@ -3,7 +3,7 @@
 //! Provides global atomic byte counters and a callback mechanism for reporting
 //! traffic statistics to the host application (iOS/Android) via FFI.
 
-use portable_atomic::AtomicU64;
+use crate::util::atomic::AtomicU64;
 #[cfg(feature = "control-stats")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -299,7 +299,7 @@ pub fn get_traffic_counters() -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use portable_atomic::AtomicU64;
+    use crate::util::atomic::AtomicU64;
 
     /// The TUN path counts once, into two places: the process-wide totals a
     /// mobile host reads, and this flow's own entry. A second wrapper would

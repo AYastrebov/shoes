@@ -91,6 +91,17 @@ pub const ENOBUFS_RAW: i32 = 10055; // WSAENOBUFS
 #[cfg(not(windows))]
 pub const ENOBUFS_RAW: i32 = libc::ENOBUFS;
 
+/// A 64-bit atomic on every target: std's where the target has one, and
+/// `portable_atomic`'s lock-backed fallback where it does not (Keenetic's
+/// mipsel, `max-atomic-width` 32). The std type wherever it exists, so a
+/// public field of this type keeps its type on every target that had it.
+pub mod atomic {
+    #[cfg(target_has_atomic = "64")]
+    pub use std::sync::atomic::AtomicU64;
+    #[cfg(not(target_has_atomic = "64"))]
+    pub use portable_atomic::AtomicU64;
+}
+
 /// How loudly to log a connection that ended with `e`.
 ///
 /// One table instead of a per-file copy: the accept loops had grown
