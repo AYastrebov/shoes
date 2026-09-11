@@ -211,6 +211,18 @@ fn main() {
         }
     }
 
+    // Subcommands an operator such as awg-manager already calls by these
+    // names: `check <config>` is `--dry-run`, `version` is `--version`.
+    // See docs/specs/2026-09-11-awg-manager-engine.md, "Slice 1".
+    if args.first().map(String::as_str) == Some("version") {
+        println!("shoes {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.first().map(String::as_str) == Some("check") {
+        args.remove(0);
+        dry_run = true;
+    }
+
     let directives = logging::resolve_directives();
     let mut writers: Vec<Box<dyn logging::LogWriter>> = Vec::new();
 
@@ -407,6 +419,8 @@ fn main() {
         // (the reload debounce, a prepare) is buffered by the stream and
         // handled at the next wait.
         let mut signals = ShutdownSignals::install();
+        // The operator's reload request, kept for the same reason.
+        let mut reload = ReloadSignal::install();
 
         let mut first_launch = true;
         loop {
@@ -427,25 +441,31 @@ fn main() {
             };
             first_launch = false;
 
-            if reload_state.is_none() {
-                // No reload mode: nothing to do but serve until the OS
-                // asks the process to exit.
-                let (what, code) = signals.recv().await;
-                shut_down(what, code, join_handles).await;
-            }
-
-            // Wait for a change, then keep trying until an edit produces a
-            // config that loads. The running servers keep serving the
-            // last-good configuration the whole time: killing a live proxy
-            // over a half-saved file punishes the edit before it is done.
+            // Wait for a reason to reload, then keep trying until an edit
+            // produces a config that loads. The running servers keep serving
+            // the last-good configuration the whole time: killing a live
+            // proxy over a half-saved file punishes the edit before it is
+            // done.
+            //
+            // Two reasons, treated differently. A file change is debounced,
+            // because an editor saves in pieces. A SIGHUP is not: the
+            // operator that sent it has finished writing, and it arrives
+            // whether or not the watcher is on -- `--no-reload` disables the
+            // watcher, not the operator.
             prepared = loop {
-                let (watcher, rx) = reload_state.as_mut().expect("checked above");
-                tokio::select! {
-                    changed = rx.recv() => {
-                        changed.expect("the watcher thread is co-owned");
-                    }
+                let debounce = tokio::select! {
+                    () = async {
+                        match reload_state.as_mut() {
+                            Some((_, rx)) => {
+                                rx.recv().await.expect("the watcher thread is co-owned");
+                            }
+                            // No watcher: only a signal can end this wait.
+                            None => futures::future::pending::<()>().await,
+                        }
+                    } => true,
+                    () = reload.recv() => false,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
-                }
+                };
 
                 // The debounce and the prepare stay under the signal
                 // select: a SIGTERM during a reload whose DNS bootstrap
@@ -454,11 +474,17 @@ fn main() {
                 // SIGKILL, the unflushed death this handler removes.
                 let outcome = tokio::select! {
                     outcome = async {
-                        println!("Configs changed, reloading in 3 seconds..");
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        // Remove any extra events
-                        while rx.try_recv().is_ok() {}
-                        prepare_servers(&args, Some(watcher)).await
+                        if debounce {
+                            println!("Configs changed, reloading in 3 seconds..");
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            // Remove any extra events
+                            if let Some((_, rx)) = reload_state.as_mut() {
+                                while rx.try_recv().is_ok() {}
+                            }
+                        } else {
+                            println!("Received SIGHUP, reloading..");
+                        }
+                        prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
                     } => outcome,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 };
@@ -511,6 +537,50 @@ async fn shut_down(
     }
     log::logger().flush();
     std::process::exit(code);
+}
+
+/// The operator's reload request: `SIGHUP` on Unix, nothing elsewhere.
+///
+/// A resumable stream for the reason `ShutdownSignals` gives: installed once
+/// and kept across every wait, so a signal that lands during a prepare is
+/// buffered rather than lost.
+struct ReloadSignal {
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl ReloadSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let hangup = match signal(SignalKind::hangup()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Could not install the SIGHUP handler: {e}");
+                    None
+                }
+            };
+            Self { hangup }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Resolves on each `SIGHUP`; pends forever if there is no handler.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match &mut self.hangup {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => futures::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        futures::future::pending::<()>().await
+    }
 }
 
 /// The OS's stop requests, as resumable streams.
