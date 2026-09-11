@@ -164,6 +164,18 @@ fn print_usage_and_exit(arg0: String) {
 }
 
 fn main() {
+    // Ignore SIGHUP from the first instruction until the runtime installs
+    // the real handler below. Before that there is nothing to reload, and
+    // the OS default for the signal is death -- so an operator's reload sent
+    // to a process still parsing its arguments killed it. Dropped rather
+    // than buffered for these few milliseconds, which is the right
+    // direction: a reload of nothing is nothing.
+    #[cfg(unix)]
+    // SAFETY: setting a disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
     let mut num_threads = 0usize;
@@ -367,7 +379,10 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        let mut reload_state = if no_reload {
+        // No watcher for a validation-only run: `check` has nothing to
+        // reload, and the watcher unwraps a missing path, which turned
+        // `check missing.yaml` into a panic where an exit code was promised.
+        let mut reload_state = if no_reload || dry_run {
             None
         } else {
             let (watcher, rx) = start_notify_thread(args.clone());
@@ -401,6 +416,16 @@ fn main() {
             return;
         }
 
+        // Installed before the first prepare, not after it: until this is
+        // installed a SIGHUP has the OS default disposition, which is death.
+        // An operator that sends one during a start-up prepare -- a DNS
+        // bootstrap stalled on a dead network -- gets it buffered and
+        // honoured at the first wait instead. The stop signals stay where
+        // they are: buffering a SIGTERM behind a stalled start-up prepare
+        // would be the escalation-to-SIGKILL this loop was rewritten to
+        // avoid, and there is nothing to clean up before the first launch.
+        let mut reload = ReloadSignal::install();
+
         let mut prepared = match prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
         {
             Ok(p) => p,
@@ -419,8 +444,6 @@ fn main() {
         // (the reload debounce, a prepare) is buffered by the stream and
         // handled at the next wait.
         let mut signals = ShutdownSignals::install();
-        // The operator's reload request, kept for the same reason.
-        let mut reload = ReloadSignal::install();
 
         let mut first_launch = true;
         loop {
@@ -452,8 +475,16 @@ fn main() {
             // operator that sent it has finished writing, and it arrives
             // whether or not the watcher is on -- `--no-reload` disables the
             // watcher, not the operator.
+            //
+            // `biased`, in this order: a stop request beats everything, and
+            // when a write and a SIGHUP are both pending -- the operator's
+            // usual "write, then signal" -- the signal wins, so the reload is
+            // immediate rather than debounced.
             prepared = loop {
                 let debounce = tokio::select! {
+                    biased;
+                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
+                    () = reload.recv() => false,
                     () = async {
                         match reload_state.as_mut() {
                             Some((_, rx)) => {
@@ -463,8 +494,6 @@ fn main() {
                             None => futures::future::pending::<()>().await,
                         }
                     } => true,
-                    () = reload.recv() => false,
-                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 };
 
                 // The debounce and the prepare stay under the signal
@@ -477,13 +506,25 @@ fn main() {
                         if debounce {
                             println!("Configs changed, reloading in 3 seconds..");
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            // Remove any extra events
-                            if let Some((_, rx)) = reload_state.as_mut() {
-                                while rx.try_recv().is_ok() {}
-                            }
                         } else {
                             println!("Received SIGHUP, reloading..");
                         }
+                        // One reload for one edit, whichever way it was
+                        // announced: a write the watcher saw and a SIGHUP the
+                        // operator sent for the same write are both pending
+                        // now, and whichever won the select above, the other
+                        // must not trigger a second restart afterwards.
+                        //
+                        // What this does not cover: an event still in flight
+                        // in the watcher's callback, or a write that lands
+                        // during the prepare. Those cause one extra reload
+                        // later, which is the pre-existing trade -- the
+                        // watcher path drained only before its prepare too --
+                        // and the right direction: an edit is never lost.
+                        if let Some((_, rx)) = reload_state.as_mut() {
+                            while rx.try_recv().is_ok() {}
+                        }
+                        reload.drain();
                         prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
                     } => outcome,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
@@ -566,6 +607,19 @@ impl ReloadSignal {
         #[cfg(not(unix))]
         {
             Self {}
+        }
+    }
+
+    /// Discard every `SIGHUP` that has arrived and not been read.
+    ///
+    /// A poll with a throwaway waker: the stream registers it, and the next
+    /// `recv` replaces it, so nothing is lost and nothing is woken twice.
+    fn drain(&mut self) {
+        #[cfg(unix)]
+        if let Some(s) = &mut self.hangup {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            while let std::task::Poll::Ready(Some(())) = s.poll_recv(&mut cx) {}
         }
     }
 
