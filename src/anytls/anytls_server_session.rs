@@ -769,6 +769,7 @@ impl AnyTlsSession {
             ConnectDecision::Allow {
                 chain_group,
                 remote_location,
+                ..
             } => {
                 log::debug!(
                     "AnyTLS stream {} routing {} through chain",
@@ -907,6 +908,7 @@ impl AnyTlsSession {
             ConnectDecision::Allow {
                 chain_group,
                 remote_location,
+                ..
             } => {
                 log::debug!(
                     "AnyTLS stream {} UoT V2 connect: routing {} through chain",

@@ -63,6 +63,12 @@ mod buf_reader;
 mod buffer_sizing;
 mod client_proxy_chain;
 mod client_proxy_selector;
+/// One entry per live connection, for a controller to read.
+pub mod connection_registry;
+
+/// A Clash-compatible controller and a Prometheus `/metrics`.
+#[cfg(feature = "clash-api")]
+pub mod clash_api;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;

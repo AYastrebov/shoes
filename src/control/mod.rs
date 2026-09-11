@@ -570,7 +570,19 @@ async fn prepare_configs(
         configs: validated_configs,
         dns_groups,
         outbounds,
+        clash_api,
+        groups,
     } = create_server_configs(configs)?;
+
+    // A library host -- the daemon, a mobile extension -- does not mount the
+    // controller; the CLI does. Saying so beats a config whose `clash_api:`
+    // block is silently doing nothing.
+    if let Some(api) = &clash_api {
+        warn!(
+            "config declares clash_api on {}, but this host does not serve it;              the controller is the `shoes` CLI's",
+            api.listen
+        );
+    }
 
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;
@@ -629,9 +641,14 @@ async fn prepare_configs(
     // snapshot. Replace rather than merge: a reload must not carry the
     // previous config's servers into the new list.
     #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
+    {
+        crate::outbound_stats::install(&outbounds);
+        crate::outbound_stats::install_groups(&groups);
+    }
+    // A reload replaces the listeners, so it replaces their rules too.
+    crate::connection_registry::reset_rule_lists();
     #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
+    let _ = (outbounds, groups);
 
     Ok(PreparedService {
         tun_config,

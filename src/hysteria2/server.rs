@@ -47,7 +47,7 @@ use crate::quic_transport::{
 };
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_forward::connect_client_tcp_stream;
+use crate::tcp::tcp_forward::connect_client_tcp_stream_routed;
 use crate::util::allocate_vec;
 
 use super::frame::{
@@ -61,8 +61,10 @@ async fn process_connection(
     password: &'static str,
     conn: quinn::Incoming,
     udp_enabled: bool,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+    let source = connection.remote_address();
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
@@ -146,7 +148,13 @@ async fn process_connection(
     };
 
     let tcp_connection = connection.clone();
-    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver);
+    let tcp_loop = run_tcp_loop(
+        tcp_connection,
+        client_proxy_selector,
+        resolver,
+        source,
+        inbound,
+    );
 
     let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
 
@@ -709,6 +717,7 @@ async fn run_udp_local_to_remote_loop(
                     Ok(ConnectDecision::Allow {
                         chain_group,
                         remote_location,
+                        ..
                     }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
                         warn!("Blocked UDP forward to {remote_location}");
@@ -837,6 +846,7 @@ async fn run_udp_local_to_remote_loop(
                         Ok(ConnectDecision::Allow {
                             chain_group: _,
                             remote_location,
+                            ..
                         }) => remote_location,
                         Ok(ConnectDecision::Block) => {
                             warn!("Blocked UDP forward to {remote_location}");
@@ -886,6 +896,8 @@ async fn run_tcp_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -906,8 +918,15 @@ async fn run_tcp_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                source,
+                inbound,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -991,6 +1010,8 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     let (remote_location, stream_reader) = match handle_tcp_header(&mut recv).await {
         Ok(res) => res,
@@ -1000,7 +1021,16 @@ async fn process_tcp_stream(
         }
     };
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let handle = crate::connection_registry::register(
+        source,
+        inbound,
+        crate::connection_registry::Network::Tcp,
+    );
+    handle.set_destination(&remote_location);
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
 
     // `connect_client_tcp_stream`, not `setup_client_tcp_stream`: the latter
     // writes the chain's early data into the requester's stream as soon as it
@@ -1008,9 +1038,10 @@ async fn process_tcp_stream(
     // response. The client would then parse the target's greeting as a status
     // byte and a message length. The early data is written below, after the
     // response it belongs behind.
+    let rules_at_judgement = client_proxy_selector.clone();
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        connect_client_tcp_stream(
+        connect_client_tcp_stream_routed(
             client_proxy_selector,
             resolver,
             remote_location.clone().into(),
@@ -1021,7 +1052,15 @@ async fn process_tcp_stream(
     // nothing sees a stream that opened and closed, and cannot tell a refused
     // target from a server that fell over.
     let (mut client_stream, early_data) = match setup_client_stream_future.await {
-        Ok(Ok(Some(pair))) => pair,
+        Ok(Ok(Some((stream, early_data, route)))) => {
+            handle.set_route(
+                route.chain,
+                route.group,
+                Some(route.rule_index),
+                Some(rules_at_judgement.rule_summaries()),
+            );
+            (stream, early_data)
+        }
         Ok(Ok(None)) => {
             // Must have been blocked. The rule that blocked it is ours and
             // stays ours; the client is told the request was refused.
@@ -1073,17 +1112,28 @@ async fn process_tcp_stream(
     };
     drop(stream_reader);
 
-    // Use 32KB buffers to match hysteria2/sing-box reference implementations
-    let copy_result = copy_bidirectional_with_sizes(
-        &mut server_stream,
-        &mut client_stream,
-        // no need to flush even through we wrote this response since it's quic
-        false,
-        client_requires_flush,
-        32768,
-        32768,
-    )
-    .await;
+    // Use 32KB buffers to match hysteria2/sing-box reference implementations.
+    // The copy runs until it ends or a controller asks for this connection
+    // to go; without the registry `closed()` never resolves.
+    let copy_result = {
+        let copy = copy_bidirectional_with_sizes(
+            &mut server_stream,
+            &mut client_stream,
+            // no need to flush even through we wrote this response since it's quic
+            false,
+            client_requires_flush,
+            32768,
+            32768,
+        );
+        tokio::pin!(copy);
+        tokio::select! {
+            result = &mut copy => result,
+            () = handle.closed() => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "closed by the controller",
+            )),
+        }
+    };
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 
@@ -1108,6 +1158,8 @@ pub async fn start_hysteria2_server(
         enable_segmentation_offload: listener.obfs.is_none(),
     };
 
+    let inbound =
+        crate::connection_registry::intern(format!("hysteria2@{}", listener.bind_address));
     start_quic_listeners(listener, params, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
@@ -1118,6 +1170,7 @@ pub async fn start_hysteria2_server(
                 hysteria2_password,
                 conn,
                 udp_enabled,
+                inbound,
             )
             .await
         }

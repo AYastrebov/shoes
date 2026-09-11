@@ -404,6 +404,22 @@ impl ClientProxyChain {
         remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
+        self.connect_tcp_attributed(remote_location, resolver)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Connect, and say which outbound carried it.
+    ///
+    /// The selection happens here and nowhere else, so this is the only
+    /// place that can answer the question. The answer is the exit hop's
+    /// counters rather than a name: a chain has no name to give, and the
+    /// counters carry the key they were registered under.
+    pub async fn connect_tcp_attributed(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(TcpClientSetupResult, ExitAttribution)> {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
                 initial_hop,
@@ -510,18 +526,23 @@ impl ClientProxyChain {
                     );
                     let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
                         result.client_stream,
-                        counters,
+                        counters.clone(),
                     );
                     // early_data never travels through the stream and would
                     // otherwise be lost from the count entirely.
                     if let Some(data) = &result.early_data {
                         counting.count_early_data(data.len());
                     }
-                    TcpClientSetupResult {
-                        client_stream: Box::new(counting),
-                        early_data: result.early_data,
-                    }
+                    (
+                        TcpClientSetupResult {
+                            client_stream: Box::new(counting),
+                            early_data: result.early_data,
+                        },
+                        ExitAttribution { counters },
+                    )
                 };
+                #[cfg(not(feature = "control-stats"))]
+                let result = (result, ExitAttribution {});
 
                 Ok(result)
             }
@@ -544,11 +565,18 @@ impl ClientProxyChain {
                     if let Some(data) = &result.early_data {
                         counting.count_early_data(data.len());
                     }
-                    TcpClientSetupResult {
-                        client_stream: Box::new(counting),
-                        early_data: result.early_data,
-                    }
+                    (
+                        TcpClientSetupResult {
+                            client_stream: Box::new(counting),
+                            early_data: result.early_data,
+                        },
+                        ExitAttribution {
+                            counters: connector_counters[_idx].clone(),
+                        },
+                    )
                 };
+                #[cfg(not(feature = "control-stats"))]
+                let result = (result, ExitAttribution {});
 
                 Ok(result)
             }
@@ -807,6 +835,15 @@ fn select_subsequent<'a>(
         .collect()
 }
 
+/// Who a connection's bytes were credited to.
+///
+/// Empty without `control-stats`, so a caller writes the same code in both
+/// builds and a build with no counters carries no field.
+pub struct ExitAttribution {
+    #[cfg(feature = "control-stats")]
+    pub counters: Arc<OutboundCounters>,
+}
+
 /// A group of proxy chains for round-robin selection.
 pub struct ClientChainGroup {
     chains: Vec<ClientProxyChain>,
@@ -851,9 +888,23 @@ impl ClientChainGroup {
         remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
+        self.connect_tcp_attributed(remote_location, resolver)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Connect through one of the group's chains, and say which outbound
+    /// carried it.
+    pub async fn connect_tcp_attributed(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(TcpClientSetupResult, ExitAttribution)> {
         let idx = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[idx % self.chains.len()];
-        chain.connect_tcp(remote_location, resolver).await
+        chain
+            .connect_tcp_attributed(remote_location, resolver)
+            .await
     }
 
     pub async fn connect_udp_bidirectional(

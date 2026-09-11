@@ -211,6 +211,9 @@ jobs:
       # unwind across extern "C" (UB) and report a panicking engine as a
       # clean stop. Checking the surface of the profile that ships also
       # makes this job verify the right artifact.
+      - name: Guard the mobile builds against the controller
+        run: scripts/check-mobile-features.sh
+
       - name: Build staticlib
         run: cargo build --locked --profile release-mobile --features ffi,control-stats --target aarch64-apple-darwin
 

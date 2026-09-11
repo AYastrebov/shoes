@@ -174,16 +174,48 @@ pub fn report_traffic() {
 //
 // This is used instead of post-hoc counting so that long-lived TCP connections
 // (large downloads, persistent streams) report traffic incrementally.
+/// Where a flow's own byte counters live, when anything is reading them.
+///
+/// Zero-sized without the registry, so the struct below has the same layout
+/// a mobile build has today: this is per TUN flow, and `pin_project_lite`
+/// does not accept a `#[cfg]` on a field.
+#[cfg(feature = "control-connections")]
+type ConnectionTarget = Option<std::sync::Arc<crate::connection_registry::ConnectionCounters>>;
+#[cfg(not(feature = "control-connections"))]
+type ConnectionTarget = ();
+
 pin_project_lite::pin_project! {
     pub struct TrafficCountingStream<S> {
         #[pin]
         inner: S,
+        // A second target: this flow's own entry in the connection
+        // registry. See ConnectionTarget above for why it is a type alias
+        // rather than a cfg'd field.
+        connection: ConnectionTarget,
     }
 }
 
 impl<S> TrafficCountingStream<S> {
+    /// Count into the process-wide totals only.
+    ///
+    /// `allow(dead_code)` for the reason this module's accessors give: with
+    /// the registry on, the TUN path uses `with_connection` instead, and
+    /// which constructor has a caller depends on the build.
+    #[allow(dead_code)]
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            connection: Default::default(),
+        }
+    }
+
+    /// Count into the process-wide totals and into one connection's entry.
+    #[cfg(feature = "control-connections")]
+    pub fn with_connection(
+        inner: S,
+        connection: Option<std::sync::Arc<crate::connection_registry::ConnectionCounters>>,
+    ) -> Self {
+        Self { inner, connection }
     }
 }
 
@@ -200,6 +232,12 @@ impl<S: tokio::io::AsyncRead> tokio::io::AsyncRead for TrafficCountingStream<S> 
             let n = buf.filled().len() - before;
             if n > 0 {
                 add_upload_bytes(n as u64);
+                #[cfg(feature = "control-connections")]
+                if let Some(counters) = this.connection.as_ref() {
+                    counters
+                        .up
+                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         result
@@ -216,6 +254,12 @@ impl<S: tokio::io::AsyncWrite> tokio::io::AsyncWrite for TrafficCountingStream<S
         let result = this.inner.poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n @ 1..)) = &result {
             add_download_bytes(*n as u64);
+            #[cfg(feature = "control-connections")]
+            if let Some(counters) = this.connection.as_ref() {
+                counters
+                    .down
+                    .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         result
     }
@@ -255,6 +299,40 @@ pub fn get_traffic_counters() -> (u64, u64) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// The TUN path counts once, into two places: the process-wide totals a
+    /// mobile host reads, and this flow's own entry. A second wrapper would
+    /// be a second poll per byte.
+    #[cfg(feature = "control-connections")]
+    #[tokio::test]
+    async fn the_tun_counter_also_feeds_a_connection_entry() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = TEST_LOCK.lock().await;
+        reset_traffic_counters();
+
+        let (mut peer, near) = tokio::io::duplex(64);
+        let handle = crate::connection_registry::register(
+            "10.0.0.2:4000".parse().unwrap(),
+            "tun",
+            crate::connection_registry::Network::Tcp,
+        );
+        let mut stream = TrafficCountingStream::with_connection(near, handle.counters());
+
+        // Asymmetric, so a transposition fails rather than passing.
+        peer.write_all(b"12345").await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(b"ab").await.unwrap();
+
+        let counters = handle.counters().expect("tracked");
+        assert_eq!(counters.up.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.down.load(Ordering::Relaxed), 2);
+
+        // And the process-wide totals still see the same bytes.
+        assert_eq!(get_traffic_counters(), (5, 2));
+    }
 
     #[tokio::test]
     async fn test_add_and_reset_counters() {

@@ -4,9 +4,23 @@ mod anytls;
 mod async_stream;
 mod buf_reader;
 mod buffer_sizing;
+#[cfg(feature = "clash-api")]
+mod clash_api;
 mod client_proxy_chain;
+// The binary declares its own modules rather than using the library, so the
+// controller's `crate::control::logs` path needs a `control` here too. Only
+// the log ring: this process hosts no ServiceHandle.
+#[cfg(feature = "clash-api")]
+mod control {
+    // `allow(dead_code)`: the ring's fields are read by whatever streams
+    // them, which in this binary is the controller's log route.
+    #[allow(dead_code)]
+    #[path = "logs.rs"]
+    pub mod logs;
+}
 mod client_proxy_selector;
 mod config;
+mod connection_registry;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
@@ -260,6 +274,11 @@ fn main() {
         }
     }
 
+    // Installed before the config is read, because logging is: it costs one
+    // pointer until a controller starts and allocates the ring.
+    #[cfg(feature = "clash-api")]
+    writers.push(Box::new(clash_api::logs::DynamicBroadcastWriter));
+
     logging::init_multi_logger(writers, directives);
     logging::install_panic_hook();
 
@@ -451,8 +470,18 @@ fn main() {
         // handled at the next wait.
         let mut signals = ShutdownSignals::install();
 
+        #[cfg(feature = "clash-api")]
+        let mut api: Option<ApiRunner> = None;
+
         let mut first_launch = true;
         loop {
+            // Taken before the launch consumes `prepared`: the controller
+            // reports the listener ports, and is reconciled after the
+            // servers are up so a failed launch does not start one.
+            #[cfg(feature = "clash-api")]
+            let (api_wanted, api_ports) =
+                (prepared.clash_api.clone(), prepared.server_configs.clone());
+
             let join_handles = match launch_servers(prepared).await {
                 Ok(handles) => handles,
                 Err(e) if first_launch => {
@@ -469,6 +498,11 @@ fn main() {
                 }
             };
             first_launch = false;
+
+            #[cfg(feature = "clash-api")]
+            {
+                api = reconcile_api(api.take(), api_wanted.as_ref(), &api_ports).await;
+            }
 
             // Wait for a reason to reload, then keep trying until an edit
             // produces a config that loads. The running servers keep serving
@@ -742,11 +776,105 @@ impl ShutdownSignals {
     }
 }
 
+/// The controller, and the handle that stops it.
+#[cfg(feature = "clash-api")]
+struct ApiRunner {
+    config: config::ClashApiConfig,
+    state: std::sync::Arc<clash_api::ApiState>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    /// The serve task, awaited on stop: the listener is released when the
+    /// task observes the stop, not when it is sent, and a bind on the same
+    /// address before that is "address in use" -- deterministically so on
+    /// a single-threaded runtime, where nothing polls the task in between.
+    done: tokio::task::JoinHandle<()>,
+}
+
+/// Start, keep, replace or stop the controller to match the configuration
+/// that just launched.
+///
+/// Same listen, secret and origins: keep it, so a dashboard's open sockets
+/// survive a reload of the proxies. Anything else: stop it -- which ends
+/// its streams, so a rotated secret revokes them -- and start a new one.
+/// No block at all: stop it.
+#[cfg(feature = "clash-api")]
+async fn reconcile_api(
+    current: Option<ApiRunner>,
+    wanted: Option<&config::ClashApiConfig>,
+    server_configs: &[config::Config],
+) -> Option<ApiRunner> {
+    if let (Some(running), Some(want)) = (&current, wanted)
+        && running.config.listen == want.listen
+        && running.config.secret == want.secret
+        && running.config.allow_origins == want.allow_origins
+    {
+        // The cap and the proxies' ports can change under a listener that
+        // stays.
+        connection_registry::set_cap(want.max_tracked_connections);
+        *running.state.ports.write() = clash_api::Ports::from_configs(server_configs);
+        return current;
+    }
+
+    if let Some(running) = current {
+        println!("Stopping the Clash API on {}", running.config.listen);
+        // Dropping the sender would do as well; sending says it was meant.
+        let _ = running.stop.send(());
+        let _ = running.done.await;
+    }
+
+    let want = wanted?.clone();
+    let listener = match tokio::net::TcpListener::bind(want.listen).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            // The proxies are already serving; a controller that cannot bind
+            // is reported and skipped rather than taking them down.
+            eprintln!("Could not bind the Clash API on {}: {e}", want.listen);
+            return None;
+        }
+    };
+
+    connection_registry::set_cap(want.max_tracked_connections);
+    let ring = clash_api::logs::install_ring(512);
+    let state = std::sync::Arc::new(clash_api::ApiState {
+        config: want.clone(),
+        ports: parking_lot::RwLock::new(clash_api::Ports::from_configs(server_configs)),
+        started: std::time::Instant::now(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        log: Some(ring),
+    });
+
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    let done = tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Err(e) = clash_api::serve_on(listener, state, rx).await {
+                eprintln!("Clash API stopped: {e}");
+            }
+        }
+    });
+
+    Some(ApiRunner {
+        config: want,
+        state,
+        stop,
+        done,
+    })
+}
+
 /// Everything a validated configuration needs to start serving.
 struct PreparedServers {
     server_configs: Vec<config::Config>,
     dns_registry: dns::DnsRegistry,
     outbounds: outbound_stats::OutboundSet,
+    /// Group membership, installed beside the outbounds.
+    groups: outbound_stats::OutboundGroupSet,
+    /// The controller this configuration asks for, if any. Carried through
+    /// the reload path so the serve loop can compare it to the running one.
+    ///
+    /// `allow(dead_code)`: the serve loop reads it under the feature, and
+    /// without the feature nothing does -- the block is still parsed and
+    /// validated, so a config means one thing in every build.
+    #[allow(dead_code)]
+    clash_api: Option<config::ClashApiConfig>,
 }
 
 /// Load, validate, and resolve a configuration without touching the servers
@@ -786,8 +914,22 @@ async fn prepare_servers(
         configs: server_configs,
         dns_groups,
         outbounds,
+        clash_api,
+        groups,
     } = config::create_server_configs(configs)
         .map_err(|e| format!("Failed to create server configs: {e}"))?;
+
+    // A block this binary cannot serve is a config that silently does less
+    // than it says. Parsed and validated in every build so a config file
+    // means one thing everywhere; served only where the feature is on.
+    #[cfg(not(feature = "clash-api"))]
+    if let Some(api) = &clash_api {
+        println!(
+            "WARNING: config declares clash_api on {}, but this build has no \
+             `clash-api` feature; it will not be served",
+            api.listen
+        );
+    }
 
     // Build DNS registry from expanded groups (async - resolves hostnames)
     let dns_registry = dns::build_dns_registry(dns_groups)
@@ -798,6 +940,8 @@ async fn prepare_servers(
         server_configs,
         dns_registry,
         outbounds,
+        groups,
+        clash_api,
     })
 }
 
@@ -813,14 +957,23 @@ async fn launch_servers(
         server_configs,
         mut dns_registry,
         outbounds,
+        groups,
+        // The serve loop reconciles the controller; launching servers does
+        // not touch it, so that a reload's listener survives the restart.
+        clash_api: _,
     } = prepared;
 
     // Replace, not add: a reload must not carry the previous config's
     // servers into the new list.
     #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
+    {
+        crate::outbound_stats::install(&outbounds);
+        crate::outbound_stats::install_groups(&groups);
+    }
+    // A reload replaces the listeners, so it replaces their rules too.
+    crate::connection_registry::reset_rule_lists();
     #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
+    let _ = (outbounds, groups);
 
     println!("\nStarting {} server(s)..", server_configs.len());
 
