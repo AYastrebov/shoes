@@ -69,6 +69,7 @@ async fn process_connection(
     password: &'static str,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
     // allow 0.5-RTT data transmission before the handshake fully completes.
@@ -144,7 +145,14 @@ async fn process_connection(
     // This reduces task count and avoids spawning separate tasks for the main loops.
     let heartbeat_loop = run_heartbeat_loop(heartbeat_connection, heartbeat_cancel_token);
 
-    let bi_loop = run_bidirectional_loop(bi_connection, bi_client_proxy_selector, bi_resolver);
+    let source = connection.remote_address();
+    let bi_loop = run_bidirectional_loop(
+        bi_connection,
+        bi_client_proxy_selector,
+        bi_resolver,
+        source,
+        inbound,
+    );
 
     let uni_loop = run_unidirectional_loop(
         uni_connection,
@@ -275,6 +283,8 @@ async fn run_bidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -296,8 +306,15 @@ async fn run_bidirectional_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                source,
+                inbound,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -321,6 +338,8 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
@@ -342,7 +361,16 @@ async fn process_tcp_stream(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let handle = crate::connection_registry::register(
+        source,
+        inbound,
+        crate::connection_registry::Network::Tcp,
+    );
+    handle.set_destination(&remote_location);
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(
@@ -1387,6 +1415,7 @@ pub async fn start_tuic_server(
         enable_segmentation_offload: listener.obfs.is_none(),
     };
 
+    let inbound = crate::connection_registry::intern(format!("tuic@{}", listener.bind_address));
     start_quic_listeners(listener, params, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
@@ -1398,6 +1427,7 @@ pub async fn start_tuic_server(
                 password,
                 conn,
                 zero_rtt_handshake,
+                inbound,
             )
             .await
         }

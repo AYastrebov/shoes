@@ -56,6 +56,30 @@ fn accept_exhausted_a_resource(e: &std::io::Error) -> bool {
     }
 }
 
+/// The label a listener's connections are counted against: the protocol as
+/// a controller spells it, then the bind, so two listeners of one protocol
+/// do not merge into one row.
+///
+/// Interned, and built once per listener rather than per connection.
+pub fn inbound_label(protocol: &crate::config::ServerProxyConfig, bind: &str) -> &'static str {
+    use crate::config::ServerProxyConfig as P;
+    // mihomo's spellings where one exists, since a dashboard displays these
+    // verbatim; the protocol's own Display otherwise.
+    let name = match protocol {
+        P::Http { .. } => "http".to_string(),
+        P::Socks { .. } => "socks5".to_string(),
+        P::Mixed { .. } => "mixed".to_string(),
+        P::Shadowsocks { .. } => "shadowsocks".to_string(),
+        P::Vless { .. } => "vless".to_string(),
+        P::Vmess { .. } => "vmess".to_string(),
+        P::Trojan { .. } => "trojan".to_string(),
+        P::Hysteria2 { .. } => "hysteria2".to_string(),
+        P::TuicV5 { .. } => "tuic".to_string(),
+        other => other.to_string().to_lowercase(),
+    };
+    crate::connection_registry::intern(format!("{name}@{bind}"))
+}
+
 /// The accept loop. The listener is bound by the caller, before the task
 /// spawns: a bind failure must surface from `start_servers` as an error
 /// the launch path can act on, not panic silently inside a task nobody
@@ -66,6 +90,7 @@ async fn run_tcp_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    inbound: &'static str,
 ) {
     let TcpConfig { no_delay } = tcp_config;
     let limiter = Arc::new(tokio::sync::Semaphore::new(
@@ -112,7 +137,25 @@ async fn run_tcp_server(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
+            // Registered before the stream is handed on, and counted at this
+            // edge: `up` is what the client sent, handshake included. The
+            // handle travels with the connection and takes its entry out of
+            // the table when the task ends, however it ends.
+            let handle = crate::connection_registry::register(
+                addr,
+                inbound,
+                crate::connection_registry::Network::Tcp,
+            );
+            let stream = crate::connection_registry::counted(stream, &handle);
+            match process_stream(
+                stream,
+                cloned_handler,
+                cloned_resolver,
+                cloned_sniff,
+                handle,
+            )
+            .await
+            {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
                 Err(e) => log::log!(
                     crate::util::connection_end_level(&e),
@@ -147,6 +190,7 @@ async fn run_unix_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    inbound: &'static str,
 ) {
     let limiter = Arc::new(tokio::sync::Semaphore::new(
         crate::util::MAX_INFLIGHT_PER_LISTENER,
@@ -174,7 +218,23 @@ async fn run_unix_server(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
+            // A Unix peer has no address a controller can show, so the
+            // source is the unspecified one rather than a fabricated port.
+            let handle = crate::connection_registry::register(
+                std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                inbound,
+                crate::connection_registry::Network::Tcp,
+            );
+            let stream = crate::connection_registry::counted(stream, &handle);
+            match process_stream(
+                stream,
+                cloned_handler,
+                cloned_resolver,
+                cloned_sniff,
+                handle,
+            )
+            .await
+            {
                 Ok(()) => debug!("{addr:?} finished successfully"),
                 Err(e) => log::log!(
                     crate::util::connection_end_level(&e),
@@ -201,6 +261,7 @@ pub async fn process_stream<AS>(
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     sniff: Option<SniffSettings>,
+    handle: crate::connection_registry::ConnectionHandle,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -226,6 +287,20 @@ where
         }
     };
 
+    // The destination as the inbound protocol asked for it, which is the
+    // first thing a controller can show about a connection. Sniffing may
+    // refine it later; the UDP shapes that route per destination have none
+    // to record here.
+    match &setup_result {
+        TcpServerSetupResult::TcpForward {
+            remote_location, ..
+        }
+        | TcpServerSetupResult::BidirectionalUdp {
+            remote_location, ..
+        } => handle.set_destination(remote_location),
+        _ => {}
+    }
+
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -244,6 +319,7 @@ where
                 proxy_selector,
                 resolver,
                 sniff,
+                handle,
             })
             .await
         }
@@ -253,6 +329,9 @@ where
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
+            // Held for the association: dropping it here would take the
+            // entry out of the table while the connection is still running.
+            let _handle = handle;
             let action = proxy_selector
                 .judge(remote_location.into(), &resolver)
                 .await?;
@@ -284,6 +363,7 @@ where
             need_initial_flush,
             proxy_selector,
         } => {
+            let _handle = handle;
             // Per-destination routing: each packet is routed based on its destination
             run_udp_routing(
                 ServerStream::Targeted(server_stream),
@@ -298,6 +378,7 @@ where
             need_initial_flush,
             proxy_selector,
         } => {
+            let _handle = handle;
             // Per-destination routing: each session is routed based on its destination
             run_udp_routing(
                 ServerStream::Session(server_stream),
@@ -308,8 +389,11 @@ where
             .await
         }
         TcpServerSetupResult::AlreadyHandled => {
-            // Connection is being handled by a spawned task (e.g., Reality fallback).
-            // Nothing more to do here.
+            // A detached task owns the socket now, and this one is about to
+            // return: the entry goes with the handle rather than outliving
+            // the task that could have removed it. The connection is served
+            // either way; it is not listed.
+            drop(handle);
             Ok(())
         }
     }
@@ -460,12 +544,14 @@ async fn start_tcp_servers(
                     let resolver = resolver.clone();
                     let sniff = sniff.clone();
                     let listener = new_tcp_listener(socket_addr, 4096, None)?;
+                    let inbound = inbound_label(&protocol, &socket_addr.to_string());
                     let handle = tokio::spawn(run_tcp_server(
                         listener,
                         tcp_config,
                         resolver,
                         tcp_handler,
                         sniff,
+                        inbound,
                     ));
                     handles.push(handle);
                 }
@@ -476,12 +562,19 @@ async fn start_tcp_servers(
         BindLocation::Path(_path_buf) => {
             #[cfg(target_family = "unix")]
             {
+                let inbound = inbound_label(&protocol, &_path_buf.display().to_string());
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
                 debug!("TCP handler: {tcp_handler:?}");
                 let listener = bind_unix_listener(_path_buf).await?;
-                let handle = tokio::spawn(run_unix_server(listener, resolver, tcp_handler, sniff));
+                let handle = tokio::spawn(run_unix_server(
+                    listener,
+                    resolver,
+                    tcp_handler,
+                    sniff,
+                    inbound,
+                ));
                 handles.push(handle);
             }
             #[cfg(not(target_family = "unix"))]
@@ -499,6 +592,30 @@ async fn start_tcp_servers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A controller shows this string, and per-inbound counters are keyed by
+    /// it, so it has to name both the protocol and which listener it was.
+    #[test]
+    fn a_listener_label_names_the_protocol_and_the_bind() {
+        let socks: crate::config::ServerProxyConfig = serde_yaml::from_str("type: socks").unwrap();
+        assert_eq!(inbound_label(&socks, "0.0.0.0:1080"), "socks5@0.0.0.0:1080");
+
+        let http: crate::config::ServerProxyConfig = serde_yaml::from_str("type: http").unwrap();
+        assert_eq!(inbound_label(&http, "0.0.0.0:8080"), "http@0.0.0.0:8080");
+
+        // Two listeners of one protocol are two labels, or their counters
+        // would merge into one row.
+        assert_ne!(
+            inbound_label(&socks, "0.0.0.0:1080"),
+            inbound_label(&socks, "0.0.0.0:1081")
+        );
+
+        // Interned: a reload rebuilds the same listeners and must not leak.
+        assert!(std::ptr::eq(
+            inbound_label(&socks, "0.0.0.0:1080"),
+            inbound_label(&socks, "0.0.0.0:1080")
+        ));
+    }
 
     /// EMFILE does not consume the backlog entry, so retrying instantly
     /// spins; ECONNABORTED does consume it, so backing off would only

@@ -61,8 +61,10 @@ async fn process_connection(
     password: &'static str,
     conn: quinn::Incoming,
     udp_enabled: bool,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+    let source = connection.remote_address();
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
@@ -146,7 +148,13 @@ async fn process_connection(
     };
 
     let tcp_connection = connection.clone();
-    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver);
+    let tcp_loop = run_tcp_loop(
+        tcp_connection,
+        client_proxy_selector,
+        resolver,
+        source,
+        inbound,
+    );
 
     let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
 
@@ -886,6 +894,8 @@ async fn run_tcp_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -906,8 +916,15 @@ async fn run_tcp_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                source,
+                inbound,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -991,6 +1008,8 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    source: std::net::SocketAddr,
+    inbound: &'static str,
 ) -> std::io::Result<()> {
     let (remote_location, stream_reader) = match handle_tcp_header(&mut recv).await {
         Ok(res) => res,
@@ -1000,7 +1019,16 @@ async fn process_tcp_stream(
         }
     };
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let handle = crate::connection_registry::register(
+        source,
+        inbound,
+        crate::connection_registry::Network::Tcp,
+    );
+    handle.set_destination(&remote_location);
+    let mut server_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
+        QuicStream::from(send, recv),
+        &handle,
+    ));
 
     // `connect_client_tcp_stream`, not `setup_client_tcp_stream`: the latter
     // writes the chain's early data into the requester's stream as soon as it
@@ -1108,6 +1136,8 @@ pub async fn start_hysteria2_server(
         enable_segmentation_offload: listener.obfs.is_none(),
     };
 
+    let inbound =
+        crate::connection_registry::intern(format!("hysteria2@{}", listener.bind_address));
     start_quic_listeners(listener, params, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
@@ -1118,6 +1148,7 @@ pub async fn start_hysteria2_server(
                 hysteria2_password,
                 conn,
                 udp_enabled,
+                inbound,
             )
             .await
         }

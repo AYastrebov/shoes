@@ -30,6 +30,10 @@ pub struct ForwardRequest {
     pub proxy_selector: Arc<ClientProxySelector>,
     pub resolver: Arc<dyn Resolver>,
     pub sniff: Option<SniffSettings>,
+    /// This connection's place in the registry, for the fields only the
+    /// forward path learns -- the sniffed host, and the route -- and for the
+    /// close a controller can ask for.
+    pub handle: crate::connection_registry::ConnectionHandle,
 }
 
 pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
@@ -42,7 +46,11 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         proxy_selector,
         resolver,
         sniff,
+        handle,
     } = request;
+
+    // Filled in and selected on by the routed connect below.
+    let _handle = &handle;
 
     let mut initial_data: Vec<u8> = initial_remote_data
         .map(|d| d.into_vec())
@@ -298,6 +306,13 @@ mod tests {
                 proxy_selector: selector,
                 resolver: server_resolver,
                 sniff,
+                // Registered as a real accept loop would, so the forward
+                // path under test is the one that runs in production.
+                handle: crate::connection_registry::register(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "test",
+                    crate::connection_registry::Network::Tcp,
+                ),
             })
             .await
         });
