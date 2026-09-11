@@ -174,10 +174,28 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!(
         "    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)"
     );
+    eprintln!(
+        "    check <config.yaml> [config.yaml...]           Parse the config and exit (same as --dry-run)"
+    );
+    eprintln!(
+        "    version                                        Print version information and exit"
+    );
     std::process::exit(1);
 }
 
 fn main() {
+    // Ignore SIGHUP from the first instruction until the runtime installs
+    // the real handler below. Before that there is nothing to reload, and
+    // the OS default for the signal is death -- so an operator's reload sent
+    // to a process still parsing its arguments killed it. Dropped rather
+    // than buffered for these few milliseconds, which is the right
+    // direction: a reload of nothing is nothing.
+    #[cfg(unix)]
+    // SAFETY: setting a disposition before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
     let mut num_threads = 0usize;
@@ -223,6 +241,18 @@ fn main() {
             print_usage_and_exit(arg0);
             return;
         }
+    }
+
+    // Subcommands an operator such as awg-manager already calls by these
+    // names: `check <config>` is `--dry-run`, `version` is `--version`.
+    // See docs/specs/2026-09-11-awg-manager-engine.md, "Slice 1".
+    if args.first().map(String::as_str) == Some("version") {
+        println!("shoes {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.first().map(String::as_str) == Some("check") {
+        args.remove(0);
+        dry_run = true;
     }
 
     let directives = logging::resolve_directives();
@@ -374,7 +404,10 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        let mut reload_state = if no_reload {
+        // No watcher for a validation-only run: `check` has nothing to
+        // reload, and the watcher unwraps a missing path, which turned
+        // `check missing.yaml` into a panic where an exit code was promised.
+        let mut reload_state = if no_reload || dry_run {
             None
         } else {
             let (watcher, rx) = start_notify_thread(args.clone());
@@ -407,6 +440,16 @@ fn main() {
             }
             return;
         }
+
+        // Installed before the first prepare, not after it: until this is
+        // installed a SIGHUP has the OS default disposition, which is death.
+        // An operator that sends one during a start-up prepare -- a DNS
+        // bootstrap stalled on a dead network -- gets it buffered and
+        // honoured at the first wait instead. The stop signals stay where
+        // they are: buffering a SIGTERM behind a stalled start-up prepare
+        // would be the escalation-to-SIGKILL this loop was rewritten to
+        // avoid, and there is nothing to clean up before the first launch.
+        let mut reload = ReloadSignal::install();
 
         let mut prepared = match prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
         {
@@ -461,25 +504,37 @@ fn main() {
                 api = reconcile_api(api.take(), api_wanted.as_ref(), &api_ports).await;
             }
 
-            if reload_state.is_none() {
-                // No reload mode: nothing to do but serve until the OS
-                // asks the process to exit.
-                let (what, code) = signals.recv().await;
-                shut_down(what, code, join_handles).await;
-            }
-
-            // Wait for a change, then keep trying until an edit produces a
-            // config that loads. The running servers keep serving the
-            // last-good configuration the whole time: killing a live proxy
-            // over a half-saved file punishes the edit before it is done.
+            // Wait for a reason to reload, then keep trying until an edit
+            // produces a config that loads. The running servers keep serving
+            // the last-good configuration the whole time: killing a live
+            // proxy over a half-saved file punishes the edit before it is
+            // done.
+            //
+            // Two reasons, treated differently. A file change is debounced,
+            // because an editor saves in pieces. A SIGHUP is not: the
+            // operator that sent it has finished writing, and it arrives
+            // whether or not the watcher is on -- `--no-reload` disables the
+            // watcher, not the operator.
+            //
+            // `biased`, in this order: a stop request beats everything, and
+            // when a write and a SIGHUP are both pending -- the operator's
+            // usual "write, then signal" -- the signal wins, so the reload is
+            // immediate rather than debounced.
             prepared = loop {
-                let (watcher, rx) = reload_state.as_mut().expect("checked above");
-                tokio::select! {
-                    changed = rx.recv() => {
-                        changed.expect("the watcher thread is co-owned");
-                    }
+                let debounce = tokio::select! {
+                    biased;
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
-                }
+                    () = reload.recv() => false,
+                    () = async {
+                        match reload_state.as_mut() {
+                            Some((_, rx)) => {
+                                rx.recv().await.expect("the watcher thread is co-owned");
+                            }
+                            // No watcher: only a signal can end this wait.
+                            None => futures::future::pending::<()>().await,
+                        }
+                    } => true,
+                };
 
                 // The debounce and the prepare stay under the signal
                 // select: a SIGTERM during a reload whose DNS bootstrap
@@ -488,11 +543,41 @@ fn main() {
                 // SIGKILL, the unflushed death this handler removes.
                 let outcome = tokio::select! {
                     outcome = async {
-                        println!("Configs changed, reloading in 3 seconds..");
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        // Remove any extra events
-                        while rx.try_recv().is_ok() {}
-                        prepare_servers(&args, Some(watcher)).await
+                        if debounce {
+                            println!("Configs changed, reloading in 3 seconds..");
+                            // The signal cuts the debounce short. In the
+                            // usual "write, then signal" the watcher's event
+                            // arrives first, in milliseconds, and wins the
+                            // select above; a SIGHUP that then sat behind the
+                            // full debounce would be the delay it exists to
+                            // skip. It is consumed here, and so cannot fire a
+                            // second reload after this one.
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                                () = reload.recv() => {
+                                    println!("Received SIGHUP, reloading now..");
+                                }
+                            }
+                        } else {
+                            println!("Received SIGHUP, reloading..");
+                        }
+                        // One reload for one edit, whichever way it was
+                        // announced: a write the watcher saw and a SIGHUP the
+                        // operator sent for the same write are both pending
+                        // now, and whichever won the select above, the other
+                        // must not trigger a second restart afterwards.
+                        //
+                        // What this does not cover: an event still in flight
+                        // in the watcher's callback, or a write that lands
+                        // during the prepare. Those cause one extra reload
+                        // later, which is the pre-existing trade -- the
+                        // watcher path drained only before its prepare too --
+                        // and the right direction: an edit is never lost.
+                        if let Some((_, rx)) = reload_state.as_mut() {
+                            while rx.try_recv().is_ok() {}
+                        }
+                        reload.drain();
+                        prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
                     } => outcome,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 };
@@ -545,6 +630,63 @@ async fn shut_down(
     }
     log::logger().flush();
     std::process::exit(code);
+}
+
+/// The operator's reload request: `SIGHUP` on Unix, nothing elsewhere.
+///
+/// A resumable stream for the reason `ShutdownSignals` gives: installed once
+/// and kept across every wait, so a signal that lands during a prepare is
+/// buffered rather than lost.
+struct ReloadSignal {
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl ReloadSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let hangup = match signal(SignalKind::hangup()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Could not install the SIGHUP handler: {e}");
+                    None
+                }
+            };
+            Self { hangup }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Discard every `SIGHUP` that has arrived and not been read.
+    ///
+    /// A poll with a throwaway waker: the stream registers it, and the next
+    /// `recv` replaces it, so nothing is lost and nothing is woken twice.
+    fn drain(&mut self) {
+        #[cfg(unix)]
+        if let Some(s) = &mut self.hangup {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            while let std::task::Poll::Ready(Some(())) = s.poll_recv(&mut cx) {}
+        }
+    }
+
+    /// Resolves on each `SIGHUP`; pends forever if there is no handler.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match &mut self.hangup {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => futures::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        futures::future::pending::<()>().await
+    }
 }
 
 /// The OS's stop requests, as resumable streams.
