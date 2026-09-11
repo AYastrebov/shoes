@@ -4,7 +4,20 @@ mod anytls;
 mod async_stream;
 mod buf_reader;
 mod buffer_sizing;
+#[cfg(feature = "clash-api")]
+mod clash_api;
 mod client_proxy_chain;
+// The binary declares its own modules rather than using the library, so the
+// controller's `crate::control::logs` path needs a `control` here too. Only
+// the log ring: this process hosts no ServiceHandle.
+#[cfg(feature = "clash-api")]
+mod control {
+    // `allow(dead_code)`: the ring's fields are read by whatever streams
+    // them, which in this binary is the controller's log route.
+    #[allow(dead_code)]
+    #[path = "logs.rs"]
+    pub mod logs;
+}
 mod client_proxy_selector;
 mod config;
 mod connection_registry;
@@ -711,6 +724,8 @@ async fn launch_servers(
         crate::outbound_stats::install(&outbounds);
         crate::outbound_stats::install_groups(&groups);
     }
+    // A reload replaces the listeners, so it replaces their rules too.
+    crate::connection_registry::reset_rule_lists();
     #[cfg(not(feature = "control-stats"))]
     let _ = (outbounds, groups);
 

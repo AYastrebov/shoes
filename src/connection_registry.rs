@@ -228,11 +228,19 @@ mod imp {
     struct Registry {
         entries: DashMap<u64, Arc<Entry>>,
         inbounds: DashMap<&'static str, InboundCounters>,
+        /// Every live listener's rule list, in the order the listeners were
+        /// started.
+        ///
+        /// Here rather than in the router because a connection's rule index
+        /// points into one of these, and the two have to be read together:
+        /// a listing shows them all, and a connection names one.
+        rule_lists: Mutex<Vec<Arc<[RuleSummary]>>>,
     }
 
     static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Registry {
         entries: DashMap::new(),
         inbounds: DashMap::new(),
+        rule_lists: Mutex::new(Vec::new()),
     });
 
     /// The registry is process-global and cargo runs tests in parallel, so
@@ -498,6 +506,27 @@ mod imp {
         pub down: u64,
     }
 
+    /// Record a listener's rules, once, as it starts.
+    ///
+    /// Identity-deduplicated: several listeners of one config share a
+    /// selector, and a controller should list those rules once.
+    pub fn install_rule_list(list: Arc<[RuleSummary]>) {
+        let mut lists = REGISTRY.rule_lists.lock();
+        if !lists.iter().any(|l| Arc::ptr_eq(l, &list)) {
+            lists.push(list);
+        }
+    }
+
+    /// Forget every list. Called where a reload replaces the listeners, for
+    /// the reason `install` gives about outbounds.
+    pub fn reset_rule_lists() {
+        REGISTRY.rule_lists.lock().clear();
+    }
+
+    pub fn rule_lists() -> Vec<Arc<[RuleSummary]>> {
+        REGISTRY.rule_lists.lock().clone()
+    }
+
     /// Per-listener counters, sorted by label. O(configured listeners).
     pub fn inbound_stats() -> Vec<InboundStats> {
         let mut out: Vec<_> = REGISTRY
@@ -573,6 +602,13 @@ mod imp {
             None
         }
     }
+
+    /// Nothing reads rules without a controller, so nothing keeps them.
+    #[inline(always)]
+    pub fn install_rule_list<R>(_list: R) {}
+
+    #[inline(always)]
+    pub fn reset_rule_lists() {}
 }
 
 #[cfg(not(feature = "control-connections"))]

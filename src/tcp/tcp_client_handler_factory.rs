@@ -442,5 +442,9 @@ pub fn create_tcp_client_proxy_selector(
                 .with_proxy_hint(proxy_hint)
         })
         .collect::<Vec<_>>();
-    ClientProxySelector::new(rules)
+    let selector = ClientProxySelector::new(rules);
+    // Recorded for a controller listing rules. Identity-deduplicated there,
+    // so several listeners sharing one selector list their rules once.
+    crate::connection_registry::install_rule_list(selector.rule_summaries());
+    selector
 }
