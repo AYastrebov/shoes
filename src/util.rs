@@ -96,10 +96,10 @@ pub const ENOBUFS_RAW: i32 = libc::ENOBUFS;
 /// mipsel, `max-atomic-width` 32). The std type wherever it exists, so a
 /// public field of this type keeps its type on every target that had it.
 pub mod atomic {
-    #[cfg(target_has_atomic = "64")]
-    pub use std::sync::atomic::AtomicU64;
     #[cfg(not(target_has_atomic = "64"))]
     pub use portable_atomic::AtomicU64;
+    #[cfg(target_has_atomic = "64")]
+    pub use std::sync::atomic::AtomicU64;
 }
 
 /// How loudly to log a connection that ended with `e`.
