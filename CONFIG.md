@@ -1235,7 +1235,7 @@ client_chain:
 
 ### Hot Reloading
 
-Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
+Configuration changes are automatically detected and applied without restarting, after a three-second debounce. Disable with `--no-reload` flag. Sending `SIGHUP` reloads immediately, with or without the watcher.
 
 ### mTLS (Mutual TLS)
 
@@ -1270,13 +1270,22 @@ shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
   -t, --threads NUM    Worker threads (default: CPU count)
+  -l, --log-file PATH  Log to file (repeatable; "-" means stderr; default: stderr)
   -d, --dry-run        Parse config and exit
   --no-reload          Disable hot-reloading
+  -V, --version        Print version and exit
 
 COMMANDS:
   generate-reality-keypair                       Generate Reality X25519 keypair
   generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
+  generate-vless-user-id                         Generate a random VLESS/VMESS user ID
+  check <config.yaml> [config.yaml...]           Parse config and exit (same as --dry-run)
+  version                                        Print version and exit
 ```
+
+`check` exits 0 when every config loads and 1 with the error on stderr
+otherwise. A running process reloads on `SIGHUP` immediately, even with
+`--no-reload`, which disables only the file watcher.
 
 ## Tips
 
