@@ -605,6 +605,14 @@ struct PreparedServers {
     server_configs: Vec<config::Config>,
     dns_registry: dns::DnsRegistry,
     outbounds: outbound_stats::OutboundSet,
+    /// The controller this configuration asks for, if any. Carried through
+    /// the reload path so the serve loop can compare it to the running one.
+    ///
+    /// `allow(dead_code)`: read by the serve loop only once the controller
+    /// exists to start; without the feature nothing reads it at all, which
+    /// is the same reason and is permanent.
+    #[allow(dead_code)]
+    clash_api: Option<config::ClashApiConfig>,
 }
 
 /// Load, validate, and resolve a configuration without touching the servers
@@ -644,8 +652,21 @@ async fn prepare_servers(
         configs: server_configs,
         dns_groups,
         outbounds,
+        clash_api,
     } = config::create_server_configs(configs)
         .map_err(|e| format!("Failed to create server configs: {e}"))?;
+
+    // A block this binary cannot serve is a config that silently does less
+    // than it says. Parsed and validated in every build so a config file
+    // means one thing everywhere; served only where the feature is on.
+    #[cfg(not(feature = "clash-api"))]
+    if let Some(api) = &clash_api {
+        println!(
+            "WARNING: config declares clash_api on {}, but this build has no \
+             `clash-api` feature; it will not be served",
+            api.listen
+        );
+    }
 
     // Build DNS registry from expanded groups (async - resolves hostnames)
     let dns_registry = dns::build_dns_registry(dns_groups)
@@ -656,6 +677,7 @@ async fn prepare_servers(
         server_configs,
         dns_registry,
         outbounds,
+        clash_api,
     })
 }
 
@@ -671,6 +693,9 @@ async fn launch_servers(
         server_configs,
         mut dns_registry,
         outbounds,
+        // The serve loop reconciles the controller; launching servers does
+        // not touch it, so that a reload's listener survives the restart.
+        clash_api: _,
     } = prepared;
 
     // Replace, not add: a reload must not carry the previous config's

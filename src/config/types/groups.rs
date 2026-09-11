@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::option_util::OneOrSome;
 
+use super::clash_api::ClashApiConfig;
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
 use super::rule_set::RuleSetConfig;
@@ -176,6 +177,10 @@ pub enum Config {
     DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
     RuleSet(RuleSetConfig),
+    /// The Clash-compatible controller. A variant in every build, not only
+    /// where `clash-api` is on: a config file then means the same thing to
+    /// every binary, and only what is *done* with the block is gated.
+    ClashApi(ClashApiConfig),
 }
 
 impl<'de> serde::de::Deserialize<'de> for Config {
@@ -203,6 +208,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_addresses = map.contains_key(Value::String("addresses".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
         let has_pem = map.contains_key(Value::String("pem".to_string()));
+        let has_clash_api = map.contains_key(Value::String("clash_api".to_string()));
 
         // Check if this is a TUN config
         // TUN configs have 'device_name' (Linux/Windows) or 'device_fd'
@@ -225,7 +231,19 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let is_tun_config = has_device_name || has_device_fd || has_netmask || has_destination;
 
         // Try to determine which variant based on fields
-        if has_pem {
+        if has_clash_api {
+            // The block is a mapping under its own key -- `clash_api: {
+            // listen, ... }` -- so the inner value is what deserializes.
+            // Checked before the `address` branch below: the block carries
+            // no other distinguishing key, and `listen` is not one of them.
+            let inner = map
+                .get(Value::String("clash_api".to_string()))
+                .cloned()
+                .expect("checked above");
+            serde_yaml::from_value(inner)
+                .map(Config::ClashApi)
+                .map_err(|e| Error::custom(format!("invalid clash_api config: {e}")))
+        } else if has_pem {
             // NamedPem (pem field is unique to NamedPem)
             serde_yaml::from_value(value)
                 .map(Config::NamedPem)
@@ -274,7 +292,8 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
                 - DNS config group: must have 'dns_group' field\n\
-                - Rule-set: must have 'rule_set' field"
+                - Rule-set: must have 'rule_set' field\n\
+                - Clash API: must have 'clash_api' field"
             )))
         }
     }
@@ -293,6 +312,14 @@ impl serde::ser::Serialize for Config {
             Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
             Config::RuleSet(rule_set) => rule_set.serialize(serializer),
+            // Re-wrapped under its key, so a dumped config round-trips
+            // through the discriminator above.
+            Config::ClashApi(api) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("clash_api", api)?;
+                map.end()
+            }
         }
     }
 }

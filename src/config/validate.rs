@@ -44,6 +44,9 @@ pub struct ValidatedConfigs {
     /// here and installed where a service starts — never here, because this
     /// function also serves `--dry-run` and the config editor.
     pub outbounds: crate::outbound_stats::OutboundSet,
+    /// The controller block, at most one, validated. `None` when the config
+    /// has none, which is every config that does not ask for one.
+    pub clash_api: Option<super::types::ClashApiConfig>,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -97,6 +100,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut named_pems: HashMap<String, String> = HashMap::new();
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
     let mut rule_sets: HashMap<String, Arc<RuleSet>> = HashMap::new();
+    let mut clash_api: Option<super::types::ClashApiConfig> = None;
 
     for config in all_configs.into_iter() {
         match config {
@@ -151,6 +155,18 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                         format!("dns group already exists: {}", group_name),
                     ));
                 }
+            }
+            Config::ClashApi(api) => {
+                // One controller, or none. Two would bind two ports and
+                // disagree about which is the machine's control plane.
+                if clash_api.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "more than one clash_api block; keep one",
+                    ));
+                }
+                api.validate()?;
+                clash_api = Some(api);
             }
             Config::RuleSet(config) => {
                 if rule_sets.contains_key(&config.rule_set) {
@@ -259,6 +275,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         configs: result,
         dns_groups: final_dns_groups,
         outbounds,
+        clash_api,
     })
 }
 
@@ -2426,6 +2443,79 @@ fn expand_selection(
 
 #[cfg(test)]
 mod tests {
+
+    /// The block reaches a host through validation, not only through serde.
+    #[test]
+    fn a_clash_api_block_parses_validates_and_is_returned() {
+        let yaml = "
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+- clash_api:
+    listen: 127.0.0.1:9090
+    secret: s
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let validated = create_server_configs(configs).unwrap();
+        let api = validated.clash_api.expect("returned to the host");
+        assert_eq!(api.listen, "127.0.0.1:9090".parse().unwrap());
+        assert_eq!(api.secret.as_deref(), Some("s"));
+        // The block is not a server, so it must not reach the server list.
+        assert_eq!(validated.configs.len(), 1);
+    }
+
+    #[test]
+    fn a_config_without_the_block_has_no_controller() {
+        let yaml = "- address: 127.0.0.1:1080\n  protocol:\n    type: socks\n";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert!(create_server_configs(configs).unwrap().clash_api.is_none());
+    }
+
+    #[test]
+    fn two_clash_api_blocks_are_refused() {
+        let yaml = "
+- clash_api: { listen: 127.0.0.1:9090 }
+- clash_api: { listen: 127.0.0.1:9091 }
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let Err(err) = create_server_configs(configs) else {
+            panic!("two controllers must be refused");
+        };
+        assert!(err.to_string().contains("more than one"), "{err}");
+    }
+
+    /// The bind rule is enforced where a config is loaded, not only on the
+    /// type: a `--dry-run` must refuse an open controller.
+    #[test]
+    fn a_public_bind_without_a_secret_fails_validation() {
+        let yaml = "- clash_api: { listen: 0.0.0.0:9090 }";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let Err(err) = create_server_configs(configs) else {
+            panic!("an open controller must be refused");
+        };
+        assert!(err.to_string().contains("secret is required"), "{err}");
+    }
+
+    /// The discriminator has to pick the block out of a list that also holds
+    /// a Unix-socket server, whose only key is `path`, and a rule-set.
+    #[test]
+    fn the_block_round_trips_through_a_mixed_config_list() {
+        let yaml = "
+- clash_api: { listen: 127.0.0.1:9090 }
+- path: /run/shoes.sock
+  protocol:
+    type: socks
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(configs[0], Config::ClashApi(_)));
+        assert!(matches!(configs[1], Config::Server(_)));
+        let dumped = serde_yaml::to_string(&configs).unwrap();
+        let reparsed: Vec<Config> = serde_yaml::from_str(&dumped).unwrap();
+        match &reparsed[0] {
+            Config::ClashApi(api) => assert_eq!(api.listen, "127.0.0.1:9090".parse().unwrap()),
+            other => panic!("expected the controller, got {other:?}"),
+        }
+    }
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::config::types::tun::TEST_TUN_DEVICE_NAME;

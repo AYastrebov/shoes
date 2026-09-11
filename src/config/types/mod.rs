@@ -12,7 +12,9 @@
 //! - [`rules`]: Rule configurations for traffic routing
 //! - [`groups`]: Top-level configuration groups and the Config enum
 //! - [`dns`]: DNS server configuration
+//! - [`clash_api`]: the Clash-compatible controller block
 
+pub mod clash_api;
 pub mod client;
 pub mod common;
 pub mod dns;
@@ -29,6 +31,7 @@ pub mod transport;
 pub mod tun;
 
 // Re-export all public types for convenience
+pub use clash_api::ClashApiConfig;
 #[allow(unused_imports)]
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,

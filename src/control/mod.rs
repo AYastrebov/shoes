@@ -570,7 +570,18 @@ async fn prepare_configs(
         configs: validated_configs,
         dns_groups,
         outbounds,
+        clash_api,
     } = create_server_configs(configs)?;
+
+    // A library host -- the daemon, a mobile extension -- does not mount the
+    // controller; the CLI does. Saying so beats a config whose `clash_api:`
+    // block is silently doing nothing.
+    if let Some(api) = &clash_api {
+        warn!(
+            "config declares clash_api on {}, but this host does not serve it;              the controller is the `shoes` CLI's",
+            api.listen
+        );
+    }
 
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;

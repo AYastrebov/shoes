@@ -52,6 +52,17 @@ ffi = []  # Enable FFI module for non-Android builds
 control-logs = []   # subscribable log stream; bounded in-memory ring
 control-stats = []  # counters beyond the two byte totals
 desktop = ["control-logs", "control-stats"]
+# One entry per live connection, counted at the accept edge: source,
+# destination, exit outbound, matching rule and two byte counters. Runtime
+# state per *connection* rather than per configured item, which is the cost
+# the two features above were split to keep attributable, so it is off for
+# mobile for the same reason and `desktop` does not pull it in.
+control-connections = ["control-stats"]
+# The Clash-compatible controller and the Prometheus /metrics beside it, on
+# the CLI. Reads the registry above, the outbound registry and the log ring;
+# serves none of it without a `clash_api:` block in the config. See
+# docs/specs/2026-09-09-clash-api.md.
+clash-api = ["control-logs", "control-connections", "dep:serde_json"]
 # This build is linked into an Apple Network Extension, so the system kills it
 # at a memory cap rather than warning it, and src/buffer_sizing.rs picks the
 # constrained per-connection budget.
@@ -99,6 +110,13 @@ required-features = ["daemon"]
 
 [dependencies]
 async-trait = "*"
+# Optional, and enabled by two features that do not overlap in platform:
+# `daemon` writes the revert state file and parses `ip -j route show default`
+# (macOS and Linux), `clash-api` renders JSON bodies (every platform the CLI
+# builds for). Declared here rather than in a target section for the second:
+# a target-gated optional is a no-op off that target, which would leave the
+# controller without a serializer on Windows.
+serde_json = { version = "*", optional = true }
 awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "b6b4bcb4372858fdf77c1184c86170d1732b3de1", default-features = false }
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -206,12 +224,6 @@ prost = { version = "0.14", optional = true }
 # `net` is what carries UnixListenerStream, which is how the listener reaches
 # `serve_with_incoming_shutdown`.
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
-# The revert state file. JSON rather than the YAML this crate already parses:
-# it is written by a program and read by a program, never edited by hand, and
-# a crash-recovery record wants the format with the fewest ways to be
-# ambiguous. Also what parses `ip -j route show default` on Linux.
-serde_json = { version = "*", optional = true }
-
 # The two that genuinely are macOS-only: DNS through SCDynamicStore, Mullvad's
 # bindings. Not `networksetup`, which addresses a service by display name and
 # has been broken that way since macOS 14.3 (libnyanpasu/nyanpasu-service#26);
