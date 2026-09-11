@@ -54,10 +54,12 @@ Spec: "Slice 1: the process contract".
 - Modify: `src/main.rs:166-210` (argument loop), `:236` (subcommand block), `:409-490` (serve loop), `:520-600` (`ShutdownSignals`)
 - Create: `tests/process_contract.rs`
 
+**Status:** done in `66b7b63` on `feature/engine-contract`. The SIGHUP test uses `std::process` with a kill-on-drop guard, because tokio's `process` feature is not enabled in this crate; the Clash plan's Task 8 tests should do the same.
+
 **Interfaces:**
 - Produces: `shoes check <config>...` (exit 0/1), `shoes version` (prints `shoes <version>`), and a `ReloadSignal` stream in `main.rs` with `async fn recv(&mut self)` that resolves on `SIGHUP` and pends forever elsewhere.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 //! The process contract awg-manager holds an engine to. Drives the real
@@ -142,12 +144,12 @@ async fn sighup_reloads_immediately_even_with_no_reload() {
 
 `libc` is a normal dependency, so the test can use it; if the integration test cannot see it, add `libc = "*"` under `[dev-dependencies]`.
 
-- [ ] **Step 2: Run, expect failure**
+- [x] **Step 2: Run, expect failure**
 
 Run: `cargo test --locked --test process_contract`
 Expected: `check` and `version` fail (unknown argument, exit 1); `sighup` fails (no reload happens).
 
-- [ ] **Step 3: Subcommands**
+- [x] **Step 3: Subcommands**
 
 In `main.rs`, right after the option loop ends (before `if args.iter().any(|s| s == "generate-reality-keypair")`):
 
@@ -166,7 +168,7 @@ In `main.rs`, right after the option loop ends (before `if args.iter().any(|s| s
 
 The dry-run block already exits 1 and prints `Dry run failed: …` to stderr; it stays.
 
-- [ ] **Step 4: `SIGHUP`**
+- [x] **Step 4: `SIGHUP`**
 
 Add beside `ShutdownSignals`:
 
@@ -254,7 +256,7 @@ In the serve loop, install `let mut reload = ReloadSignal::install();` beside `s
 
 `join_handles` is moved into `shut_down` in two arms of one loop iteration; the existing code has the same shape and compiles because `shut_down` returns `!`. Keep the `first_launch` handling and the restart code after the loop as they are.
 
-- [ ] **Step 5: Run, gates, commit**
+- [x] **Step 5: Run, gates, commit**
 
 ```bash
 perl -e 'alarm 300; exec @ARGV' -- cargo test --locked --test process_contract
