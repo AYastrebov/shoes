@@ -310,8 +310,8 @@ async fn process_streams(
             .await
         }
         TcpServerSetupResult::AlreadyHandled => {
-            // The entry goes with the handle; see the TCP path for why.
-            drop(handle);
+            // The entry goes with the handle as this arm returns; see the
+            // TCP path for why, and why there is no explicit `drop`.
             // Connection already handled by a spawned task (e.g., Reality fallback)
             Ok(())
         }

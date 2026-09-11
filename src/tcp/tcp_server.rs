@@ -394,7 +394,11 @@ where
             // return: the entry goes with the handle rather than outliving
             // the task that could have removed it. The connection is served
             // either way; it is not listed.
-            drop(handle);
+            //
+            // No explicit `drop`: the handle goes out of scope on the next
+            // line, and without the registry it is a zero-sized type with no
+            // `Drop` at all, which clippy rightly calls a call that does
+            // nothing.
             Ok(())
         }
     }
