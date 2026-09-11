@@ -108,6 +108,280 @@ pub async fn get(addr: SocketAddr, path: &str, secret: Option<&str>) -> Reply {
     request(addr, "GET", path, &headers, "").await
 }
 
+/// A child that dies with the test, whichever way the test ends.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn wait_for(addr: SocketAddr) {
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{addr} never came up");
+}
+
+/// SOCKS5 CONNECT with no authentication, returning the stream past the
+/// reply so the caller can talk to the target.
+async fn socks_connect(proxy: SocketAddr, target: SocketAddr) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    stream.write_all(&[5, 1, 0]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 0], "no-auth must be accepted");
+
+    let std::net::SocketAddr::V4(v4) = target else {
+        panic!("the test targets are v4")
+    };
+    let mut request = vec![5, 1, 0, 1];
+    request.extend_from_slice(&v4.ip().octets());
+    request.extend_from_slice(&v4.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0, "the CONNECT was refused");
+    stream
+}
+
+/// The claim this test exists for: a connection through a running shoes is
+/// listed with its route, can be closed from the controller, and moves the
+/// traffic stream -- which on a server has no TUN to count at.
+#[tokio::test]
+async fn a_forwarded_connection_is_listed_counted_and_closable() {
+    let socks_port = free_port();
+    let api_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "- address: 127.0.0.1:{socks_port}\n  protocol:\n    type: socks\n\
+             - clash_api:\n    listen: 127.0.0.1:{api_port}\n"
+        ),
+    )
+    .unwrap();
+
+    let child = Child(
+        std::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg("--no-reload")
+            .arg(&config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let api: SocketAddr = format!("127.0.0.1:{api_port}").parse().unwrap();
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    wait_for(api).await;
+    wait_for(proxy).await;
+
+    // An upstream that answers three bytes for every five, so the two
+    // directions differ and a transposition fails rather than passing.
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut buf = [0u8; 5];
+        while stream.read_exact(&mut buf).await.is_ok() {
+            if stream.write_all(b"abc").await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut traffic = ws_open(api, "/traffic").await;
+    let _first_is_zero = ws_read_text(&mut traffic).await;
+
+    let mut client = socks_connect(proxy, upstream_addr).await;
+    let mut echo = [0u8; 3];
+    for _ in 0..4 {
+        client.write_all(b"12345").await.unwrap();
+        client.read_exact(&mut echo).await.unwrap();
+    }
+
+    // Wait for the route, which is recorded after the dial.
+    //
+    // The port is a string in this metadata, as mihomo sends it, so the
+    // comparison is against a string rather than the number it looks like.
+    let want_port = upstream_addr.port().to_string();
+    let mut listed = None;
+    for _ in 0..100 {
+        let body = json(&get(api, "/connections", None).await);
+        if let Some(found) = body["connections"].as_array().unwrap().iter().find(|c| {
+            c["metadata"]["destinationPort"] == want_port.as_str()
+                && !c["chains"].as_array().unwrap().is_empty()
+        }) {
+            listed = Some(found.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let listed = listed.expect("the connection is listed with its route");
+
+    assert_eq!(listed["metadata"]["type"], "socks5");
+    assert_eq!(listed["metadata"]["network"], "tcp");
+    assert_eq!(
+        listed["metadata"]["inboundName"],
+        format!("socks5@127.0.0.1:{socks_port}")
+    );
+    assert_eq!(listed["chains"][0], "direct", "the exit outbound");
+    assert_eq!(listed["rule"], "Match", "the catch-all rule allowed it");
+    // The SOCKS handshake is counted at the client edge too, hence ">=".
+    assert!(listed["upload"].as_u64().unwrap() >= 20, "{listed}");
+    assert!(listed["download"].as_u64().unwrap() >= 12, "{listed}");
+
+    // The server-mode traffic claim: a non-zero tick with no TUN anywhere.
+    let mut saw_bytes = false;
+    for _ in 0..4 {
+        client.write_all(b"12345").await.unwrap();
+        client.read_exact(&mut echo).await.unwrap();
+        let tick: serde_json::Value =
+            serde_json::from_str(&ws_read_text(&mut traffic).await).unwrap();
+        if tick["up"].as_u64().unwrap() > 0 && tick["down"].as_u64().unwrap() > 0 {
+            saw_bytes = true;
+            break;
+        }
+    }
+    assert!(saw_bytes, "/traffic stayed flat in server mode");
+
+    // Counted under the listener's own label. Not an exact figure: the
+    // readiness probe above also connected, and a count is a count.
+    let metrics = get(api, "/metrics", None).await.body;
+    let label = format!("socks5@127.0.0.1:{socks_port}");
+    let counted = metrics
+        .lines()
+        .find(|l| l.starts_with("shoes_inbound_connections_total{") && l.contains(&label))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(counted >= 1, "expected {label} in:\n{metrics}");
+
+    // Closing it from the controller ends the client's stream, which is the
+    // only thing that makes a dashboard's disconnect button mean anything.
+    let id = listed["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        request(api, "DELETE", &format!("/connections/{id}"), &[], "")
+            .await
+            .code,
+        204
+    );
+    let mut probe = [0u8; 1];
+    let ended =
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut probe)).await;
+    assert!(
+        matches!(ended, Ok(Ok(0)) | Ok(Err(_))),
+        "the client's stream should end after DELETE: {ended:?}"
+    );
+
+    for _ in 0..100 {
+        let body = json(&get(api, "/connections", None).await);
+        if body["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != id)
+        {
+            drop(child);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the entry outlived its connection");
+}
+
+/// A reload replaces the proxies; the controller and its open sockets stay.
+#[tokio::test]
+async fn the_listener_survives_a_config_reload() {
+    let socks_port = free_port();
+    let api_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+
+    let write = |name: &str| {
+        // A group nothing references is still a configured outbound, so it
+        // appears in /proxies -- which is how this test sees the swap
+        // without needing traffic to flow through it.
+        let yaml = format!(
+            "- address: 127.0.0.1:{socks_port}\n\
+             \x20 protocol:\n\
+             \x20   type: socks\n\
+             - client_group: pool\n\
+             \x20 client_proxies:\n\
+             \x20   - name: {name}\n\
+             \x20     address: 127.0.0.1:1\n\
+             \x20     protocol:\n\
+             \x20       type: socks\n\
+             - clash_api:\n\
+             \x20   listen: 127.0.0.1:{api_port}\n"
+        );
+        std::fs::write(&config_path, yaml).unwrap();
+    };
+
+    write("first");
+    let child = Child(
+        std::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg(&config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let api: SocketAddr = format!("127.0.0.1:{api_port}").parse().unwrap();
+    wait_for(api).await;
+
+    let proxies = json(&get(api, "/proxies", None).await);
+    assert!(
+        proxies["proxies"].get("first").is_some(),
+        "the first config's outbound: {proxies}"
+    );
+
+    let mut ws = ws_open(api, "/traffic").await;
+    let _ = ws_read_text(&mut ws).await;
+
+    write("second");
+
+    // The file watcher debounces for three seconds, so this polls well past
+    // that rather than sleeping a fixed amount.
+    let mut swapped = false;
+    for _ in 0..200 {
+        let proxies = json(&get(api, "/proxies", None).await);
+        if proxies["proxies"].get("second").is_some() {
+            assert!(
+                proxies["proxies"].get("first").is_none(),
+                "a reload replaces rather than accumulates: {proxies}"
+            );
+            swapped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(swapped, "the reload never took");
+
+    let still_open =
+        tokio::time::timeout(std::time::Duration::from_secs(3), ws_read_text(&mut ws)).await;
+    assert!(
+        still_open.is_ok(),
+        "the dashboard's socket died across a reload"
+    );
+    drop(child);
+}
+
 /// Write one line into a ring the way the global logger would.
 fn push(
     ring: &shoes::control::logs::BroadcastLogWriter,

@@ -244,6 +244,11 @@ fn main() {
         }
     }
 
+    // Installed before the config is read, because logging is: it costs one
+    // pointer until a controller starts and allocates the ring.
+    #[cfg(feature = "clash-api")]
+    writers.push(Box::new(clash_api::logs::DynamicBroadcastWriter));
+
     logging::init_multi_logger(writers, directives);
     logging::install_panic_hook();
 
@@ -422,8 +427,18 @@ fn main() {
         // handled at the next wait.
         let mut signals = ShutdownSignals::install();
 
+        #[cfg(feature = "clash-api")]
+        let mut api: Option<ApiRunner> = None;
+
         let mut first_launch = true;
         loop {
+            // Taken before the launch consumes `prepared`: the controller
+            // reports the listener ports, and is reconciled after the
+            // servers are up so a failed launch does not start one.
+            #[cfg(feature = "clash-api")]
+            let (api_wanted, api_ports) =
+                (prepared.clash_api.clone(), prepared.server_configs.clone());
+
             let join_handles = match launch_servers(prepared).await {
                 Ok(handles) => handles,
                 Err(e) if first_launch => {
@@ -440,6 +455,11 @@ fn main() {
                 }
             };
             first_launch = false;
+
+            #[cfg(feature = "clash-api")]
+            {
+                api = reconcile_api(api.take(), api_wanted.as_ref(), &api_ports).await;
+            }
 
             if reload_state.is_none() {
                 // No reload mode: nothing to do but serve until the OS
@@ -614,6 +634,70 @@ impl ShutdownSignals {
     }
 }
 
+/// The controller, and the handle that stops it.
+#[cfg(feature = "clash-api")]
+struct ApiRunner {
+    config: config::ClashApiConfig,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Start, keep, replace or stop the controller to match the configuration
+/// that just launched.
+///
+/// Same listen and secret: keep it, so a dashboard's open sockets survive a
+/// reload of the proxies. Anything else: stop it and start a new one. No
+/// block at all: stop it.
+#[cfg(feature = "clash-api")]
+async fn reconcile_api(
+    current: Option<ApiRunner>,
+    wanted: Option<&config::ClashApiConfig>,
+    server_configs: &[config::Config],
+) -> Option<ApiRunner> {
+    if let (Some(running), Some(want)) = (&current, wanted)
+        && running.config.listen == want.listen
+        && running.config.secret == want.secret
+    {
+        // The cap can change under a listener that stays.
+        connection_registry::set_cap(want.max_tracked_connections);
+        return current;
+    }
+
+    if let Some(running) = current {
+        println!("Stopping the Clash API on {}", running.config.listen);
+        // Dropping the sender would do as well; sending says it was meant.
+        let _ = running.stop.send(());
+    }
+
+    let want = wanted?.clone();
+    let listener = match tokio::net::TcpListener::bind(want.listen).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            // The proxies are already serving; a controller that cannot bind
+            // is reported and skipped rather than taking them down.
+            eprintln!("Could not bind the Clash API on {}: {e}", want.listen);
+            return None;
+        }
+    };
+
+    connection_registry::set_cap(want.max_tracked_connections);
+    let ring = clash_api::logs::install_ring(512);
+    let state = std::sync::Arc::new(clash_api::ApiState {
+        config: want.clone(),
+        ports: clash_api::Ports::from_configs(server_configs),
+        started: std::time::Instant::now(),
+        log: Some(ring),
+    });
+
+    let (stop, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(e) = clash_api::serve_on(listener, state, rx).await {
+            eprintln!("Clash API stopped: {e}");
+        }
+    });
+
+    Some(ApiRunner { config: want, stop })
+}
+
 /// Everything a validated configuration needs to start serving.
 struct PreparedServers {
     server_configs: Vec<config::Config>,
@@ -624,9 +708,9 @@ struct PreparedServers {
     /// The controller this configuration asks for, if any. Carried through
     /// the reload path so the serve loop can compare it to the running one.
     ///
-    /// `allow(dead_code)`: read by the serve loop only once the controller
-    /// exists to start; without the feature nothing reads it at all, which
-    /// is the same reason and is permanent.
+    /// `allow(dead_code)`: the serve loop reads it under the feature, and
+    /// without the feature nothing does -- the block is still parsed and
+    /// validated, so a config means one thing in every build.
     #[allow(dead_code)]
     clash_api: Option<config::ClashApiConfig>,
 }
