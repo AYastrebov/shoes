@@ -296,6 +296,7 @@ pub async fn run_tun_server(
 
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
+                    let local_addr = new_conn.local_addr;
                     // Restore before routing, so hostname rules see the domain.
                     let target =
                         fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
@@ -308,6 +309,7 @@ pub async fn run_tun_server(
                         proxy_selector,
                         resolver,
                         sniff.as_ref(),
+                        local_addr,
                     )
                     .await
                     {
@@ -420,10 +422,20 @@ async fn handle_tcp_connection<S>(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     sniff: Option<&crate::sniff::SniffSettings>,
+    source: std::net::SocketAddr,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    // Registered here rather than at an accept loop: the TUN stack is the
+    // accept edge, and this is the first place that has both ends of a flow.
+    let handle = crate::connection_registry::register(
+        source,
+        "tun",
+        crate::connection_registry::Network::Tcp,
+    );
+    handle.set_destination(&target);
+
     let mut connection = connection;
     let mut sniffed_prefix: Vec<u8> = Vec::new();
     let mut judged: crate::address::ResolvedLocation = target.clone().into();
@@ -445,6 +457,7 @@ where
         sniffed_prefix = result.buffered;
         if let Some(name) = result.sniffed.as_ref().and_then(|s| s.domain.as_deref()) {
             debug!("sniffed {name} for {target}");
+            handle.set_sniffed_host(name);
             judged = crate::sniff::judged_location(name, addr);
         }
     }
@@ -463,10 +476,21 @@ where
             );
 
             match chain_group
-                .connect_tcp(remote_location.clone(), &resolver)
+                .connect_tcp_attributed(remote_location.clone(), &resolver)
                 .await
             {
-                Ok(setup_result) => {
+                Ok((setup_result, _exit)) => {
+                    #[cfg(feature = "control-stats")]
+                    let chain = Some(_exit.counters.key().clone());
+                    #[cfg(not(feature = "control-stats"))]
+                    let chain = None;
+                    handle.set_route(
+                        chain,
+                        proxy_selector.group_name(_rule_index),
+                        Some(_rule_index),
+                        Some(proxy_selector.rule_summaries()),
+                    );
+
                     debug!(
                         "TCP: connected to {}, starting bidirectional copy",
                         remote_location.location()
@@ -478,7 +502,15 @@ where
                     } = setup_result;
 
                     // Wrap the local connection with traffic counting so bytes
-                    // are reported in real time, not only after the stream closes.
+                    // are reported in real time, not only after the stream
+                    // closes. The registry's entry is a second target on the
+                    // same wrapper rather than a second wrapper.
+                    #[cfg(feature = "control-connections")]
+                    let mut counting = traffic::TrafficCountingStream::with_connection(
+                        connection,
+                        handle.counters(),
+                    );
+                    #[cfg(not(feature = "control-connections"))]
                     let mut counting = traffic::TrafficCountingStream::new(connection);
 
                     // The final hop can hand back payload it read while still
@@ -498,7 +530,20 @@ where
                         remote.flush().await?;
                     }
 
-                    let result = tokio::io::copy_bidirectional(&mut counting, &mut remote).await;
+                    // Ends when the copy does or when a controller asks for
+                    // this connection to go; without the registry the second
+                    // future never resolves.
+                    let result = {
+                        let copy = tokio::io::copy_bidirectional(&mut counting, &mut remote);
+                        tokio::pin!(copy);
+                        tokio::select! {
+                            result = &mut copy => result,
+                            () = handle.closed() => Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "closed by the controller",
+                            )),
+                        }
+                    };
 
                     match result {
                         Ok((client_to_remote, remote_to_client)) => {
@@ -932,9 +977,16 @@ mod tests {
         let local = HelloThenEof {
             hello: Some(b"through-the-configured-dns".to_vec()),
         };
-        handle_tcp_connection(local, target, selector, resolver, None)
-            .await
-            .unwrap();
+        handle_tcp_connection(
+            local,
+            target,
+            selector,
+            resolver,
+            None,
+            "10.0.0.2:40000".parse().unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             names
@@ -971,9 +1023,16 @@ mod tests {
 
         let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34)), 443);
 
-        handle_tcp_connection(local, target, selector, resolver, None)
-            .await
-            .unwrap();
+        handle_tcp_connection(
+            local,
+            target,
+            selector,
+            resolver,
+            None,
+            "10.0.0.2:40000".parse().unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             written.lock().unwrap().as_slice(),
@@ -1095,9 +1154,16 @@ mod tests {
             timeout: std::time::Duration::from_millis(300),
         };
 
-        handle_tcp_connection(local, target, selector, resolver, Some(&settings))
-            .await
-            .unwrap();
+        handle_tcp_connection(
+            local,
+            target,
+            selector,
+            resolver,
+            Some(&settings),
+            "10.0.0.2:40000".parse().unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             target_seen.lock().unwrap().as_slice(),

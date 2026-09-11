@@ -134,6 +134,9 @@ struct SocketInfo {
 pub struct NewTcpConnection {
     pub connection: TcpConnection,
     pub remote_addr: SocketAddr,
+    /// The address inside the tunnel that opened it. Known here from the
+    /// SYN, and carried out so a connection can say who it belongs to.
+    pub local_addr: SocketAddr,
 }
 
 /// Shared state for communication between main thread and stack thread.
@@ -820,6 +823,7 @@ fn create_tcp_connection(
             new_tcp_conn: NewTcpConnection {
                 connection,
                 remote_addr: dst_addr,
+                local_addr: src_addr,
             },
         },
         control,

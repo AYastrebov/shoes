@@ -195,6 +195,21 @@ impl NetLocation {
     }
 }
 
+impl From<SocketAddr> for NetLocation {
+    /// A resolved address is a location whose address is an IP. The reverse
+    /// is `to_socket_addr_nonblocking`, which is `None` for a hostname.
+    fn from(addr: SocketAddr) -> Self {
+        let address = match addr.ip() {
+            IpAddr::V4(v4) => Address::Ipv4(v4),
+            IpAddr::V6(v6) => Address::Ipv6(v6),
+        };
+        Self {
+            address,
+            port: addr.port(),
+        }
+    }
+}
+
 impl std::fmt::Display for NetLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}:{}", self.address, self.port)
