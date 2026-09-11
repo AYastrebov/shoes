@@ -259,8 +259,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
-[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
+# 64-bit atomics for targets without them (Keenetic mipsel); see util::AtomicU64.
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = "1.15.0"
+
+# jemalloc for better memory performance (not supported on Windows MSVC, iOS,
+# or Android). Not on MIPS either: the Keenetic mipsel routers are 32-bit
+# soft-float with 128-256 MiB, where jemalloc's arenas cost more RSS than they
+# save, its build has no background-thread support for the target, and the
+# musl cross GCCs crash compiling it.
+[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android", target_arch = "mips")))'.dependencies]
 tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]

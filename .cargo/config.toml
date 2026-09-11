@@ -1,3 +1,10 @@
 # Static linking for musl targets
 [target.'cfg(target_env = "musl")']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Keenetic mipsel: Rust's musl targets normally link their own copies of
+# musl's C runtime start files, shipped with the prebuilt std. A tier-3
+# target built with `build-std` has none, so the cross toolchain's own are
+# used instead. See Cross.toml.
+[target.mipsel-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no"]

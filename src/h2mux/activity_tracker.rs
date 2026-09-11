@@ -1,10 +1,14 @@
 //! Activity tracking for h2mux connection idle timeout detection.
 //!
 //! Tracks the last time activity occurred on a connection to support idle timeout.
-//! Uses atomic operations for lock-free performance.
+//! An atomic rather than a lock: on every target with 64-bit atomics the
+//! update is a single store. On one without them (Keenetic's mipsel) the
+//! atomic is lock-backed, which at the rate a connection changes activity
+//! costs nothing measurable.
 
+use crate::util::atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Timeout constants matching sing-mux behavior.
