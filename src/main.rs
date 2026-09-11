@@ -91,10 +91,21 @@ mod vmess;
 mod websocket;
 mod xudp;
 
-#[cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_env = "msvc",
+    target_os = "ios",
+    target_os = "android",
+    target_arch = "mips"
+)))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))]
+// Not on MIPS: see the dependency's note in Cargo.toml.
+#[cfg(not(any(
+    target_env = "msvc",
+    target_os = "ios",
+    target_os = "android",
+    target_arch = "mips"
+)))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 

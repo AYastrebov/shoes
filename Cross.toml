@@ -1,0 +1,28 @@
+# Cross-compilation for Keenetic routers (Entware): aarch64-3.10 and
+# mipsel-3.4. Rust's mipsel musl target is tier 3 (no prebuilt std), so it
+# needs a nightly toolchain and `build-std`; aws-lc-sys has no prebuilt
+# bindings for MIPS, so its `bindgen` feature needs libclang in the image.
+# The `main` images rather than the 0.2.5 ones: the older images' GCC
+# segfaults on jemalloc's sources.
+# `AWS_LC_SYS_NO_PREFIX=1` when building for it: the prefixed bindings name
+# every function with LLVM's verbatim-name marker (`\u{1}`), which the MIPS
+# backend fails to strip, so the linker looks for symbols that start with a
+# control byte. Unprefixed, the bindings carry no marker. Nothing else in
+# the binary uses the unprefixed names (ring has its own prefix).
+[target.mipsel-unknown-linux-musl]
+image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:main"
+build-std = true
+env.passthrough = ["AWS_LC_SYS_NO_PREFIX"]
+pre-build = [
+    "export DEBIAN_FRONTEND=noninteractive TZ=UTC && apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev",
+    # std's unwinder on musl is `libunwind`, which the prebuilt std carries
+    # and a `build-std` one does not; GCC's `libgcc_eh` has the same
+    # `_Unwind_*` interface, so it serves under that name.
+    "d=$(dirname $(mipsel-linux-muslsf-gcc -print-libgcc-file-name)) && ln -sf $d/libgcc_eh.a $d/libunwind.a",
+]
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+pre-build = [
+    "export DEBIAN_FRONTEND=noninteractive TZ=UTC && apt-get update && apt-get install -y --no-install-recommends cmake",
+]

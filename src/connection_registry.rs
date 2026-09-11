@@ -27,7 +27,11 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+// `portable_atomic` rather than std: the Keenetic mipsel target has no
+// 64-bit atomics, and this is a lock-backed fallback there and the std
+// type everywhere else.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

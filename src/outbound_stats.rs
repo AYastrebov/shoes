@@ -172,8 +172,9 @@ pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(feature = "control-stats")]
 mod registry {
     use super::OutboundSet;
+    use portable_atomic::AtomicU64;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, RwLock};
 
     /// The counters for one outbound.

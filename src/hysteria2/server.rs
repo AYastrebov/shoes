@@ -1,9 +1,10 @@
+use portable_atomic::AtomicU64;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use std::str;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 

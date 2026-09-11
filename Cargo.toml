@@ -198,6 +198,7 @@ tokio-util = { version = "*", features = ["time"] }
 url = "*"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+portable-atomic = "1.15.0"
 
 # Optional so that only a `--features daemon` build compiles it: a build
 # dependency costs build time on every target otherwise, including the mobile
@@ -259,8 +260,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
-[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
+# jemalloc for better memory performance (not supported on Windows MSVC, iOS,
+# or Android). Not on MIPS either: the Keenetic mipsel routers are 32-bit
+# soft-float with 128-256 MiB, where jemalloc's arenas cost more RSS than they
+# save, its build has no background-thread support for the target, and the
+# musl cross GCCs crash compiling it.
+[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android", target_arch = "mips")))'.dependencies]
 tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
