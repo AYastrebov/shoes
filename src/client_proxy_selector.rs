@@ -123,6 +123,9 @@ pub struct ConnectRule {
     pub group_name: Option<Arc<str>>,
     /// The exit key of a rule that routes through exactly one outbound, for
     /// a listing when there is no group name to show instead.
+    /// Read only by the rule summary, which only a build with the
+    /// connection registry renders.
+    #[cfg_attr(not(feature = "control-connections"), allow(dead_code))]
     pub proxy_hint: Option<String>,
 }
 
@@ -161,6 +164,11 @@ impl ConnectRule {
 /// where a Clash rule is a single condition. The rendering is therefore a
 /// summary, and says so: a rule with one mask renders as that mask, and
 /// anything larger renders as `RuleSet` with what it holds.
+///
+/// Rendered and kept only with the connection registry: a build without a
+/// controller has no reader, and a phone should not carry a string per rule
+/// for one -- see the feature notes in Cargo.toml.
+#[cfg(feature = "control-connections")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSummary {
     pub rule_type: &'static str,
@@ -168,6 +176,7 @@ pub struct RuleSummary {
     pub proxy: String,
 }
 
+#[cfg(feature = "control-connections")]
 impl RuleSummary {
     fn for_rule(rule: &ConnectRule) -> Self {
         let proxy = match (&rule.action, &rule.group_name) {
@@ -218,6 +227,13 @@ impl RuleSummary {
         }
     }
 }
+
+/// What a build without the connection registry keeps of the rule
+/// summaries: nothing. A marker rather than `()`, so a call site that
+/// passes it on reads as passing a value.
+#[cfg(not(feature = "control-connections"))]
+#[derive(Debug, Clone, Copy)]
+pub struct NoRuleSummaries;
 
 #[derive(Debug)]
 pub enum ConnectAction {
@@ -295,6 +311,7 @@ pub struct ClientProxySelector {
     /// Every rule rendered once, at construction: a controller listing them
     /// and a connection naming one both read this, and neither should be
     /// rendering strings on a connection's path.
+    #[cfg(feature = "control-connections")]
     summaries: Arc<[RuleSummary]>,
     /// If false, hostname rules will not trigger DNS resolution to match against IP-based
     /// destinations. This is useful when a huge blocklist or rule list is provided.
@@ -376,6 +393,7 @@ impl ClientProxySelector {
             None
         };
 
+        #[cfg(feature = "control-connections")]
         let summaries: Arc<[RuleSummary]> = rules
             .iter()
             .map(RuleSummary::for_rule)
@@ -384,6 +402,7 @@ impl ClientProxySelector {
 
         Self {
             rules,
+            #[cfg(feature = "control-connections")]
             summaries,
             resolve_rule_hostnames,
             cache,
@@ -391,8 +410,18 @@ impl ClientProxySelector {
     }
 
     /// Every rule as a controller lists them, in the order they are matched.
+    #[cfg(feature = "control-connections")]
     pub fn rule_summaries(&self) -> Arc<[RuleSummary]> {
         self.summaries.clone()
+    }
+
+    /// Without the registry nothing lists rules, so nothing is rendered or
+    /// kept. The call sites hand this to the registry's shim, which is
+    /// generic in the list precisely so that it takes the marker here.
+    #[cfg(not(feature = "control-connections"))]
+    #[inline(always)]
+    pub fn rule_summaries(&self) -> NoRuleSummaries {
+        NoRuleSummaries
     }
 
     /// The named group a rule routes through, if it has one.
@@ -884,6 +913,7 @@ mod tests {
     /// A shoes rule is a list; a Clash rule is one condition. The rendering
     /// is a summary, and the cases that must not be confused are the
     /// catch-all, a single mask, and anything larger.
+    #[cfg(feature = "control-connections")]
     #[test]
     fn summaries_render_one_type_and_payload_per_rule() {
         let selector = ClientProxySelector::new(vec![

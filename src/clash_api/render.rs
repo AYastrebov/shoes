@@ -5,6 +5,8 @@
 //! rather than a panel in production. See the spec, "The proxy model",
 //! "Rules" and "The endpoint table".
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use crate::connection_registry as conns;
@@ -28,10 +30,11 @@ pub fn configs(state: &super::ApiState) -> Value {
         log::LevelFilter::Info => "info",
         log::LevelFilter::Debug | log::LevelFilter::Trace => "debug",
     };
+    let ports = state.ports.read().clone();
     json!({
-        "port": state.ports.http,
-        "socks-port": state.ports.socks,
-        "mixed-port": state.ports.mixed,
+        "port": ports.http,
+        "socks-port": ports.socks,
+        "mixed-port": ports.mixed,
         "redir-port": 0,
         "tproxy-port": 0,
         "allow-lan": true,
@@ -39,7 +42,7 @@ pub fn configs(state: &super::ApiState) -> Value {
         "mode": "rule",
         "log-level": level,
         "ipv6": true,
-        "tun": { "enable": state.ports.tun },
+        "tun": { "enable": ports.tun },
     })
 }
 
@@ -95,11 +98,16 @@ fn group(name: &str, group_type: &str, now: &str, members: &[String], udp: bool)
 pub fn proxies(groups_only: bool) -> Value {
     let details = outbound_stats::details();
     let stats = outbound_stats::snapshot_all();
+    // Keyed once each: a listing is linear in the outbounds, not quadratic.
+    let stats_by_name: HashMap<&str, &outbound_stats::OutboundStats> =
+        stats.iter().map(|s| (s.name.as_str(), s)).collect();
+    let udp_by_name: HashMap<&str, bool> =
+        details.iter().map(|d| (d.name.as_str(), d.udp)).collect();
 
     let mut map = serde_json::Map::new();
     if !groups_only {
         for detail in &details {
-            let s = stats.iter().find(|s| s.name == detail.name);
+            let s = stats_by_name.get(detail.name.as_str()).copied();
             map.insert(detail.name.clone(), leaf(detail, s));
         }
     }
@@ -107,13 +115,10 @@ pub fn proxies(groups_only: bool) -> Value {
     for g in outbound_stats::groups() {
         // A round-robin group is a LoadBalance in Clash terms, and has no
         // chosen member to report.
-        let udp = g.members.iter().all(|m| {
-            details
-                .iter()
-                .find(|d| d.name == *m)
-                .map(|d| d.udp)
-                .unwrap_or(true)
-        });
+        let udp = g
+            .members
+            .iter()
+            .all(|m| udp_by_name.get(m.as_str()).copied().unwrap_or(true));
         map.insert(
             g.name.clone(),
             group(&g.name, "LoadBalance", "", &g.members, udp),
@@ -270,8 +275,7 @@ mod tests {
         assert_eq!(rfc3339(t), "2026-09-11T12:00:00Z");
         // A leap day, which the month arithmetic is the easiest to get wrong on.
         let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_709_208_000);
-        assert_eq!(leap, leap);
-        assert!(rfc3339(leap).starts_with("2024-02-29"), "{}", rfc3339(leap));
+        assert_eq!(rfc3339(leap), "2024-02-29T12:00:00Z");
     }
 
     #[test]

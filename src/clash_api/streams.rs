@@ -10,8 +10,14 @@ use std::time::Duration;
 use super::ws::Sink;
 use super::{ApiState, render};
 
-/// Send `tick()`'s frame every `every` until the client goes away.
-async fn periodic<S: Sink, F: FnMut() -> String + Send>(mut sink: S, every: Duration, mut tick: F) {
+/// Send `tick()`'s frame every `every` until the client goes away or the
+/// controller does.
+async fn periodic<S: Sink, F: FnMut() -> String + Send>(
+    state: &ApiState,
+    mut sink: S,
+    every: Duration,
+    mut tick: F,
+) {
     let mut interval = tokio::time::interval(every);
     loop {
         tokio::select! {
@@ -21,36 +27,50 @@ async fn periodic<S: Sink, F: FnMut() -> String + Send>(mut sink: S, every: Dura
                 }
             }
             () = sink.closed() => return,
+            // The controller stopping -- a reload that changed its secret
+            // or its listen, or dropped the block -- ends every stream it
+            // served: a subscriber that authenticated with the old secret
+            // must not outlive it.
+            () = state.shutdown.cancelled() => {
+                sink.close().await;
+                return;
+            }
         }
     }
 }
 
 /// Bytes since the last tick. The first frame is zero, which is what a
 /// dashboard's graph starts from.
-pub async fn traffic<S: Sink>(sink: S) {
+pub async fn traffic<S: Sink>(state: Arc<ApiState>, sink: S) {
     let mut last = crate::connection_registry::totals();
-    periodic(sink, Duration::from_secs(1), move || {
+    periodic(&state, sink, Duration::from_secs(1), move || {
         let now = crate::connection_registry::totals();
         let frame = serde_json::json!({
             "up": now.up.saturating_sub(last.up),
             "down": now.down.saturating_sub(last.down),
         });
-        last = now;
+        // A reading taken between an entry leaving the table and its bytes
+        // being folded into the totals is short by that connection. The
+        // mark keeps the higher value, so the next tick reports what moved
+        // since, rather than that connection's whole life again.
+        last.up = last.up.max(now.up);
+        last.down = last.down.max(now.down);
         frame.to_string()
     })
     .await
 }
 
-pub async fn memory<S: Sink>(sink: S) {
-    periodic(sink, Duration::from_secs(1), || {
+pub async fn memory<S: Sink>(state: Arc<ApiState>, sink: S) {
+    periodic(&state, sink, Duration::from_secs(1), || {
         // `oslimit` is mihomo's cap on itself; shoes has none to report.
         serde_json::json!({ "inuse": super::memory::rss(), "oslimit": 0 }).to_string()
     })
     .await
 }
 
-pub async fn connections<S: Sink>(sink: S, interval_ms: u64) {
+pub async fn connections<S: Sink>(state: Arc<ApiState>, sink: S, interval_ms: u64) {
     periodic(
+        &state,
         sink,
         // Clamped: a dashboard asking for a millisecond would have the
         // process render the whole table a thousand times a second.
@@ -168,6 +188,10 @@ pub async fn logs<S: Sink>(state: Arc<ApiState>, filter: log::LevelFilter, mut s
                 Err(_) => return,
             },
             () = sink.closed() => return,
+            () = state.shutdown.cancelled() => {
+                sink.close().await;
+                return;
+            }
         }
     }
 }
@@ -194,6 +218,10 @@ impl Sink for ChunkedSink {
     async fn closed(&mut self) {
         self.tx.closed().await
     }
+
+    /// Nothing to say: dropping the sender ends the body, which is how a
+    /// chunked response ends.
+    async fn close(&mut self) {}
 }
 
 pub fn chunked<F, Fut>(run: F) -> hyper::Response<super::ApiBody>

@@ -115,6 +115,9 @@ pub fn connection_end_level(e: &std::io::Error) -> log::Level {
         ConnectionAborted | ConnectionReset | UnexpectedEof | BrokenPipe | NotConnected => {
             log::Level::Debug
         }
+        // What a forwarding task reports when a controller asked for its
+        // connection to close: a request honoured, not a failure.
+        Interrupted => log::Level::Debug,
         TimedOut => log::Level::Info,
         _ => log::Level::Error,
     }

@@ -57,7 +57,9 @@ impl Network {
 ///
 /// `allow(unused_imports)` for the reason the module header gives: the
 /// binary and the library declare this module separately, and which build
-/// has a reader depends on the features.
+/// has a reader depends on the features. Gated like the selector's own
+/// definition: without the registry nothing renders a rule.
+#[cfg(feature = "control-connections")]
 #[allow(unused_imports)]
 pub use crate::client_proxy_selector::RuleSummary;
 
@@ -184,6 +186,12 @@ mod imp {
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     static CAP: AtomicUsize = AtomicUsize::new(4096);
+    /// Tracked entries, admitted against `CAP` in one atomic step so the
+    /// cap is a hard bound: a burst of accepts that each read the table's
+    /// length and then inserted could all pass a check the last of them
+    /// should have failed. Cheaper than the length too, which on a
+    /// sharded map is a sum over every shard.
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
 
     // Process-wide totals, folded once per connection in `Drop` -- never on
     // the polling path, so no connection's bytes touch a line another
@@ -244,9 +252,13 @@ mod imp {
     });
 
     /// The registry is process-global and cargo runs tests in parallel, so
-    /// every test that registers or reads totals takes this first.
+    /// every test that registers or reads totals takes this first -- the
+    /// ones here, and the ones elsewhere that forward a real connection
+    /// through an accept path. A tokio mutex, so an async test can hold it
+    /// across its awaits; the sync tests here take it with `blocking_lock`
+    /// before they build a runtime.
     #[cfg(test)]
-    pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A connection's place in the table, for as long as the task lives.
     ///
@@ -268,7 +280,11 @@ mod imp {
         inbound: &'static str,
         network: Network,
     ) -> ConnectionHandle {
-        if REGISTRY.entries.len() >= CAP.load(Ordering::Relaxed) {
+        let cap = CAP.load(Ordering::Relaxed);
+        let admitted = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            (live < cap).then_some(live + 1)
+        });
+        if admitted.is_err() {
             UNTRACKED.fetch_add(1, Ordering::Relaxed);
             return ConnectionHandle { entry: None };
         }
@@ -362,6 +378,12 @@ mod imp {
                 return;
             };
             REGISTRY.entries.remove(&e.id);
+            // Floors at zero for the reason the inbound counter below gives,
+            // and more so: an underflow here would refuse every connection
+            // the cap from then on.
+            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
             let up = e.counters.up.load(Ordering::Relaxed);
             let down = e.counters.down.load(Ordering::Relaxed);
             FOLDED_UP.fetch_add(up, Ordering::Relaxed);
@@ -489,7 +511,7 @@ mod imp {
             down += kv.value().counters.down.load(Ordering::Relaxed);
         }
         Totals {
-            active: REGISTRY.entries.len(),
+            active: LIVE.load(Ordering::Relaxed),
             total: TOTAL.load(Ordering::Relaxed),
             untracked: UNTRACKED.load(Ordering::Relaxed),
             up,
@@ -686,7 +708,7 @@ mod tests {
     #[cfg(feature = "control-connections")]
     #[test]
     fn bytes_are_counted_at_the_client_edge() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         block_on(async {
@@ -712,7 +734,7 @@ mod tests {
     #[cfg(feature = "control-connections")]
     #[test]
     fn late_fields_appear_in_the_snapshot_and_drop_removes_the_entry() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
 
         let handle = register(addr(5002), "socks5@test", Network::Tcp);
         handle.set_destination(&NetLocation::from_str("example.com:443", None).unwrap());
@@ -758,7 +780,7 @@ mod tests {
     #[cfg(feature = "control-connections")]
     #[test]
     fn drop_folds_bytes_into_the_process_and_inbound_totals() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
 
         let label = intern("fold@test".to_string());
         let before = inbound_stats().into_iter().find(|i| i.inbound == label);
@@ -796,7 +818,7 @@ mod tests {
     #[cfg(feature = "control-connections")]
     #[test]
     fn close_wakes_the_holder_and_the_entry_leaves_only_on_drop() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
 
         block_on(async {
             let handle = register(addr(5004), "socks5@test", Network::Tcp);
@@ -823,7 +845,7 @@ mod tests {
     #[cfg(feature = "control-connections")]
     #[test]
     fn over_the_cap_connections_are_served_but_not_tracked() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
 
         // Exactly the live count: every further registration is refused,
         // whatever else the process is doing.
@@ -857,6 +879,43 @@ mod tests {
         set_cap(4096);
     }
 
+    /// The cap holds under a burst: every thread registers at once, and
+    /// exactly `cap` of them are tracked -- not "about", which is what a
+    /// read-then-insert gives when the reads all land before the inserts.
+    #[cfg(feature = "control-connections")]
+    #[test]
+    fn the_cap_is_a_hard_bound_under_concurrent_registration() {
+        let _guard = REGISTRY_TEST_LOCK.blocking_lock();
+
+        const ROOM: usize = 8;
+        const THREADS: usize = 64;
+        let live = totals().active;
+        set_cap(live + ROOM);
+
+        let gate = Arc::new(std::sync::Barrier::new(THREADS));
+        // Every thread spawned before any is joined: a join in the same
+        // chain as the spawn would wait on the first thread, which waits on
+        // the barrier for the others.
+        let threads: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    register(addr(6000 + i as u16), "burst@test", Network::Tcp)
+                })
+            })
+            .collect();
+        let handles: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        let tracked = handles.iter().filter(|h| h.counters().is_some()).count();
+        assert_eq!(tracked, ROOM, "exactly the room the cap left, never more");
+        assert_eq!(totals().active, live + ROOM);
+
+        drop(handles);
+        assert_eq!(totals().active, live, "every admission was released");
+        set_cap(4096);
+    }
+
     /// Without the feature the calls exist, cost nothing, and `closed()`
     /// never resolves -- which is what lets a forwarding task select on it
     /// unconditionally.
@@ -865,7 +924,7 @@ mod tests {
     async fn the_shim_is_inert() {
         let handle = register(SocketAddr::from(([127, 0, 0, 1], 1)), "x", Network::Tcp);
         handle.set_sniffed_host("h");
-        handle.set_route::<Arc<[RuleSummary]>>(None, None, Some(0), None);
+        handle.set_route::<()>(None, None, Some(0), None);
         assert!(handle.counters().is_none());
 
         let (_peer, near) = tokio::io::duplex(8);

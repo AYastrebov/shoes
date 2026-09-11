@@ -30,13 +30,14 @@ pub async fn spawn(
             max_tracked_connections: 4096,
             state_file: None,
         },
-        ports: Ports {
+        ports: parking_lot::RwLock::new(Ports {
             socks: 1080,
             http: 0,
             mixed: 0,
             tun: false,
-        },
+        }),
         started: std::time::Instant::now(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
         log: None,
     });
     let (stop, rx) = tokio::sync::oneshot::channel();
@@ -66,7 +67,21 @@ pub async fn request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Reply {
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    try_request(addr, method, path, headers, body)
+        .await
+        .unwrap_or_else(|| panic!("{method} {path} on {addr}: no reply"))
+}
+
+/// `None` when the listener is not there or drops the connection: for a
+/// test that polls across a controller restart.
+pub async fn try_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Option<Reply> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
@@ -76,36 +91,39 @@ pub async fn request(
     }
     req.push_str("\r\n");
     req.push_str(body);
-    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(req.as_bytes()).await.ok()?;
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.unwrap();
+    stream.read_to_end(&mut raw).await.ok()?;
     let text = String::from_utf8_lossy(&raw).to_string();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let mut lines = head.split("\r\n");
-    let code = lines
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let code = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
     let headers = lines
         .filter_map(|l| l.split_once(": "))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    Reply {
+    Some(Reply {
         code,
         headers,
         body: body.to_string(),
-    }
+    })
+}
+
+fn bearer(secret: Option<&str>) -> Option<String> {
+    secret.map(|s| format!("Bearer {s}"))
 }
 
 pub async fn get(addr: SocketAddr, path: &str, secret: Option<&str>) -> Reply {
-    let auth = secret.map(|s| format!("Bearer {s}"));
+    let auth = bearer(secret);
     let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("Authorization", a.as_str())).collect();
     request(addr, "GET", path, &headers, "").await
+}
+
+pub async fn try_get(addr: SocketAddr, path: &str, secret: Option<&str>) -> Option<Reply> {
+    let auth = bearer(secret);
+    let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("Authorization", a.as_str())).collect();
+    try_request(addr, "GET", path, &headers, "").await
 }
 
 /// A child that dies with the test, whichever way the test ends.
@@ -118,12 +136,20 @@ impl Drop for Child {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// `N` distinct free ports.
+///
+/// Every listener stays bound until all are allocated: binding and
+/// releasing one at a time can hand the same port back twice, and a
+/// process told to listen on it twice fails to start.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    ports.try_into().unwrap()
 }
 
 async fn wait_for(addr: SocketAddr) {
@@ -164,8 +190,7 @@ async fn socks_connect(proxy: SocketAddr, target: SocketAddr) -> tokio::net::Tcp
 /// traffic stream -- which on a server has no TUN to count at.
 #[tokio::test]
 async fn a_forwarded_connection_is_listed_counted_and_closable() {
-    let socks_port = free_port();
-    let api_port = free_port();
+    let [socks_port, api_port] = free_ports::<2>();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml");
     std::fs::write(
@@ -308,8 +333,7 @@ async fn a_forwarded_connection_is_listed_counted_and_closable() {
 /// A reload replaces the proxies; the controller and its open sockets stay.
 #[tokio::test]
 async fn the_listener_survives_a_config_reload() {
-    let socks_port = free_port();
-    let api_port = free_port();
+    let [socks_port, api_port] = free_ports::<2>();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml");
 
@@ -382,6 +406,66 @@ async fn the_listener_survives_a_config_reload() {
     drop(child);
 }
 
+/// A reload that changes the secret restarts the controller on the same
+/// port, and the old secret stops working. The old task releases the socket
+/// only when it is next polled, so a bind that did not wait for it was
+/// "address in use" and the controller was gone until the next edit.
+#[tokio::test]
+async fn a_changed_secret_restarts_the_controller_on_the_same_port() {
+    let [socks_port, api_port] = free_ports::<2>();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let write = |secret: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "- address: 127.0.0.1:{socks_port}\n  protocol:\n    type: socks\n\
+                 - clash_api:\n    listen: 127.0.0.1:{api_port}\n    secret: {secret}\n"
+            ),
+        )
+        .unwrap();
+    };
+    write("first");
+
+    let child = Child(
+        std::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
+            // The watcher on: the rotation is an edit, as an operator makes it.
+            .arg(&config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let api: SocketAddr = format!("127.0.0.1:{api_port}").parse().unwrap();
+    wait_for(api).await;
+    assert_eq!(get(api, "/version", Some("first")).await.code, 200);
+
+    write("second");
+
+    // Past the debounce and the restart; polled rather than slept, and
+    // tolerant of the moment between the old listener and the new.
+    let mut rotated = false;
+    for _ in 0..300 {
+        if let Some(reply) = try_get(api, "/version", Some("second")).await
+            && reply.code == 200
+        {
+            rotated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        rotated,
+        "the controller never came back with the new secret"
+    );
+    assert_eq!(
+        get(api, "/version", Some("first")).await.code,
+        401,
+        "the old secret is gone with the old controller"
+    );
+    drop(child);
+}
+
 /// Write one line into a ring the way the global logger would.
 fn push(
     ring: &shoes::control::logs::BroadcastLogWriter,
@@ -449,6 +533,122 @@ pub async fn ws_read_text(stream: &mut tokio::net::TcpStream) -> String {
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await.unwrap();
     String::from_utf8(payload).unwrap()
+}
+
+/// RFC 6455 has a client mask every frame, and a server fail the connection
+/// on one that is not. The failure is a close frame with the protocol-error
+/// code, then the socket goes; the frame itself is never read as a frame.
+#[tokio::test]
+async fn an_unmasked_client_frame_is_answered_with_a_protocol_error_close() {
+    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+    let mut ws = ws_open(addr, "/traffic?token=s").await;
+
+    // A ping with the mask bit clear: FIN, opcode 9, length 0.
+    ws.write_all(&[0x89, 0x00]).await.unwrap();
+
+    assert_eq!(
+        ws_read_until_close(&mut ws).await,
+        1002u16.to_be_bytes(),
+        "the close code is 1002, protocol error"
+    );
+    assert_ws_hung_up(&mut ws).await;
+}
+
+/// A ping is answered with a pong even when it lands between two ticks,
+/// split across two segments: the reader keeps its place across the select
+/// that drops it each tick, so no byte is lost and no frame is split.
+#[tokio::test]
+async fn a_ping_split_across_ticks_is_still_answered() {
+    let (addr, _stop) = spawn(None, vec![]).await;
+    let mut ws = ws_open(addr, "/traffic").await;
+    let _ = ws_read_text(&mut ws).await;
+
+    // A masked ping "hi": header and one mask byte now, the rest after a
+    // traffic tick has come and gone.
+    ws.write_all(&[0x89, 0x82, 1]).await.unwrap();
+    let _ = ws_read_text(&mut ws).await;
+    ws.write_all(&[2, 3, 4, b'h' ^ 1, b'i' ^ 2]).await.unwrap();
+
+    // The pong, among the text frames.
+    let payload = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let mut header = [0u8; 2];
+            ws.read_exact(&mut header).await.unwrap();
+            let len = match header[1] & 0x7f {
+                126 => {
+                    let mut extended = [0u8; 2];
+                    ws.read_exact(&mut extended).await.unwrap();
+                    u16::from_be_bytes(extended) as usize
+                }
+                n => n as usize,
+            };
+            let mut payload = vec![0u8; len];
+            ws.read_exact(&mut payload).await.unwrap();
+            if header[0] & 0x0f == 0xA {
+                break payload;
+            }
+        }
+    })
+    .await
+    .expect("a pong within 3 s");
+    assert_eq!(
+        payload, b"hi",
+        "the pong carries the ping's payload, unmasked"
+    );
+}
+
+/// Stopping the controller ends the streams it served, close frame first:
+/// a subscriber that authenticated with a rotated secret must not stream on
+/// after the reload that rotated it.
+#[tokio::test]
+async fn stopping_the_controller_closes_its_open_streams() {
+    let (addr, stop) = spawn(None, vec![]).await;
+    let mut ws = ws_open(addr, "/traffic").await;
+    let _ = ws_read_text(&mut ws).await;
+
+    drop(stop);
+
+    let payload = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        ws_read_until_close(&mut ws),
+    )
+    .await
+    .expect("a close frame within 3 s of the stop");
+    assert_eq!(payload, 1001u16.to_be_bytes(), "1001: going away");
+    assert_ws_hung_up(&mut ws).await;
+}
+
+/// Frames until a close arrives; its payload, which carries the code.
+/// Text frames already in flight ahead of the close are read past.
+pub async fn ws_read_until_close(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    loop {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream.read_exact(&mut extended).await.unwrap();
+                u16::from_be_bytes(extended) as usize
+            }
+            n => n as usize,
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        if header[0] & 0x0f == 0x8 {
+            return payload;
+        }
+    }
+}
+
+/// After a close the server hangs up: nothing but EOF or a reset follows.
+pub async fn assert_ws_hung_up(stream: &mut tokio::net::TcpStream) {
+    let mut rest = [0u8; 16];
+    let read =
+        tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut rest)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "the socket must be closed after the close frame: {read:?}"
+    );
 }
 
 #[tokio::test]
@@ -568,8 +768,9 @@ async fn logs_replay_the_backlog_then_stream() {
             max_tracked_connections: 4096,
             state_file: None,
         },
-        ports: Ports::default(),
+        ports: parking_lot::RwLock::new(Ports::default()),
         started: std::time::Instant::now(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
         log: Some(ring.clone()),
     });
     let (_stop, rx) = tokio::sync::oneshot::channel();

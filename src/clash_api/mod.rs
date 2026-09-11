@@ -86,8 +86,15 @@ impl Ports {
 /// Everything a request needs that is not in a registry.
 pub struct ApiState {
     pub config: ClashApiConfig,
-    pub ports: Ports,
+    /// Behind a lock: a reload that keeps this controller -- same listen,
+    /// same secret -- may still have moved the proxies' ports.
+    pub ports: parking_lot::RwLock<Ports>,
     pub started: std::time::Instant,
+    /// Cancelled when the controller stops. Every stream it served ends on
+    /// it, close frame first, and so does every connection still being
+    /// read: stopping the listener alone would leave a subscriber that
+    /// authenticated with a rotated secret streaming indefinitely.
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// The log ring, when one was installed. `None` means `/logs` has
     /// nothing to stream rather than that it is unsupported.
     #[cfg(feature = "control-logs")]
@@ -106,6 +113,9 @@ pub async fn serve_on(
             result = listener.accept() => result,
             _ = &mut shutdown => {
                 log::info!("Clash API on {} stopping", state.config.listen);
+                // The streams and the connections go with the listener; see
+                // `ApiState::shutdown`.
+                state.shutdown.cancel();
                 return Ok(());
             }
         };
@@ -123,15 +133,26 @@ pub async fn serve_on(
         let state = state.clone();
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(stream);
+            let stopping = state.shutdown.clone();
             let service = service_fn(move |req| {
                 let state = state.clone();
                 async move { Ok::<_, Infallible>(route(req, state).await) }
             });
-            // `with_upgrades`, so the streaming routes can take the socket.
-            let _ = hyper::server::conn::http1::Builder::new()
+            // A timer, so hyper's header-read timeout is in force: without
+            // one it is silently off, and a client that connects and says
+            // nothing holds a task for as long as it likes, before any
+            // secret is checked. `with_upgrades`, so the streaming routes
+            // can take the socket.
+            let connection = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
                 .serve_connection(io, service)
-                .with_upgrades()
-                .await;
+                .with_upgrades();
+            tokio::select! {
+                result = connection => {
+                    let _ = result;
+                }
+                () = stopping.cancelled() => {}
+            }
         });
     }
 }
@@ -171,7 +192,46 @@ pub(crate) fn query_param(query: Option<&str>, name: &str) -> Option<String> {
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_string())
+        .map(|(_, v)| percent_decode(v, true))
+}
+
+/// `%XX` escapes undone, and `+` read as a space where the text is a
+/// form-encoded query. mihomo decodes both -- Go's `URL.Query` for a token,
+/// `PathUnescape` for a proxy name -- and a dashboard escapes what it puts
+/// in a URL, so a secret with a `+` or an outbound named with a space or
+/// a flag arrives here escaped and must be compared unescaped.
+pub(crate) fn percent_decode(raw: &str, plus_is_space: bool) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                // Not an escape: kept as written, like Go does on a
+                // malformed one it is lenient about.
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `*` when no origins are configured, which is what a dashboard served
@@ -291,7 +351,9 @@ async fn dispatch(
         (Method::GET, ["proxies"]) => json(StatusCode::OK, render::proxies(false)),
         (Method::GET, ["group"]) => json(StatusCode::OK, render::proxies(true)),
         (Method::GET, ["proxies", name]) | (Method::GET, ["group", name]) => {
-            match render::proxy(name) {
+            // Escaped on the wire: hyper refuses a non-ASCII request line,
+            // so a name with a flag or a space only ever arrives this way.
+            match render::proxy(&percent_decode(name, false)) {
                 Some(proxy) => json(StatusCode::OK, proxy),
                 None => error(StatusCode::NOT_FOUND, "proxy not found"),
             }
@@ -308,11 +370,23 @@ async fn dispatch(
         // WebSockets, and mihomo also serves them as chunked JSON lines on a
         // plain GET. Two arms each, because the two sinks are different
         // types and a producer is generic over them.
-        (Method::GET, ["traffic"]) if ws::is_upgrade(&req) => ws::upgrade(req, streams::traffic),
-        (Method::GET, ["traffic"]) => streams::chunked(streams::traffic),
+        (Method::GET, ["traffic"]) => {
+            let state = state.clone();
+            if ws::is_upgrade(&req) {
+                ws::upgrade(req, move |sink| streams::traffic(state, sink))
+            } else {
+                streams::chunked(move |sink| streams::traffic(state, sink))
+            }
+        }
 
-        (Method::GET, ["memory"]) if ws::is_upgrade(&req) => ws::upgrade(req, streams::memory),
-        (Method::GET, ["memory"]) => streams::chunked(streams::memory),
+        (Method::GET, ["memory"]) => {
+            let state = state.clone();
+            if ws::is_upgrade(&req) {
+                ws::upgrade(req, move |sink| streams::memory(state, sink))
+            } else {
+                streams::chunked(move |sink| streams::memory(state, sink))
+            }
+        }
 
         (Method::GET, ["logs"]) => {
             let Some(filter) = streams::parse_level(req.uri().query()) else {
@@ -332,10 +406,11 @@ async fn dispatch(
             let interval = query_param(req.uri().query(), "interval")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1000);
+            let state = state.clone();
             if ws::is_upgrade(&req) {
-                ws::upgrade(req, move |sink| streams::connections(sink, interval))
+                ws::upgrade(req, move |sink| streams::connections(state, sink, interval))
             } else {
-                streams::chunked(move |sink| streams::connections(sink, interval))
+                streams::chunked(move |sink| streams::connections(state, sink, interval))
             }
         }
         (Method::GET, ["connections"]) => json(StatusCode::OK, render::connections()),
@@ -424,6 +499,28 @@ mod tests {
         );
         assert_eq!(query_param(Some("level=debug"), "token"), None);
         assert_eq!(query_param(None, "token"), None);
+    }
+
+    /// What a dashboard's `encodeURIComponent` makes of a secret or a name
+    /// has to compare equal to what the config holds.
+    #[test]
+    fn escapes_are_undone_the_way_a_browser_made_them() {
+        assert_eq!(
+            query_param(Some("token=p%2Bq+r%20s"), "token").as_deref(),
+            Some("p+q r s"),
+            "a query is form-encoded: `+` is a space, `%2B` is a plus"
+        );
+        assert_eq!(
+            percent_decode("%F0%9F%87%AF%F0%9F%87%B5+Tokyo", false),
+            "\u{1F1EF}\u{1F1F5}+Tokyo",
+            "a path is not form-encoded: `+` stays"
+        );
+        assert_eq!(percent_decode("100%", false), "100%", "a stray `%` is kept");
+        assert_eq!(
+            percent_decode("%zz", false),
+            "%zz",
+            "and so is a malformed escape"
+        );
     }
 
     #[test]

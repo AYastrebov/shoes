@@ -1112,17 +1112,28 @@ async fn process_tcp_stream(
     };
     drop(stream_reader);
 
-    // Use 32KB buffers to match hysteria2/sing-box reference implementations
-    let copy_result = copy_bidirectional_with_sizes(
-        &mut server_stream,
-        &mut client_stream,
-        // no need to flush even through we wrote this response since it's quic
-        false,
-        client_requires_flush,
-        32768,
-        32768,
-    )
-    .await;
+    // Use 32KB buffers to match hysteria2/sing-box reference implementations.
+    // The copy runs until it ends or a controller asks for this connection
+    // to go; without the registry `closed()` never resolves.
+    let copy_result = {
+        let copy = copy_bidirectional_with_sizes(
+            &mut server_stream,
+            &mut client_stream,
+            // no need to flush even through we wrote this response since it's quic
+            false,
+            client_requires_flush,
+            32768,
+            32768,
+        );
+        tokio::pin!(copy);
+        tokio::select! {
+            result = &mut copy => result,
+            () = handle.closed() => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "closed by the controller",
+            )),
+        }
+    };
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 

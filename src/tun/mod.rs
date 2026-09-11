@@ -919,6 +919,10 @@ mod tests {
     /// datapath the TUN session uses.
     #[tokio::test]
     async fn a_tun_dns_block_resolves_through_its_configured_upstream() {
+        // Forwards a real connection through the registry, whose own tests
+        // assert on its process-wide totals; serialised with them.
+        #[cfg(feature = "control-connections")]
+        let _registry = crate::connection_registry::REGISTRY_TEST_LOCK.lock().await;
         let names = Arc::new(Mutex::new(Vec::new()));
         let dns_addr = spawn_recording_dns_upstream(names.clone()).await;
 
@@ -1012,6 +1016,10 @@ mod tests {
 
     #[tokio::test]
     async fn tun_forwards_early_data_to_the_local_connection() {
+        // Forwards a real connection through the registry, whose own tests
+        // assert on its process-wide totals; serialised with them.
+        #[cfg(feature = "control-connections")]
+        let _registry = crate::connection_registry::REGISTRY_TEST_LOCK.lock().await;
         let socks_addr = spawn_socks_server_with_early_data(b"EARLY").await;
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         let selector = selector_through_socks(socks_addr, resolver.clone());
@@ -1135,6 +1143,10 @@ mod tests {
 
     #[tokio::test]
     async fn tun_sniffs_the_sni_and_sends_the_name_upstream() {
+        // Forwards a real connection through the registry, whose own tests
+        // assert on its process-wide totals; serialised with them.
+        #[cfg(feature = "control-connections")]
+        let _registry = crate::connection_registry::REGISTRY_TEST_LOCK.lock().await;
         let target_seen = Arc::new(Mutex::new(Vec::new()));
         let payload_seen = Arc::new(Mutex::new(Vec::new()));
         let socks_addr =

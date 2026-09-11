@@ -638,15 +638,22 @@ impl ShutdownSignals {
 #[cfg(feature = "clash-api")]
 struct ApiRunner {
     config: config::ClashApiConfig,
+    state: std::sync::Arc<clash_api::ApiState>,
     stop: tokio::sync::oneshot::Sender<()>,
+    /// The serve task, awaited on stop: the listener is released when the
+    /// task observes the stop, not when it is sent, and a bind on the same
+    /// address before that is "address in use" -- deterministically so on
+    /// a single-threaded runtime, where nothing polls the task in between.
+    done: tokio::task::JoinHandle<()>,
 }
 
 /// Start, keep, replace or stop the controller to match the configuration
 /// that just launched.
 ///
-/// Same listen and secret: keep it, so a dashboard's open sockets survive a
-/// reload of the proxies. Anything else: stop it and start a new one. No
-/// block at all: stop it.
+/// Same listen, secret and origins: keep it, so a dashboard's open sockets
+/// survive a reload of the proxies. Anything else: stop it -- which ends
+/// its streams, so a rotated secret revokes them -- and start a new one.
+/// No block at all: stop it.
 #[cfg(feature = "clash-api")]
 async fn reconcile_api(
     current: Option<ApiRunner>,
@@ -656,9 +663,12 @@ async fn reconcile_api(
     if let (Some(running), Some(want)) = (&current, wanted)
         && running.config.listen == want.listen
         && running.config.secret == want.secret
+        && running.config.allow_origins == want.allow_origins
     {
-        // The cap can change under a listener that stays.
+        // The cap and the proxies' ports can change under a listener that
+        // stays.
         connection_registry::set_cap(want.max_tracked_connections);
+        *running.state.ports.write() = clash_api::Ports::from_configs(server_configs);
         return current;
     }
 
@@ -666,6 +676,7 @@ async fn reconcile_api(
         println!("Stopping the Clash API on {}", running.config.listen);
         // Dropping the sender would do as well; sending says it was meant.
         let _ = running.stop.send(());
+        let _ = running.done.await;
     }
 
     let want = wanted?.clone();
@@ -683,19 +694,28 @@ async fn reconcile_api(
     let ring = clash_api::logs::install_ring(512);
     let state = std::sync::Arc::new(clash_api::ApiState {
         config: want.clone(),
-        ports: clash_api::Ports::from_configs(server_configs),
+        ports: parking_lot::RwLock::new(clash_api::Ports::from_configs(server_configs)),
         started: std::time::Instant::now(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
         log: Some(ring),
     });
 
     let (stop, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        if let Err(e) = clash_api::serve_on(listener, state, rx).await {
-            eprintln!("Clash API stopped: {e}");
+    let done = tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Err(e) = clash_api::serve_on(listener, state, rx).await {
+                eprintln!("Clash API stopped: {e}");
+            }
         }
     });
 
-    Some(ApiRunner { config: want, stop })
+    Some(ApiRunner {
+        config: want,
+        state,
+        stop,
+        done,
+    })
 }
 
 /// Everything a validated configuration needs to start serving.

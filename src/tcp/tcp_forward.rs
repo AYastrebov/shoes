@@ -305,6 +305,9 @@ mod tests {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // The outbound lock first, then the registry's: the one order every
+        // test that takes both uses.
+        let _registry = registry::REGISTRY_TEST_LOCK.blocking_lock();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -437,6 +440,10 @@ mod tests {
         selector: Option<Arc<ClientProxySelector>>,
         upstream: Option<SocketAddr>,
     ) -> Outcome {
+        // Forwards a real connection through the registry, whose own tests
+        // assert on its process-wide totals; serialised with them.
+        #[cfg(feature = "control-connections")]
+        let _registry = crate::connection_registry::REGISTRY_TEST_LOCK.lock().await;
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
         let (upstream_addr, received) = match upstream {
