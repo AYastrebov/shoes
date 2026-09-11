@@ -770,6 +770,29 @@ impl ClientProxyConfig {
     }
 
     /// Returns the protocol name for display/error messages
+    /// Whether the protocol can carry UDP at all.
+    ///
+    /// What a controller's `udp` flag means: a property of the protocol, not
+    /// of whether this particular server has it switched on.
+    pub fn supports_udp(&self) -> bool {
+        matches!(
+            self,
+            ClientProxyConfig::Direct
+                | ClientProxyConfig::Socks { .. }
+                | ClientProxyConfig::Shadowsocks { .. }
+                | ClientProxyConfig::Snell { .. }
+                | ClientProxyConfig::Vless { .. }
+                | ClientProxyConfig::Trojan { .. }
+                | ClientProxyConfig::Vmess { .. }
+                | ClientProxyConfig::Mieru { .. }
+                | ClientProxyConfig::Anytls { .. }
+                | ClientProxyConfig::Wireguard(..)
+                | ClientProxyConfig::AmneziaWg(..)
+                | ClientProxyConfig::Hysteria2(..)
+                | ClientProxyConfig::Tuic(..)
+        )
+    }
+
     pub fn protocol_name(&self) -> &str {
         match self {
             ClientProxyConfig::Direct => "Direct",

@@ -606,6 +606,8 @@ struct PreparedServers {
     server_configs: Vec<config::Config>,
     dns_registry: dns::DnsRegistry,
     outbounds: outbound_stats::OutboundSet,
+    /// Group membership, installed beside the outbounds.
+    groups: outbound_stats::OutboundGroupSet,
     /// The controller this configuration asks for, if any. Carried through
     /// the reload path so the serve loop can compare it to the running one.
     ///
@@ -654,6 +656,7 @@ async fn prepare_servers(
         dns_groups,
         outbounds,
         clash_api,
+        groups,
     } = config::create_server_configs(configs)
         .map_err(|e| format!("Failed to create server configs: {e}"))?;
 
@@ -678,6 +681,7 @@ async fn prepare_servers(
         server_configs,
         dns_registry,
         outbounds,
+        groups,
         clash_api,
     })
 }
@@ -694,6 +698,7 @@ async fn launch_servers(
         server_configs,
         mut dns_registry,
         outbounds,
+        groups,
         // The serve loop reconciles the controller; launching servers does
         // not touch it, so that a reload's listener survives the restart.
         clash_api: _,
@@ -702,9 +707,12 @@ async fn launch_servers(
     // Replace, not add: a reload must not carry the previous config's
     // servers into the new list.
     #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
+    {
+        crate::outbound_stats::install(&outbounds);
+        crate::outbound_stats::install_groups(&groups);
+    }
     #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
+    let _ = (outbounds, groups);
 
     println!("\nStarting {} server(s)..", server_configs.len());
 

@@ -616,6 +616,7 @@ async fn create_connection(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
+            ..
         } => {
             let stream = chain_group
                 .connect_udp_bidirectional(resolver, remote_location)

@@ -117,6 +117,13 @@ pub struct ConnectRule {
     /// Consulted only when no mask on this rule matched.
     pub rule_sets: Vec<Arc<RuleSet>>,
     pub action: ConnectAction,
+    /// The named client group this rule was written to route through, if it
+    /// was written as one. Reported on a connection and in a rule listing;
+    /// routing does not consult it.
+    pub group_name: Option<Arc<str>>,
+    /// The exit key of a rule that routes through exactly one outbound, for
+    /// a listing when there is no group name to show instead.
+    pub proxy_hint: Option<String>,
 }
 
 impl ConnectRule {
@@ -129,6 +136,85 @@ impl ConnectRule {
             masks,
             rule_sets,
             action,
+            group_name: None,
+            proxy_hint: None,
+        }
+    }
+
+    /// The group this rule routes through, for reporting.
+    pub fn with_group(mut self, name: Option<String>) -> Self {
+        self.group_name = name.map(Arc::from);
+        self
+    }
+
+    /// The single outbound this rule routes through, for reporting when it
+    /// has no group name.
+    pub fn with_proxy_hint(mut self, hint: Option<String>) -> Self {
+        self.proxy_hint = hint;
+        self
+    }
+}
+
+/// One rule as a controller shows it: one type, one payload, one proxy.
+///
+/// A shoes rule is a list of masks and rule sets, any of which matches,
+/// where a Clash rule is a single condition. The rendering is therefore a
+/// summary, and says so: a rule with one mask renders as that mask, and
+/// anything larger renders as `RuleSet` with what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSummary {
+    pub rule_type: &'static str,
+    pub payload: String,
+    pub proxy: String,
+}
+
+impl RuleSummary {
+    fn for_rule(rule: &ConnectRule) -> Self {
+        let proxy = match (&rule.action, &rule.group_name) {
+            (ConnectAction::Block, _) => "REJECT".to_string(),
+            (_, Some(group)) => group.to_string(),
+            (_, None) => rule
+                .proxy_hint
+                .clone()
+                .unwrap_or_else(|| "chain".to_string()),
+        };
+
+        if rule.rule_sets.is_empty() && rule.masks.len() == 1 {
+            let mask = &rule.masks[0];
+            // A zero netmask is `AddressMask::ANY` -- the catch-all a config
+            // writes as `0.0.0.0/0`, which Clash calls MATCH. A hostname
+            // mask matches the name and its subdomains, which is
+            // DomainSuffix rather than Domain.
+            let rule_type = if mask.address_mask.netmask == 0 {
+                "Match"
+            } else {
+                match mask.address_mask.address {
+                    Address::Hostname(_) => "DomainSuffix",
+                    Address::Ipv4(_) => "IPCIDR",
+                    Address::Ipv6(_) => "IPCIDR6",
+                }
+            };
+            let payload = if rule_type == "Match" {
+                String::new()
+            } else {
+                mask.to_string()
+            };
+            return Self {
+                rule_type,
+                payload,
+                proxy,
+            };
+        }
+
+        let sets: Vec<&str> = rule.rule_sets.iter().map(|s| s.name()).collect();
+        Self {
+            rule_type: "RuleSet",
+            payload: if sets.is_empty() {
+                format!("{} masks", rule.masks.len())
+            } else {
+                format!("{} masks, sets: {}", rule.masks.len(), sets.join(","))
+            },
+            proxy,
         }
     }
 }
@@ -161,7 +247,11 @@ impl ConnectAction {
     /// ResolvedLocation is created (the resolved_addr doesn't apply to a different
     /// destination). Otherwise, the original location is passed through, preserving
     /// any resolution that was done during rule matching.
-    pub fn to_decision(&self, location: ResolvedLocation) -> ConnectDecision<'_> {
+    pub fn to_decision(
+        &self,
+        location: ResolvedLocation,
+        rule_index: usize,
+    ) -> ConnectDecision<'_> {
         match self {
             ConnectAction::Allow {
                 override_address,
@@ -186,6 +276,7 @@ impl ConnectAction {
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
+                    rule_index,
                 }
             }
             ConnectAction::Block => ConnectDecision::Block,
@@ -201,6 +292,10 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 #[derive(Debug)]
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
+    /// Every rule rendered once, at construction: a controller listing them
+    /// and a connection naming one both read this, and neither should be
+    /// rendering strings on a connection's path.
+    summaries: Arc<[RuleSummary]>,
     /// If false, hostname rules will not trigger DNS resolution to match against IP-based
     /// destinations. This is useful when a huge blocklist or rule list is provided.
     /// However, this means that the user needs to make sure DNS resolutions are not done
@@ -219,6 +314,10 @@ pub enum ConnectDecision<'a> {
     Allow {
         chain_group: &'a ClientChainGroup,
         remote_location: ResolvedLocation,
+        /// Which rule allowed it, as an index into the selector's list.
+        /// Carried so a connection can report the rule that chose its route
+        /// without the forward path re-deriving it.
+        rule_index: usize,
     },
     Block,
 }
@@ -277,11 +376,30 @@ impl ClientProxySelector {
             None
         };
 
+        let summaries: Arc<[RuleSummary]> = rules
+            .iter()
+            .map(RuleSummary::for_rule)
+            .collect::<Vec<_>>()
+            .into();
+
         Self {
             rules,
+            summaries,
             resolve_rule_hostnames,
             cache,
         }
+    }
+
+    /// Every rule as a controller lists them, in the order they are matched.
+    pub fn rule_summaries(&self) -> Arc<[RuleSummary]> {
+        self.summaries.clone()
+    }
+
+    /// The named group a rule routes through, if it has one.
+    pub fn group_name(&self, rule_index: usize) -> Option<Arc<str>> {
+        self.rules
+            .get(rule_index)
+            .and_then(|r| r.group_name.clone())
     }
 
     /// Judge a connection request, using the cache for faster repeated lookups.
@@ -331,7 +449,9 @@ impl ClientProxySelector {
             Some(rule_index) => {
                 // Cache the result
                 cache.insert(location.location(), CachedDecision::Allow(rule_index));
-                Ok(self.rules[rule_index].action.to_decision(location))
+                Ok(self.rules[rule_index]
+                    .action
+                    .to_decision(location, rule_index))
             }
             None => {
                 // Cache the block decision
@@ -359,7 +479,9 @@ impl ClientProxySelector {
         )
         .await?
         {
-            Some(rule_index) => Ok(self.rules[rule_index].action.to_decision(location)),
+            Some(rule_index) => Ok(self.rules[rule_index]
+                .action
+                .to_decision(location, rule_index)),
             None => Ok(ConnectDecision::Block),
         }
     }
@@ -372,9 +494,9 @@ impl ClientProxySelector {
         location: ResolvedLocation,
     ) -> ConnectDecision<'_> {
         match cached {
-            CachedDecision::Allow(rule_index) => {
-                self.rules[rule_index].action.to_decision(location)
-            }
+            CachedDecision::Allow(rule_index) => self.rules[rule_index]
+                .action
+                .to_decision(location, rule_index),
             CachedDecision::Block => ConnectDecision::Block,
         }
     }
@@ -688,6 +810,79 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// The index the decision carries is what a connection reports as the
+    /// rule that routed it, so it must be the rule that actually matched --
+    /// not the first, and not the last.
+    #[tokio::test]
+    async fn a_decision_carries_the_index_of_the_rule_that_matched() {
+        let resolver = mock_resolver();
+        let selector = ClientProxySelector::new(vec![
+            block_rule(vec!["10.0.0.0/8"]),
+            allow_rule(vec!["192.168.0.0/16"], "lan"),
+            allow_rule(vec!["0.0.0.0/0"], "any"),
+        ]);
+
+        async fn matched(
+            selector: &ClientProxySelector,
+            resolver: &Arc<dyn Resolver>,
+            location: &str,
+        ) -> Option<usize> {
+            let loc: ResolvedLocation = NetLocation::from_str(location, Some(80)).unwrap().into();
+            match selector.judge(loc, resolver).await.unwrap() {
+                ConnectDecision::Allow { rule_index, .. } => Some(rule_index),
+                ConnectDecision::Block => None,
+            }
+        }
+
+        assert_eq!(
+            matched(&selector, &resolver, "192.168.1.1:80").await,
+            Some(1)
+        );
+        assert_eq!(matched(&selector, &resolver, "1.2.3.4:80").await, Some(2));
+        assert_eq!(
+            matched(&selector, &resolver, "10.1.2.3:80").await,
+            None,
+            "blocked"
+        );
+    }
+
+    /// A shoes rule is a list; a Clash rule is one condition. The rendering
+    /// is a summary, and the cases that must not be confused are the
+    /// catch-all, a single mask, and anything larger.
+    #[test]
+    fn summaries_render_one_type_and_payload_per_rule() {
+        let selector = ClientProxySelector::new(vec![
+            block_rule(vec!["ads.example"]),
+            allow_rule(vec!["10.0.0.0/8", "192.168.0.0/16"], "lan")
+                .with_group(Some("eu".to_string())),
+            allow_rule(vec!["0.0.0.0/0"], "any").with_proxy_hint(Some("direct".to_string())),
+        ]);
+        let summaries = selector.rule_summaries();
+
+        assert_eq!(summaries[0].rule_type, "DomainSuffix");
+        assert_eq!(summaries[0].payload, "ads.example/128");
+        assert_eq!(summaries[0].proxy, "REJECT", "a block rule rejects");
+
+        assert_eq!(
+            summaries[1].rule_type, "RuleSet",
+            "two masks are not one condition"
+        );
+        assert!(summaries[1].payload.contains('2'), "{:?}", summaries[1]);
+        assert_eq!(summaries[1].proxy, "eu", "the group it routes through");
+
+        assert_eq!(
+            summaries[2].rule_type, "Match",
+            "0.0.0.0/0 is the catch-all"
+        );
+        assert_eq!(summaries[2].payload, "");
+        assert_eq!(summaries[2].proxy, "direct", "the one outbound it uses");
+
+        // The group name is reachable by index, which is how a connection
+        // reports it without holding the rule.
+        assert_eq!(selector.group_name(1).as_deref(), Some("eu"));
+        assert_eq!(selector.group_name(2), None);
     }
 
     /// Helper to create a mock resolver as Arc<dyn Resolver>

@@ -571,6 +571,7 @@ async fn prepare_configs(
         dns_groups,
         outbounds,
         clash_api,
+        groups,
     } = create_server_configs(configs)?;
 
     // A library host -- the daemon, a mobile extension -- does not mount the
@@ -640,9 +641,12 @@ async fn prepare_configs(
     // snapshot. Replace rather than merge: a reload must not carry the
     // previous config's servers into the new list.
     #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
+    {
+        crate::outbound_stats::install(&outbounds);
+        crate::outbound_stats::install_groups(&groups);
+    }
     #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
+    let _ = (outbounds, groups);
 
     Ok(PreparedService {
         tun_config,

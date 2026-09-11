@@ -20,6 +20,11 @@ pub struct RuleConfig {
     /// serialised.
     pub loaded_rule_sets: Vec<Arc<RuleSet>>,
     pub action: RuleActionConfig,
+    /// The named client group this rule was written to route through, kept
+    /// for reporting. Filled during validation, before group references are
+    /// expanded away, and never serialised: it is derived from the config
+    /// rather than part of it.
+    pub group_name: Option<String>,
 }
 
 impl Default for RuleConfig {
@@ -32,6 +37,7 @@ impl Default for RuleConfig {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
             },
+            group_name: None,
         }
     }
 }
@@ -291,6 +297,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
             rule_sets: temp.rule_sets,
             loaded_rule_sets: Vec::new(),
             action,
+            group_name: None,
         })
     }
 }

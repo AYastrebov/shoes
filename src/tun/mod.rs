@@ -455,6 +455,7 @@ where
         crate::client_proxy_selector::ConnectDecision::Allow {
             chain_group,
             remote_location,
+            rule_index: _rule_index,
         } => {
             debug!(
                 "TCP: connecting to {} via chain",

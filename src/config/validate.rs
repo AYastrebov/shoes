@@ -47,6 +47,10 @@ pub struct ValidatedConfigs {
     /// The controller block, at most one, validated. `None` when the config
     /// has none, which is every config that does not ask for one.
     pub clash_api: Option<super::types::ClashApiConfig>,
+    /// Group membership as the config wrote it, for a controller that lists
+    /// proxies by group. Built before expansion, which is the only point
+    /// where the nesting is still visible.
+    pub groups: crate::outbound_stats::OutboundGroupSet,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -83,6 +87,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
             },
+            group_name: None,
         }],
     );
     rule_groups.insert(
@@ -92,6 +97,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             rule_sets: NoneOrSome::Unspecified,
             loaded_rule_sets: Vec::new(),
             action: RuleActionConfig::Block,
+            group_name: None,
         }],
     );
 
@@ -191,9 +197,27 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     // expects to see it listed at zero rather than missing.
     for configs in client_groups.values() {
         for config in configs {
-            outbounds.insert(&config.stats_key()?, &config.address.to_string())?;
+            let key = config.stats_key()?;
+            outbounds.insert(&key, &config.address.to_string())?;
+            outbounds.describe(
+                &key,
+                config.protocol.protocol_name(),
+                config.protocol.supports_udp(),
+            );
         }
     }
+
+    // Membership, from the resolved groups: their members are leaf configs
+    // by this point, which is the list a controller shows under a group.
+    let mut groups = crate::outbound_stats::OutboundGroupSet::default();
+    for (name, configs) in client_groups.iter() {
+        let members = configs
+            .iter()
+            .map(|c| c.stats_key())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        groups.entries.push((name.clone(), members));
+    }
+    groups.entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Embed PEMs into all client configs in groups before they're used
     for configs in client_groups.values_mut() {
@@ -276,6 +300,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         dns_groups: final_dns_groups,
         outbounds,
         clash_api,
+        groups,
     })
 }
 
@@ -2189,6 +2214,19 @@ fn validate_rule_config(
             ));
         }
 
+        // The group a rule was written to route through, taken before the
+        // expansion below turns the reference into inline configs. Only the
+        // single-chain, single-hop shape is a "routes through group X" rule;
+        // anything else is a chain, and reports as one.
+        let mut routed_through_group: Option<String> = None;
+        if client_chains.len() == 1
+            && let Some(chain) = client_chains.iter().next()
+            && let OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(name))) =
+                &chain.hops
+        {
+            routed_through_group = Some(name.clone());
+        }
+
         // Validate each chain
         for (chain_index, chain) in client_chains.iter_mut().enumerate() {
             // First validate all hops in this chain
@@ -2202,6 +2240,8 @@ fn validate_rule_config(
             // Validate AmneziaWG is the only hop in its chain
             validate_amneziawg_chain_position(&chain.hops, chain_index)?;
         }
+
+        rule_config.group_name = routed_through_group;
     }
 
     Ok(())
@@ -2430,6 +2470,14 @@ fn expand_selection(
             )
         })?,
     };
+
+    for config in configs.iter() {
+        outbounds.describe(
+            &config.stats_key()?,
+            config.protocol.protocol_name(),
+            config.protocol.supports_udp(),
+        );
+    }
 
     // Every chain hop funnels through here, inline ones included, which is
     // the form that would otherwise go unlisted. Insertion is idempotent, so

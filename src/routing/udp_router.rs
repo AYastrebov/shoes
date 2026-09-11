@@ -1049,6 +1049,7 @@ impl<'a> UdpRouter<'a> {
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
+                    ..
                 } => {
                     let client_stream = chain_group
                         .connect_udp_bidirectional(&resolver, remote_location)

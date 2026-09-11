@@ -61,6 +61,11 @@ fn conflict(key: &str, first: &str, second: &str) -> std::io::Error {
 #[derive(Debug, Default, Clone)]
 pub struct OutboundSet {
     entries: HashMap<String, String>,
+    /// What each key is, for a controller that shows a proxy's type and
+    /// whether it carries UDP. Filled beside `insert`; absent for a key
+    /// nothing described, which reads as an unknown type rather than a
+    /// wrong one.
+    details: HashMap<String, (String, bool)>,
 }
 
 /// `allow(dead_code)` for the reason `tun::traffic` gives about its own
@@ -127,6 +132,30 @@ impl OutboundSet {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().map(|(k, a)| (k.as_str(), a.as_str()))
     }
+
+    /// Record what a key is. First description wins, for the reason
+    /// `insert` gives: group expansion presents the same outbound many
+    /// times, and they agree.
+    pub fn describe(&mut self, key: &str, protocol: &str, udp: bool) {
+        self.details
+            .entry(key.to_string())
+            .or_insert_with(|| (protocol.to_string(), udp));
+    }
+
+    pub fn detail_of(&self, key: &str) -> Option<(&str, bool)> {
+        self.details.get(key).map(|(p, u)| (p.as_str(), *u))
+    }
+}
+
+/// Group membership as the config wrote it: a name, and the members in
+/// order, each a leaf key or another group's name.
+///
+/// Built before expansion, which is the only point where the nesting is
+/// still visible -- by the time chains exist, a group is a list of configs
+/// and its name is gone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OutboundGroupSet {
+    pub entries: Vec<(String, Vec<String>)>,
 }
 
 /// The registry is process-global and cargo runs tests in parallel, so every
@@ -153,9 +182,21 @@ mod registry {
         upload_bytes: AtomicU64,
         download_bytes: AtomicU64,
         active_connections: AtomicUsize,
+        /// The key these counters are registered under.
+        ///
+        /// Carried so a connection can name its exit outbound: the chain
+        /// hands back the counters it credited, and this is what turns them
+        /// back into a name without the chain knowing about the registry.
+        /// Empty for the unattributed counters, which no chain names.
+        key: Arc<str>,
     }
 
     impl OutboundCounters {
+        /// The name this outbound is listed under.
+        pub fn key(&self) -> &Arc<str> {
+            &self.key
+        }
+
         /// Bytes sent towards the outbound.
         pub fn add_upload(&self, bytes: u64) {
             self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -190,8 +231,24 @@ mod registry {
         pub active_connections: usize,
     }
 
+    /// What a leaf is, for a controller's proxy list.
+    ///
+    /// `allow(dead_code)` for the reason `snapshot_all` gives below: the
+    /// only reader is a controller, and a binary without one compiles this
+    /// with nothing to call it.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutboundDetail {
+        pub name: String,
+        pub protocol: String,
+        pub udp: bool,
+    }
+
     struct Entry {
         counters: Arc<OutboundCounters>,
+        /// Read by `details`; see the note there.
+        #[allow(dead_code)]
+        detail: Option<(String, bool)>,
         /// The address this key was installed with. Carried for a Debug dump
         /// and for the conflict message an `OutboundSet` produces; nothing
         /// reads it at runtime, because conflicts are settled at config load.
@@ -217,13 +274,73 @@ mod registry {
                 (
                     key.to_string(),
                     Entry {
-                        counters: Arc::new(OutboundCounters::default()),
+                        counters: Arc::new(OutboundCounters {
+                            key: Arc::from(key),
+                            ..Default::default()
+                        }),
+                        detail: set.detail_of(key).map(|(p, u)| (p.to_string(), u)),
                         address: address.to_string(),
                     },
                 )
             })
             .collect();
         *registry().write().unwrap() = fresh;
+    }
+
+    /// What each registered outbound is, sorted by name.
+    #[allow(dead_code)]
+    pub fn details() -> Vec<OutboundDetail> {
+        let guard = registry().read().unwrap();
+        let mut out: Vec<OutboundDetail> = guard
+            .iter()
+            .map(|(name, entry)| {
+                let (protocol, udp) = entry
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| ("Unknown".to_string(), false));
+                OutboundDetail {
+                    name: name.clone(),
+                    protocol,
+                    udp,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// A named group and the members it holds.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutboundGroup {
+        pub name: String,
+        pub members: Vec<String>,
+    }
+
+    fn groups_registry() -> &'static RwLock<super::OutboundGroupSet> {
+        static GROUPS: OnceLock<RwLock<super::OutboundGroupSet>> = OnceLock::new();
+        GROUPS.get_or_init(|| RwLock::new(super::OutboundGroupSet::default()))
+    }
+
+    /// Replace the group list with the running config's, beside `install`
+    /// and for the same reason: a reload replaces rather than accumulates.
+    pub fn install_groups(groups: &super::OutboundGroupSet) {
+        *groups_registry().write().unwrap() = groups.clone();
+    }
+
+    /// Every configured group, in the order validation built them.
+    #[allow(dead_code)]
+    pub fn groups() -> Vec<OutboundGroup> {
+        groups_registry()
+            .read()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|(name, members)| OutboundGroup {
+                name: name.clone(),
+                members: members.clone(),
+            })
+            .collect()
     }
 
     /// The counters for a key, or [`unattributed`] if the running config does

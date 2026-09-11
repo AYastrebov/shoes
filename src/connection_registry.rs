@@ -51,18 +51,15 @@ impl Network {
     }
 }
 
-/// One rule as a dashboard shows it.
+/// One rule as a dashboard shows it, computed once by the selector that
+/// owns the rules. Re-exported so a reader of the registry does not need to
+/// know where a connection's rule list came from.
 ///
-/// Defined here until the selector owns it: a shoes rule is a list of masks
-/// and rule sets where a Clash rule is one type and one payload, so the
-/// rendering is a summary and is stated as one. Moves to
-/// `crate::client_proxy_selector` when that computes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuleSummary {
-    pub rule_type: &'static str,
-    pub payload: String,
-    pub proxy: String,
-}
+/// `allow(unused_imports)` for the reason the module header gives: the
+/// binary and the library declare this module separately, and which build
+/// has a reader depends on the features.
+#[allow(unused_imports)]
+pub use crate::client_proxy_selector::RuleSummary;
 
 /// The two atomics a connection owns. Uncontended: nothing but this
 /// connection's own stream touches them on the polling path.

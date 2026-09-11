@@ -49,9 +49,6 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         handle,
     } = request;
 
-    // Filled in and selected on by the routed connect below.
-    let _handle = &handle;
-
     let mut initial_data: Vec<u8> = initial_remote_data
         .map(|d| d.into_vec())
         .unwrap_or_default();
@@ -83,9 +80,15 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
 
         if let Some(name) = result.sniffed.as_ref().and_then(|s| s.domain.as_deref()) {
             log::debug!("sniffed {name} for {remote_location}");
+            handle.set_sniffed_host(name);
             judged = sniff::judged_location(name, addr);
         }
     }
+
+    // Kept past the move below: the rule list a connection's index points
+    // into is this selector's, and a reload that installs a new one must not
+    // change what an old connection reports.
+    let rules_at_judgement = proxy_selector.clone();
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
@@ -93,7 +96,15 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
     );
 
     let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
+        Ok(Ok(Some((stream, route)))) => {
+            handle.set_route(
+                route.chain,
+                route.group,
+                Some(route.rule_index),
+                Some(rules_at_judgement.rule_summaries()),
+            );
+            stream
+        }
         Ok(Ok(None)) => {
             // Must have been blocked.
             let _ = server_stream.shutdown().await;
@@ -129,13 +140,27 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         true
     };
 
-    let copy_result = copy_bidirectional(
-        &mut server_stream,
-        &mut client_stream,
-        server_need_initial_flush,
-        client_need_initial_flush,
-    )
-    .await;
+    // The copy runs until it ends or a controller asks for this connection
+    // to go. Without the registry `closed()` never resolves, so the select
+    // costs a branch that is never taken.
+    let copy_result = {
+        let copy = copy_bidirectional(
+            &mut server_stream,
+            &mut client_stream,
+            server_need_initial_flush,
+            client_need_initial_flush,
+        );
+        tokio::pin!(copy);
+        tokio::select! {
+            result = &mut copy => result,
+            () = handle.closed() => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "closed by the controller",
+            )),
+        }
+        // The scope ends here so the copy releases both streams before the
+        // shutdown below takes them.
+    };
 
     let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
 
@@ -153,9 +178,9 @@ pub async fn setup_client_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: ResolvedLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    let Some((client_stream, early_data)) =
-        connect_client_tcp_stream(client_proxy_selector, resolver, remote_location).await?
+) -> std::io::Result<Option<(Box<dyn AsyncStream>, Route)>> {
+    let Some((client_stream, early_data, route)) =
+        connect_client_tcp_stream_routed(client_proxy_selector, resolver, remote_location).await?
     else {
         return Ok(None);
     };
@@ -165,22 +190,36 @@ pub async fn setup_client_tcp_stream(
         server_stream.flush().await?;
     }
 
-    Ok(Some(client_stream))
+    Ok(Some((client_stream, route)))
+}
+
+/// What the rule engine decided for one connection.
+///
+/// Known only where the rules are consulted and the chain is selected, and
+/// dropped there until now -- which is why a connection could not say what
+/// routed it.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub rule_index: usize,
+    /// The exit outbound's key, when the build counts outbounds.
+    pub chain: Option<Arc<str>>,
+    /// The named group the rule routed through, if it was written as one.
+    pub group: Option<Arc<str>>,
 }
 
 /// Dial the target, handing back anything the chain read past its own
-/// handshake instead of writing it.
+/// handshake instead of writing it, and the route that was chosen.
 ///
 /// The early data belongs to the requester and has to reach it, but *when* it
 /// may be written is the protocol's business: one that answers its own request
 /// only after the dial has to put that answer in front of these bytes, or the
 /// requester parses the target's greeting as the response. `Ok(None)` is the
 /// rules blocking the request.
-pub async fn connect_client_tcp_stream(
+pub async fn connect_client_tcp_stream_routed(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: ResolvedLocation,
-) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<Vec<u8>>)>> {
+) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<Vec<u8>>, Route)>> {
     let action = client_proxy_selector
         .judge(remote_location, &resolver)
         .await?;
@@ -189,13 +228,29 @@ pub async fn connect_client_tcp_stream(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
+            rule_index,
         } => {
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
+            let (
+                TcpClientSetupResult {
+                    client_stream,
+                    early_data,
+                },
+                _exit,
+            ) = chain_group
+                .connect_tcp_attributed(remote_location, &resolver)
+                .await?;
 
-            Ok(Some((client_stream, early_data)))
+            #[cfg(feature = "control-stats")]
+            let chain = Some(_exit.counters.key().clone());
+            #[cfg(not(feature = "control-stats"))]
+            let chain = None;
+
+            let route = Route {
+                rule_index,
+                chain,
+                group: client_proxy_selector.group_name(rule_index),
+            };
+            Ok(Some((client_stream, early_data, route)))
         }
         ConnectDecision::Block => Ok(None),
     }
@@ -233,6 +288,117 @@ mod tests {
         });
 
         (addr, rx)
+    }
+
+    /// The route a connection reports has to come from the forward path, not
+    /// from a helper a test calls directly: the whole point is that the
+    /// values reach the registry on the way through.
+    ///
+    /// Sync around a `block_on` rather than `#[tokio::test]`: it installs the
+    /// process-global outbound registry, so it holds that registry's lock,
+    /// and a lock guard has no business crossing an await point.
+    #[cfg(feature = "control-connections")]
+    #[test]
+    fn a_forwarded_connection_records_its_route_and_can_be_closed() {
+        use crate::connection_registry as registry;
+
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // An outbound the chain can be attributed to, installed as a running
+                // config would install it.
+                let mut set = crate::outbound_stats::OutboundSet::default();
+                set.insert("direct", "0.0.0.0:0").unwrap();
+                set.describe("direct", "Direct", true);
+                crate::outbound_stats::install(&set);
+
+                let (upstream_addr, _received) = spawn_recorder().await;
+                let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let inbound_addr = inbound.local_addr().unwrap();
+
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                let selector = allow_everything(resolver.clone());
+                let source: SocketAddr = "127.0.0.1:5100".parse().unwrap();
+
+                let server_resolver = resolver.clone();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = inbound.accept().await.unwrap();
+                    let handle = registry::register(source, "test@forward", registry::Network::Tcp);
+                    let destination =
+                        NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), upstream_addr.port());
+                    // The accept path records the destination before dispatching
+                    // here; this stands in for it, so the entry has the shape a
+                    // controller would see.
+                    handle.set_destination(&destination);
+                    forward_tcp(ForwardRequest {
+                        remote_location: destination,
+                        server_stream: Box::new(stream),
+                        server_need_initial_flush: false,
+                        connection_success_response: None,
+                        initial_remote_data: None,
+                        proxy_selector: selector,
+                        resolver: server_resolver,
+                        sniff: None,
+                        handle,
+                    })
+                    .await
+                });
+
+                let mut client = TcpStream::connect(inbound_addr).await.unwrap();
+                client.write_all(b"hello").await.unwrap();
+
+                // Wait for the route to be recorded: it is set after the dial.
+                let mut listed = None;
+                for _ in 0..100 {
+                    if let Some(c) = registry::snapshot()
+                        .into_iter()
+                        .find(|c| c.source == source && c.chain.is_some())
+                    {
+                        listed = Some(c);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let listed = listed.expect("the connection is listed with its route");
+
+                assert_eq!(listed.inbound, "test@forward");
+                assert_eq!(listed.destination_port, upstream_addr.port());
+                assert_eq!(
+                    listed.chain.as_deref(),
+                    Some("direct"),
+                    "the exit outbound the chain actually used"
+                );
+                assert_eq!(listed.rule, Some(0), "the rule that allowed it");
+                assert_eq!(
+                    listed.rule_summary.as_ref().map(|r| r.rule_type),
+                    Some("Match"),
+                    "rendered against the list that judged it"
+                );
+
+                // A controller closing it ends the client's stream, which is the
+                // only way a dashboard's disconnect button means anything.
+                assert!(registry::close(listed.id));
+                let mut buf = [0u8; 1];
+                let ended =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
+                        .await;
+                assert!(
+                    matches!(ended, Ok(Ok(0)) | Ok(Err(_))),
+                    "the client's stream should end once the controller closes it: {ended:?}"
+                );
+
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+                assert!(
+                    registry::snapshot().iter().all(|c| c.id != listed.id),
+                    "and the entry leaves when the task does"
+                );
+            });
     }
 
     fn direct_group(resolver: Arc<dyn Resolver>) -> ClientChainGroup {

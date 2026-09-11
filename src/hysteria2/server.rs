@@ -47,7 +47,7 @@ use crate::quic_transport::{
 };
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_forward::connect_client_tcp_stream;
+use crate::tcp::tcp_forward::connect_client_tcp_stream_routed;
 use crate::util::allocate_vec;
 
 use super::frame::{
@@ -717,6 +717,7 @@ async fn run_udp_local_to_remote_loop(
                     Ok(ConnectDecision::Allow {
                         chain_group,
                         remote_location,
+                        ..
                     }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
                         warn!("Blocked UDP forward to {remote_location}");
@@ -845,6 +846,7 @@ async fn run_udp_local_to_remote_loop(
                         Ok(ConnectDecision::Allow {
                             chain_group: _,
                             remote_location,
+                            ..
                         }) => remote_location,
                         Ok(ConnectDecision::Block) => {
                             warn!("Blocked UDP forward to {remote_location}");
@@ -1036,9 +1038,10 @@ async fn process_tcp_stream(
     // response. The client would then parse the target's greeting as a status
     // byte and a message length. The early data is written below, after the
     // response it belongs behind.
+    let rules_at_judgement = client_proxy_selector.clone();
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        connect_client_tcp_stream(
+        connect_client_tcp_stream_routed(
             client_proxy_selector,
             resolver,
             remote_location.clone().into(),
@@ -1049,7 +1052,15 @@ async fn process_tcp_stream(
     // nothing sees a stream that opened and closed, and cannot tell a refused
     // target from a server that fell over.
     let (mut client_stream, early_data) = match setup_client_stream_future.await {
-        Ok(Ok(Some(pair))) => pair,
+        Ok(Ok(Some((stream, early_data, route)))) => {
+            handle.set_route(
+                route.chain,
+                route.group,
+                Some(route.rule_index),
+                Some(rules_at_judgement.rule_summaries()),
+            );
+            (stream, early_data)
+        }
         Ok(Ok(None)) => {
             // Must have been blocked. The rule that blocked it is ours and
             // stays ours; the client is told the request was refused.

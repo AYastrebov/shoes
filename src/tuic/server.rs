@@ -371,6 +371,9 @@ async fn process_tcp_stream(
         QuicStream::from(send, recv),
         &handle,
     ));
+    // Kept past the move: the rule list this connection's index points into
+    // is this selector's.
+    let rules_at_judgement = client_proxy_selector.clone();
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(
@@ -382,7 +385,15 @@ async fn process_tcp_stream(
     );
 
     let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
+        Ok(Ok(Some((stream, route)))) => {
+            handle.set_route(
+                route.chain,
+                route.group,
+                Some(route.rule_index),
+                Some(rules_at_judgement.rule_summaries()),
+            );
+            stream
+        }
         Ok(Ok(None)) => {
             // Must have been blocked.
             let _ = server_stream.shutdown().await;
@@ -552,6 +563,7 @@ impl UdpSession {
                         ConnectDecision::Allow {
                             chain_group: _,
                             remote_location,
+                            ..
                         } => remote_location,
                         ConnectDecision::Block => {
                             return Err(std::io::Error::other(format!(
@@ -1011,6 +1023,7 @@ async fn process_udp_packet(
                     Ok(ConnectDecision::Allow {
                         chain_group,
                         remote_location,
+                        ..
                     }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
                         return Err(std::io::Error::other(format!(
