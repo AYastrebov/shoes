@@ -117,7 +117,11 @@ impl Sink for TextSink {
                     return;
                 }
                 OPCODE_PING => {
-                    if self.write_control(OPCODE_PONG, &payload).await.is_err() {
+                    // Bound rather than tested inline: clippy would have the
+                    // condition become a match guard, and a guard cannot
+                    // `await`.
+                    let answered = self.write_control(OPCODE_PONG, &payload).await;
+                    if answered.is_err() {
                         return;
                     }
                 }
