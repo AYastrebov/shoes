@@ -3,8 +3,7 @@
 //! Tracks the last time activity occurred on a connection to support idle timeout.
 //! An atomic rather than a lock: on every target with 64-bit atomics the
 //! update is a single store. On one without them (Keenetic's mipsel) the
-//! atomic is lock-backed, which at the rate a connection changes activity
-//! costs nothing measurable.
+//! atomic is lock-backed; its cost there has not been measured.
 
 use crate::util::atomic::AtomicU64;
 use std::sync::Arc;

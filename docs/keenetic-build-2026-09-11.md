@@ -41,8 +41,9 @@ hashing "~80MB" takes about 13 s of CPU on soft-float MIPS.
 
 ## What it took
 
-The aarch64 build needed nothing beyond cross-rs. The mipsel build needed
-seven things, each recorded in the tree so `scripts/build-keenetic.sh`
+The aarch64 build needed nothing beyond cross-rs and cmake, which its
+image lacks and a `pre-build` step installs (`Cross.toml`). The mipsel
+build needed seven things, each recorded in the tree so `scripts/build-keenetic.sh`
 reproduces it:
 
 1. **cross-rs `main` images, not 0.2.5.** The older images' GCC segfaults
@@ -59,7 +60,13 @@ reproduces it:
 4. **`build-std` on nightly.** `mipsel-unknown-linux-musl` is tier 3: no
    prebuilt std. Pinned to `nightly-2026-09-11` (rustc 1.100.0-nightly,
    67eda617e), and the cross images are pinned by digest, so the script
-   reproduces these numbers rather than whatever the tags point at later.
+   builds with the same Rust toolchain, C cross compiler and musl rather
+   than whatever the tags point at later. Two inputs are not pinned: the
+   `cross` release (not recorded) and the cmake, clang and libclang that
+   the images' `pre-build` step installs from the archive on the day. A
+   newer clang can change bindgen's output and a newer cmake aws-lc's
+   native build, so a later run can differ from these sizes; pinning them
+   needs a dated archive snapshot for the images' distribution.
    (`Cross.toml`, `scripts/build-keenetic.sh`)
 5. **The toolchain's own C runtime files.** Rust's musl targets link the
    start files and `libunwind` that ship with the prebuilt std, which a

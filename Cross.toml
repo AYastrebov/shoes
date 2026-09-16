@@ -4,6 +4,10 @@
 # bindings for MIPS, so its `bindgen` feature needs libclang in the image.
 # The `main` images rather than the 0.2.5 ones: the older images' GCC
 # segfaults on jemalloc's sources. Pinned by digest, since the tag moves.
+# The `pre-build` apt packages are not pinned: `apt-get` installs whatever
+# cmake, clang and libclang the archive has on the day, and a newer one can
+# change bindgen's output or aws-lc's native build. The digest pins the
+# toolchain that compiles and links; byte-exact sizes are not guaranteed.
 # `AWS_LC_SYS_NO_PREFIX=1` when building for it: the prefixed bindings name
 # every function with LLVM's verbatim-name marker (`\u{1}`), which the MIPS
 # backend fails to strip, so the linker looks for symbols that start with a

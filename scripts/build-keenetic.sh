@@ -8,7 +8,8 @@
 # for why each of those is there and what the binaries measured.
 #
 # Prerequisites:
-#   cargo install cross --locked
+#   cargo install cross --locked   (the version used for the measurements
+#                                   was not recorded)
 #   rustup target add aarch64-unknown-linux-musl
 #   rustup toolchain install nightly-2026-09-11 --profile minimal --component rust-src
 #
@@ -23,6 +24,8 @@ cd "$(dirname "$0")/.."
 # The nightly the measurements were taken with (rustc 1.100.0-nightly,
 # 67eda617e 2026-09-10); the cross images are pinned by digest in Cross.toml
 # for the same reason. Override with NIGHTLY=nightly to try a newer one.
+# Not pinned: the cross release and the apt packages the images' pre-build
+# installs (Cross.toml), so a rerun can differ from the documented sizes.
 NIGHTLY=${NIGHTLY:-nightly-2026-09-11}
 
 profile=${1:-release}
