@@ -17,7 +17,7 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{self, Thread},
+    thread,
     time::Duration,
 };
 
@@ -53,6 +53,91 @@ pub type PacketBuffer = Vec<u8>;
 /// backend supplies its own: a byte down the wake pipe on Unix, an event set
 /// on Windows.
 pub type StackWaker = Arc<dyn Fn() + Send + Sync>;
+
+/// The one way anything off the stack thread gets its attention.
+///
+/// The stack thread sleeps inside the platform wait — `poll()` on Unix,
+/// `WaitForMultipleObjects` on Windows — and only the device becoming
+/// readable, the backend's wake primitive, or the timeout gets it out. The
+/// TCP side used to reach for `Thread::unpark`, which does none of those: it
+/// sets a flag the next `thread::park()` would observe, and this thread never
+/// parks. So a segment written by tokio, a receive buffer drained by tokio, a
+/// connection dropped by tokio, and a new-connection channel being wired all
+/// sat until the next packet arrived or the loop's timer tick fired. The loop
+/// capped that tick at 10 ms to keep the latency bearable, which cost a wakeup
+/// every 10 ms for as long as any socket was open — on a phone with the screen
+/// off as much as anywhere.
+///
+/// This routes every such event through the backend's real wake primitive,
+/// and uses it — a syscall — only when the thread is actually asleep. `armed`
+/// is set by the stack thread just before it sleeps and cleared when it wakes;
+/// `pending` records that something happened while it was awake, so it skips
+/// the coming sleep rather than being woken from it. Both are sequentially
+/// consistent on purpose: the proof that no wakeup is lost is Dekker's — of
+/// the notifier's `pending` store and the thread's `armed` store, one is
+/// visible to the other side's load, so either the notifier fires the wake or
+/// the thread declines to sleep. That argument needs a single total order.
+///
+/// sing-tun's engine is the same shape (`stack_go_engine.go`: `postMessage`
+/// pushes a lock-free node and writes an eventfd only while the engine is
+/// parked; `park` clears it). smoltcp does the socket work here, so this wraps
+/// the existing per-backend wake pipe / event rather than an eventfd, but the
+/// arm/pending handshake is the part worth copying.
+pub struct StackNotifier {
+    /// Something changed since the stack thread last looked.
+    pending: AtomicBool,
+    /// The stack thread is asleep, or about to be, and nobody has woken it.
+    armed: AtomicBool,
+    /// The backend's real wake primitive: the Unix wake-pipe write, the
+    /// Windows `SetEvent`. Called only when `armed`.
+    wake: StackWaker,
+}
+
+impl StackNotifier {
+    pub fn new(wake: StackWaker) -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicBool::new(false),
+            armed: AtomicBool::new(false),
+            wake,
+        })
+    }
+
+    /// Ask the stack thread to run an iteration. Two atomics and no syscall
+    /// when it is awake; a single wake when it is asleep, however many callers
+    /// arrive before it gets up.
+    pub fn notify(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+        // Swap rather than a plain load-then-store: only the caller that flips
+        // `armed` from true fires the wake, so two racing notifiers do not
+        // both write the pipe.
+        if self.armed.swap(false, Ordering::SeqCst) {
+            (self.wake)();
+        }
+    }
+
+    /// Stack thread only: declare that a sleep is next. Returns true when
+    /// something is already pending, in which case the caller must not sleep.
+    fn arm(&self) -> bool {
+        self.armed.store(true, Ordering::SeqCst);
+        if self.pending.swap(false, Ordering::SeqCst) {
+            // A notify that landed before this arm may or may not have seen
+            // `armed` set; clear it ourselves so its wake, if it fired, is the
+            // harmless spurious kind rather than a lost one.
+            self.armed.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stack thread only: back from the sleep, however it ended. Also drains
+    /// the `pending` flag, since the thread is about to do a full iteration
+    /// that covers whatever set it.
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        self.pending.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Maximum number of read buffers cached globally.
 ///
@@ -200,10 +285,18 @@ pub trait StackDevice: Device {
     /// device is gone and the loop must stop.
     fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>>;
 
-    /// Park a packet for the next smoltcp poll to consume.
+    /// Queue a packet for smoltcp, behind any already queued.
+    ///
+    /// A queue rather than one slot: the loop reads a whole batch off the
+    /// device, hands it all over, then polls once. `Interface::poll` drains
+    /// everything `receive` offers before it runs egress, so a batch of N
+    /// packets costs one egress sweep over the sockets instead of N. The old
+    /// shape polled after every stored packet, which with a page load's worth
+    /// of connections open was most of what the thread did. This mirrors
+    /// sing-tun's `processBurst` (read up to a batch, then one flush).
     fn store_packet(&mut self, pkt: PooledBuffer);
 
-    /// Whether a parked packet is waiting.
+    /// Whether any queued packet is still waiting to be polled.
     fn has_pending(&self) -> bool;
 
     /// Write one packet, dropping it (and returning `Ok`) when the device
@@ -227,8 +320,9 @@ pub trait StackDevice: Device {
 pub struct StackHandle {
     /// Handle to the stack thread
     thread_handle: Option<thread::JoinHandle<()>>,
-    /// Thread handle for waking the stack thread
-    stack_thread: Thread,
+    /// How anything off the stack thread wakes it: sets a flag and, only when
+    /// the thread is parked, fires the backend's wake primitive.
+    notifier: Arc<StackNotifier>,
     /// Flag to signal thread shutdown
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
@@ -242,6 +336,12 @@ impl StackHandle {
     /// `make_device` builds — on the stack thread itself, so a device whose
     /// handles are not `Send` (raw Windows event handles) never crosses a
     /// thread boundary.
+    ///
+    /// `wake` is the backend's primitive for getting that thread out of its
+    /// wait — the Unix wake-pipe write, the Windows `SetEvent` — and the
+    /// [`StackNotifier`] built around it is what the device's `wait` must also
+    /// select on, so a `notify` actually interrupts the sleep.
+    ///
     /// Fallible: `thread::spawn` fails with EAGAIN under thread or
     /// memory pressure -- plausible inside a Network Extension's memory
     /// cap -- and an `expect` here aborted the whole host app instead of
@@ -249,6 +349,7 @@ impl StackHandle {
     pub fn spawn<D, F>(
         thread_name: &str,
         options: TcpStackOptions,
+        wake: StackWaker,
         make_device: F,
     ) -> io::Result<Self>
     where
@@ -257,6 +358,7 @@ impl StackHandle {
     {
         let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let notifier = StackNotifier::new(wake);
         let shared_state = Arc::new(Mutex::new(SharedState {
             udp_response_rx: None,
             new_conn_tx: None,
@@ -265,6 +367,7 @@ impl StackHandle {
         let thread_handle = {
             let running = running.clone();
             let shared_state = shared_state.clone();
+            let notifier = notifier.clone();
 
             thread::Builder::new()
                 .name(thread_name.to_owned())
@@ -277,7 +380,14 @@ impl StackHandle {
                                 return;
                             }
                         };
-                        run_stack_loop(device, options, udp_tx, running.clone(), shared_state);
+                        run_stack_loop(
+                            device,
+                            options,
+                            udp_tx,
+                            running.clone(),
+                            shared_state,
+                            notifier,
+                        );
                     });
                 })
                 .map_err(|e| {
@@ -285,11 +395,9 @@ impl StackHandle {
                 })?
         };
 
-        let stack_thread = thread_handle.thread().clone();
-
         Ok(Self {
             thread_handle: Some(thread_handle),
-            stack_thread,
+            notifier,
             running,
             udp_rx: Some(udp_rx),
             shared_state,
@@ -301,12 +409,21 @@ impl StackHandle {
         self.udp_rx.take()
     }
 
+    /// A waker the tokio side calls after queueing a UDP response, so the
+    /// stack thread writes it now rather than on its next wakeup. Coalesced
+    /// through the notifier: a burst of responses costs one wake, not one per
+    /// datagram. This is what backends now hand out as their `udp_waker`.
+    pub fn waker(&self) -> StackWaker {
+        let notifier = self.notifier.clone();
+        Arc::new(move || notifier.notify())
+    }
+
     /// Set the channel for UDP responses to write back to TUN.
     pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
         }
-        self.stack_thread.unpark();
+        self.notifier.notify();
     }
 
     /// Set the channel for notifying about new TCP connections.
@@ -314,7 +431,7 @@ impl StackHandle {
         if let Ok(mut state) = self.shared_state.lock() {
             state.new_conn_tx = Some(tx);
         }
-        self.stack_thread.unpark();
+        self.notifier.notify();
     }
 
     /// Check if the stack thread is still running.
@@ -322,11 +439,14 @@ impl StackHandle {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// First half of shutdown: mark the loop stopped and unpark the thread.
-    /// The backend fires its platform wake between this and [`Self::join`].
+    /// First half of shutdown: mark the loop stopped and wake the thread so
+    /// it sees the flag now rather than at its next packet or timer tick. A
+    /// backend that has a second reason to wake — Windows shutting the session
+    /// down, which is also what unblocks a read in progress — still fires that
+    /// between this and [`Self::join`].
     pub fn signal_stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        self.stack_thread.unpark();
+        self.notifier.notify();
     }
 
     /// Wait for the stack thread to finish. The join is what guarantees the
@@ -396,13 +516,14 @@ pub fn run_stack_thread_guarded(running: Arc<AtomicBool>, f: impl FnOnce()) {
 ///
 /// This is the body that used to live in `tcp_stack_direct.rs` as
 /// `run_direct_stack_thread`, with the fd-specific `wait_readable` behind
-/// [`StackDevice::wait`] and nothing else changed.
+/// [`StackDevice::wait`].
 pub fn run_stack_loop<D: StackDevice>(
     mut device: D,
     options: TcpStackOptions,
     udp_tx: UnboundedSender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
+    notifier: Arc<StackNotifier>,
 ) {
     info!("smoltcp stack thread initializing...");
 
@@ -449,10 +570,14 @@ pub fn run_stack_loop<D: StackDevice>(
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
 
-    let stack_thread = thread::current();
-
     let mut phy_wait_error_count: u32 = 0;
     const MAX_PHY_WAIT_ERRORS: u32 = 10;
+
+    // Reused across iterations rather than freshly allocated each time: this
+    // is the path everything the tunnel carries goes through, so a `Vec` per
+    // batch is an allocation per batch.
+    let mut tcp_packets: Vec<PooledBuffer> = Vec::with_capacity(MAX_PACKET_BATCH);
+    let mut sockets_to_remove: Vec<SocketHandle> = Vec::new();
 
     info!("smoltcp stack thread started, entering main loop");
 
@@ -469,7 +594,7 @@ pub fn run_stack_loop<D: StackDevice>(
         }
 
         // Reads packets from TUN and filters by protocol (batch processing).
-        let mut tcp_packets: Vec<PooledBuffer> = Vec::new();
+        tcp_packets.clear();
         let mut packets_read = 0;
 
         while packets_read < MAX_PACKET_BATCH {
@@ -521,7 +646,7 @@ pub fn run_stack_loop<D: StackDevice>(
                                         dst_addr,
                                         tcp_buffer_size,
                                         &mut socket_set,
-                                        &stack_thread,
+                                        &notifier,
                                     ) {
                                         sockets.insert(
                                             new_conn.handle,
@@ -577,18 +702,21 @@ pub fn run_stack_loop<D: StackDevice>(
             break;
         }
 
-        // Processes batched TCP/ICMP packets through smoltcp.
+        // Hands the whole batch to smoltcp and polls once. `Interface::poll`
+        // drains everything the device offers through `receive` before it runs
+        // egress, so a batch of N packets is one egress sweep over the sockets
+        // rather than N, and the ACKs and window updates the batch produces go
+        // out together. The device queues what it is handed; see
+        // `StackDevice::store_packet`.
         let has_tcp_packet = !tcp_packets.is_empty();
-        for pkt in tcp_packets {
+        for pkt in tcp_packets.drain(..) {
             device.store_packet(pkt);
-            let now = smol_now();
-            iface.poll(now, &mut device, &mut socket_set);
         }
 
         let now = smol_now();
         iface.poll(now, &mut device, &mut socket_set);
 
-        let mut sockets_to_remove = Vec::new();
+        sockets_to_remove.clear();
 
         for (handle, socket_info) in sockets.iter() {
             let handle = *handle;
@@ -705,7 +833,7 @@ pub fn run_stack_loop<D: StackDevice>(
             }
         }
 
-        for handle in sockets_to_remove {
+        for handle in sockets_to_remove.drain(..) {
             if let Some(socket_info) = sockets.remove(&handle) {
                 active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
                 #[cfg(feature = "control-stats")]
@@ -735,33 +863,45 @@ pub fn run_stack_loop<D: StackDevice>(
         // Wait for data using the platform's readiness primitive - this is
         // the key for event-driven I/O
         if !has_tcp_packet && !device.has_pending() {
-            // Cap poll_delay at 10ms to balance CPU usage vs throughput
-            let delay = iface.poll_delay(after_transfer, &socket_set);
-            let wait_duration = delay.map(|d| {
-                let millis = d.total_millis().min(10);
-                SmolDuration::from_millis(millis)
-            });
+            // Sleep until smoltcp's own next deadline — a retransmit, a
+            // keepalive, a closing timer, or nothing at all — rather than the
+            // old 10 ms cap. The cap existed because a segment or response
+            // handed over by tokio could not otherwise wake the thread before
+            // the next tick; the notifier does that now, so the wait can be as
+            // long as smoltcp says it is safe to be. `arm` publishes that a
+            // sleep is next and returns true if a `notify` already raced in,
+            // in which case we skip the sleep and loop again to handle it.
+            let wait_duration = iface
+                .poll_delay(after_transfer, &socket_set)
+                .map(|d| SmolDuration::from_millis(d.total_millis().min(MAX_POLL_WAIT_MILLIS)));
 
-            // Sleeps until the TUN has something to read, the backend's
-            // shutdown signal says to stop, or the delay smoltcp asked for
-            // elapses. If the device becomes invalid (e.g. removed), the wait
-            // returns an error immediately with no sleep, creating a hot spin
-            // loop. The try_recv path usually catches this first, but this
-            // counter acts as a backstop: after 10 consecutive non-EINTR
-            // errors with no successful reads in between, treat the device as
-            // dead.
-            if let Err(e) = device.wait(wait_duration)
-                && e.kind() != io::ErrorKind::Interrupted
-            {
-                phy_wait_error_count += 1;
-                if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
-                    error!(
-                        "device wait failed {} consecutive times (last: {}). Stack thread stopping.",
-                        phy_wait_error_count, e
-                    );
-                    running.store(false, Ordering::Relaxed);
-                } else {
-                    warn!("device wait error ({}): {}", phy_wait_error_count, e);
+            if notifier.arm() {
+                notifier.disarm();
+            } else {
+                // Sleeps until the TUN has something to read, the notifier
+                // fires the backend's wake primitive, the backend's shutdown
+                // signal says to stop, or the delay elapses. If the device
+                // becomes invalid (e.g. removed), the wait returns an error
+                // immediately with no sleep, creating a hot spin loop. The
+                // try_recv path usually catches this first, but this counter
+                // acts as a backstop: after 10 consecutive non-EINTR errors
+                // with no successful reads in between, treat the device as
+                // dead.
+                let wait_result = device.wait(wait_duration);
+                notifier.disarm();
+                if let Err(e) = wait_result
+                    && e.kind() != io::ErrorKind::Interrupted
+                {
+                    phy_wait_error_count += 1;
+                    if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
+                        error!(
+                            "device wait failed {} consecutive times (last: {}). Stack thread stopping.",
+                            phy_wait_error_count, e
+                        );
+                        running.store(false, Ordering::Relaxed);
+                    } else {
+                        warn!("device wait error ({}): {}", phy_wait_error_count, e);
+                    }
                 }
             }
         }
@@ -790,7 +930,7 @@ fn create_tcp_connection(
     dst_addr: SocketAddr,
     buffer_size: usize,
     socket_set: &mut SocketSet<'static>,
-    stack_thread: &Thread,
+    notifier: &Arc<StackNotifier>,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
     let mut socket = TcpSocket::new(
         TcpSocketBuffer::new(vec![0u8; buffer_size]),
@@ -815,7 +955,7 @@ fn create_tcp_connection(
     let control = Arc::new(TcpConnectionControl::new(buffer_size, buffer_size));
 
     let handle = socket_set.add(socket);
-    let connection = TcpConnection::new(control.clone(), stack_thread.clone());
+    let connection = TcpConnection::new(control.clone(), notifier.clone());
 
     Some((
         CreateConnectionResult {
@@ -1049,7 +1189,7 @@ mod tests {
         /// the `&mut self` read path to consume.
         queued: Mutex<VecDeque<Script>>,
         written: Arc<Mutex<Vec<Vec<u8>>>>,
-        pending_rx: Option<PooledBuffer>,
+        pending: VecDeque<PooledBuffer>,
         mtu: usize,
     }
 
@@ -1064,7 +1204,7 @@ mod tests {
 
     impl StackDevice for ScriptedDevice {
         fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
-            if let Some(pkt) = self.pending_rx.take() {
+            if let Some(pkt) = self.pending.pop_front() {
                 return Ok(Some(pkt));
             }
             match self.next_script() {
@@ -1079,11 +1219,11 @@ mod tests {
         }
 
         fn store_packet(&mut self, pkt: PooledBuffer) {
-            self.pending_rx = Some(pkt);
+            self.pending.push_back(pkt);
         }
 
         fn has_pending(&self) -> bool {
-            self.pending_rx.is_some()
+            !self.pending.is_empty()
         }
 
         fn write_packet(&self, data: &[u8]) -> io::Result<()> {
@@ -1121,7 +1261,7 @@ mod tests {
             &mut self,
             _timestamp: SmolInstant,
         ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            self.pending_rx.take().map(|buffer| {
+            self.pending.pop_front().map(|buffer| {
                 (
                     PooledRxToken { buffer },
                     ScriptedTxToken {
@@ -1182,7 +1322,7 @@ mod tests {
                 rx: script_rx,
                 queued: Mutex::new(VecDeque::new()),
                 written: written.clone(),
-                pending_rx: None,
+                pending: VecDeque::new(),
                 mtu: 1500,
             };
 
@@ -1198,10 +1338,16 @@ mod tests {
                 new_conn_tx: Some(conn_tx),
             }));
 
+            // The scripted device's `wait` sleeps on the script channel, which
+            // a test drives directly, so the notifier's wake need do nothing:
+            // a `notify` sets `pending` and the next `arm` sees it. Real
+            // backends pass a pipe/event waker here instead.
+            let notifier = StackNotifier::new(Arc::new(|| {}));
+
             let handle = {
                 let running = running.clone();
                 thread::spawn(move || {
-                    run_stack_loop(device, options, udp_tx, running, shared_state);
+                    run_stack_loop(device, options, udp_tx, running, shared_state, notifier);
                 })
             };
 
@@ -1453,5 +1599,128 @@ mod tests {
             );
             thread::sleep(StdDuration::from_millis(10));
         }
+    }
+
+    /// The batched-ingress contract the loop depends on: `store_packet` queues
+    /// rather than overwrites, so a whole read batch survives to be drained by
+    /// one `poll`. A single-slot device would keep only the last, which is the
+    /// regression this guards.
+    #[test]
+    fn stored_packets_are_queued_and_drained_in_order() {
+        let mut device = ScriptedDevice {
+            rx: std_mpsc::channel().1,
+            queued: Mutex::new(VecDeque::new()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            pending: VecDeque::new(),
+            mtu: 1500,
+        };
+
+        assert!(!device.has_pending());
+        for port in [1u16, 2, 3] {
+            let mut buffer = PooledBuffer::with_capacity(device.mtu + 4);
+            buffer.extend_from_slice(&syn_packet(port));
+            device.store_packet(buffer);
+        }
+        assert!(device.has_pending());
+
+        // smoltcp drains through `Device::receive`; each stored packet must
+        // come back, in order, before the device reports empty.
+        let mut drained = Vec::new();
+        while let Some((rx, _tx)) = Device::receive(&mut device, SmolInstant::from_millis(0)) {
+            let port = smoltcp::phy::RxToken::consume(rx, |frame| {
+                let ip = Ipv4Packet::new_checked(frame).unwrap();
+                TcpPacket::new_checked(ip.payload()).unwrap().src_port()
+            });
+            drained.push(port);
+        }
+        assert_eq!(
+            drained,
+            vec![1, 2, 3],
+            "the whole batch must survive in order"
+        );
+        assert!(!device.has_pending());
+    }
+
+    /// End to end: a burst of SYNs read in one batch and polled once must each
+    /// become a connection. None may be dropped on the way through the loop.
+    #[test]
+    fn every_syn_in_a_burst_becomes_a_connection() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+
+        const BURST: u16 = 8;
+        for i in 0..BURST {
+            harness
+                .script_tx
+                .send(Script::Packet(syn_packet(30000 + i)))
+                .unwrap();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..BURST {
+            let conn = recv_within(&mut harness.conn_rx, "a connection from the burst");
+            seen.insert(conn.local_addr.port());
+        }
+        assert_eq!(
+            seen.len(),
+            BURST as usize,
+            "every SYN in the batch must open its own connection"
+        );
+
+        harness.stop();
+    }
+
+    /// A `notify` that lands while the thread is between iterations — before it
+    /// arms — must make the coming `arm` decline to sleep, not be lost.
+    #[test]
+    fn notify_before_arm_makes_arm_decline_to_sleep() {
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notifier = {
+            let woke = woke.clone();
+            StackNotifier::new(Arc::new(move || {
+                woke.fetch_add(1, Ordering::SeqCst);
+            }))
+        };
+
+        // Not armed yet: notify records pending but does not touch the wake
+        // primitive, since the thread is awake.
+        notifier.notify();
+        assert_eq!(woke.load(Ordering::SeqCst), 0);
+        // The thread now goes to arm: it must see the pending flag and refuse
+        // to sleep.
+        assert!(
+            notifier.arm(),
+            "arm must see the earlier notify and skip the sleep"
+        );
+        notifier.disarm();
+
+        // With nothing pending, the next arm sleeps.
+        assert!(!notifier.arm());
+        notifier.disarm();
+    }
+
+    /// A `notify` that lands while the thread is parked must fire the wake
+    /// primitive exactly once, however many notifies pile up before it wakes.
+    #[test]
+    fn notify_while_armed_wakes_once() {
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notifier = {
+            let woke = woke.clone();
+            StackNotifier::new(Arc::new(move || {
+                woke.fetch_add(1, Ordering::SeqCst);
+            }))
+        };
+
+        // The thread arms and, with nothing pending, commits to sleeping.
+        assert!(!notifier.arm());
+        // Three notifies arrive while it is parked: the first fires the wake,
+        // the rest coalesce because `armed` is already cleared.
+        notifier.notify();
+        notifier.notify();
+        notifier.notify();
+        assert_eq!(woke.load(Ordering::SeqCst), 1, "a burst must cost one wake");
+
+        notifier.disarm();
     }
 }

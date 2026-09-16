@@ -11,12 +11,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
-    thread::Thread,
 };
 
 use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use super::stack_common::StackNotifier;
 
 /// TCP socket state machine.
 ///
@@ -164,18 +165,22 @@ impl TcpConnectionControl {
 /// Implements AsyncRead and AsyncWrite for use with tokio.
 pub struct TcpConnection {
     control: Arc<TcpConnectionControl>,
-    thread: Thread,
+    notifier: Arc<StackNotifier>,
 }
 
 impl TcpConnection {
     /// Create a new TCP connection.
-    pub fn new(control: Arc<TcpConnectionControl>, thread: Thread) -> Self {
-        Self { control, thread }
+    pub fn new(control: Arc<TcpConnectionControl>, notifier: Arc<StackNotifier>) -> Self {
+        Self { control, notifier }
     }
 
-    /// Wake up the stack thread.
+    /// Get the stack thread to run an iteration: data was written into the
+    /// send buffer, drained from the receive buffer (freeing window), or the
+    /// connection was dropped. Was `Thread::unpark`, which the stack thread
+    /// never saw because it parks in `poll()`, not `thread::park()`; the write
+    /// then waited out the loop's timer tick. See [`StackNotifier`].
     fn notify(&self) {
-        self.thread.unpark();
+        self.notifier.notify();
     }
 }
 
