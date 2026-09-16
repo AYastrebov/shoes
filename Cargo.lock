@@ -2598,6 +2598,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "pin-project-lite",
+ "portable-atomic",
  "prost",
  "quinn",
  "rand",
