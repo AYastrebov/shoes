@@ -137,6 +137,15 @@ impl StackNotifier {
         self.armed.store(false, Ordering::SeqCst);
         self.pending.store(false, Ordering::SeqCst);
     }
+
+    /// Test only: read and clear the `pending` flag, so a test can assert that
+    /// a caller (a `TcpConnection` write, read-drain or drop) reached `notify`.
+    /// With the notifier never armed, `notify` sets `pending` without firing
+    /// the wake, which this observes.
+    #[cfg(test)]
+    pub(crate) fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
 }
 
 /// Maximum number of read buffers cached globally.
@@ -864,13 +873,21 @@ pub fn run_stack_loop<D: StackDevice>(
         // the key for event-driven I/O
         if !has_tcp_packet && !device.has_pending() {
             // Sleep until smoltcp's own next deadline — a retransmit, a
-            // keepalive, a closing timer, or nothing at all — rather than the
-            // old 10 ms cap. The cap existed because a segment or response
+            // keepalive, a closing timer — or, when it has none, until the
+            // one-second dead-device backstop below. What is gone is the old
+            // 10 ms cap, which existed only because a segment or response
             // handed over by tokio could not otherwise wake the thread before
-            // the next tick; the notifier does that now, so the wait can be as
-            // long as smoltcp says it is safe to be. `arm` publishes that a
-            // sleep is next and returns true if a `notify` already raced in,
+            // the next tick; the notifier does that now. So an idle connection
+            // with no sub-second timer wakes at most once a second (to notice a
+            // torn-down device the platform did not report — see
+            // `MAX_POLL_WAIT_MILLIS`), not a hundred times. `arm` publishes that
+            // a sleep is next and returns true if a `notify` already raced in,
             // in which case we skip the sleep and loop again to handle it.
+            //
+            // The `min` is belt-and-braces: both backend `wait`s clamp to
+            // `MAX_POLL_WAIT_MILLIS` too, so a `None` deadline already becomes
+            // the one-second wait. Capping here as well keeps the backstop true
+            // of any future backend whose `wait` forgets to.
             let wait_duration = iface
                 .poll_delay(after_transfer, &socket_set)
                 .map(|d| SmolDuration::from_millis(d.total_millis().min(MAX_POLL_WAIT_MILLIS)));

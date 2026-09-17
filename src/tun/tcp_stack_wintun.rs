@@ -85,8 +85,10 @@ pub struct TcpStackWintun {
     /// The session, held here so Drop can signal shutdown; the adapter and
     /// library handles ride along inside and outlive the stack thread.
     tun: Arc<OpenedWintun>,
-    /// Wake event shared with the device's wait; None if creation failed.
-    wake_event: Option<Arc<WakeEvent>>,
+    // The wake event is not held here: the device (on the stack thread) and
+    // the notifier's waker closure each own an `Arc<WakeEvent>` clone, which is
+    // what keeps it alive. Retaining a third, unread copy here was only dead
+    // weight — and a dead-code warning on the binary build.
 }
 
 impl Drop for TcpStackWintun {
@@ -128,11 +130,7 @@ impl TcpStackWintun {
             WintunDevice::new(session, device_wake, options.mtu)
         })?;
 
-        Ok(Self {
-            handle,
-            tun,
-            wake_event,
-        })
+        Ok(Self { handle, tun })
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).

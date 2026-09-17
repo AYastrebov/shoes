@@ -170,6 +170,11 @@ impl TcpStackDirect {
 /// The descriptor is duplicated so the closure cannot write to a reused
 /// descriptor number after Drop closes the pipe — it outlives this call inside
 /// the notifier, whose teardown races the stack's own.
+///
+/// `F_DUPFD_CLOEXEC`, not `dup`: the pipe ends are `FD_CLOEXEC` (see
+/// `new_wake_pipe`), but a plain `dup` clears that flag on the copy. Since this
+/// copy lives for the whole life of the stack, a child spawned while the tunnel
+/// is up would otherwise inherit the wake-pipe writer and hold it open.
 fn pipe_waker(wake_tx: RawFd) -> StackWaker {
     if wake_tx < 0 {
         // The pipe could not be created at startup; wakeups fall back to the
@@ -177,11 +182,11 @@ fn pipe_waker(wake_tx: RawFd) -> StackWaker {
         return std::sync::Arc::new(|| {});
     }
     // SAFETY: wake_tx is a live pipe descriptor owned by the stack.
-    let duped = unsafe { libc::dup(wake_tx) };
+    let duped = unsafe { libc::fcntl(wake_tx, libc::F_DUPFD_CLOEXEC, 0) };
     if duped < 0 {
         return std::sync::Arc::new(|| {});
     }
-    // SAFETY: `duped` was just returned by dup() and nothing else owns it.
+    // SAFETY: `duped` was just returned by F_DUPFD_CLOEXEC and nothing else owns it.
     let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(duped) };
     std::sync::Arc::new(move || {
         use std::os::fd::AsRawFd;

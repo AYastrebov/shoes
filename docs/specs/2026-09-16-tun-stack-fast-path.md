@@ -76,9 +76,12 @@ wake-pipe write, the Windows `SetEvent` — which the device's `wait` already
 selects on. Everything off the thread (a written segment, a drained receive
 buffer, a dropped connection, a queued UDP response, a channel being wired,
 shutdown) now goes through `notify()` instead of `unpark`. With a real wake in
-hand, the loop's wait is no longer capped at 10 ms: it sleeps until smoltcp's
-own next deadline (`poll_delay`) or until `notify` fires. An idle tunnel with
-open connections now sleeps for seconds, not 10 ms at a time.
+hand, the loop's 10 ms cap is gone: it sleeps until smoltcp's own next deadline
+(`poll_delay`) or until `notify` fires. A one-second ceiling stays as the
+dead-device backstop (`MAX_POLL_WAIT_MILLIS`, kept because a platform may not
+wake the wait when the device is torn down — macOS does not), so an idle
+connection with no sub-second timer wakes at most once a second rather than a
+hundred times.
 
 ## Correctness of the notifier
 
