@@ -20,6 +20,7 @@ Reviewed against `mobile` at `89aebfa`. What has merged since this was written, 
 | #22 Clash API slice 1 (`a85cda6`) | The connection registry exists, so every "if landed" below is now "call it". `register` and `counted` compile to no-ops without `control-connections`, so the calls are unconditional. `/version` answers, which is awg-manager's third health probe. |
 | #24 Keenetic builds (`89aebfa`) | Slice 6 ran out of order and mostly succeeded: `scripts/build-keenetic.sh` produces aarch64 and mipsel binaries. What is left of it is listed under "Slices 3 to 6". The router run in Task 5 has a binary to use. |
 | #25 TUN fast path (`4e0df5e`) | Nothing here; it matters to the two tun modes, which need no engine work. |
+| #27 `redirect` inbound and router limits | Tasks 2 and 3. Each has a **Status** block saying where the build departed from its steps; both departures from the *design* (no loopback rule for `redirect`, and `SO_ORIGINAL_DST` answering for connections nobody redirected) are in the spec. Task 4 opens with what they left for it. |
 
 **The first router run is unblocked and does not wait for slice 2.** The spec's order of work puts it after slice 1: the legacy-tunnel mode needs only a `mixed` inbound, `SIGHUP`, `check`, `version` and Clash `/version`, all of which are on `mobile`, and an aarch64 binary, which the build script produces. It is gated on the awg-manager emitter, which is that repository's work. It is also slice 5's gate and the first real RSS figure, so it is worth more than its size suggests. Tasks 2 to 4 can proceed in parallel with it.
 
@@ -32,7 +33,7 @@ Corrections made in this review, each marked **(review)** where it lands:
 - **The netfilter tests used `tokio::process`**, which Task 1 found is not enabled in this crate. They use `std::process` with the kill-on-drop guard from `tests/process_contract.rs`.
 - **The redirect test's loop-avoidance recipe was left as thinking-out-loud.** It is one definite recipe now.
 - **Task 5 missed the documentation rule**: `CONFIG.md`, an `examples/` config and the release smoke loop (AGENTS.md, "Every option reaches the documentation and an example").
-- Gates, environment and commit conventions now follow AGENTS.md; the development host is Linux, so the root-gated tests run locally and not only in CI.
+- Gates, environment and commit conventions now follow AGENTS.md. The development host is Linux, so the root-gated tests *can* run locally, but only by hand: `sudo` there asks for a password, so an agent cannot run them and CI is where they are actually exercised.
 
 ## Global Constraints
 
@@ -42,7 +43,7 @@ Corrections made in this review, each marked **(review)** where it lands:
 - **`udp_nat_max` bounds file descriptors**: sessions across all clients of a `tproxy` listener never exceed it, and neither do reply sockets. Both are enforced by a budget shared across the listener's clients (Tasks 3 and 4), not by a per-client figure. **(review)**
 - **Registry**: both inbounds call `connection_registry::register` / `counted` at the accept edge with a label from `tcp_server::inbound_label`, exactly as `src/tcp/tcp_server.rs` does for the others. Unconditional: the no-feature build gets the no-op versions.
 - **Packet path** (AGENTS.md, "Packet paths"): the `tproxy` demux runs once per datagram. No task per datagram, every queue bounded with a comment saying that a full one drops, and no fresh `Vec` per datagram where a shared buffer does the job (Task 4 says how).
-- **Gates for every task** are AGENTS.md's verification gate, in full. Add `cargo test --locked --features clash-api` whenever a task touches the registry or `inbound_label`, because those arms only compile there. The FFI clippy pair is needed only if a task strays into `src/config/mod.rs` or `src/socket_protector.rs`; `src/socket_util.rs` alone does not need it. The netfilter tests are `sudo -E env "PATH=$PATH" cargo test --locked --test transparent -- --ignored`, on the development host as well as in CI.
+- **Gates for every task** are AGENTS.md's verification gate, in full. Add `cargo test --locked --features clash-api` whenever a task touches the registry or `inbound_label`, because those arms only compile there. The FFI clippy pair is needed only if a task strays into `src/config/mod.rs` or `src/socket_protector.rs`; `src/socket_util.rs` alone does not need it. The netfilter tests are built as the user and run as root, so nothing in `target/` ends up root-owned: `cargo test --locked --test transparent --no-run`, then `sudo target/debug/deps/transparent-<hash> --ignored`. `test.yml` does exactly this in its `Transparent inbound tests (root)` step.
 - **Commits** follow AGENTS.md: `area: imperative summary`, the why in the body, the co-author trailer, and the same command again if signing fails with `failed to fill whole buffer`.
 
 ---
@@ -815,11 +816,22 @@ Spec: "Slice 2" → "`tproxy`".
 
 **Files:**
 - Modify: `src/tproxy/mod.rs`
+- Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")
 - Modify: `src/tcp/tcp_server.rs` (the `Transport::Udp => todo!()` arm in `start_tcp_or_quic_servers`, `:483` at `89aebfa`), `src/socket_util.rs` (transparent bind helpers), `src/tproxy/sys.rs`
 - Modify: `tests/transparent.rs` (second test)
 
+**What Tasks 2 and 3 left for this task.** Each was deferred because it had no caller, or no safe meaning, until the inbound existed. They are part of this task's definition of done, and the listings further down predate them:
+
+- **The `Tproxy` config variant, its `Display` and its validation** (`src/config/types/server.rs`, `src/config/validate.rs`). The listing under Task 2, "`src/config/validate.rs`, in `validate_server_config`", is the shape: Linux only, loopback only, `tproxy` if and only if `transport: udp`, both fields positive, and `udp_timeout` at most 86400 (see the notes after the demux listing). The if-and-only-if closes a hole that exists on `mobile` today: `transport: udp` with any protocol passes validation and then panics on `todo!()` at startup. Model the function on `validate_redirect_listener`, which is where `redirect`'s rules ended up; do not resurrect the combined `transparent` block.
+- **The factory arm**: `ServerProxyConfig::Tproxy { .. } => unreachable!(...)` in `tcp_server_handler_factory.rs`, and a refusal of `tproxy` as an inner protocol in `validate_server_proxy_config`, beside `redirect`'s.
+- **No `inbound_label` arm.** The fallback lowercases `Display`, so `TPROXY` becomes `tproxy@…` by itself, as `redirect` did.
+- **The re-export** from `src/routing/mod.rs` of `RouterLimits` and `run_udp_routing_with_limits`, which Task 3 could not add without a caller.
+- **`RouterLimits` is `Clone`, not `Copy`**, and the budget permit is taken by the router itself: this task only constructs the limits and hands each client's router a clone.
+- **The test helpers as built differ from the listings.** `spawn_shoes_as_nobody(dir, config)` has no `net_admin` parameter yet; add it, with the `setcap` on the copy. `wait_for` takes `&mut Child` and fails if shoes has exited, because the port was released before shoes bound it; `wait_for_udp_bound` must do the same, or a shoes that lost the port to another process passes the wait and fails the test somewhere unhelpful.
+- **There is no loop guard to fall back on here.** `tproxy` is loopback-bound precisely because a wildcard `IP_TRANSPARENT` socket also receives ordinarily delivered datagrams and relays them to itself (awg-manager's issue #689, quoted in the spec). There is no per-datagram equivalent of Task 2's local-address comparison to fall back on, so the loopback rule is the whole defence; test the refusal of `0.0.0.0`.
+
 **Interfaces:**
-- Consumes: Task 2 `sys::{v4, v6}`; Task 3 `run_udp_routing_with_limits`, `RouterLimits` and its `shared_budget`.
+- Consumes: Task 2 `sys::{v4, v6}` (private to `mod linux`, which is where this task's functions go too); Task 3 `run_udp_routing_with_limits`, `RouterLimits` and its `shared_budget`.
 - Produces also: `sys::{make_transparent, recv_with_original_destination}`, moved here from Task 2 so they land with their caller. **(review)**
 - Produces: `pub async fn start_tproxy_udp_server(config: ServerConfig, resolver: Arc<dyn Resolver>) -> io::Result<Vec<JoinHandle<()>>>`; `struct TproxyClientStream` implementing `AsyncTargetedMessageStream`.
 
@@ -1299,8 +1311,8 @@ The exact loopback-marking recipe may need one iteration on the CI kernel; that 
 cargo test --locked tproxy
 cargo clippy --locked --bins --tests -- -D warnings
 cargo build --locked --features control-stats
-# Linux, root: sudo -E cargo test --locked --test transparent -- --ignored
-git add src/tproxy src/socket_util.rs src/tcp/tcp_server.rs src/routing tests/transparent.rs
+# root: build as yourself, then sudo target/debug/deps/transparent-<hash> --ignored (see Global Constraints)
+git add src/tproxy src/socket_util.rs src/tcp src/config src/routing tests/transparent.rs
 git -c user.email=ayastrebov@gmail.com commit -m "tproxy inbound: transparent UDP with per-client routing and spoofed replies"
 ```
 
@@ -1309,30 +1321,21 @@ git -c user.email=ayastrebov@gmail.com commit -m "tproxy inbound: transparent UD
 ### Task 5: CI, docs, and the router run
 
 **Files:**
-- Modify: `.github/workflows/test.yml`, `.github/workflows/build.yml`, `README.md`, `CONFIG.md`, `ROADMAP.md`, this plan.
-- Create: `examples/transparent_proxy.yaml`
+- Modify: `.github/workflows/test.yml`, `README.md`, `CONFIG.md`, `ROADMAP.md`, `examples/transparent_proxy.yaml`, this plan.
+
+**Much of this task was done early, with `redirect` (PR #27),** because AGENTS.md wants an option documented in the commit that adds it. What exists: the root CI step, `redirect` in `CONFIG.md` and the README, `examples/transparent_proxy.yaml` with the TCP listener and its place in the Linux arm of the smoke loop, and the ROADMAP section. What is left is `tproxy`'s share of each, and the router run. The steps below are the first draft's; read each as "extend", not "create".
 
 - [ ] **Step 1: CI step**
 
-In `test.yml` after the desktop step, Linux only:
-
-```yaml
-      # The transparent inbounds under real netfilter rules. Root on the
-      # runner is what makes iptables and IP_TRANSPARENT available.
-      - name: Transparent inbound tests (root)
-        if: runner.os == 'Linux'
-        run: sudo -E env "PATH=$PATH" cargo test --locked --test transparent -- --ignored
-```
-
-The runner needs `iptables` and `setcap` (`libcap2-bin`); both are on `ubuntu-latest` and `ubuntu-24.04-arm` today, but install them explicitly in the step so an image change fails loudly here rather than as a confusing test error.
+The step exists (`Transparent inbound tests (root)`), and it runs every `#[ignore]`d test in the `transparent` binary, so Task 4's test is picked up with no workflow change. One addition: Task 4's test calls `setcap`, so add `command -v setcap` beside the step's `command -v iptables`, for the same reason that one is there. If the binary is missing, `libcap2-bin` is the package.
 
 - [ ] **Step 2: README, CONFIG.md, the example, the smoke loop**
 
 **(review)** The first draft stopped at the README. AGENTS.md's rule is that every option reaches `CONFIG.md` with its default and `examples/` with a config that parses, and that the example joins the release smoke loop:
 
 - `CONFIG.md`: `redirect` (no fields) and `tproxy` (`udp_timeout`, default 300; `udp_nat_max`, default 4096), both Linux-only; `tproxy` loopback-only and `redirect` on any address (it has to be the wildcard on a router); `transport: udp` required for `tproxy` and refused for everything else. Say the things a user learns painfully otherwise: shoes installs no firewall rules or policy routes; `IP_TRANSPARENT` needs `CAP_NET_ADMIN`; a `tproxy` listener without the `ip rule`/`ip route local` pair binds happily and receives nothing; `udp_nat_max` above the descriptor limit is warned about, not refused.
-- `examples/transparent_proxy.yaml`: both listeners on awg-manager's ports (`51272` TCP, `51271` UDP) with a direct rule. Cert-free, so it qualifies for the loop.
-- `.github/workflows/build.yml`, `Smoke test binary`: add `transparent_proxy` to the **Linux** arm of the `case`, not the common list; validation refuses it on the other two, which is the behaviour, not a failure. A dry run does not bind, so it needs no capability.
+- `examples/transparent_proxy.yaml`: add the `tproxy` listener on `127.0.0.1:51271` beside the existing `redirect` one, and the `ip rule` / `ip route local` / mangle `TPROXY` lines to its header comment. Note the asymmetry the file will then show and explain it there: `redirect` on the wildcard, `tproxy` on loopback, each for the reason in the spec's security notes.
+- `.github/workflows/build.yml`: nothing to do. `transparent_proxy` is already in the Linux arm of the smoke loop, and a dry run does not bind, so the `tproxy` listener needs no capability there.
 
 
 Under "Supported Protocols" add a "Transparent proxy (Linux)" subsection with the two YAML blocks from the spec and the sentence that the kernel plumbing is the host's, with the `ip rule` / `ip route local` / `TPROXY` lines the test uses as the reference recipe.
@@ -1350,12 +1353,12 @@ This is the *second* router run. The first one is the legacy-tunnel mode and is 
 
 - [ ] **Step 4: ROADMAP**
 
-`ROADMAP.md` has no entry for any of this work. Add one section, "awg-manager engine", pointing at the spec and saying what is deliberately missing after slice 2 and what each gap costs a user: no logical or source rules (awg-manager's rule editor is limited to what `masks` expresses), no DNS rules or port-53 hijack outside TUN (DNS from LAN clients on the tproxy mode bypasses shoes unless the host redirects it), no Chrome ClientHello (unmeasured), no big-endian `mips` build and no shipped MIPS artifact. AGENTS.md: a gap is written down with what it costs to leave.
+The section exists ("awg-manager engine: what is left"). When `tproxy` lands, move its bullet from open to done, and replace "the `redirect` inbound has never met a router's kernel" with whatever the router run found. For reference, the first draft of this step asked for a section saying what is deliberately missing after slice 2 and what each gap costs a user: no logical or source rules (awg-manager's rule editor is limited to what `masks` expresses), no DNS rules or port-53 hijack outside TUN (DNS from LAN clients on the tproxy mode bypasses shoes unless the host redirects it), no Chrome ClientHello (unmeasured), no big-endian `mips` build and no shipped MIPS artifact. AGENTS.md: a gap is written down with what it costs to leave.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .github/workflows/test.yml .github/workflows/build.yml README.md CONFIG.md ROADMAP.md examples/transparent_proxy.yaml docs/plans/2026-09-11-awg-manager-engine.md
+git add .github/workflows/test.yml README.md CONFIG.md ROADMAP.md examples/transparent_proxy.yaml docs/plans/2026-09-11-awg-manager-engine.md
 git -c user.email=ayastrebov@gmail.com commit -m "ci+docs: transparent inbound tests under root; README section"
 ```
 
