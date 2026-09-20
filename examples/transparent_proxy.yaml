@@ -1,0 +1,31 @@
+# Transparent proxy for TCP (Linux only): the target of NAT REDIRECT.
+#
+# shoes installs no firewall rules; the host, or a manager such as
+# awg-manager, does. For a router's LAN that is, for example:
+#
+#   iptables -t nat -A PREROUTING -i br0 -p tcp ! -d 192.168.1.0/24 \
+#       -j REDIRECT --to-ports 51272
+#
+# A connection that rule diverts arrives here, and shoes forwards it to the
+# address it was originally going to, through the rules below.
+#
+# Bind the wildcard, not 127.0.0.1, when the clients are other hosts:
+# REDIRECT rewrites the destination to the address of the interface the packet
+# arrived on, so a loopback listener never sees it. A loopback bind is right
+# only for redirecting this host's own connections from the OUTPUT chain.
+#
+# A client that connects to this port directly is refused: the kernel, not
+# the client, says where a connection was going.
+- address: "0.0.0.0:51272"
+  protocol:
+    type: redirect
+  # The original destination is an IP address. Sniffing recovers the hostname
+  # so that domain rules can match.
+  sniff: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:1080"
+        protocol:
+          type: socks

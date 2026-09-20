@@ -53,6 +53,7 @@ mod quic_stream;
 mod quic_transport;
 mod reality;
 mod reality_client_handler;
+mod redirect_handler;
 mod resolver;
 mod routing;
 mod rule_set;
@@ -78,6 +79,7 @@ mod tcp;
 mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
+mod tproxy;
 mod trojan_handler;
 mod tuic;
 #[cfg(any(unix, windows))]

@@ -46,6 +46,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
 - [Desktop clients](#desktop-clients)
 - [Apple integration: what the first consumer asked for](#apple-integration-what-the-first-consumer-asked-for)
+- [awg-manager engine: what is left](#awg-manager-engine-what-is-left)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
@@ -663,6 +664,43 @@ The same callback does not exist on Android: the JNI `start` still gets its
 failures through `getLastError()` and a poll of `isRunning()`. The Rust side
 is shared, so the Kotlin half is a `StopListener` interface and a global
 reference; the question is whether anyone is asking.
+
+## awg-manager engine: what is left
+
+shoes as the engine behind awg-manager on Keenetic routers, in place of a
+61 MB sing-box fork. Design in `docs/specs/2026-09-11-awg-manager-engine.md`,
+tasks in `docs/plans/2026-09-11-awg-manager-engine.md`.
+
+Done: the process contract (`check`, `version`, `SIGHUP`), the Clash API
+slice awg-manager's health probe and log tail need, aarch64 and mipsel builds
+(`scripts/build-keenetic.sh`), and the `redirect` inbound for transparent TCP.
+That is enough for awg-manager's legacy-tunnel mode, which has not been run on
+a router yet: it waits on awg-manager's emitter, not on anything here.
+
+Open, with what each costs while it stays open:
+
+- **No `tproxy` UDP inbound.** awg-manager's tproxy router mode is `redirect`
+  for TCP plus `tproxy` for UDP; with only the first, a router's LAN gets TCP
+  through shoes and UDP (QUIC, DNS, games, VoIP) not at all, so the mode cannot
+  be switched over. Plan tasks 3 and 4.
+- **The `redirect` inbound has never met a router's kernel.** It is tested
+  under a real NAT rule in CI, from the `OUTPUT` chain of one host. The
+  `PREROUTING` path from a LAN client on Keenetic's 4.9 kernel is the one that
+  matters and is untried.
+- **No logical or source-address rules, no per-rule UDP timeout, no `.srs`
+  encoder.** awg-manager's rule editor emits all four; until they exist its
+  emitter has to refuse those rules for shoes. Spec slice 3.
+- **No DNS rules, and no port-53 hijack outside TUN.** On the tproxy mode a
+  LAN client's DNS goes wherever the host's firewall sends it, not through
+  shoes' resolver, and awg-manager's DNS rewrites have nowhere to land. Spec
+  slice 4.
+- **No Chrome-shaped ClientHello.** Unmeasured rather than known to matter;
+  the first router run with a Reality link is the measurement. Spec slice 5,
+  and see [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting).
+- **MIPS is a build, not a release.** mipsel comes from a script on a
+  developer's machine; big-endian `mips`, which awg-manager also ships for, has
+  not been attempted; and nothing beyond `version` and `check` has run on the
+  target, so the lock-backed 64-bit atomics it uses are compiled and untested.
 
 ## Hysteria: the rest of the surface
 

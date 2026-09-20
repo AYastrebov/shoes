@@ -37,7 +37,7 @@ Corrections made in this review, each marked **(review)** where it lands:
 ## Global Constraints
 
 - **Linux only for the two inbounds.** `redirect` and `tproxy` are refused at validation on every other OS with a message naming Linux; every `libc` call sits under `#[cfg(target_os = "linux")]`, and the config types exist everywhere so a config parses the same on a Mac.
-- **Loopback only** (spec, "Security notes"): a `redirect` or `tproxy` bind on a non-loopback address is a validation error.
+- **Loopback only, for `tproxy`** (spec, "Security notes"): a `tproxy` bind on a non-loopback address is a validation error. `redirect` was under the same rule until Task 2 found it cannot be: `REDIRECT` delivers to the LAN interface's address, so awg-manager's own `redirect-in` listens on `0.0.0.0`. A direct connection is refused instead.
 - **No debounce on `SIGHUP`** (spec, "Slice 1"); `--no-reload` does not disable it.
 - **`udp_nat_max` bounds file descriptors**: sessions across all clients of a `tproxy` listener never exceed it, and neither do reply sockets. Both are enforced by a budget shared across the listener's clients (Tasks 3 and 4), not by a per-client figure. **(review)**
 - **Registry**: both inbounds call `connection_registry::register` / `counted` at the accept edge with a label from `tcp_server::inbound_label`, exactly as `src/tcp/tcp_server.rs` does for the others. Unconditional: the no-feature build gets the no-op versions.
@@ -299,6 +299,16 @@ git -c user.email=ayastrebov@gmail.com commit -m "shoes: check and version subco
 
 Spec: "Slice 2" → "`redirect`".
 
+**Status:** done on `feature/redirect-inbound`. What was built differs from the steps below in five places, and the code is the reference where they disagree:
+
+1. **`Some` from `SO_ORIGINAL_DST` does not mean redirected.** Step 1's first test failed on the development host for a reason the plan had not imagined: with conntrack loaded, a connection dialled straight at the listener reports the listener's own address, so the handler's `None` check never fired and a direct connection made shoes dial itself without end. `AsyncStream for TcpStream` now compares the answer with the local address (canonical forms) and reports `None` when they match. `tests/transparent.rs` has a rootless test for it that hangs and fails without the comparison.
+2. **No loopback rule.** `REDIRECT` in `PREROUTING` rewrites the destination to the inbound interface's address, not `127.0.0.1`; awg-manager binds its sing-box `redirect-in` to `0.0.0.0` for that reason (`internal/singbox/router/service_lifecycle.go`). Validation accepts any IP; item 1 is what makes that safe.
+3. **Only the `Redirect` variant was added.** `Tproxy` waits for Task 4: adding it now would make validation accept a config that then hits `todo!()` in `start_tcp_or_quic_servers`. Task 4 adds the variant, its validation and its `unreachable!` factory arm together.
+4. **`redirect` nested in TLS or WebSocket is refused**, which the plan did not cover: the handler would be handed a wrapper with no socket to ask.
+5. **`inbound_label` needed no arm.** Its fallback lowercases `Display`, which gives `redirect@…`. `OutboundCountingStream` got no forward either: it wraps outbound streams, which no `redirect` handler ever sees.
+
+The root-gated test runs in CI (`Transparent inbound tests (root)` in `test.yml`); it is built unprivileged and run under `sudo` so `target/` stays the runner's. It was not run on the development host, where `sudo` needs a password.
+
 **Files:**
 - Modify: `src/async_stream.rs` — the `AsyncStream` trait and its impls for `TcpStream`, `PermitStream`, `Box<T>`, `&mut T` (`:173, 235, 313, 528-529` at `89aebfa`)
 - Modify: `src/connection_registry.rs:160` (forward the method on `CountingStream`). This one is not optional: the accept loop wraps every stream in `counted` before the handler sees it, so without the forward a `redirect` listener refuses every connection in a `clash-api` build and works in a default one.
@@ -310,7 +320,7 @@ Spec: "Slice 2" → "`redirect`".
 **Interfaces:**
 - Produces: `AsyncStream::original_destination(&self) -> Option<SocketAddr>` (default `None`); `ServerProxyConfig::Redirect {}`; `RedirectServerHandler::new(proxy_selector)`.
 
-- [ ] **Step 1: Failing unit test**
+- [x] **Step 1: Failing unit test**
 
 In `src/async_stream.rs` tests:
 
@@ -360,12 +370,12 @@ And in `src/redirect_handler.rs` tests, with the crate's `TestStream` or a `toki
 
 `allow_everything()` is the helper in `src/tcp/tcp_forward.rs` tests; copy it (it is ten lines) rather than making it `pub`.
 
-- [ ] **Step 2: Run, expect failure**
+- [x] **Step 2: Run, expect failure**
 
 Run: `cargo test --locked original_destination redirect`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: The trait method and the Linux impl**
+- [x] **Step 3: The trait method and the Linux impl**
 
 In `src/async_stream.rs`:
 
@@ -450,7 +460,7 @@ If `v6` is unused by anything but `original_destination` at this point it is sti
 
 Declare `mod tproxy;` in `src/lib.rs` and `src/main.rs` (unconditionally; the file is empty of code off Linux).
 
-- [ ] **Step 4: The handler, the variant, validation, the factory**
+- [x] **Step 4: The handler, the variant, validation, the factory**
 
 `src/redirect_handler.rs`:
 
@@ -565,7 +575,7 @@ Also the existing `if server_config.transport != Transport::Tcp && server_config
 
 `src/tcp/tcp_server.rs::inbound_label`: `P::Redirect { .. } => "redirect".to_string()`, `P::Tproxy { .. } => "tproxy".to_string()`, matching the arms around them. The match is exhaustive, so the build fails until these exist.
 
-- [ ] **Step 5: The root-gated netfilter test**
+- [x] **Step 5: The root-gated netfilter test**
 
 `tests/transparent.rs`:
 
@@ -679,7 +689,7 @@ async fn redirect_forwards_to_the_original_destination() {
 
 A panic between `iptables -A` and `iptables -D` would leave the rule installed on the development host, which is why the body runs inside `timeout(...)` and the assertion comes after the delete. Keep that order when editing.
 
-- [ ] **Step 6: Run, gates, commit**
+- [x] **Step 6: Run, gates, commit**
 
 ```bash
 cargo test --locked original_destination redirect validate

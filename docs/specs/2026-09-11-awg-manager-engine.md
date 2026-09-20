@@ -143,7 +143,7 @@ Every sing-box feature awg-manager emits or calls, against shoes today.
 | Clash API: proxies, select, delay, logs, connections | `clash.go` | Clash spec slices 1–3 | Clash spec |
 | `selector` with `default`, `urltest` | `subscription/materialize.go` | Clash spec slices 2–3 | Clash spec |
 | `cache_file` selection persistence | `operator_baseconfig.go:1146` | Clash spec `state_file` | Clash spec |
-| `redirect` inbound (TCP, `SO_ORIGINAL_DST`) | `service_lifecycle.go:1252` | **no** | 2 |
+| `redirect` inbound (TCP, `SO_ORIGINAL_DST`) | `service_lifecycle.go:1252` | yes | done |
 | `tproxy` inbound (UDP, `IP_TRANSPARENT`), `udp_timeout`, `udp_nat_max` | `service_lifecycle.go:1240` | **no** | 2 |
 | `tun` with routes left to the host | `config_fakeip.go:77` | yes, smoltcp stack | — |
 | Fake IP with configurable ranges | `config_fakeip.go:93` | yes (`fake_ip` on TUN) | — |
@@ -246,7 +246,7 @@ connection, and the only question is where it was going.
 ### `redirect`
 
 ```yaml
-- address: 127.0.0.1:51272
+- address: 0.0.0.0:51272
   protocol:
     type: redirect
   rules: [...]
@@ -274,6 +274,25 @@ itself.
 
 The destination is an IP and port; sniffing gives rules a hostname, as it
 does for every other inbound.
+
+Two things the implementation found that this section first got wrong
+(2026-09-20):
+
+- **`Some` from the socket option does not mean redirected.** Wherever
+  conntrack is loaded it tracks ordinary connections too, and for a client
+  that dialled the listener directly the option answers with the listener's
+  own address. Forwarding that is shoes dialling itself without end. The
+  `TcpStream` implementation therefore compares the answer with the socket's
+  local address, in canonical form so a v4-mapped local address matches, and
+  reports `None` when they are equal.
+- **The listener cannot be loopback-only.** `REDIRECT` in `PREROUTING`
+  rewrites the destination to the primary address of the interface the packet
+  arrived on, not to `127.0.0.1`; a loopback listener never sees a LAN
+  client, and the kernel answers RST. awg-manager binds its `redirect-in` to
+  `0.0.0.0` for exactly this reason
+  (`internal/singbox/router/service_lifecycle.go`, the comment above
+  `redirectListen`, citing its commit `96a61c77`). See
+  [Security notes](#security-notes) for what replaces the rule.
 
 ### `tproxy`
 
@@ -449,7 +468,7 @@ emits for sing-box. Right: what it emits for shoes.
 | sing-box | shoes |
 |---|---|
 | `inbounds[].type: mixed`, `listen`, `listen_port`, `users` | `- address: <listen>:<port>`, `protocol: { type: mixed, username, password }` (one user; a second user is a second listener) |
-| `inbounds[].type: redirect` | `protocol: { type: redirect }` (slice 2) |
+| `inbounds[].type: redirect`, `listen: 0.0.0.0` | `address: 0.0.0.0:<port>`, `protocol: { type: redirect }` |
 | `inbounds[].type: tproxy`, `udp_timeout`, `udp_nat_max` | `transport: udp`, `protocol: { type: tproxy, udp_timeout, udp_nat_max }` (slice 2) |
 | `inbounds[].type: tun`, `interface_name`, `address`, `mtu`, `auto_route: false` | `- device_name`, `address`, `netmask`, `mtu`; routes stay the host's |
 | `outbounds[].tag` | `name` on the `ClientConfig`; the key everywhere else |
@@ -501,11 +520,16 @@ slice.
 ## Security notes
 
 - **`redirect` and `tproxy` listeners trust the kernel.** They forward
-  whatever arrives to wherever the kernel says it was going. Bound to
-  loopback by default; a non-loopback bind is refused at validation, the
-  same rule as the Clash API's, because a transparent listener reachable
-  from the LAN is an open proxy to the original destination of any packet
-  a host can craft.
+  whatever arrives to wherever the kernel says it was going. For `tproxy` a
+  non-loopback bind is refused at validation: `TPROXY --on-ip 127.0.0.1`
+  delivers to a loopback socket, and awg-manager found a wildcard bind there
+  to be a self-sustaining flow loop (its issue #689). For `redirect` the
+  bind cannot be restricted, because `REDIRECT` delivers to the LAN
+  interface's address. What stands in for the rule is that the client never
+  chooses the destination: the kernel records it, and a connection that
+  reaches the port without being redirected reports the listener's own
+  address and is refused. A reachable `redirect` port is therefore a port
+  that resets, not an open proxy.
 - **`IP_TRANSPARENT` needs `CAP_NET_ADMIN`.** The listener reports the
   failure to set it as a startup error naming the capability rather than
   falling through to a socket that receives nothing.
@@ -565,6 +589,8 @@ Slice 1 and 2 tests, at the level where a missing call is visible:
 | Swap or second engine | Second engine, opt-in per mode | The gap table has six slices; the legacy mode works with one |
 | Config translation | awg-manager emits shoes YAML from its model | It already parses every link format itself; a Clash importer in shoes was rejected on 2026-09-09 |
 | Where redirect reads the destination | A default method on `AsyncStream`, implemented on `TcpStream` | The handler only sees `dyn AsyncStream`; the accept loop has the socket |
+| `redirect` bind address | Any IP; a direct connection is refused instead | `REDIRECT` rewrites to the interface address, so loopback-only cannot work on a router |
+| `redirect` nested inside TLS or WebSocket | Refused at validation | The handler would be handed a wrapper with no socket option to read |
 | tproxy UDP model | `AsyncTargetedMessageStream` into the existing `UdpRouter` | The router already does per-destination sessions, routing and expiry |
 | Reply spoofing | `IP_TRANSPARENT` sockets in a per-client LRU keyed by remote, total bounded by `udp_nat_max` | The only portable way; a cache rather than one per session because the router owns sessions and the stream owns sockets |
 | `udp_nat_max` enforcement | One budget per listener, shared by its per-client routers | A per-router cap multiplies by the number of clients |

@@ -274,6 +274,42 @@ protocol:
   targets: string | [string]   # Target address(es)
 ```
 
+### Redirect (transparent TCP, Linux)
+```yaml
+- address: "0.0.0.0:51272"
+  protocol:
+    type: redirect             # No fields
+```
+
+The target of the kernel's NAT `REDIRECT`. There is nothing to configure
+because there is no protocol: the connection arrives as the client sent it, and
+shoes reads where it was going from the socket (`SO_ORIGINAL_DST`) and forwards
+it there through the listener's `rules`. Add `sniff: true` to give domain rules
+a hostname, since the original destination is always an IP address.
+
+- **Linux only**, TCP only, and only as a listener's own protocol. Each of the
+  other cases is refused when the config is loaded.
+- **shoes installs no firewall rules.** Without a `REDIRECT` rule sending
+  traffic to the port, the listener starts and nothing ever arrives. See
+  `examples/transparent_proxy.yaml` for a rule.
+- **Bind the wildcard when the clients are other hosts.** `REDIRECT` in
+  `PREROUTING` rewrites the destination to the address of the interface the
+  packet arrived on, not to `127.0.0.1`, so a listener on `127.0.0.1` never sees
+  a LAN client and the kernel answers with a reset. `127.0.0.1` is right only
+  for this host's own connections redirected from `OUTPUT`.
+- **A direct connection to the port is refused**, which is what keeps a wildcard
+  bind from being an open proxy. The kernel decides the destination, never the
+  client; a connection nobody redirected reports the listener's own address,
+  and shoes closes it rather than dial itself.
+- **Exclude the host's own addresses from the rule** (`! -d` the LAN subnet and
+  the WAN address). shoes dials the original destination *from this host*, so a
+  LAN client redirected on its way to the router's admin port or SSH arrives
+  there as a local connection, past any `INPUT` rule that keeps the LAN out.
+  shoes cannot tell such a destination from any other; the rule has to.
+- **Exclude shoes' own traffic from the rule** (`-m owner ! --uid-owner`, a
+  mark, or the outbound interface). shoes dials the same address the client
+  did, and a rule that matches that dial sends it straight back.
+
 ### Hysteria2
 ```yaml
 protocol:

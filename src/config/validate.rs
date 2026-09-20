@@ -954,6 +954,13 @@ fn validate_server_config(
         )?;
     }
 
+    // `redirect` is valid here and nowhere else: the arm for it in
+    // `validate_server_proxy_config` is the refusal for the nested case, so
+    // the top-level one is checked on its own and does not go through it.
+    if matches!(server_config.protocol, ServerProxyConfig::Redirect {}) {
+        return validate_redirect_listener(server_config);
+    }
+
     validate_server_proxy_config(
         &mut server_config.protocol,
         client_groups,
@@ -964,6 +971,49 @@ fn validate_server_config(
         outbounds,
     )?;
 
+    Ok(())
+}
+
+/// Where a `redirect` listener may run. It forwards whatever the kernel
+/// redirected to wherever the kernel says it was going.
+fn validate_redirect_listener(server_config: &ServerConfig) -> std::io::Result<()> {
+    // SO_ORIGINAL_DST is netfilter's. Refused rather than accepted and
+    // useless: elsewhere every connection would be turned away at runtime.
+    if !cfg!(target_os = "linux") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the redirect inbound needs Linux: it reads SO_ORIGINAL_DST, which NAT REDIRECT sets",
+        ));
+    }
+
+    if server_config.transport != Transport::Tcp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the redirect inbound is TCP only; NAT REDIRECT has no original destination to \
+             read on any other transport",
+        ));
+    }
+
+    // NAT REDIRECT delivers to a port, so a Unix socket can never receive one.
+    if let super::types::BindLocation::Path(_) = server_config.bind_location {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the redirect inbound listens on a TCP address, not a Unix socket: NAT REDIRECT \
+             delivers to a port",
+        ));
+    }
+
+    // No loopback rule, deliberately, although the first design had one.
+    // REDIRECT in PREROUTING rewrites the destination to the primary address
+    // of the interface the packet came in on, not to 127.0.0.1, so a loopback
+    // listener never sees a LAN client's connection and the kernel answers
+    // RST. awg-manager binds its sing-box `redirect-in` to 0.0.0.0 for that
+    // reason (`internal/singbox/router/service_lifecycle.go`, "redirect-in →
+    // 0.0.0.0"). What keeps a reachable listener from being an open proxy is
+    // that a client cannot choose the original destination: the kernel
+    // records it, and a connection dialled at the listener directly reports
+    // the listener's own address, which `original_destination` turns into a
+    // refusal.
     Ok(())
 }
 
@@ -1650,6 +1700,16 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 "NaiveProxy must be used inside a TLS or Reality protocol. \
                  Configure it as the inner protocol of tls: or reality: targets.",
+            ));
+        }
+        // Reached only when nested; see `validate_server_config`. Inside
+        // TLS or WebSocket the handler is handed a wrapper, not the accepted
+        // socket, so there is no original destination to read.
+        ServerProxyConfig::Redirect {} => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "redirect can only be a listener's own protocol, not an inner one: it reads the \
+                 original destination from the accepted socket",
             ));
         }
         ServerProxyConfig::Vless { user_id, .. } => {
@@ -5004,5 +5064,79 @@ mod handshake_chain_tests {
             "got {:?}",
             set.iter().collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_validation_tests {
+    use crate::config::load_config_str;
+
+    fn validate(yaml: &str) -> std::io::Result<()> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    fn refusal(yaml: &str) -> String {
+        validate(yaml)
+            .expect_err("this redirect listener must be refused")
+            .to_string()
+    }
+
+    /// The wildcard is the bind a router needs: REDIRECT rewrites to the LAN
+    /// interface's address, which a loopback listener never receives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_redirect_listener_is_accepted_on_loopback_and_on_the_wildcard() {
+        for bind in [
+            "127.0.0.1:51272",
+            "[::1]:51272",
+            "0.0.0.0:51272",
+            "[::]:51272",
+        ] {
+            validate(&format!(
+                "- address: \"{bind}\"\n  protocol: {{type: redirect}}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{bind}: {e}"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_redirect_listener_on_a_unix_socket_is_refused() {
+        let err = refusal("- path: /tmp/shoes-redirect.sock\n  protocol: {type: redirect}\n");
+        assert!(err.contains("Unix socket"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn redirect_on_another_transport_is_refused() {
+        let err = refusal(
+            "- address: \"127.0.0.1:51272\"\n  transport: udp\n  protocol: {type: redirect}\n",
+        );
+        assert!(err.contains("TCP only"), "{err}");
+    }
+
+    /// Nested, the handler would be handed a WebSocket or TLS wrapper with
+    /// no socket option to read, and refuse every connection at runtime.
+    #[test]
+    fn redirect_as_an_inner_protocol_is_refused() {
+        let err = refusal(
+            r#"
+- address: "127.0.0.1:51272"
+  protocol:
+    type: ws
+    targets:
+      - matching_path: /
+        protocol: {type: redirect}
+"#,
+        );
+        assert!(err.contains("not an inner one"), "{err}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn redirect_is_refused_off_linux_by_name() {
+        let err = refusal("- address: \"127.0.0.1:51272\"\n  protocol: {type: redirect}\n");
+        assert!(err.contains("Linux"), "{err}");
     }
 }

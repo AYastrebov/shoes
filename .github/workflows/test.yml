@@ -94,6 +94,20 @@ jobs:
       - name: Run tests with the Clash API enabled
         run: cargo test --locked --features clash-api
 
+      # The redirect inbound under a real NAT rule, which needs root. Built
+      # as the runner and run under sudo, so nothing in target/ ends up owned
+      # by root and the cache step can still read it. iptables is named
+      # explicitly so an image that drops it fails here, not as a test error.
+      - name: Transparent inbound tests (root)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v iptables
+          test_bin=$(cargo test --locked --test transparent --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.name == "transparent") | .executable')
+          sudo "$test_bin" --ignored
+
       - name: Guard the mobile builds against the controller
         run: scripts/check-mobile-features.sh
 

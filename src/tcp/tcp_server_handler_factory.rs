@@ -256,6 +256,9 @@ pub fn create_tcp_server_handler(
                 client_proxy_selector.clone(),
             ))
         }
+        ServerProxyConfig::Redirect {} => Box::new(
+            crate::redirect_handler::RedirectServerHandler::new(client_proxy_selector.clone()),
+        ),
         ServerProxyConfig::Anytls {
             users,
             padding_scheme,
