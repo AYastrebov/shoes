@@ -304,7 +304,7 @@ Spec: "Slice 2" → "`redirect`".
 1. **`Some` from `SO_ORIGINAL_DST` does not mean redirected.** Step 1's first test failed on the development host for a reason the plan had not imagined: with conntrack loaded, a connection dialled straight at the listener reports the listener's own address, so the handler's `None` check never fired and a direct connection made shoes dial itself without end. `AsyncStream for TcpStream` now compares the answer with the local address (canonical forms) and reports `None` when they match. `tests/transparent.rs` has a rootless test for it that hangs and fails without the comparison.
 2. **No loopback rule.** `REDIRECT` in `PREROUTING` rewrites the destination to the inbound interface's address, not `127.0.0.1`; awg-manager binds its sing-box `redirect-in` to `0.0.0.0` for that reason (`internal/singbox/router/service_lifecycle.go`). Validation accepts any IP; item 1 is what makes that safe.
 3. **Only the `Redirect` variant was added.** `Tproxy` waits for Task 4: adding it now would make validation accept a config that then hits `todo!()` in `start_tcp_or_quic_servers`. Task 4 adds the variant, its validation and its `unreachable!` factory arm together.
-4. **`redirect` nested in TLS or WebSocket is refused**, which the plan did not cover: the handler would be handed a wrapper with no socket to ask.
+4. **`redirect` nested in TLS or WebSocket is refused**, which the plan did not cover: the handler would be handed a wrapper with no socket to ask. So is a link-local IPv6 original destination, whose interface scope `NetLocation` cannot carry to the dial.
 5. **`inbound_label` needed no arm.** Its fallback lowercases `Display`, which gives `redirect@…`. `OutboundCountingStream` got no forward either: it wraps outbound streams, which no `redirect` handler ever sees.
 
 The root-gated test runs in CI (`Transparent inbound tests (root)` in `test.yml`); it is built unprivileged and run under `sudo` so `target/` stays the runner's. It was not run on the development host, where `sudo` needs a password.
@@ -532,7 +532,9 @@ impl TcpServerHandler for RedirectServerHandler {
 
 with `fn default_udp_timeout_secs() -> u64 { 300 }` and `fn default_udp_nat_max() -> usize { 4096 }`, and `Display` arms `Self::Redirect { .. } => write!(f, "Redirect")`, `Self::Tproxy { .. } => write!(f, "TPROXY")`. `Redirect {}` with braces so `type: redirect` parses as a unit-like tagged variant the way the others do.
 
-`src/config/validate.rs`, in `validate_server_config` (after the transport checks around `:850`):
+`src/config/validate.rs`, in `validate_server_config` (after the transport checks around `:850`).
+
+**Superseded for `redirect`**, which has no loopback rule (Status, item 2) and is validated by `validate_redirect_listener` as built. The listing below, loopback check included, is still the shape Task 4 wants for `tproxy`, where the rule holds; read it as that.
 
 ```rust
     let transparent = matches!(server_config.protocol, ServerProxyConfig::Redirect { .. } | ServerProxyConfig::Tproxy { .. });
@@ -705,6 +707,15 @@ git -c user.email=ayastrebov@gmail.com commit -m "redirect inbound: forward a NA
 
 Spec: "Slice 2" → "`tproxy`" (`udp_timeout`, `udp_nat_max`).
 
+**Status:** done on `feature/redirect-inbound`, as its own commit. Differences from the steps below, where the code is the reference:
+
+1. **No re-export from `src/routing/mod.rs` yet.** `RouterLimits` and `run_udp_routing_with_limits` have no caller outside the module until Task 4, and `-D warnings` rejects an unused `pub use`. Task 4 adds `pub use udp_router::{RouterLimits, ..., run_udp_routing_with_limits}` with its consumer. Nothing inside the module is dead: `run_udp_routing` delegates to the new function with `RouterLimits::default()`.
+2. **The tests drive the real router end to end**, through the module's scripted server stream against loopback echo sockets, rather than asserting on `sessions.len()`. What they observe is what a client would: a datagram over the cap is never answered, and one sent after the slot is freed is.
+3. **One `warn!` per episode, not per datagram.** The first refusal warns, later ones log at `debug!`, and a session ending re-arms the warning.
+4. **The timeout a session is created with is untestable, and says so.** Reintroducing the 200-second constant at the `expiry_queue.insert` site was caught by no test, because the first datagram's write resets the timer at once on every path tried. The other use, in `reset_expiry`, is covered twice: by a destination that answers and by one that never does. The second test's comment records this rather than claiming coverage it does not have.
+
+Mutations run, each restored afterwards: no per-router cap (the cap test fails, alone); the budget permit dropped instead of held by the session (the shared-budget test fails, alone); the default timeout in `reset_expiry` (both expiry tests fail).
+
 **Files:**
 - Modify: `src/routing/udp_router.rs` — `SESSION_TIMEOUT_SECS` and its two uses, `UdpRouter::new`, the session-create path beside `pending_creates`, `run_udp_routing`
 - Modify: `src/routing/mod.rs` — the re-export
@@ -712,7 +723,7 @@ Spec: "Slice 2" → "`tproxy`" (`udp_timeout`, `udp_nat_max`).
 **Interfaces:**
 - Produces: `pub struct RouterLimits { pub session_timeout: Duration, pub max_sessions: usize, pub shared_budget: Option<Arc<Semaphore>> }` with `Default` = today's behaviour (200 s, `usize::MAX`, no budget); `run_udp_routing_with_limits(server, selector, resolver, need_initial_flush, limits)`; `run_udp_routing` unchanged, delegating with `RouterLimits::default()`.
 
-- [ ] **Step 1: Failing test**
+- [x] **Step 1: Failing test**
 
 In `udp_router.rs` tests, using whatever fake targeted stream the module's tests already build (there is a test harness around line 1400; reuse its stream type):
 
@@ -729,12 +740,12 @@ In `udp_router.rs` tests, using whatever fake targeted stream the module's tests
 
 Write it against the existing harness's shape: feed a datagram to destination A, poll, assert `sessions.len() == 1`; feed one to B, poll, assert still 1 and that B's datagram was dropped with a `warn!`; advance time past 200 ms (`tokio::time::pause()` + `advance`), poll, assert 0; feed B, poll, assert 1.
 
-- [ ] **Step 2: Run, expect failure**
+- [x] **Step 2: Run, expect failure**
 
 Run: `cargo test --locked udp_router::tests::the_session_cap`
 Expected: FAIL to compile (`RouterLimits`).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Per-listener session policy. The defaults are what every UDP inbound had
@@ -788,7 +799,7 @@ Extend Step 1's test with the shared case: two routers on one `Semaphore::new(1)
 
 `run_udp_routing_with_limits` is `run_udp_routing` with the extra argument; `run_udp_routing` calls it with `RouterLimits::default()`. Export both and `RouterLimits` from `src/routing/mod.rs`.
 
-- [ ] **Step 4: Run, commit**
+- [x] **Step 4: Run, commit**
 
 ```bash
 cargo test --locked udp_router
@@ -1193,9 +1204,10 @@ pub use linux::*;
 - `buf.resize(MAX_DATAGRAM, 0)` after a `split_to` re-zeroes 64 KiB per datagram, which is its own per-packet cost. If that shows in a profile, keep a plain `Vec` for `recvmsg` and `copy_from_slice` into a `BytesMut` sized to `n`; either way the rule is one amortised allocation, not one `Vec` per datagram. Pick one, measure, and say which in the comment.
 - `inbound_label(&config.protocol, ..)` borrows a field while `config.rules` and `config.bind_location` have been moved out. That compiles, because the moves are of other fields and the two `tproxy` fields are `Copy`; if a later edit makes it stop compiling, borrow the label before the moves rather than cloning the protocol.
 - The registry entry is per LAN client, not per UDP session, so its destination stays unset and `/connections` shows one `tproxy@…` row per client. The spec's testing section asked for the original destination there; that holds for `redirect` and is given up for `tproxy`, where a row per destination would mean a registry write on the session-create path. Recorded in the spec's decisions.
+- **Bound `udp_timeout` at validation, not only below.** `RouterLimits::session_timeout` goes straight into `DelayQueue::insert`, which panics past the timer's maximum (about two years), and the panic would be inside the router task. Refuse `udp_timeout` above 86400 with a message saying so, beside the existing refusal of zero for either field. `RouterLimits` itself stays unvalidated: it is an internal type and its one producer is this config.
 - `raise_nofile_limit(udp_nat_max)` is the spec's "RSS budget" paragraph, which no task carried: `getrlimit(RLIMIT_NOFILE)`, raise the soft limit to the hard one, log the figure, and `warn!` if `2 * udp_nat_max + 64` (sessions, reply sockets, and everything else the process holds) exceeds it. It warns rather than refuses because the limit is the host's to change and the listener degrades by dropping, not by failing. Entware's default soft limit is 1024 on some models, below the 4096 default, so this warning is expected on a router and the router run (Task 5) should record what it said.
 
-`src/routing/mod.rs:10` exports only `ServerStream` and `run_udp_routing`; extend it to `pub use udp_router::{RouterLimits, ServerStream, run_udp_routing, run_udp_routing_with_limits};` (Task 3 should already have done this; verify).
+Task 3 deliberately left the re-export for this task, where it gains a caller. `src/routing/mod.rs:10` exports only `ServerStream` and `run_udp_routing`; extend it to `pub use udp_router::{RouterLimits, ServerStream, run_udp_routing, run_udp_routing_with_limits};`.
 
 `src/tcp/tcp_server.rs`, replacing the `todo!()`:
 
@@ -1318,7 +1330,7 @@ The runner needs `iptables` and `setcap` (`libcap2-bin`); both are on `ubuntu-la
 
 **(review)** The first draft stopped at the README. AGENTS.md's rule is that every option reaches `CONFIG.md` with its default and `examples/` with a config that parses, and that the example joins the release smoke loop:
 
-- `CONFIG.md`: `redirect` (no fields) and `tproxy` (`udp_timeout`, default 300; `udp_nat_max`, default 4096), both Linux-only and loopback-only, `transport: udp` required for `tproxy` and refused for everything else. Say the things a user learns painfully otherwise: shoes installs no firewall rules or policy routes; `IP_TRANSPARENT` needs `CAP_NET_ADMIN`; a `tproxy` listener without the `ip rule`/`ip route local` pair binds happily and receives nothing; `udp_nat_max` above the descriptor limit is warned about, not refused.
+- `CONFIG.md`: `redirect` (no fields) and `tproxy` (`udp_timeout`, default 300; `udp_nat_max`, default 4096), both Linux-only; `tproxy` loopback-only and `redirect` on any address (it has to be the wildcard on a router); `transport: udp` required for `tproxy` and refused for everything else. Say the things a user learns painfully otherwise: shoes installs no firewall rules or policy routes; `IP_TRANSPARENT` needs `CAP_NET_ADMIN`; a `tproxy` listener without the `ip rule`/`ip route local` pair binds happily and receives nothing; `udp_nat_max` above the descriptor limit is warned about, not refused.
 - `examples/transparent_proxy.yaml`: both listeners on awg-manager's ports (`51272` TCP, `51271` UDP) with a direct rule. Cert-free, so it qualifies for the loop.
 - `.github/workflows/build.yml`, `Smoke test binary`: add `transparent_proxy` to the **Linux** arm of the `case`, not the common list; validation refuses it on the other two, which is the behaviour, not a failure. A dry run does not bind, so it needs no capability.
 
