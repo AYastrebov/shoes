@@ -27,7 +27,9 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+// Std's on every target that has one; see `util::AtomicU64`.
+use crate::util::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
