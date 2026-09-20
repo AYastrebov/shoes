@@ -9,7 +9,7 @@
 //! (`tun/tun_windows.go`: shutdown sets the read-wait event and the reader
 //! observes the closed flag).
 
-use std::{io, sync::Arc};
+use std::{collections::VecDeque, io, sync::Arc};
 
 use log::{trace, warn};
 use smoltcp::{
@@ -85,8 +85,10 @@ pub struct TcpStackWintun {
     /// The session, held here so Drop can signal shutdown; the adapter and
     /// library handles ride along inside and outlive the stack thread.
     tun: Arc<OpenedWintun>,
-    /// Wake event shared with the device's wait; None if creation failed.
-    wake_event: Option<Arc<WakeEvent>>,
+    // The wake event is not held here: the device (on the stack thread) and
+    // the notifier's waker closure each own an `Arc<WakeEvent>` clone, which is
+    // what keeps it alive. Retaining a third, unread copy here was only dead
+    // weight — and a dead-code warning on the binary build.
 }
 
 impl Drop for TcpStackWintun {
@@ -116,19 +118,19 @@ impl TcpStackWintun {
 
         let session = tun.session.clone();
         let device_wake = wake_event.clone();
+        // The stack thread's wake primitive: SetEvent on the wake event the
+        // device's `wait` also sleeps on. Handed to the notifier, which fires
+        // it only while the thread is parked.
+        let wake = event_waker(&wake_event);
         // The session event handles are fetched inside the closure, on the
         // stack thread itself: raw HANDLEs are not Send, and nothing outside
         // that thread needs them. The wake event travels as an Arc, whose
         // Send is the deliberate exception WakeEvent exists to declare.
-        let handle = StackHandle::spawn("shoes-smoltcp-wintun", options, move || {
+        let handle = StackHandle::spawn("shoes-smoltcp-wintun", options, wake, move || {
             WintunDevice::new(session, device_wake, options.mtu)
         })?;
 
-        Ok(Self {
-            handle,
-            tun,
-            wake_event,
-        })
+        Ok(Self { handle, tun })
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
@@ -151,23 +153,32 @@ impl TcpStackWintun {
         self.handle.is_running()
     }
 
-    /// A waker for the UDP response path: sets the wake event so the stack
-    /// thread leaves `WaitForMultipleObjects` and drains the response
-    /// channel now rather than on the wait timeout.
+    /// A waker for the UDP response path: queue the datagram, then call this,
+    /// and the stack thread drains the response channel now rather than on the
+    /// wait timeout. Routed through the notifier, which sets the wake event
+    /// only when the thread is asleep and coalesces a burst into one signal.
     pub fn udp_waker(&self) -> StackWaker {
-        match &self.wake_event {
-            Some(event) => {
-                let event = event.clone();
-                Arc::new(move || {
-                    // SAFETY: the Arc keeps the handle alive for the
-                    // closure's lifetime; SetEvent is thread-safe.
-                    unsafe {
-                        SetEvent(event.0);
-                    }
-                })
-            }
-            None => Arc::new(|| {}),
+        self.handle.waker()
+    }
+}
+
+/// The stack thread's wake primitive: `SetEvent` on the wake event, which
+/// gets it out of `WaitForMultipleObjects`. Returned as a [`StackWaker`] for
+/// the notifier to hold. `None` when the event could not be created, in which
+/// case wakeups fall back to the wait timeout.
+fn event_waker(wake_event: &Option<Arc<WakeEvent>>) -> StackWaker {
+    match wake_event {
+        Some(event) => {
+            let event = event.clone();
+            Arc::new(move || {
+                // SAFETY: the Arc keeps the handle alive for the closure's
+                // lifetime; SetEvent is thread-safe.
+                unsafe {
+                    SetEvent(event.0);
+                }
+            })
         }
+        None => Arc::new(|| {}),
     }
 }
 
@@ -182,7 +193,9 @@ struct WintunDevice {
     /// Set by the UDP waker; auto-reset, so waking consumes the signal.
     wake_event: Option<Arc<WakeEvent>>,
     mtu: usize,
-    pending_rx: Option<PooledBuffer>,
+    /// A whole read batch, queued for smoltcp to drain through `receive` in
+    /// one `poll`. Was a single slot polled after each packet.
+    pending: VecDeque<PooledBuffer>,
 }
 
 impl WintunDevice {
@@ -203,7 +216,7 @@ impl WintunDevice {
             shutdown_event,
             wake_event,
             mtu,
-            pending_rx: None,
+            pending: VecDeque::with_capacity(super::stack_common::MAX_PACKET_BATCH),
         })
     }
 }
@@ -215,7 +228,7 @@ impl StackDevice for WintunDevice {
     /// `read()` performs, and returning the ring slot immediately keeps the
     /// driver's ring from filling while smoltcp works.
     fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
-        if let Some(pkt) = self.pending_rx.take() {
+        if let Some(pkt) = self.pending.pop_front() {
             return Ok(Some(pkt));
         }
 
@@ -250,13 +263,13 @@ impl StackDevice for WintunDevice {
         }
     }
 
-    /// Store a packet for later processing by smoltcp.
+    /// Queue a packet for the next smoltcp poll to drain.
     fn store_packet(&mut self, pkt: PooledBuffer) {
-        self.pending_rx = Some(pkt);
+        self.pending.push_back(pkt);
     }
 
     fn has_pending(&self) -> bool {
-        self.pending_rx.is_some()
+        !self.pending.is_empty()
     }
 
     /// Write a packet to the send ring.
@@ -331,7 +344,7 @@ impl Device for WintunDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending_rx.take() {
+        if let Some(buffer) = self.pending.pop_front() {
             let rx = PooledRxToken { buffer };
             let tx = WintunTxToken {
                 session: self.session.clone(),

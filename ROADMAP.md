@@ -457,6 +457,33 @@ Adapter creation itself needs Administrator and `wintun.dll`, so that half
 lives in an `#[ignore]`d test run by hand, plus a live end-to-end run —
 TCP, UDP/DNS, Fake IP and ICMP through a real adapter with routed traffic.
 
+#### TUN stack fast path — done, and what is left
+
+Spec: [docs/specs/2026-09-16-tun-stack-fast-path.md](./docs/specs/2026-09-16-tun-stack-fast-path.md).
+
+Two structural wins taken from sing-tun's 1.15 stack and fitted onto smoltcp:
+the shared loop now hands smoltcp a whole read batch and polls once (one
+egress sweep per batch, not per packet), and a `StackNotifier` gives the stack
+thread a wakeup it can actually receive, so a written segment or a dropped
+connection no longer waits out a timer tick and the wait is no longer capped
+at 10 ms — an idle tunnel with open connections stops waking a hundred times a
+second.
+
+What sing-tun has and this does not, in descending order of expected benefit,
+each blocked on smoltcp rather than on effort:
+
+- **Segmentation offload** (`IFF_VNET_HDR` + TSO on TX, GRO on RX). The
+  largest throughput win — 64 KiB super-segments cut per-byte syscalls and
+  poll sweeps by an order of magnitude — but smoltcp neither emits nor accepts
+  super-segments, so it needs changes below the loop.
+- **Multi-queue**: one interface per queue with the kernel steering by flow
+  hash. smoltcp runs a single interface; this is more surface than the two
+  changes above.
+- **Direct-socket splice**: bytes moved TUN↔socket inside the loop for direct
+  outbounds, bypassing the ring-buffer bridge. smoltcp always terminates the
+  connection itself, so there is no fd to splice; it helps direct outbounds
+  only, not proxy chains, which is shoes' main case.
+
 ### 3. macOS Network Extension provider — done
 
 Design: [docs/superpowers/specs/2026-08-28-macos-network-extension-design.md](./docs/superpowers/specs/2026-08-28-macos-network-extension-design.md).

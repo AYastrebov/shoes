@@ -11,12 +11,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
-    thread::Thread,
 };
 
 use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use super::stack_common::StackNotifier;
 
 /// TCP socket state machine.
 ///
@@ -164,18 +165,22 @@ impl TcpConnectionControl {
 /// Implements AsyncRead and AsyncWrite for use with tokio.
 pub struct TcpConnection {
     control: Arc<TcpConnectionControl>,
-    thread: Thread,
+    notifier: Arc<StackNotifier>,
 }
 
 impl TcpConnection {
     /// Create a new TCP connection.
-    pub fn new(control: Arc<TcpConnectionControl>, thread: Thread) -> Self {
-        Self { control, thread }
+    pub fn new(control: Arc<TcpConnectionControl>, notifier: Arc<StackNotifier>) -> Self {
+        Self { control, notifier }
     }
 
-    /// Wake up the stack thread.
+    /// Get the stack thread to run an iteration: data was written into the
+    /// send buffer, drained from the receive buffer (freeing window), or the
+    /// connection was dropped. Was `Thread::unpark`, which the stack thread
+    /// never saw because it parks in `poll()`, not `thread::park()`; the write
+    /// then waited out the loop's timer tick. See [`StackNotifier`].
     fn notify(&self) {
-        self.thread.unpark();
+        self.notifier.notify();
     }
 }
 
@@ -337,5 +342,51 @@ mod tests {
         control.set_closed();
         assert_eq!(control.send_state(), TcpSocketState::Closed);
         assert_eq!(control.recv_state(), TcpSocketState::Closed);
+    }
+
+    /// Every path that changes what the stack thread would do on its next
+    /// iteration — a write that queues a segment, a read that drains the
+    /// receive buffer and frees window, and a drop that requests close — must
+    /// wake the stack. These are the three call sites of `TcpConnection::notify`
+    /// and the regression this guards is one of them silently losing it: the
+    /// notifier records that `notify` was reached, observed here through
+    /// `take_pending` (the notifier is never armed, so `notify` sets the flag
+    /// without firing a real wake).
+    #[test]
+    fn write_read_drain_and_drop_each_wake_the_stack() {
+        use std::task::{Context, Waker};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        let notifier = StackNotifier::new(std::sync::Arc::new(|| {}));
+        let control = Arc::new(TcpConnectionControl::new(4096, 4096));
+        let mut conn = TcpConnection::new(control.clone(), notifier.clone());
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // A write queues bytes for the stack to turn into segments.
+        notifier.take_pending();
+        match Pin::new(&mut conn).poll_write(&mut cx, b"hello") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, 5),
+            other => panic!("unexpected poll_write result: {other:?}"),
+        }
+        assert!(notifier.take_pending(), "a write must wake the stack");
+
+        // A read that drains buffered data frees receive window, which the
+        // stack has to advertise.
+        control.enqueue_recv_data(b"world");
+        let mut buf = [0u8; 16];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        match Pin::new(&mut conn).poll_read(&mut cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => assert_eq!(read_buf.filled(), b"world"),
+            other => panic!("unexpected poll_read result: {other:?}"),
+        }
+        assert!(
+            notifier.take_pending(),
+            "a read that drains data must wake the stack"
+        );
+
+        // Dropping the connection requests a close the stack has to act on.
+        notifier.take_pending();
+        drop(conn);
+        assert!(notifier.take_pending(), "dropping must wake the stack");
     }
 }
