@@ -299,8 +299,16 @@ a hostname, since the original destination is always an IP address.
   for this host's own connections redirected from `OUTPUT`.
 - **A direct connection to the port is refused**, which is what keeps a wildcard
   bind from being an open proxy. The kernel decides the destination, never the
-  client; a connection nobody redirected reports the listener's own address,
-  and shoes closes it rather than dial itself.
+  client. A connection nobody redirected has no original destination, in one
+  of two ways, and shoes closes it in both. With conntrack loaded, which it
+  is on any host that has a `REDIRECT` rule, the kernel reports the listener's
+  own address, and shoes treats that as none rather than dial itself. Without
+  it the kernel reports nothing at all. Either way the log says `connection
+  was not redirected`; if it says so for *every* connection, the `REDIRECT`
+  rule is not matching and the clients are reaching the port some other way.
+- **A link-local IPv6 destination is refused** (`fe80::/10`). Such an address
+  means nothing without its interface, and the scope the kernel reports is not
+  carried to the outbound dial.
 - **Exclude the host's own addresses from the rule** (`! -d` the LAN subnet and
   the WAN address). shoes dials the original destination *from this host*, so a
   LAN client redirected on its way to the router's admin port or SSH arrives

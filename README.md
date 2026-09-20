@@ -39,7 +39,7 @@ All server protocols plus:
 - **XTLS Vision** (for VLESS)
 
 ### Transparent Proxy (Linux)
-- **Redirect** - the target of NAT `REDIRECT` for TCP; forwards each connection to where the kernel says it was going (`examples/transparent_proxy.yaml`). shoes installs no firewall rules; the host does
+- **Redirect** - the target of NAT `REDIRECT` for TCP; forwards each connection to where the kernel says it was going (`examples/transparent_proxy.yaml`). shoes installs no firewall rules: the host, or a manager such as awg-manager, has to add the `REDIRECT` rule that sends traffic to the listener
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying

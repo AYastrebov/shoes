@@ -395,6 +395,10 @@ struct SessionCreateResult {
 /// Type alias for the session creation future
 type SessionCreateFuture = Pin<Box<dyn Future<Output = io::Result<SessionCreateResult>> + Send>>;
 
+/// See `UdpRouter::remote_factory`.
+#[cfg(test)]
+type RemoteFactory = Box<dyn Fn(&NetLocation) -> SessionCreateFuture + Send + Sync>;
+
 /// Pending session creation state
 struct PendingSessionCreate {
     lookup_key: LookupKey,
@@ -449,6 +453,13 @@ pub struct UdpRouter<'a> {
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 
+    /// Tests only: replaces the real connect path, so a test can hand the
+    /// router a remote whose writes or shutdown stay pending. Two parts of
+    /// the limits are visible no other way: the deadline a session is created
+    /// with, and the budget share a remote keeps while it shuts down.
+    #[cfg(test)]
+    remote_factory: Option<RemoteFactory>,
+
     limits: RouterLimits,
     /// Set when a cap first turns a datagram away and cleared by the next
     /// admission, so a flood over a full table logs once per episode rather
@@ -497,6 +508,8 @@ impl<'a> UdpRouter<'a> {
             last_server_write: Instant::now(),
             selector,
             resolver,
+            #[cfg(test)]
+            remote_factory: None,
             limits,
             cap_reported: false,
         }
@@ -1126,6 +1139,41 @@ impl<'a> UdpRouter<'a> {
         }
     }
 
+    /// Resolve, judge and connect: how a session gets its remote.
+    fn connect_future(&self, destination: &NetLocation) -> SessionCreateFuture {
+        let selector = Arc::clone(&self.selector);
+        let resolver = Arc::clone(&self.resolver);
+        let dest_for_future = destination.clone();
+
+        Box::pin(async move {
+            let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
+            // Create ResolvedLocation with pre-resolved address
+            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
+            let decision = selector.judge(resolved_location, &resolver).await?;
+
+            match decision {
+                ConnectDecision::Allow {
+                    chain_group,
+                    remote_location,
+                    ..
+                } => {
+                    let client_stream = chain_group
+                        .connect_udp_bidirectional(&resolver, remote_location)
+                        .await?;
+
+                    Ok(SessionCreateResult {
+                        remote: client_stream,
+                        resolved_addr,
+                    })
+                }
+                ConnectDecision::Block => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Destination blocked by routing rules",
+                )),
+            }
+        })
+    }
+
     /// Start session creation
     #[inline]
     fn start_session_creation(
@@ -1154,37 +1202,14 @@ impl<'a> UdpRouter<'a> {
         debug!("Creating session for {}", destination);
 
         let initial_data = data.to_vec();
-        let selector = Arc::clone(&self.selector);
-        let resolver = Arc::clone(&self.resolver);
-        let dest_for_future = destination.clone();
 
-        let future: SessionCreateFuture = Box::pin(async move {
-            let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
-            // Create ResolvedLocation with pre-resolved address
-            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
-            let decision = selector.judge(resolved_location, &resolver).await?;
-
-            match decision {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location,
-                    ..
-                } => {
-                    let client_stream = chain_group
-                        .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
-
-                    Ok(SessionCreateResult {
-                        remote: client_stream,
-                        resolved_addr,
-                    })
-                }
-                ConnectDecision::Block => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Destination blocked by routing rules",
-                )),
-            }
-        });
+        #[cfg(test)]
+        let future = match &self.remote_factory {
+            Some(factory) => factory(&destination),
+            None => self.connect_future(&destination),
+        };
+        #[cfg(not(test))]
+        let future = self.connect_future(&destination);
 
         let index = self.pending_creates.len();
         self.pending_creates.push(PendingSessionCreate {
@@ -1715,13 +1740,212 @@ mod tests {
     /// timer, so it is the write path's use of the listener's timeout that
     /// frees the slot here, where the test above leans on the read path's.
     ///
-    /// Neither test can see the timeout a session is created with. The first
-    /// datagram's write resets the timer straight away, on every path that
-    /// was tried, so a wrong value there is overwritten before it can matter.
+    /// Neither this test nor the one above can see the timeout a session is
+    /// *created* with: a real socket accepts its first write at once, which
+    /// resets the timer. `..._first_write_stalls_...` below covers that one,
+    /// with a remote that does not.
     #[tokio::test]
     async fn test_a_session_that_never_hears_back_expires_on_the_listeners_timeout() {
         let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         cap_then_expiry(silent.local_addr().unwrap(), 0).await;
+    }
+
+    /// What a test can see of a `FakeRemote`, and the one thing it can do to it.
+    #[derive(Default)]
+    struct FakeRemoteState {
+        writes_stay_pending: bool,
+        shutdown_may_finish: bool,
+        shutdown_polled: bool,
+        dropped: bool,
+        shutdown_waker: Option<Waker>,
+    }
+
+    /// A session remote that never hears back, whose writes and shutdown can
+    /// be held pending. The real connect path cannot produce either, and they
+    /// are exactly where two of the limits' promises are kept or broken.
+    struct FakeRemote(Arc<Mutex<FakeRemoteState>>);
+
+    impl Drop for FakeRemote {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().dropped = true;
+        }
+    }
+
+    impl AsyncReadMessage for FakeRemote {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for FakeRemote {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            if self.0.lock().unwrap().writes_stay_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncFlushMessage for FakeRemote {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for FakeRemote {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut state = self.0.lock().unwrap();
+            state.shutdown_polled = true;
+            if state.shutdown_may_finish {
+                return Poll::Ready(Ok(()));
+            }
+            state.shutdown_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for FakeRemote {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for FakeRemote {}
+
+    /// Run a router whose every session gets a `FakeRemote` sharing `state`.
+    /// Owns the server stream so the whole thing can be spawned.
+    async fn run_with_fake_remotes(
+        mut server: ServerStream,
+        limits: RouterLimits,
+        state: Arc<Mutex<FakeRemoteState>>,
+    ) -> io::Result<()> {
+        let resolver = test_resolver();
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            limits,
+        );
+        router.remote_factory = Some(Box::new(move |_destination| {
+            let remote: Box<dyn AsyncMessageStream> = Box::new(FakeRemote(state.clone()));
+            Box::pin(async move {
+                Ok(SessionCreateResult {
+                    remote,
+                    resolved_addr: "192.0.2.1:9".parse().unwrap(),
+                })
+            })
+        }));
+        router.await
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A session whose first write never completes is never touched again, so
+    /// the only deadline it ever has is the one it was created with. That one
+    /// has to be the listener's timeout too: with the 200-second default left
+    /// there, a destination that accepts nothing holds its slot, and its share
+    /// of the listener's budget, for over three minutes.
+    #[tokio::test]
+    async fn test_a_session_whose_first_write_stalls_expires_on_the_listeners_timeout() {
+        let state = Arc::new(Mutex::new(FakeRemoteState {
+            writes_stay_pending: true,
+            shutdown_may_finish: true,
+            ..Default::default()
+        }));
+        let (stream, _inner) = scripted(
+            vec![(location("192.0.2.1:9".parse().unwrap()), b"one".to_vec())],
+            usize::MAX,
+        );
+        let limits = RouterLimits {
+            session_timeout: Duration::from_millis(100),
+            ..RouterLimits::default()
+        };
+
+        let router = tokio::spawn(run_with_fake_remotes(
+            ServerStream::Targeted(Box::new(stream)),
+            limits,
+            state.clone(),
+        ));
+
+        wait_until(
+            "the stalled session expires and its remote is dropped",
+            || state.lock().unwrap().dropped,
+        )
+        .await;
+        router.abort();
+    }
+
+    /// The budget counts descriptors, and a removed session's remote keeps its
+    /// descriptor until its shutdown completes. Its share must stay taken for
+    /// exactly that long: returned at removal, it admits a new session on top
+    /// of a socket that is still open, and under churn that is over the cap.
+    #[tokio::test]
+    async fn test_a_remote_still_shutting_down_keeps_its_share_of_the_budget() {
+        let state = Arc::new(Mutex::new(FakeRemoteState::default()));
+        let (stream, _inner) = scripted(
+            vec![(location("192.0.2.1:9".parse().unwrap()), b"one".to_vec())],
+            usize::MAX,
+        );
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let limits = RouterLimits {
+            session_timeout: Duration::from_millis(100),
+            shared_budget: Some(budget.clone()),
+            ..RouterLimits::default()
+        };
+
+        let router = tokio::spawn(run_with_fake_remotes(
+            ServerStream::Targeted(Box::new(stream)),
+            limits,
+            state.clone(),
+        ));
+
+        // Expiry removes the session, and the router starts shutting its
+        // remote down; the fake keeps that pending.
+        wait_until("the expired session's remote is being shut down", || {
+            state.lock().unwrap().shutdown_polled
+        })
+        .await;
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "the socket is still open, so its share is still taken"
+        );
+
+        let waker = {
+            let mut state = state.lock().unwrap();
+            state.shutdown_may_finish = true;
+            state.shutdown_waker.take()
+        };
+        waker
+            .expect("a pending shutdown registers its waker")
+            .wake();
+
+        wait_until("the remote is dropped", || state.lock().unwrap().dropped).await;
+        assert_eq!(budget.available_permits(), 1, "and now it is back");
+        router.abort();
     }
 
     /// A `tproxy` listener runs one router per LAN client and promises one
