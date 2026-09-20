@@ -9,6 +9,14 @@ its `1.14.0-awgm.16` engine pin. The Clash API this depends on is
 [docs/specs/2026-09-09-clash-api.md](./2026-09-09-clash-api.md), revised the
 same day for awg-manager's call list; nothing there is repeated here.
 
+**Status, 2026-09-20** (`mobile` at `89aebfa`). Slice 1 shipped in #23. Clash
+API slice 1, the part awg-manager's health probe and log tail need, shipped
+in #22. Slice 6 ran out of order in #24 and produced a working mipsel build;
+what is left of it is in [Slice 6](#slice-6-mips). The first router run in
+[Order of work](#order-of-work) is therefore blocked on nothing in this
+repository, only on the awg-manager emitter. Slice 2 is next here. Rows and
+paragraphs below that those merges changed are marked with the PR.
+
 ## Table of Contents
 
 - [Problem](#problem)
@@ -104,7 +112,7 @@ load, a direct outbound over loopback:
 | | sing-box 1.14 | shoes 0.4.1 | ratio |
 |---|---|---|---|
 | Binary, aarch64 Linux, static | 61.4 MB (fork) | 13.3 MB | 4.6× |
-| Binary, mipsel Linux | 74.3 MB (fork) | no stable build | |
+| Binary, mipsel Linux, static | 74.3 MB (fork) | 17.1 MB (#24; 10.1 MB as `release-mobile`) | 4.3× |
 | Idle RSS, one `mixed` inbound | 47 MB | 12.4 MB | 3.8× |
 | Idle RSS, plus Reality and Hysteria2 outbounds | 48 MB | 12.8 MB | 3.7× |
 | Peak RSS, 8 streams × 50 MB × 3 | 55 MB | 14 MB | 3.9× |
@@ -128,9 +136,9 @@ Every sing-box feature awg-manager emits or calls, against shoes today.
 | Feature | awg-manager site | shoes today | Slice |
 |---|---|---|---|
 | `mixed` inbound, optional users | `config.go:225,777` | yes | — |
-| `SIGHUP` reload | `process.go:582` | file watcher only | 1 |
-| `check -C` | `validate.go:64` | `--dry-run` | 1 (alias) |
-| `version` subcommand and `/version` | `installer.go:286` | `--version`, prints `shoes 0.4.1` | 1 |
+| `SIGHUP` reload | `process.go:582` | yes (#23) | done |
+| `check -C` | `validate.go:64` | `check <config>` (#23) | done |
+| `version` subcommand and `/version` | `installer.go:286` | both (#23, #22) | done |
 | Log lines classifiable as inbound/outbound/dns/router | `logs.go:94` | Clash spec, `/logs` | done in Clash spec |
 | Clash API: proxies, select, delay, logs, connections | `clash.go` | Clash spec slices 1–3 | Clash spec |
 | `selector` with `default`, `urltest` | `subscription/materialize.go` | Clash spec slices 2–3 | Clash spec |
@@ -161,7 +169,8 @@ Every sing-box feature awg-manager emits or calls, against shoes today.
 | `vmess` | `vlink/vlink.go:95` | n/a, dropped by awg-manager | — |
 | AmneziaWG 2/3 endpoint | `awg3endpoint/conf.go` | yes, 3.0 and 3.1 | — |
 | `GOMEMLIMIT` | `process.go:160` | n/a | — |
-| mipsel, mips builds | `sysenv.go:23` | **no** (Rust tier 3) | 6 |
+| mipsel build | `sysenv.go:23` | builds from a script, not shipped (#24) | 6 (rest) |
+| mips (big-endian) build | `sysenv.go:23` | **no**, not attempted | 6 (rest) |
 
 ## Scope and slices
 
@@ -279,7 +288,7 @@ does for every other inbound.
 ```
 
 Linux only. `Transport::Udp` exists in the config and is `todo!()` in
-`start_tcp_or_quic_servers` (`src/tcp/tcp_server.rs:394`); this is its first
+`start_tcp_or_quic_servers` (`src/tcp/tcp_server.rs`); this is its first
 implementation, and it is specific to `tproxy` until another UDP-native
 inbound wants it.
 
@@ -294,11 +303,19 @@ rules, and expires them. `udp_timeout` becomes the router's session expiry
 for this listener and `udp_nat_max` its session cap; both are per-listener
 settings passed into `UdpRouter` rather than constants.
 
+The router keeps sessions per destination for one client, so the listener
+runs one router per client address behind a demultiplexer. That makes
+`udp_nat_max` a figure no single router can enforce: it is a budget shared
+by every router of the listener, and a session holds a permit from it for
+as long as it lives. (Revised 2026-09-20; the first plan gave each client
+the whole figure.)
+
 Replies must appear to come from the original destination. A reply socket
-per `(original destination)` is bound with `IP_TRANSPARENT` to that address
-and port, sends to the client, and is closed with the session. That is what
-every tproxy implementation does; it costs one socket per live session,
-which is bounded by `udp_nat_max`.
+is bound with `IP_TRANSPARENT` to the remote's address and port and sends
+to the client. Each client keeps a small LRU of them keyed by remote, and
+the listener bounds their total at `udp_nat_max` with a second shared
+budget, so the descriptor cost of a listener is at most twice that figure
+whatever the number of clients.
 
 The kernel side is awg-manager's: the `fwmark 0x1` policy route into table
 `100` with a `local` default is what makes a transparent socket receive the
@@ -407,17 +424,22 @@ nightly Rust toolchain" for MIPS. The Keenetic targets are kernel 3.4,
 below Rust's documented 3.2 minimum only by a version that does not matter,
 and softfloat, which the target triples above assume.
 
-**What it takes.** A CI job that installs nightly with `rust-src`, builds
-`--target mipsel-unknown-linux-musl -Z build-std=std,panic_abort` with a
-`musl` cross linker, and ships `shoes-linux-mipsel-musl.tar.gz` and the
-`mips` twin. A test that the binary starts on a real KN-1010 and carries
-a connection.
+**What happened** (#24, [docs/keenetic-build-2026-09-11.md](../keenetic-build-2026-09-11.md)).
+mipsel builds, statically, at 17.1 MB, and starts under QEMU. Of the three
+things listed as possible blockers when this was written: jemalloc did fail
+(the cross GCC crashes compiling it) and the MIPS build uses the system
+allocator; aws-lc-sys built, but only with bindgen in the image and
+unprefixed symbols, around an LLVM MIPS bug; smoltcp was fine. One blocker
+nobody listed: the target has no 64-bit atomics, so the counters take
+`portable-atomic` there. The nightly MIPS backend also crashes about one
+build in two, and the script retries.
 
-**What could stop it.** jemalloc on MIPS (`tikv-jemallocator` is the CLI's
-allocator; switching the MIPS build to the system allocator is the fallback
-and costs a `cfg`); aws-lc-sys's C build under the cross toolchain; and
-smoltcp, ring-free by construction, is fine. None of these are known to
-fail; none are known to pass.
+**What is left.** The big-endian `mips` target, not attempted. A shipped
+artifact: the build is a script, not a release job, and a per-PR job was
+declined for cost. A connection carried on the target: only `version` and
+`check` have run, under emulation, and the `portable_atomic` branch is
+compiled there and tested nowhere. A KN-1010 that starts the binary and
+carries a connection is still the test that closes this slice.
 
 ## The config mapping
 
@@ -514,8 +536,9 @@ Slice 1 and 2 tests, at the level where a missing call is visible:
   reaches the echo and the reply arrives with the echo's address as source.
   The session cap and expiry are unit-tested on `UdpRouter` with a fake
   targeted stream.
-- **Registry**: both inbounds appear in `/connections` with their labels
-  and the original destination.
+- **Registry**: both inbounds appear in `/connections` with their labels;
+  `redirect` rows carry the original destination, `tproxy` rows are per
+  client and do not (see Decisions).
 - **awg-manager**: the tproxy router mode on a Keenetic aarch64 with shoes
   as the engine, all three awg-manager health probes green (`/proc/net/tcp`
   LISTEN on 51272, `/proc/net/udp` on 51271, Clash `/version`), and the RSS
@@ -523,16 +546,17 @@ Slice 1 and 2 tests, at the level where a missing call is visible:
 
 ## Order of work
 
-1. Slice 1 (plan tasks 1–2). Then the awg-manager emitter for the
+1. Slice 1 (plan task 1; done, #23). Then the awg-manager emitter for the
    legacy-tunnel mode, and the first router run: the RSS table and a
-   Reality link, which is also slice 5's gate.
-2. Slice 2 (plan tasks 3–6). Then the tproxy router mode under awg-manager.
+   Reality link, which is also slice 5's gate. Everything this needs from
+   shoes is on `mobile`, including the aarch64 binary (#24).
+2. Slice 2 (plan tasks 2–5). Then the tproxy router mode under awg-manager.
 3. Clash API slices 1–3 interleave here as awg-manager needs them: slice 1
    for health and logs is needed with the first router run; slices 2–3 for
    subscriptions.
 4. Slice 3, then slice 4, each planned after the previous one has run.
 5. Slice 5 only if its gate says so.
-6. Slice 6.
+6. The rest of slice 6.
 
 ## Decisions
 
@@ -542,11 +566,13 @@ Slice 1 and 2 tests, at the level where a missing call is visible:
 | Config translation | awg-manager emits shoes YAML from its model | It already parses every link format itself; a Clash importer in shoes was rejected on 2026-09-09 |
 | Where redirect reads the destination | A default method on `AsyncStream`, implemented on `TcpStream` | The handler only sees `dyn AsyncStream`; the accept loop has the socket |
 | tproxy UDP model | `AsyncTargetedMessageStream` into the existing `UdpRouter` | The router already does per-destination sessions, routing and expiry |
-| Reply spoofing | One `IP_TRANSPARENT` socket per session | The only portable way; bounded by `udp_nat_max` |
+| Reply spoofing | `IP_TRANSPARENT` sockets in a per-client LRU keyed by remote, total bounded by `udp_nat_max` | The only portable way; a cache rather than one per session because the router owns sessions and the stream owns sockets |
+| `udp_nat_max` enforcement | One budget per listener, shared by its per-client routers | A per-router cap multiplies by the number of clients |
+| `tproxy` in `/connections` | One row per LAN client, destination unset | A row per destination is a registry write on the session-create path |
 | Logical rules syntax | `all_of` / `any_of` | Reads as what it is; `masks` stays `any_of` |
 | `.srs` encoder | In shoes, behind sing-box's subcommand names | awg-manager shells out with those arguments today |
 | Chrome ClientHello | Gated on a live DPI test | The cost is large and the need is unmeasured |
-| MIPS | Last | Toolchain project; the user's ordering |
+| MIPS | Last; the mipsel build ran early in #24, the rest stays last | Toolchain project; the user's ordering |
 | `SIGHUP` debounce | None | The sender finished writing |
 
 ## Deliberately out of scope
