@@ -10,15 +10,40 @@
 
 **Spec:** `docs/specs/2026-09-11-awg-manager-engine.md`, slices 1 and 2. The Clash API plan (`docs/plans/2026-09-09-clash-api.md`) is independent; where a task here touches the connection registry it says so, and the touch is the same call the other inbounds make.
 
+## Status, 2026-09-20
+
+Reviewed against `mobile` at `89aebfa`. What has merged since this was written, and what each changes here:
+
+| Merged | What it settles for this plan |
+|---|---|
+| #23 engine contract (`d986808`) | Task 1 is done. Slice 1 is complete. |
+| #22 Clash API slice 1 (`a85cda6`) | The connection registry exists, so every "if landed" below is now "call it". `register` and `counted` compile to no-ops without `control-connections`, so the calls are unconditional. `/version` answers, which is awg-manager's third health probe. |
+| #24 Keenetic builds (`89aebfa`) | Slice 6 ran out of order and mostly succeeded: `scripts/build-keenetic.sh` produces aarch64 and mipsel binaries. What is left of it is listed under "Slices 3 to 6". The router run in Task 5 has a binary to use. |
+| #25 TUN fast path (`4e0df5e`) | Nothing here; it matters to the two tun modes, which need no engine work. |
+
+**The first router run is unblocked and does not wait for slice 2.** The spec's order of work puts it after slice 1: the legacy-tunnel mode needs only a `mixed` inbound, `SIGHUP`, `check`, `version` and Clash `/version`, all of which are on `mobile`, and an aarch64 binary, which the build script produces. It is gated on the awg-manager emitter, which is that repository's work. It is also slice 5's gate and the first real RSS figure, so it is worth more than its size suggests. Tasks 2 to 4 can proceed in parallel with it.
+
+Corrections made in this review, each marked **(review)** where it lands:
+
+- **`udp_nat_max` was not enforced.** Task 4's demux capped *clients* at `udp_nat_max` and then gave *each* client a router capped at the same figure, so the listener's bound was the square of what the constraint below promises. One shared budget now spans the listener.
+- **The reply-socket total was unbounded**, 64 per client with no cap on the sum. Same fix, second budget. The spec's `RLIMIT_NOFILE` raise was in no task; it is in Task 4 now.
+- **Task 2 would have failed the gate.** It put `make_transparent` and `recv_with_original_destination` in `tproxy::sys` two tasks before anything calls them; `mod tproxy` is declared in `src/main.rs`, so `--bins -D warnings` rejects them as dead code (AGENTS.md, "Traps"). They move to Task 4, where their caller is.
+- **Local copies of kernel constants are dropped.** libc 0.2.189, the locked version, exports all six (`SO_ORIGINAL_DST`, `IP6T_SO_ORIGINAL_DST`, `IP_TRANSPARENT`, `IP_RECVORIGDSTADDR`, `IPV6_TRANSPARENT`, `IPV6_RECVORIGDSTADDR`) with the values the plan had typed out. A second copy can only drift.
+- **The netfilter tests used `tokio::process`**, which Task 1 found is not enabled in this crate. They use `std::process` with the kill-on-drop guard from `tests/process_contract.rs`.
+- **The redirect test's loop-avoidance recipe was left as thinking-out-loud.** It is one definite recipe now.
+- **Task 5 missed the documentation rule**: `CONFIG.md`, an `examples/` config and the release smoke loop (AGENTS.md, "Every option reaches the documentation and an example").
+- Gates, environment and commit conventions now follow AGENTS.md; the development host is Linux, so the root-gated tests run locally and not only in CI.
+
 ## Global Constraints
 
 - **Linux only for the two inbounds.** `redirect` and `tproxy` are refused at validation on every other OS with a message naming Linux; every `libc` call sits under `#[cfg(target_os = "linux")]`, and the config types exist everywhere so a config parses the same on a Mac.
 - **Loopback only** (spec, "Security notes"): a `redirect` or `tproxy` bind on a non-loopback address is a validation error.
 - **No debounce on `SIGHUP`** (spec, "Slice 1"); `--no-reload` does not disable it.
-- **`udp_nat_max` bounds file descriptors**: sessions across all clients of a `tproxy` listener never exceed it; the reply-socket cache is 64 per client and bounded by the same figure in total.
-- **Registry**: both inbounds call `connection_registry::register` / `counted` (Clash plan Task 2) if that has landed; if not, they call nothing and the Clash plan's Task 3 adds the calls with the others.
-- **Gates for every task:** `cargo fmt --all -- --check`, `cargo clippy --locked --bins --tests -- -D warnings`, `cargo test --locked`, `cargo build --locked --features control-stats`, and on Linux `cargo test --locked -- --ignored tproxy redirect` under `sudo` for the netfilter tests.
-- **Environment:** `export PATH=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:$PATH`. Commits use `git -c user.email=ayastrebov@gmail.com commit`. No `timeout` on macOS: `perl -e 'alarm 300; exec @ARGV' -- cargo test ...`.
+- **`udp_nat_max` bounds file descriptors**: sessions across all clients of a `tproxy` listener never exceed it, and neither do reply sockets. Both are enforced by a budget shared across the listener's clients (Tasks 3 and 4), not by a per-client figure. **(review)**
+- **Registry**: both inbounds call `connection_registry::register` / `counted` at the accept edge with a label from `tcp_server::inbound_label`, exactly as `src/tcp/tcp_server.rs` does for the others. Unconditional: the no-feature build gets the no-op versions.
+- **Packet path** (AGENTS.md, "Packet paths"): the `tproxy` demux runs once per datagram. No task per datagram, every queue bounded with a comment saying that a full one drops, and no fresh `Vec` per datagram where a shared buffer does the job (Task 4 says how).
+- **Gates for every task** are AGENTS.md's verification gate, in full. Add `cargo test --locked --features clash-api` whenever a task touches the registry or `inbound_label`, because those arms only compile there. The FFI clippy pair is needed only if a task strays into `src/config/mod.rs` or `src/socket_protector.rs`; `src/socket_util.rs` alone does not need it. The netfilter tests are `sudo -E env "PATH=$PATH" cargo test --locked --test transparent -- --ignored`, on the development host as well as in CI.
+- **Commits** follow AGENTS.md: `area: imperative summary`, the why in the body, the co-author trailer, and the same command again if signing fails with `failed to fill whole buffer`.
 
 ---
 
@@ -34,15 +59,18 @@
 **Modified files**
 - `src/main.rs` — subcommands, `SIGHUP` in the serve loop.
 - `src/async_stream.rs` — `original_destination` on `AsyncStream`; `TcpStream`, `PermitStream`, `Box<T>` impls.
-- `src/connection_registry.rs` (only if landed) — `CountingStream` forwards `original_destination`.
+- `src/connection_registry.rs` — `CountingStream` forwards `original_destination` (its `impl AsyncStream` is empty today).
 - `src/config/types/server.rs` — `Redirect`, `Tproxy` variants, `Display`.
 - `src/config/validate.rs` — OS and bind rules for both; `transport: udp` only with `tproxy`.
 - `src/tcp/tcp_server_handler_factory.rs` — `Redirect` arm.
 - `src/tcp/tcp_server.rs` — `Transport::Udp` arm.
-- `src/routing/udp_router.rs` — `RouterLimits`, `run_udp_routing_with_limits`.
+- `src/routing/udp_router.rs`, `src/routing/mod.rs` — `RouterLimits`, `run_udp_routing_with_limits`, the re-export.
 - `src/lib.rs`, `src/main.rs` — module declarations.
-- `README.md` — a section for the two inbounds.
+- `README.md`, `CONFIG.md` — a section for the two inbounds; every field and its default.
+- `examples/transparent_proxy.yaml` — both inbounds, cert-free.
 - `.github/workflows/test.yml` — the root-gated Linux step.
+- `.github/workflows/build.yml` — the example joins the Linux arm of the `Smoke test binary` loop (validation refuses it elsewhere).
+- `ROADMAP.md` — the awg-manager engine work and what is left of it.
 
 ---
 
@@ -272,10 +300,10 @@ git -c user.email=ayastrebov@gmail.com commit -m "shoes: check and version subco
 Spec: "Slice 2" → "`redirect`".
 
 **Files:**
-- Modify: `src/async_stream.rs:173, 235, 313, 528-529`
-- Modify: `src/connection_registry.rs` if present (forward the method on `CountingStream`)
+- Modify: `src/async_stream.rs` — the `AsyncStream` trait and its impls for `TcpStream`, `PermitStream`, `Box<T>`, `&mut T` (`:173, 235, 313, 528-529` at `89aebfa`)
+- Modify: `src/connection_registry.rs:160` (forward the method on `CountingStream`). This one is not optional: the accept loop wraps every stream in `counted` before the handler sees it, so without the forward a `redirect` listener refuses every connection in a `clash-api` build and works in a default one.
 - Create: `src/redirect_handler.rs`
-- Modify: `src/config/types/server.rs:676-830` (variant, `Display`), `src/config/validate.rs:1596` (arm), `src/tcp/tcp_server_handler_factory.rs:252`
+- Modify: `src/config/types/server.rs` (`ServerProxyConfig` variant, `Display`), `src/config/validate.rs` (`validate_server_config`), `src/tcp/tcp_server_handler_factory.rs`, `src/tcp/tcp_server.rs` (`inbound_label`). Line numbers from the first draft have moved; go by symbol.
 - Modify: `src/lib.rs`, `src/main.rs` (`mod redirect_handler;`)
 - Create: `tests/transparent.rs` (first test)
 
@@ -363,9 +391,13 @@ impl AsyncStream for TcpStream {
 }
 ```
 
-`PermitStream`, `Box<T>`, `&mut T`, `OutboundCountingStream` and (if landed) `CountingStream` forward: `fn original_destination(&self) -> Option<SocketAddr> { self.inner.original_destination() }` (`(**self)` for `Box`, `(**self)` for `&mut T`).
+`PermitStream`, `Box<T>`, `&mut T`, `OutboundCountingStream` and `CountingStream` forward: `fn original_destination(&self) -> Option<SocketAddr> { self.inner.original_destination() }` (`(**self)` for `Box`, `(**self)` for `&mut T`).
 
-Create `src/tproxy/mod.rs` with `pub mod sys;` for now (Task 4 fills the rest) and `src/tproxy/sys.rs`:
+**(review)** The `CountingStream` forward gets its own test beside the registry's, because it is the one a default build cannot catch: wrap the `Redirected` double from Step 1 in `connection_registry::counted` and assert the address survives. Prove it can fail by deleting the forward and watching that test, and only that test, go red under `--features clash-api`.
+
+Create `src/tproxy/mod.rs` with `pub mod sys;` for now (Task 4 fills the rest) and `src/tproxy/sys.rs`.
+
+**(review)** Only `original_destination` goes in here in this task. `make_transparent` and `recv_with_original_destination` have no caller until Task 4, and `mod tproxy` is declared in `src/main.rs`, so `cargo clippy --bins -- -D warnings` would reject them as dead code; they are written in Task 4, beside their caller. The constants come from `libc`, which exports every one this module needs at the locked 0.2.189; the kernel headers they mirror are `include/uapi/linux/netfilter_ipv4.h` (`SO_ORIGINAL_DST`) and `include/uapi/linux/netfilter_ipv6/ip6_tables.h` (`IP6T_SO_ORIGINAL_DST`).
 
 ```rust
 //! The Linux socket calls behind transparent proxying. Every function here
@@ -374,39 +406,33 @@ Create `src/tproxy/mod.rs` with `pub mod sys;` for now (Task 4 fills the rest) a
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::RawFd;
 
-    // Kernel values, in case the libc crate in use predates a constant.
-    pub const SO_ORIGINAL_DST: libc::c_int = 80;
-    pub const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
-    pub const IP_TRANSPARENT: libc::c_int = 19;
-    pub const IP_RECVORIGDSTADDR: libc::c_int = 20;
-    pub const IPV6_TRANSPARENT: libc::c_int = 75;
-    pub const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
-
-    fn v4(sa: &libc::sockaddr_in) -> SocketAddr {
+    pub(super) fn v4(sa: &libc::sockaddr_in) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr)), u16::from_be(sa.sin_port)))
     }
 
-    fn v6(sa: &libc::sockaddr_in6) -> SocketAddr {
+    pub(super) fn v6(sa: &libc::sockaddr_in6) -> SocketAddr {
         SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(sa.sin6_addr.s6_addr), u16::from_be(sa.sin6_port), sa.sin6_flowinfo, sa.sin6_scope_id))
     }
 
     /// `SO_ORIGINAL_DST`: the destination before NAT `REDIRECT`. `None` when
     /// the socket was not redirected (`ENOENT`) or the option is unsupported.
     pub fn original_destination(fd: RawFd) -> Option<SocketAddr> {
+        // SAFETY: both structs are plain data the kernel fills; `len` tells it
+        // how much room there is, and the family check rejects a short write.
         unsafe {
             let mut sa6: libc::sockaddr_in6 = std::mem::zeroed();
             let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-            if libc::getsockopt(fd, libc::SOL_IPV6, IP6T_SO_ORIGINAL_DST, &mut sa6 as *mut _ as *mut libc::c_void, &mut len) == 0
+            if libc::getsockopt(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST, &mut sa6 as *mut _ as *mut libc::c_void, &mut len) == 0
                 && sa6.sin6_family as libc::c_int == libc::AF_INET6
             {
                 return Some(v6(&sa6));
             }
             let mut sa4: libc::sockaddr_in = std::mem::zeroed();
             let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            if libc::getsockopt(fd, libc::SOL_IP, SO_ORIGINAL_DST, &mut sa4 as *mut _ as *mut libc::c_void, &mut len) == 0
+            if libc::getsockopt(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST, &mut sa4 as *mut _ as *mut libc::c_void, &mut len) == 0
                 && sa4.sin_family as libc::c_int == libc::AF_INET
             {
                 return Some(v4(&sa4));
@@ -414,72 +440,13 @@ mod linux {
         }
         None
     }
-
-    fn setsockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> std::io::Result<()> {
-        let rc = unsafe { libc::setsockopt(fd, level, name, &value as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-    }
-
-    /// `IP_TRANSPARENT` (needs CAP_NET_ADMIN) and, for a listener,
-    /// `IP_RECVORIGDSTADDR` so `recvmsg` reports where each datagram was going.
-    pub fn make_transparent(fd: RawFd, ipv6: bool, receive_original_destination: bool) -> std::io::Result<()> {
-        let (level, transparent, recv) = if ipv6 {
-            (libc::SOL_IPV6, IPV6_TRANSPARENT, IPV6_RECVORIGDSTADDR)
-        } else {
-            (libc::SOL_IP, IP_TRANSPARENT, IP_RECVORIGDSTADDR)
-        };
-        setsockopt_int(fd, level, transparent, 1).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("IP_TRANSPARENT: {e} (this needs CAP_NET_ADMIN)"))
-        })?;
-        if receive_original_destination {
-            setsockopt_int(fd, level, recv, 1)?;
-        }
-        Ok(())
-    }
-
-    /// One datagram with its source and its original destination.
-    pub fn recv_with_original_destination(fd: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
-        unsafe {
-            let mut source: libc::sockaddr_storage = std::mem::zeroed();
-            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
-            // u64-aligned control buffer: cmsghdr needs it.
-            let mut control = [0u64; 32];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_name = &mut source as *mut _ as *mut libc::c_void;
-            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = std::mem::size_of_val(&control) as _;
-            let n = libc::recvmsg(fd, &mut msg, 0);
-            if n < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let source = match source.ss_family as libc::c_int {
-                libc::AF_INET => v4(&*(&source as *const _ as *const libc::sockaddr_in)),
-                libc::AF_INET6 => v6(&*(&source as *const _ as *const libc::sockaddr_in6)),
-                _ => return Err(std::io::Error::other("unknown address family")),
-            };
-            let mut destination = None;
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                let hdr = &*cmsg;
-                if hdr.cmsg_level == libc::SOL_IP && hdr.cmsg_type == IP_RECVORIGDSTADDR {
-                    destination = Some(v4(&*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in)));
-                } else if hdr.cmsg_level == libc::SOL_IPV6 && hdr.cmsg_type == IPV6_RECVORIGDSTADDR {
-                    destination = Some(v6(&*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6)));
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-            let _ = IpAddr::V4(Ipv4Addr::UNSPECIFIED); // keep the import honest on both arms
-            Ok((n as usize, source, destination))
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::*;
 ```
+
+If `v6` is unused by anything but `original_destination` at this point it is still used, so no allow is needed; if clippy disagrees on some configuration, fold the helper into its one caller rather than adding an allow.
 
 Declare `mod tproxy;` in `src/lib.rs` and `src/main.rs` (unconditionally; the file is empty of code off Linux).
 
@@ -534,19 +501,7 @@ impl TcpServerHandler for RedirectServerHandler {
 }
 ```
 
-`NetLocation` has no `From<SocketAddr>` today (`from_ip_addr` is `cfg(test)`); add beside it in `src/address.rs`:
-
-```rust
-impl From<std::net::SocketAddr> for NetLocation {
-    fn from(addr: std::net::SocketAddr) -> Self {
-        let address = match addr.ip() {
-            std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
-            std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
-        };
-        Self { address, port: addr.port() }
-    }
-}
-```
+`NetLocation: From<SocketAddr>` already exists in `src/address.rs` (it arrived with the Clash registry), so `NetLocation::from(destination)` compiles as written. **(review)**
 
 `src/config/types/server.rs`: add to the enum, near `PortForward`:
 
@@ -608,7 +563,7 @@ Also the existing `if server_config.transport != Transport::Tcp && server_config
 
 `src/tcp/tcp_server_handler_factory.rs`: `ServerProxyConfig::Redirect {} => Box::new(crate::redirect_handler::RedirectServerHandler::new(client_proxy_selector.clone())),` and `ServerProxyConfig::Tproxy { .. } => unreachable!("tproxy runs on the UDP transport, not through the TCP handler factory"),`.
 
-`src/tcp/tcp_server.rs::inbound_label` (Clash plan Task 3, if landed): `P::Redirect { .. } => "redirect"`, `P::Tproxy { .. } => "tproxy"`.
+`src/tcp/tcp_server.rs::inbound_label`: `P::Redirect { .. } => "redirect".to_string()`, `P::Tproxy { .. } => "tproxy".to_string()`, matching the arms around them. The match is exhaustive, so the build fails until these exist.
 
 - [ ] **Step 5: The root-gated netfilter test**
 
@@ -636,6 +591,43 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+const NOBODY: u32 = 65534;
+
+/// Kills the child when the test ends, pass or fail. tokio's `process`
+/// feature is not enabled in this crate, so there is no `kill_on_drop`;
+/// this is the guard `tests/process_contract.rs` uses.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// shoes as uid 65534, from a copy in `dir`. Two reasons for the uid: the
+/// netfilter rules below exclude it with `-m owner`, which is what stops
+/// shoes' own dial to the original destination from being diverted back
+/// into shoes; and it proves the inbounds need a capability, not root. The
+/// copy is because `target/` sits under a home directory `nobody` cannot
+/// traverse, and because `setcap` must not touch the build's own binary.
+fn spawn_shoes_as_nobody(dir: &std::path::Path, config: &std::path::Path, net_admin: bool) -> Child {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let bin = dir.join("shoes");
+    std::fs::copy(env!("CARGO_BIN_EXE_shoes"), &bin).unwrap();
+    for (path, mode) in [(dir, 0o755), (bin.as_path(), 0o755), (config, 0o644)] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    if net_admin {
+        sh(&format!("setcap cap_net_admin+ep {}", bin.display()));
+    }
+    Child(
+        Command::new(&bin).arg("--no-reload").arg(config).uid(NOBODY).gid(NOBODY)
+            .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap(),
+    )
+}
+
 async fn wait_for(addr: SocketAddr) {
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() { return; }
@@ -652,9 +644,7 @@ async fn redirect_forwards_to_the_original_destination() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
     std::fs::write(&config, format!("- address: 127.0.0.1:{listener_port}\n  protocol:\n    type: redirect\n")).unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
-        .arg("--no-reload").arg(&config).kill_on_drop(true)
-        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
+    let _child = spawn_shoes_as_nobody(dir.path(), &config, false);
     wait_for(format!("127.0.0.1:{listener_port}").parse().unwrap()).await;
 
     // An echo target on a port the rule below redirects away from.
@@ -668,7 +658,9 @@ async fn redirect_forwards_to_the_original_destination() {
         s.write_all(&b).await.unwrap();
     });
     // The client's own OUTPUT hook: same shape awg-manager installs in PREROUTING for the LAN.
-    let rule = format!("OUTPUT -t nat -p tcp -d 127.0.0.1 --dport {target_port} -j REDIRECT --to-ports {listener_port}");
+    // `! --uid-owner`: shoes dials the same address and port the client did.
+    // Without the exclusion that dial matches this rule too and loops.
+    let rule = format!("OUTPUT -t nat -p tcp -d 127.0.0.1 --dport {target_port} -m owner ! --uid-owner {NOBODY} -j REDIRECT --to-ports {listener_port}");
     sh(&format!("iptables -A {rule}"));
     let result = async {
         let mut c = tokio::net::TcpStream::connect(format!("127.0.0.1:{target_port}")).await.unwrap();
@@ -679,12 +671,13 @@ async fn redirect_forwards_to_the_original_destination() {
     };
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), result).await;
     sh(&format!("iptables -D {rule}"));
-    child.kill().await.unwrap();
     outcome.expect("the redirected connection reached the target through shoes");
 }
 ```
 
-The redirect rule targets the *client's* connection, so the client connects to `target_port`, the kernel diverts it to shoes, and shoes must dial `target_port` itself without being redirected again: the `REDIRECT` rule matches by `--dport` on the original destination, and shoes' outbound connection to the same port would match too. Exclude shoes' own uid: run the test with the rule `-m owner ! --uid-owner 0` if the binary runs as root, or simpler, have shoes dial an address the rule does not match: bind the echo target on `127.0.0.2:<port>` and write the rule for `-d 127.0.0.1`; shoes dials the original destination `127.0.0.1:<port>` which... also matches. Use the owner match: `-m owner ! --uid-owner $(id -u nobody)` and run the shoes child as `nobody` via `Command::uid`. Adjust the test accordingly: spawn with `.uid(65534)`; the loop guard in `RedirectServerHandler` is what this test proves does not fire.
+**(review)** The first draft of this step argued with itself about how to stop shoes' own dial from matching the rule. The answer is the owner match above, with shoes running as `nobody`; nothing else in the step depends on which loopback address the target uses. What the test proves: the client dials `target_port`, the kernel diverts it, shoes reads `SO_ORIGINAL_DST` and dials `target_port` itself, and that second connection is not diverted. If the rule is ever installed without the owner match the test hangs until its five-second timeout rather than passing by accident, because the echo is never reached.
+
+A panic between `iptables -A` and `iptables -D` would leave the rule installed on the development host, which is why the body runs inside `timeout(...)` and the assertion comes after the delete. Keep that order when editing.
 
 - [ ] **Step 6: Run, gates, commit**
 
@@ -703,10 +696,11 @@ git -c user.email=ayastrebov@gmail.com commit -m "redirect inbound: forward a NA
 Spec: "Slice 2" → "`tproxy`" (`udp_timeout`, `udp_nat_max`).
 
 **Files:**
-- Modify: `src/routing/udp_router.rs:40, 234, 953, 992, 1322-1331`, `UdpRouter::new`
+- Modify: `src/routing/udp_router.rs` — `SESSION_TIMEOUT_SECS` and its two uses, `UdpRouter::new`, the session-create path beside `pending_creates`, `run_udp_routing`
+- Modify: `src/routing/mod.rs` — the re-export
 
 **Interfaces:**
-- Produces: `pub struct RouterLimits { pub session_timeout: Duration, pub max_sessions: usize }` with `Default` = today's constants (200 s, unbounded → `usize::MAX`); `run_udp_routing_with_limits(server, selector, resolver, need_initial_flush, limits)`; `run_udp_routing` unchanged, delegating with `RouterLimits::default()`.
+- Produces: `pub struct RouterLimits { pub session_timeout: Duration, pub max_sessions: usize, pub shared_budget: Option<Arc<Semaphore>> }` with `Default` = today's behaviour (200 s, `usize::MAX`, no budget); `run_udp_routing_with_limits(server, selector, resolver, need_initial_flush, limits)`; `run_udp_routing` unchanged, delegating with `RouterLimits::default()`.
 
 - [ ] **Step 1: Failing test**
 
@@ -735,27 +729,52 @@ Expected: FAIL to compile (`RouterLimits`).
 ```rust
 /// Per-listener session policy. The defaults are what every UDP inbound had
 /// before `tproxy` made them configurable.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RouterLimits {
     pub session_timeout: Duration,
+    /// Sessions this one router may hold.
     pub max_sessions: usize,
+    /// Sessions every router sharing this budget may hold between them. A
+    /// `tproxy` listener runs one router per LAN client, and its
+    /// `udp_nat_max` is a promise about the listener, not about each client.
+    pub shared_budget: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for RouterLimits {
     fn default() -> Self {
-        Self { session_timeout: Duration::from_secs(SESSION_TIMEOUT_SECS), max_sessions: usize::MAX }
+        Self { session_timeout: Duration::from_secs(SESSION_TIMEOUT_SECS), max_sessions: usize::MAX, shared_budget: None }
     }
 }
 ```
 
-`UdpRouter` gains `limits: RouterLimits`; `new` gains the parameter; the two `Duration::from_secs(SESSION_TIMEOUT_SECS)` sites use `self.limits.session_timeout` (thread it into `RoutingSession::reset_expiry` as an argument). Before a new session is created (the `pending_creates` push, around the lookup insert at `:940`), add:
+`UdpRouter` gains `limits: RouterLimits`; `new` gains the parameter; the two `Duration::from_secs(SESSION_TIMEOUT_SECS)` sites use `self.limits.session_timeout` (thread it into `RoutingSession::reset_expiry` as an argument). Before a new session is created (the `pending_creates` push), add:
 
 ```rust
                 if self.sessions.len() + self.pending_creates.len() >= self.limits.max_sessions {
                     warn!("UDP session cap {} reached; dropping datagram to {destination}", self.limits.max_sessions);
                     continue; // or the equivalent early return in that branch
                 }
+                // The listener-wide budget. The permit lives in the pending
+                // create and then in the session, so every way a session can
+                // end -- expiry, error, the router being dropped with its
+                // client -- returns it without a line of bookkeeping.
+                let permit = match &self.limits.shared_budget {
+                    Some(budget) => match budget.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            warn!("listener UDP session budget exhausted; dropping datagram to {destination}");
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
 ```
+
+**(review)** `shared_budget` is new in this revision. The first draft had only `max_sessions`, and Task 4 handed the same figure to every client's router, so a listener with `udp_nat_max: 4096` could hold 4096 × 4096 sessions. A semaphore rather than an `AtomicUsize` because the release has to happen on every exit path including a dropped router, and an `OwnedSemaphorePermit` in the session does that by construction. `PendingSessionCreate` and `RoutingSession` each gain an `Option<OwnedSemaphorePermit>` field that is never read; name it `_budget_permit` and say why in its comment.
+
+Dropping is the right thing for a full table: it is what a full conntrack table does to a new flow, and the existing flows keep working. Say so in the comment beside the `warn!` (AGENTS.md, "Bound every queue, and decide what a full one does"). The `warn!` fires per dropped datagram, which under a flood is per packet; rate-limit it the way the router's other per-packet warnings are, or log once per crossing.
+
+Extend Step 1's test with the shared case: two routers on one `Semaphore::new(1)`, a datagram to each, the second router creates nothing; drop the first router, feed the second again, it creates its session. Prove it can fail by moving the `try_acquire_owned` after the create and watching the first assertion go red.
 
 `run_udp_routing_with_limits` is `run_udp_routing` with the extra argument; `run_udp_routing` calls it with `RouterLimits::default()`. Export both and `RouterLimits` from `src/routing/mod.rs`.
 
@@ -775,11 +794,12 @@ Spec: "Slice 2" → "`tproxy`".
 
 **Files:**
 - Modify: `src/tproxy/mod.rs`
-- Modify: `src/tcp/tcp_server.rs:394` (`Transport::Udp` arm), `src/socket_util.rs` (transparent bind helper)
+- Modify: `src/tcp/tcp_server.rs` (the `Transport::Udp => todo!()` arm in `start_tcp_or_quic_servers`, `:483` at `89aebfa`), `src/socket_util.rs` (transparent bind helpers), `src/tproxy/sys.rs`
 - Modify: `tests/transparent.rs` (second test)
 
 **Interfaces:**
-- Consumes: Task 2 `sys::{make_transparent, recv_with_original_destination}`; Task 3 `run_udp_routing_with_limits`, `RouterLimits`.
+- Consumes: Task 2 `sys::{v4, v6}`; Task 3 `run_udp_routing_with_limits`, `RouterLimits` and its `shared_budget`.
+- Produces also: `sys::{make_transparent, recv_with_original_destination}`, moved here from Task 2 so they land with their caller. **(review)**
 - Produces: `pub async fn start_tproxy_udp_server(config: ServerConfig, resolver: Arc<dyn Resolver>) -> io::Result<Vec<JoinHandle<()>>>`; `struct TproxyClientStream` implementing `AsyncTargetedMessageStream`.
 
 - [ ] **Step 1: Failing unit test**
@@ -791,7 +811,7 @@ In `src/tproxy/mod.rs` tests (Linux only, no root needed: it tests the demux and
     async fn datagrams_are_demultiplexed_by_client_and_carry_their_destination() {
         let (tx, mut stream) = TproxyClientStream::new_for_test("10.0.0.5:4000".parse().unwrap());
         let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
-        tx.send((dst, b"query".to_vec().into_boxed_slice())).await.unwrap();
+        tx.send((dst, bytes::Bytes::from_static(b"query"))).await.unwrap();
         let mut buf = [0u8; 64];
         let mut rb = tokio::io::ReadBuf::new(&mut buf);
         let target = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut rb)).await.unwrap();
@@ -806,6 +826,82 @@ Run: `cargo test --locked tproxy`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement**
+
+`src/tproxy/sys.rs`, inside `mod linux`, the two calls Task 2 left out. Constants from `libc`; the headers they mirror are `include/uapi/linux/in.h` (`IP_TRANSPARENT` 19, `IP_RECVORIGDSTADDR` 20) and `include/uapi/linux/in6.h` (`IPV6_TRANSPARENT` 75, `IPV6_RECVORIGDSTADDR` 74). These are `SOL_IP`/`SOL_IPV6` options, which unlike `SOL_SOCKET` ones have the same numbers on MIPS, so the mipsel build needs nothing special.
+
+```rust
+    fn setsockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: `value` outlives the call and the length is its size.
+        let rc = unsafe { libc::setsockopt(fd, level, name, &value as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+
+    /// `IP_TRANSPARENT` (needs CAP_NET_ADMIN) and, for a listener,
+    /// `IP_RECVORIGDSTADDR` so `recvmsg` reports where each datagram was going.
+    /// A failure is returned, never swallowed: a listener without the option
+    /// binds fine and then receives nothing, which looks like a dead network.
+    pub fn make_transparent(fd: RawFd, ipv6: bool, receive_original_destination: bool) -> std::io::Result<()> {
+        let (level, transparent, recv) = if ipv6 {
+            (libc::SOL_IPV6, libc::IPV6_TRANSPARENT, libc::IPV6_RECVORIGDSTADDR)
+        } else {
+            (libc::SOL_IP, libc::IP_TRANSPARENT, libc::IP_RECVORIGDSTADDR)
+        };
+        setsockopt_int(fd, level, transparent, 1).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("IP_TRANSPARENT: {e} (this needs CAP_NET_ADMIN)"))
+        })?;
+        if receive_original_destination {
+            setsockopt_int(fd, level, recv, 1)?;
+        }
+        Ok(())
+    }
+
+    /// One datagram with its source and its original destination.
+    pub fn recv_with_original_destination(fd: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
+        // SAFETY: every pointer in `msg` refers to a local that outlives the
+        // call; the control buffer is u64-aligned, which cmsghdr requires;
+        // CMSG_DATA is cast only after level and type say what it holds.
+        unsafe {
+            let mut source: libc::sockaddr_storage = std::mem::zeroed();
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+            let mut control = [0u64; 32];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_name = &mut source as *mut _ as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+            let n = libc::recvmsg(fd, &mut msg, 0);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if msg.msg_flags & libc::MSG_TRUNC != 0 {
+                // Reject rather than truncate: a cut datagram forwarded as if
+                // whole is worse than a dropped one.
+                return Err(std::io::Error::other("datagram larger than the receive buffer"));
+            }
+            let source = match source.ss_family as libc::c_int {
+                libc::AF_INET => v4(&*(&source as *const _ as *const libc::sockaddr_in)),
+                libc::AF_INET6 => v6(&*(&source as *const _ as *const libc::sockaddr_in6)),
+                _ => return Err(std::io::Error::other("unknown address family")),
+            };
+            let mut destination = None;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                let hdr = &*cmsg;
+                if hdr.cmsg_level == libc::SOL_IP && hdr.cmsg_type == libc::IP_RECVORIGDSTADDR {
+                    destination = Some(v4(&*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in)));
+                } else if hdr.cmsg_level == libc::SOL_IPV6 && hdr.cmsg_type == libc::IPV6_RECVORIGDSTADDR {
+                    destination = Some(v6(&*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6)));
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+            Ok((n as usize, source, destination))
+        }
+    }
+```
+
+`CMSG_DATA` is not guaranteed aligned for `sockaddr_in6` on every architecture; on mipsel an unaligned load traps. Read it with `std::ptr::read_unaligned` rather than the `&*` above if the unit test under QEMU (or a run on the router) faults there. The `recvmsg` parsing is unit-testable without root: a plain UDP socket with `IP_RECVORIGDSTADDR` set (that option needs no capability, only `IP_TRANSPARENT` does) reports its own bound address as the "original" destination, which is enough to prove the control-message walk. Write that test; it is the only coverage this `unsafe` block gets outside the root-gated one.
 
 `src/socket_util.rs`, Linux only:
 
@@ -835,6 +931,8 @@ pub fn new_transparent_reply_socket(spoof: SocketAddr) -> std::io::Result<tokio:
 ```
 
 `reuse_port: true` on the reply socket: two clients talking to the same remote need two sockets bound to the same spoofed address.
+
+Neither function calls `protect_outbound`, and that is deliberate rather than the omission AGENTS.md warns about: the reply socket's peer is a LAN client, not an upstream, and the socket protector exists only where a VPN service owns the routes (Android, iOS), which is not where `tproxy` compiles. Say so in a comment on `new_transparent_reply_socket`, so the next reader does not "fix" it.
 
 `src/tproxy/mod.rs`:
 
@@ -875,35 +973,57 @@ mod linux {
 
     const REPLY_SOCKETS_PER_CLIENT: usize = 64;
     const CLIENT_QUEUE: usize = 256;
+    const MAX_DATAGRAM: usize = 65535;
 
-    type Datagram = (SocketAddr, Box<[u8]>); // (original destination, payload)
+    type Datagram = (SocketAddr, bytes::Bytes); // (original destination, payload)
 
     /// One LAN client's view of the listener: reads are the datagrams the
     /// demux task delivered for it; writes are replies to it, spoofed.
     pub struct TproxyClientStream {
         client: SocketAddr,
         rx: mpsc::Receiver<Datagram>,
-        replies: LruCache<SocketAddr, Arc<tokio::net::UdpSocket>>,
+        replies: LruCache<SocketAddr, ReplySocket>,
+        /// Reply sockets across every client of this listener.
+        reply_budget: Arc<tokio::sync::Semaphore>,
+    }
+
+    /// A spoofed socket and its share of the listener's descriptor budget;
+    /// evicting it from the LRU returns the permit.
+    struct ReplySocket {
+        socket: Arc<tokio::net::UdpSocket>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     }
 
     impl TproxyClientStream {
-        fn new(client: SocketAddr, rx: mpsc::Receiver<Datagram>) -> Self {
-            Self { client, rx, replies: LruCache::new(std::num::NonZeroUsize::new(REPLY_SOCKETS_PER_CLIENT).unwrap()) }
+        fn new(client: SocketAddr, rx: mpsc::Receiver<Datagram>, reply_budget: Arc<tokio::sync::Semaphore>) -> Self {
+            Self { client, rx, replies: LruCache::new(std::num::NonZeroUsize::new(REPLY_SOCKETS_PER_CLIENT).unwrap()), reply_budget }
         }
 
         #[cfg(test)]
         pub fn new_for_test(client: SocketAddr) -> (mpsc::Sender<Datagram>, Self) {
             let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
-            (tx, Self::new(client, rx))
+            (tx, Self::new(client, rx, Arc::new(tokio::sync::Semaphore::new(REPLY_SOCKETS_PER_CLIENT))))
         }
 
         fn reply_socket(&mut self, spoof: SocketAddr) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
             if let Some(s) = self.replies.get(&spoof) {
-                return Ok(s.clone());
+                return Ok(s.socket.clone());
             }
-            let s = Arc::new(crate::socket_util::new_transparent_reply_socket(spoof)?);
-            self.replies.put(spoof, s.clone());
-            Ok(s)
+            // Out of budget: free this client's own oldest socket and try
+            // once more, so a busy client recycles its sockets rather than
+            // starving; if the listener is still full the reply is dropped,
+            // which for UDP is what a full socket buffer would have done.
+            let permit = match self.reply_budget.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    self.replies.pop_lru();
+                    self.reply_budget.clone().try_acquire_owned()
+                        .map_err(|_| std::io::Error::other("tproxy reply-socket budget exhausted"))?
+                }
+            };
+            let socket = Arc::new(crate::socket_util::new_transparent_reply_socket(spoof)?);
+            self.replies.put(spoof, ReplySocket { socket: socket.clone(), _permit: permit });
+            Ok(socket)
         }
     }
 
@@ -960,6 +1080,7 @@ mod linux {
         let ServerProxyConfig::Tproxy { udp_timeout, udp_nat_max } = config.protocol else {
             unreachable!("validated: transport udp is tproxy");
         };
+        raise_nofile_limit(udp_nat_max);
         let rules = config.rules.map(crate::config::ConfigSelection::unwrap_config).into_vec();
         let selector = Arc::new(crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(rules, resolver.clone()));
         let BindLocation::Address(addresses) = config.bind_location else {
@@ -971,22 +1092,34 @@ mod linux {
                 println!("Starting TPROXY UDP server at {bind}");
                 let socket = crate::socket_util::new_transparent_udp_listener(bind)?;
                 let fd = AsyncFd::new(socket)?;
-                let limits = RouterLimits { session_timeout: Duration::from_secs(udp_timeout), max_sessions: udp_nat_max };
-                handles.push(tokio::spawn(demux(fd, selector.clone(), resolver.clone(), limits)));
+                // One budget of each kind per listener, shared by every
+                // client's router and reply cache: `udp_nat_max` is a promise
+                // about the listener's descriptors, not about each client.
+                let limits = RouterLimits {
+                    session_timeout: Duration::from_secs(udp_timeout),
+                    max_sessions: udp_nat_max,
+                    shared_budget: Some(Arc::new(tokio::sync::Semaphore::new(udp_nat_max))),
+                };
+                let reply_budget = Arc::new(tokio::sync::Semaphore::new(udp_nat_max));
+                let label = crate::tcp::tcp_server::inbound_label(&config.protocol, &bind.to_string());
+                handles.push(tokio::spawn(demux(fd, selector.clone(), resolver.clone(), limits, reply_budget, label)));
             }
         }
         Ok(handles)
     }
 
-    async fn demux(fd: AsyncFd<socket2::Socket>, selector: Arc<ClientProxySelector>, resolver: Arc<dyn Resolver>, limits: RouterLimits) {
+    async fn demux(fd: AsyncFd<socket2::Socket>, selector: Arc<ClientProxySelector>, resolver: Arc<dyn Resolver>, limits: RouterLimits, reply_budget: Arc<tokio::sync::Semaphore>, label: &'static str) {
         let mut clients: HashMap<SocketAddr, Client> = HashMap::new();
-        let mut buf = vec![0u8; 65535];
+        // One growing buffer, split per datagram: `split_to(n).freeze()` hands
+        // the client task an owned `Bytes` without a fresh allocation per
+        // packet; `reserve` allocates a new block only when the last is spent.
+        let mut buf = bytes::BytesMut::new();
         let mut sweep = tokio::time::interval(Duration::from_secs(5));
-        let per_client = RouterLimits { session_timeout: limits.session_timeout, max_sessions: limits.max_sessions };
         loop {
             tokio::select! {
                 readable = fd.readable() => {
                     let mut guard = match readable { Ok(g) => g, Err(e) => { log::error!("tproxy listener: {e}"); return; } };
+                    buf.resize(MAX_DATAGRAM, 0);
                     let result = guard.try_io(|inner| sys::recv_with_original_destination(inner.get_ref().as_raw_fd(), &mut buf));
                     let (n, source, destination) = match result {
                         Ok(Ok(v)) => v,
@@ -1006,11 +1139,12 @@ mod linux {
                                 continue;
                             }
                             let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
-                            let stream = TproxyClientStream::new(source, rx);
+                            let stream = TproxyClientStream::new(source, rx, reply_budget.clone());
+                            let per_client = limits.clone();
                             let selector = selector.clone();
                             let resolver = resolver.clone();
                             let task = tokio::spawn(async move {
-                                let _handle = crate::connection_registry::register(source, "tproxy", crate::connection_registry::Network::Udp);
+                                let _handle = crate::connection_registry::register(source, label, crate::connection_registry::Network::Udp);
                                 if let Err(e) = run_udp_routing_with_limits(ServerStream::Targeted(Box::new(stream)), selector, resolver, false, per_client).await {
                                     log::debug!("tproxy client {source} ended: {e}");
                                 }
@@ -1020,7 +1154,10 @@ mod linux {
                         }
                     };
                     client.last_seen = tokio::time::Instant::now();
-                    if client.tx.try_send((destination, buf[..n].to_vec().into_boxed_slice())).is_err() {
+                    // Bounded, and full means drop: the same thing a full socket
+                    // buffer does, and the only answer that cannot stall the
+                    // listener for every other client.
+                    if client.tx.try_send((destination, buf.split_to(n).freeze())).is_err() {
                         log::debug!("tproxy: client {source} queue full; datagram dropped");
                     }
                 }
@@ -1041,9 +1178,16 @@ mod linux {
 pub use linux::*;
 ```
 
-The `connection_registry::register` line exists only if the Clash plan's Task 2 has landed; otherwise omit it and let that plan's Task 3 add it. `src/routing/mod.rs:10` exports only `ServerStream` and `run_udp_routing`; extend it to `pub use udp_router::{RouterLimits, ServerStream, run_udp_routing, run_udp_routing_with_limits};` (Task 3 should already have done this; verify).
+**(review)** notes on the listing above.
 
-`src/tcp/tcp_server.rs:394`:
+- `buf.resize(MAX_DATAGRAM, 0)` after a `split_to` re-zeroes 64 KiB per datagram, which is its own per-packet cost. If that shows in a profile, keep a plain `Vec` for `recvmsg` and `copy_from_slice` into a `BytesMut` sized to `n`; either way the rule is one amortised allocation, not one `Vec` per datagram. Pick one, measure, and say which in the comment.
+- `inbound_label(&config.protocol, ..)` borrows a field while `config.rules` and `config.bind_location` have been moved out. That compiles, because the moves are of other fields and the two `tproxy` fields are `Copy`; if a later edit makes it stop compiling, borrow the label before the moves rather than cloning the protocol.
+- The registry entry is per LAN client, not per UDP session, so its destination stays unset and `/connections` shows one `tproxy@…` row per client. The spec's testing section asked for the original destination there; that holds for `redirect` and is given up for `tproxy`, where a row per destination would mean a registry write on the session-create path. Recorded in the spec's decisions.
+- `raise_nofile_limit(udp_nat_max)` is the spec's "RSS budget" paragraph, which no task carried: `getrlimit(RLIMIT_NOFILE)`, raise the soft limit to the hard one, log the figure, and `warn!` if `2 * udp_nat_max + 64` (sessions, reply sockets, and everything else the process holds) exceeds it. It warns rather than refuses because the limit is the host's to change and the listener degrades by dropping, not by failing. Entware's default soft limit is 1024 on some models, below the 4096 default, so this warning is expected on a router and the router run (Task 5) should record what it said.
+
+`src/routing/mod.rs:10` exports only `ServerStream` and `run_udp_routing`; extend it to `pub use udp_router::{RouterLimits, ServerStream, run_udp_routing, run_udp_routing_with_limits};` (Task 3 should already have done this; verify).
+
+`src/tcp/tcp_server.rs`, replacing the `todo!()`:
 
 ```rust
         Transport::Udp => {
@@ -1070,10 +1214,8 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
     std::fs::write(&config, format!("- address: 127.0.0.1:{listener_port}\n  transport: udp\n  protocol:\n    type: tproxy\n")).unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
-        .arg("--no-reload").arg(&config).kill_on_drop(true)
-        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _child = spawn_shoes_as_nobody(dir.path(), &config, true);
+    wait_for_udp_bound(listener_port).await;
 
     // A UDP echo on a second loopback address, so the client's datagram to it
     // is what the TPROXY rule diverts, and shoes' own dial to it is not.
@@ -1107,12 +1249,27 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
     for s in setup.iter().rev() {
         let _ = Command::new("sh").arg("-c").arg(s.replace(" -A ", " -D ").replace("rule add", "rule del").replace("route add", "route del")).status();
     }
-    child.kill().await.unwrap();
     outcome.expect("the datagram went through shoes and came back spoofed");
 }
 ```
 
-Run the shoes child as uid 65534 (`.uid(65534)` on the command) so the owner match excludes its own outbound datagrams, and grant it `CAP_NET_ADMIN` with `setcap cap_net_admin+ep` on the test binary's copy of `shoes` before spawning (the test does `sh("setcap cap_net_admin+ep <path>")` on a copy in the temp dir and runs that copy). The exact loopback-marking recipe may need one iteration on the CI kernel; that is what the ignored gate is for.
+`spawn_shoes_as_nobody(.., true)` is Task 2's helper with `setcap cap_net_admin+ep` on the copy, so this test also proves the capability is sufficient and root is not required. **(review)** The first draft slept 500 ms for the listener; `wait_for_udp_bound` polls `/proc/net/udp` for the port instead, which is the probe awg-manager itself uses (spec, "Testing") and costs nothing when the listener is already up:
+
+```rust
+async fn wait_for_udp_bound(port: u16) {
+    let needle = format!(":{port:04X} ");
+    for _ in 0..100 {
+        let table = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
+        if table.lines().any(|l| l.split_whitespace().nth(1).is_some_and(|local| format!("{local} ").ends_with(&needle))) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("nothing bound UDP port {port}");
+}
+```
+
+The exact loopback-marking recipe may need one iteration on the CI kernel; that is what the ignored gate is for. It can be iterated on the development host first, which is Linux.
 
 - [ ] **Step 5: Run, gates, commit**
 
@@ -1130,7 +1287,8 @@ git -c user.email=ayastrebov@gmail.com commit -m "tproxy inbound: transparent UD
 ### Task 5: CI, docs, and the router run
 
 **Files:**
-- Modify: `.github/workflows/test.yml`, `README.md`, this plan.
+- Modify: `.github/workflows/test.yml`, `.github/workflows/build.yml`, `README.md`, `CONFIG.md`, `ROADMAP.md`, this plan.
+- Create: `examples/transparent_proxy.yaml`
 
 - [ ] **Step 1: CI step**
 
@@ -1144,22 +1302,38 @@ In `test.yml` after the desktop step, Linux only:
         run: sudo -E env "PATH=$PATH" cargo test --locked --test transparent -- --ignored
 ```
 
-- [ ] **Step 2: README**
+The runner needs `iptables` and `setcap` (`libcap2-bin`); both are on `ubuntu-latest` and `ubuntu-24.04-arm` today, but install them explicitly in the step so an image change fails loudly here rather than as a confusing test error.
+
+- [ ] **Step 2: README, CONFIG.md, the example, the smoke loop**
+
+**(review)** The first draft stopped at the README. AGENTS.md's rule is that every option reaches `CONFIG.md` with its default and `examples/` with a config that parses, and that the example joins the release smoke loop:
+
+- `CONFIG.md`: `redirect` (no fields) and `tproxy` (`udp_timeout`, default 300; `udp_nat_max`, default 4096), both Linux-only and loopback-only, `transport: udp` required for `tproxy` and refused for everything else. Say the things a user learns painfully otherwise: shoes installs no firewall rules or policy routes; `IP_TRANSPARENT` needs `CAP_NET_ADMIN`; a `tproxy` listener without the `ip rule`/`ip route local` pair binds happily and receives nothing; `udp_nat_max` above the descriptor limit is warned about, not refused.
+- `examples/transparent_proxy.yaml`: both listeners on awg-manager's ports (`51272` TCP, `51271` UDP) with a direct rule. Cert-free, so it qualifies for the loop.
+- `.github/workflows/build.yml`, `Smoke test binary`: add `transparent_proxy` to the **Linux** arm of the `case`, not the common list; validation refuses it on the other two, which is the behaviour, not a failure. A dry run does not bind, so it needs no capability.
+
 
 Under "Supported Protocols" add a "Transparent proxy (Linux)" subsection with the two YAML blocks from the spec and the sentence that the kernel plumbing is the host's, with the `ip rule` / `ip route local` / `TPROXY` lines the test uses as the reference recipe.
 
 - [ ] **Step 3: The router run**
 
-On a Keenetic aarch64 with awg-manager pointed at shoes for the tproxy router mode (awg-manager's emitter is its own work): all three of its health probes green (`/proc/net/tcp` LISTEN on 51272, `/proc/net/udp` bound on 51271, Clash `/version` once the Clash plan's slice 1 has landed), a browser on a LAN client reaching a site through it, a DNS lookup from the LAN client, and the RSS table from the spec repeated on the router. Record the figures here:
+The binary is `dist/keenetic/` from `scripts/build-keenetic.sh` (PR #24), built with `clash-api` so the third probe has something to answer. On a Keenetic aarch64 with awg-manager pointed at shoes for the tproxy router mode (awg-manager's emitter is its own work): all three of its health probes green (`/proc/net/tcp` LISTEN on 51272, `/proc/net/udp` bound on 51271, Clash `/version` once the Clash plan's slice 1 has landed), a browser on a LAN client reaching a site through it, a DNS lookup from the LAN client, and the RSS table from the spec repeated on the router. Record the figures here:
 
 ```
 Keenetic model: ____   idle RSS: ____ MB   after 1 GB download: ____ MB   fork idle: ____ MB
+RLIMIT_NOFILE the listener reported: ____   udp_nat_max warning shown: yes / no
 ```
 
-- [ ] **Step 4: Commit**
+This is the *second* router run. The first one is the legacy-tunnel mode and is unblocked now (see "Status"); if it has happened by the time this step is reached, its RSS figures go in `docs/keenetic-build-2026-09-11.md` under "What is not measured", which is the list they close.
+
+- [ ] **Step 4: ROADMAP**
+
+`ROADMAP.md` has no entry for any of this work. Add one section, "awg-manager engine", pointing at the spec and saying what is deliberately missing after slice 2 and what each gap costs a user: no logical or source rules (awg-manager's rule editor is limited to what `masks` expresses), no DNS rules or port-53 hijack outside TUN (DNS from LAN clients on the tproxy mode bypasses shoes unless the host redirects it), no Chrome ClientHello (unmeasured), no big-endian `mips` build and no shipped MIPS artifact. AGENTS.md: a gap is written down with what it costs to leave.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add .github/workflows/test.yml README.md docs/plans/2026-09-11-awg-manager-engine.md
+git add .github/workflows/test.yml .github/workflows/build.yml README.md CONFIG.md ROADMAP.md examples/transparent_proxy.yaml docs/plans/2026-09-11-awg-manager-engine.md
 git -c user.email=ayastrebov@gmail.com commit -m "ci+docs: transparent inbound tests under root; README section"
 ```
 
@@ -1171,5 +1345,9 @@ Each is planned when the slice before it has run under awg-manager on a router, 
 
 - **Slice 3, rules** (`all_of`/`any_of`, `source_masks`, per-rule `udp_timeout`, the `.srs` encoder and `rule-set compile`/`match`): after slice 2's router run shows which rule shapes awg-manager's presets actually emit against shoes.
 - **Slice 4, DNS rules**: after slice 3, because a `dns_rules` mask is a slice-3 mask.
-- **Slice 5, Chrome ClientHello**: only if the Reality link opened during the first router run is reset where the fork's is not.
-- **Slice 6, MIPS**: last, by the user's instruction; a toolchain task with its own plan.
+- **Slice 5, Chrome ClientHello**: only if the Reality link opened during the first router run is reset where the fork's is not. That run no longer waits on anything in this repository.
+- **Slice 6, MIPS**: was to be last, and ran early as PR #24. Done: a reproducible mipsel build (`scripts/build-keenetic.sh`, `Cross.toml`, `docs/keenetic-build-2026-09-11.md`), jemalloc off and `portable-atomic` in on the target, `version` and `check` passing under QEMU. Left, and still last:
+  - `mips-unknown-linux-musl` (big-endian), which awg-manager ships for and nobody has attempted. Same route as mipsel; the endianness is the new risk, in the hand-written codecs rather than the toolchain.
+  - A shipped artifact. The build is a script on a developer's machine, not a CI job: it needs nightly `build-std`, a full aws-lc build, and a retry loop around an LLVM MIPS backend that crashes about one build in two. A release-only job is the shape; a per-PR one was declined in #24's review for cost.
+  - Anything beyond `version` and `check` on the target. No connection has been carried on MIPS, under QEMU or on a router, and the `portable_atomic` branch of `util::atomic` is compiled there and tested nowhere. Running the counter tests under QEMU user emulation is the cheap first step and needs no router.
+  - Slice 2 on MIPS: `CMSG_DATA` alignment in `recv_with_original_destination` (Task 4) is the one place this plan adds code that can behave differently there.
