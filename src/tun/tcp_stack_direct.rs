@@ -5,7 +5,7 @@
 //! file supplies the descriptor-shaped [`StackDevice`] and the wake pipe that
 //! gets an idle thread out of `poll()` at shutdown.
 
-use std::{cell::RefCell, io, os::unix::io::RawFd};
+use std::{cell::RefCell, collections::VecDeque, io, os::unix::io::RawFd};
 
 use log::{error, trace, warn};
 use smoltcp::{
@@ -92,7 +92,12 @@ impl TcpStackDirect {
             }
         };
 
-        let handle = match StackHandle::spawn("shoes-smoltcp-direct", options, move || {
+        // The stack thread's wake primitive: a byte down the pipe whose read
+        // end `wait_readable` selects on. Handed to the notifier, which fires
+        // it only while the thread is parked.
+        let wake = pipe_waker(wake_tx);
+
+        let handle = match StackHandle::spawn("shoes-smoltcp-direct", options, wake, move || {
             // Sets fd to non-blocking mode once at startup for performance.
             set_nonblocking(fd)
                 .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
@@ -150,36 +155,49 @@ impl TcpStackDirect {
         self.handle.is_running()
     }
 
-    /// A waker for the UDP response path: one byte down the wake pipe gets
-    /// the stack thread out of `poll()` to drain the response channel.
-    ///
-    /// The descriptor is duplicated so the waker cannot write to a reused
-    /// descriptor number after Drop closes the pipe — the waker lives in
-    /// tokio tasks whose teardown races the stack's own.
+    /// A waker for the UDP response path: queue the datagram, then call this,
+    /// and the stack thread drains the response channel now rather than on its
+    /// next wakeup. Routed through the notifier, so it fires the wake pipe only
+    /// when the thread is asleep and coalesces a burst into one write.
     pub fn udp_waker(&self) -> StackWaker {
-        if self.wake_tx < 0 {
-            // The pipe could not be created at startup; responses fall back
-            // to being drained on the wait timeout.
-            return std::sync::Arc::new(|| {});
-        }
-        // SAFETY: wake_tx is a live pipe descriptor owned by this stack.
-        let duped = unsafe { libc::dup(self.wake_tx) };
-        if duped < 0 {
-            return std::sync::Arc::new(|| {});
-        }
-        // SAFETY: `duped` was just returned by dup() and nothing else owns it.
-        let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(duped) };
-        std::sync::Arc::new(move || {
-            use std::os::fd::AsRawFd;
-            let byte = [1u8];
-            // SAFETY: `owned` keeps the descriptor alive for the closure's
-            // lifetime. A failed write (pipe full) is fine — a full pipe is
-            // already waking the poll.
-            unsafe {
-                libc::write(owned.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
-            }
-        })
+        self.handle.waker()
     }
+}
+
+/// The stack thread's wake primitive: one byte down the wake pipe, which gets
+/// it out of `poll()`. Returned as a [`StackWaker`] for the notifier to hold.
+///
+/// The descriptor is duplicated so the closure cannot write to a reused
+/// descriptor number after Drop closes the pipe — it outlives this call inside
+/// the notifier, whose teardown races the stack's own.
+///
+/// `F_DUPFD_CLOEXEC`, not `dup`: the pipe ends are `FD_CLOEXEC` (see
+/// `new_wake_pipe`), but a plain `dup` clears that flag on the copy. Since this
+/// copy lives for the whole life of the stack, a child spawned while the tunnel
+/// is up would otherwise inherit the wake-pipe writer and hold it open.
+fn pipe_waker(wake_tx: RawFd) -> StackWaker {
+    if wake_tx < 0 {
+        // The pipe could not be created at startup; wakeups fall back to the
+        // wait timeout.
+        return std::sync::Arc::new(|| {});
+    }
+    // SAFETY: wake_tx is a live pipe descriptor owned by the stack.
+    let duped = unsafe { libc::fcntl(wake_tx, libc::F_DUPFD_CLOEXEC, 0) };
+    if duped < 0 {
+        return std::sync::Arc::new(|| {});
+    }
+    // SAFETY: `duped` was just returned by F_DUPFD_CLOEXEC and nothing else owns it.
+    let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(duped) };
+    std::sync::Arc::new(move || {
+        use std::os::fd::AsRawFd;
+        let byte = [1u8];
+        // SAFETY: `owned` keeps the descriptor alive for the closure's
+        // lifetime. A failed write (pipe full) is fine — a full pipe is
+        // already waking the poll.
+        unsafe {
+            libc::write(owned.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+        }
+    })
 }
 
 /// Direct TUN device that reads/writes directly to fd.
@@ -188,7 +206,9 @@ struct FdDevice {
     /// Read end of the wake pipe; -1 when the pipe could not be created.
     wake_fd: RawFd,
     mtu: usize,
-    pending_rx: Option<PooledBuffer>,
+    /// A whole read batch, queued for smoltcp to drain through `receive` in
+    /// one `poll`. Was a single slot polled after each packet.
+    pending: VecDeque<PooledBuffer>,
 }
 
 impl FdDevice {
@@ -197,7 +217,7 @@ impl FdDevice {
             fd,
             wake_fd,
             mtu,
-            pending_rx: None,
+            pending: VecDeque::with_capacity(super::stack_common::MAX_PACKET_BATCH),
         }
     }
 }
@@ -209,7 +229,7 @@ impl StackDevice for FdDevice {
     /// - Ok(None) if no packet was available (WouldBlock)
     /// - Err(e) if a fatal error occurred (including EOF)
     fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
-        if let Some(pkt) = self.pending_rx.take() {
+        if let Some(pkt) = self.pending.pop_front() {
             return Ok(Some(pkt));
         }
 
@@ -240,13 +260,13 @@ impl StackDevice for FdDevice {
         }
     }
 
-    /// Store a packet for later processing by smoltcp.
+    /// Queue a packet for the next smoltcp poll to drain.
     fn store_packet(&mut self, pkt: PooledBuffer) {
-        self.pending_rx = Some(pkt);
+        self.pending.push_back(pkt);
     }
 
     fn has_pending(&self) -> bool {
-        self.pending_rx.is_some()
+        !self.pending.is_empty()
     }
 
     /// Write a packet to TUN.
@@ -267,7 +287,7 @@ impl Device for FdDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending_rx.take() {
+        if let Some(buffer) = self.pending.pop_front() {
             let rx = PooledRxToken { buffer };
             let tx = DirectTxToken { fd: self.fd };
             Some((rx, tx))
