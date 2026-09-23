@@ -38,6 +38,9 @@ All server protocols plus:
 - **XTLS Reality**
 - **XTLS Vision** (for VLESS)
 
+### Transparent Proxy (Linux)
+- **Redirect** - the target of NAT `REDIRECT` for TCP; forwards each connection to where the kernel says it was going (`examples/transparent_proxy.yaml`). shoes installs no firewall rules: the host, or a manager such as awg-manager, has to add the `REDIRECT` rule that sends traffic to the listener
+
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - **Fake IP** - answers DNS locally from a private pool, so nothing resolves on the device
@@ -269,6 +272,19 @@ See the [examples](./examples) directory for all examples.
               password: secret123
           padding: true
 ```
+
+### Transparent Proxy (Linux)
+```yaml
+# With, for a LAN of 192.168.1.0/24 behind br0 (the `! -d` keeps traffic to the
+# router itself and to other LAN hosts out of the proxy):
+#   iptables -t nat -A PREROUTING -i br0 -p tcp ! -d 192.168.1.0/24 \
+#       -j REDIRECT --to-ports 51272
+- address: 0.0.0.0:51272
+  protocol:
+    type: redirect
+  sniff: true
+```
+See [CONFIG.md](CONFIG.md#redirect-transparent-tcp-linux) for why the bind is the wildcard and why a direct connection to the port is refused.
 
 ### TUN VPN
 ```yaml

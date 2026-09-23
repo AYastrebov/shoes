@@ -869,18 +869,20 @@ client_proxies:
             // The same split already exists in `.github/workflows/build.yml`,
             // whose smoke-test loop dry-runs each example only on the
             // platforms whose arm accepts it. This list is that list; keep the
-            // two together. Every non-TUN example still validates everywhere.
-            let tun_example_platforms: &[&str] = match file_name {
-                "tun_vpn.yaml" | "tun_fake_ip.yaml" => &["linux"],
+            // two together. Every other example still validates everywhere.
+            //
+            // The transparent inbounds are the same case for a different
+            // reason: they are refused off Linux by design, because the
+            // socket options they read are netfilter's.
+            let example_platforms: &[&str] = match file_name {
+                "tun_vpn.yaml" | "tun_fake_ip.yaml" | "transparent_proxy.yaml" => &["linux"],
                 "tun_windows.yaml" => &["linux", "windows"],
                 "tun_macos.yaml" => &["macos"],
                 _ => &[],
             };
-            if !tun_example_platforms.is_empty()
-                && !tun_example_platforms.contains(&std::env::consts::OS)
-            {
+            if !example_platforms.is_empty() && !example_platforms.contains(&std::env::consts::OS) {
                 println!(
-                    "  ✓ Parsed; the TUN shape belongs to {tun_example_platforms:?}, not {}",
+                    "  ✓ Parsed; this example belongs to {example_platforms:?}, not {}",
                     std::env::consts::OS
                 );
                 continue;

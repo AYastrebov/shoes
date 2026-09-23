@@ -46,6 +46,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
 - [Desktop clients](#desktop-clients)
 - [Apple integration: what the first consumer asked for](#apple-integration-what-the-first-consumer-asked-for)
+- [awg-manager engine: what is left](#awg-manager-engine-what-is-left)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
@@ -350,43 +351,35 @@ Network Extension can decline it.
   (`src/h2mux/mod.rs:60`), but they are identifiers only: no framing behind
   them. H2MUX covers our own deployments; this is purely about talking to other
   implementations.
-- **Transparent inbounds on Linux: `redirect` and `tproxy`.** We have neither.
-  The inbound enum (`src/config/types/server.rs:676`) has sixteen variants and
-  every one of them learns its destination from the protocol; `PortForward` is
-  the closest in shape but its target is configured, not recovered from the
-  kernel. TUN covers the same user problem more portably and is what the mobile
-  and desktop clients use, so this is only interesting for a Linux router or
-  gateway proxying *other* devices — where sing-box, mihomo and v2ray all ship
-  it, and where routing every byte through the userspace netstack in
-  `src/tun/tcp_stack_direct.rs` costs more than plain `accept()` on kernel
-  sockets.
+- **Transparent inbounds on Linux: `redirect` done, `tproxy` open.** This
+  entry used to open "we have neither", and argued for both from a Linux
+  router proxying *other* devices, where sing-box, mihomo and v2ray all ship
+  them and where routing every byte through the userspace netstack in
+  `src/tun/` costs more than plain `accept()` on kernel sockets. That argument
+  acquired a consumer, awg-manager, and the work moved to
+  [awg-manager engine: what is left](#awg-manager-engine-what-is-left), which
+  is where its status lives now.
 
-  `redirect` is the cheap half and the better first move: `SO_ORIGINAL_DST` by
-  `getsockopt` on the accepted socket, no privileged listener, plain `iptables
-  REDIRECT`, and it works on macOS pf as well. `tproxy` TCP is then incremental
-  — `IP_TRANSPARENT` goes in `new_tcp_listener` (`src/socket_util.rs:230`)
-  beside the existing `set_reuse_address`, and on such a listener the accepted
-  socket's `local_addr()` *is* the original destination. Both need the same
-  plumbing: `AsyncStream` (`src/async_stream.rs:173`) carries no `local_addr`
-  and `setup_server_stream` only receives `Box<dyn AsyncStream>`, so the
-  destination has to be captured in `run_tcp_server`
-  (`src/tcp/tcp_server.rs:31`) while the concrete `TcpStream` is still in hand.
-  A day between them.
+  `redirect` shipped as `src/redirect_handler.rs` and `src/tproxy/sys.rs`. Two
+  things this entry predicted turned out otherwise. The destination is not
+  captured in `run_tcp_server`: it is a defaulted `AsyncStream` method that
+  the accept path's wrappers forward, which keeps `TcpServerHandler` unchanged
+  for every other protocol at the price that a new wrapper has to remember to
+  forward it. And "it works on macOS pf as well" was not built: `SO_ORIGINAL_DST`
+  is netfilter's, pf needs `DIOCNATLOOK` on `/dev/pf`, and validation refuses
+  the inbound off Linux rather than pretend.
 
-  UDP is the part that is actually work, and a separate decision. The generic
-  engine already exists — `run_udp_routing` (`src/routing/udp_router.rs:1322`)
-  takes anything implementing `AsyncTargetedMessageStream`, with
-  `src/socks5_udp_relay.rs` as a working template — but three things sit
-  outside it. Receiving needs `IP_RECVORIGDSTADDR` and a `libc::recvmsg` with
-  hand-walked cmsgs, since tokio's `UdpSocket` has no `recvmsg`. Every other
-  UDP inbound gets one socket per client session, whereas a tproxy socket sees
-  every client on one fd and needs a source-keyed session table with idle
-  sweeping (`src/tun/udp_manager.rs` has the pattern). And replies must appear
-  to come *from* the original destination, which means a second
-  `IP_TRANSPARENT` socket bound to that address, cached per destination — that
-  one has no analog anywhere in the tree. Three to four days, and the
-  interesting paths cannot run in CI: they need `CAP_NET_ADMIN` and nftables
-  rules, so the tests would be `#[ignore]`d by default.
+  `tproxy` for TCP is not planned: awg-manager uses NAT `REDIRECT` for TCP
+  precisely because `-m socket --transparent` does not match on Keenetic's 4.9
+  kernel. `tproxy` for UDP is the open half, specified in
+  `docs/specs/2026-09-11-awg-manager-engine.md` and planned as tasks 4 and 5.
+  What this entry said about it still holds: `IP_RECVORIGDSTADDR` and a
+  hand-walked `recvmsg`, one socket seeing every client and so a source-keyed
+  table with idle sweeping, and replies from a second `IP_TRANSPARENT` socket
+  bound to the original destination. One prediction is already wrong in a
+  useful way: the interesting paths *can* run in CI. GitHub's Linux runners
+  have passwordless `sudo`, and `redirect`'s test under a real NAT rule runs
+  there on every push.
 
 ## Desktop clients
 
@@ -663,6 +656,43 @@ The same callback does not exist on Android: the JNI `start` still gets its
 failures through `getLastError()` and a poll of `isRunning()`. The Rust side
 is shared, so the Kotlin half is a `StopListener` interface and a global
 reference; the question is whether anyone is asking.
+
+## awg-manager engine: what is left
+
+shoes as the engine behind awg-manager on Keenetic routers, in place of a
+61 MB sing-box fork. Design in `docs/specs/2026-09-11-awg-manager-engine.md`,
+tasks in `docs/plans/2026-09-11-awg-manager-engine.md`.
+
+Done: the process contract (`check`, `version`, `SIGHUP`), the Clash API
+slice awg-manager's health probe and log tail need, aarch64 and mipsel builds
+(`scripts/build-keenetic.sh`), and the `redirect` inbound for transparent TCP.
+That is enough for awg-manager's legacy-tunnel mode, which has not been run on
+a router yet: it waits on awg-manager's emitter, not on anything here.
+
+Open, with what each costs while it stays open:
+
+- **No `tproxy` UDP inbound.** awg-manager's tproxy router mode is `redirect`
+  for TCP plus `tproxy` for UDP; with only the first, a router's LAN gets TCP
+  through shoes and UDP (QUIC, DNS, games, VoIP) not at all, so the mode cannot
+  be switched over. Plan tasks 3 and 4.
+- **The `redirect` inbound has never met a router's kernel.** It is tested
+  under a real NAT rule in CI, from the `OUTPUT` chain of one host. The
+  `PREROUTING` path from a LAN client on Keenetic's 4.9 kernel is the one that
+  matters and is untried.
+- **No logical or source-address rules, no per-rule UDP timeout, no `.srs`
+  encoder.** awg-manager's rule editor emits all four; until they exist its
+  emitter has to refuse those rules for shoes. Spec slice 3.
+- **No DNS rules, and no port-53 hijack outside TUN.** On the tproxy mode a
+  LAN client's DNS goes wherever the host's firewall sends it, not through
+  shoes' resolver, and awg-manager's DNS rewrites have nowhere to land. Spec
+  slice 4.
+- **No Chrome-shaped ClientHello.** Unmeasured rather than known to matter;
+  the first router run with a Reality link is the measurement. Spec slice 5,
+  and see [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting).
+- **MIPS is a build, not a release.** mipsel comes from a script on a
+  developer's machine; big-endian `mips`, which awg-manager also ships for, has
+  not been attempted; and nothing beyond `version` and `check` has run on the
+  target, so the lock-backed 64-bit atomics it uses are compiled and untested.
 
 ## Hysteria: the rest of the surface
 

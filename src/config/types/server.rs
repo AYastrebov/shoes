@@ -777,6 +777,15 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: OneOrSome<NetLocation>,
     },
+    /// Transparent TCP: the target of the kernel's NAT `REDIRECT`. The
+    /// destination is read from the socket (`SO_ORIGINAL_DST`), so there is
+    /// nothing to configure. Linux only and TCP only. It may bind any
+    /// address, the wildcard included, because `REDIRECT` delivers to the
+    /// LAN interface's address; what stops that being an open proxy is the
+    /// refusal of connections nobody redirected, in
+    /// `AsyncStream::original_destination` for `TcpStream`. See
+    /// `validate_redirect_listener`.
+    Redirect {},
     Hysteria2 {
         password: Redacted<String>,
         #[serde(default = "default_true")]
@@ -869,6 +878,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Websocket { .. } => write!(f, "Websocket"),
             Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
             Self::PortForward { .. } => write!(f, "Portforward"),
+            Self::Redirect {} => write!(f, "Redirect"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),

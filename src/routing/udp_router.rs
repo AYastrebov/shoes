@@ -22,6 +22,7 @@ use log::{debug, warn};
 use lru::LruCache;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::io::ReadBuf;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue};
 
@@ -36,8 +37,37 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::util::allocate_vec;
 
-/// Timeout for inactive sessions
+/// Timeout for inactive sessions, unless the listener sets its own
 const SESSION_TIMEOUT_SECS: u64 = 200;
+
+/// Per-listener session policy. The defaults are what every UDP inbound had
+/// before one of them made these configurable.
+#[derive(Debug, Clone)]
+pub struct RouterLimits {
+    /// How long a session may sit idle before it is removed.
+    pub session_timeout: Duration,
+    /// Sessions this one router may hold, counting those still being created.
+    pub max_sessions: usize,
+    /// Sessions every router holding this budget may hold between them.
+    ///
+    /// A `tproxy` listener runs one router per LAN client, and its
+    /// `udp_nat_max` is a promise about the listener's descriptors, not about
+    /// each client's. A semaphore rather than a counter because the share has
+    /// to come back on every way a session can end, including the router
+    /// being dropped with its client, and a permit held by the session does
+    /// that without any bookkeeping to forget.
+    pub shared_budget: Option<Arc<Semaphore>>,
+}
+
+impl Default for RouterLimits {
+    fn default() -> Self {
+        Self {
+            session_timeout: Duration::from_secs(SESSION_TIMEOUT_SECS),
+            max_sessions: usize::MAX,
+            shared_budget: None,
+        }
+    }
+}
 
 /// Maximum UDP packet size
 const MAX_UDP_PACKET_SIZE: usize = 65535;
@@ -182,6 +212,11 @@ struct RoutingSession {
 
     /// Last iteration when expiry was reset (to avoid redundant resets)
     last_expiry_iteration: usize,
+
+    /// This session's share of `RouterLimits::shared_budget`. It follows
+    /// `remote`, because the budget counts descriptors and the descriptor is
+    /// the remote's: see `remove_session`.
+    budget_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RoutingSession {
@@ -191,6 +226,7 @@ impl RoutingSession {
         resolved_addr: SocketAddr,
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
+        budget_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             destination,
@@ -206,6 +242,7 @@ impl RoutingSession {
             remote_write_eof: false,
             last_write: Instant::now(),
             last_expiry_iteration: 0,
+            budget_permit,
         }
     }
 
@@ -222,6 +259,7 @@ impl RoutingSession {
         expiry_queue: &mut DelayQueue<SessionKey>,
         _id: SessionKey,
         iteration: usize,
+        timeout: Duration,
     ) {
         if self.last_expiry_iteration == iteration {
             return; // Already reset this iteration
@@ -231,7 +269,7 @@ impl RoutingSession {
         // Use reset() which is more efficient than remove() + insert()
         // as it reuses the same slab entry and key
         if let Some(ref key) = self.expiry_key {
-            expiry_queue.reset(key, Duration::from_secs(SESSION_TIMEOUT_SECS));
+            expiry_queue.reset(key, timeout);
         }
     }
 }
@@ -357,6 +395,10 @@ struct SessionCreateResult {
 /// Type alias for the session creation future
 type SessionCreateFuture = Pin<Box<dyn Future<Output = io::Result<SessionCreateResult>> + Send>>;
 
+/// See `UdpRouter::remote_factory`.
+#[cfg(test)]
+type RemoteFactory = Box<dyn Fn(&NetLocation) -> SessionCreateFuture + Send + Sync>;
+
 /// Pending session creation state
 struct PendingSessionCreate {
     lookup_key: LookupKey,
@@ -364,6 +406,10 @@ struct PendingSessionCreate {
     session_id: u16,
     initial_data: Vec<u8>,
     future: SessionCreateFuture,
+    /// Taken before the create starts, so a burst cannot overshoot the budget
+    /// while its sessions are still connecting. Handed to the session on
+    /// success, returned by the drop on failure.
+    budget_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// The unified UDP router
@@ -391,7 +437,9 @@ pub struct UdpRouter<'a> {
     server_write_eof: bool,
 
     sessions_to_remove: HashSet<SessionKey>,
-    pending_shutdowns: VecDeque<Box<dyn AsyncMessageStream>>,
+    /// Remotes of removed sessions, each with the budget share it still
+    /// occupies until its shutdown completes and it is dropped.
+    pending_shutdowns: VecDeque<(Box<dyn AsyncMessageStream>, Option<OwnedSemaphorePermit>)>,
 
     remote_write_pool: BufferPool,
     server_write_pool: BufferPool,
@@ -404,6 +452,22 @@ pub struct UdpRouter<'a> {
 
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+
+    /// Tests only: replaces the real connect path, so a test can hand the
+    /// router a remote whose writes or shutdown stay pending. Two parts of
+    /// the limits are visible no other way: the deadline a session is created
+    /// with, and the budget share a remote keeps while it shuts down.
+    #[cfg(test)]
+    remote_factory: Option<RemoteFactory>,
+
+    limits: RouterLimits,
+    /// Set when a cap first turns a datagram away and cleared by the next
+    /// admission, so a flood over a full table logs once per episode rather
+    /// than once per packet. Cleared on admission rather than when a session
+    /// leaves because room can appear without one leaving here (a failed
+    /// create, another router returning its share of the budget) and a
+    /// session leaving here does not mean the shared budget has room.
+    cap_reported: bool,
 }
 
 impl<'a> UdpRouter<'a> {
@@ -413,6 +477,7 @@ impl<'a> UdpRouter<'a> {
         selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         need_initial_flush: bool,
+        limits: RouterLimits,
     ) -> Self {
         let session_lookup = match server {
             ServerStream::Targeted(_) => SessionLookup::ByDestination(FxHashMap::default()),
@@ -443,7 +508,48 @@ impl<'a> UdpRouter<'a> {
             last_server_write: Instant::now(),
             selector,
             resolver,
+            #[cfg(test)]
+            remote_factory: None,
+            limits,
+            cap_reported: false,
         }
+    }
+
+    /// Whether a new session may be created, and the budget share it will
+    /// hold if so. `Err` means drop the datagram: that is what a full
+    /// conntrack table does to a new flow, and the flows already in the
+    /// table are untouched by it.
+    fn admit_session(
+        &mut self,
+        destination: &NetLocation,
+    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
+        let refused_by =
+            if self.sessions.len() + self.pending_creates.len() >= self.limits.max_sessions {
+                "this listener's session cap"
+            } else {
+                let permit = match &self.limits.shared_budget {
+                    None => Ok(None),
+                    Some(budget) => budget.clone().try_acquire_owned().map(Some),
+                };
+                match permit {
+                    Ok(permit) => {
+                        self.cap_reported = false;
+                        return Ok(permit);
+                    }
+                    Err(_) => "the session budget shared across this listener",
+                }
+            };
+
+        if self.cap_reported {
+            debug!("UDP datagram to {destination} dropped: {refused_by} is full");
+        } else {
+            self.cap_reported = true;
+            warn!(
+                "UDP datagram to {destination} dropped: {refused_by} is full; \
+                 further drops are logged at debug until one is admitted again"
+            );
+        }
+        Err(())
     }
 
     /// Set server read EOF and clean up pending session creates.
@@ -499,11 +605,11 @@ impl<'a> UdpRouter<'a> {
     fn drain_remote_shutdowns(&mut self, cx: &mut Context<'_>) {
         let count = self.pending_shutdowns.len();
         for _ in 0..count {
-            let mut stream = self.pending_shutdowns.pop_front().unwrap();
+            let (mut stream, permit) = self.pending_shutdowns.pop_front().unwrap();
             if Pin::new(&mut stream).poll_shutdown_message(cx).is_pending() {
-                self.pending_shutdowns.push_back(stream);
+                self.pending_shutdowns.push_back((stream, permit));
             }
-            // If Ready (success or error), stream is dropped
+            // If Ready (success or error), stream and permit are dropped
         }
     }
 
@@ -582,6 +688,7 @@ impl<'a> UdpRouter<'a> {
                                 &mut self.expiry_queue,
                                 *id,
                                 self.expiry_iteration,
+                                self.limits.session_timeout,
                             );
                             if !session.in_remote_flush_queue {
                                 session.in_remote_flush_queue = true;
@@ -624,7 +731,11 @@ impl<'a> UdpRouter<'a> {
                         continue;
                     }
 
-                    self.start_session_creation(cx, packet, &buf[..len]);
+                    let Ok(budget_permit) = self.admit_session(&packet.destination) else {
+                        continue;
+                    };
+
+                    self.start_session_creation(cx, packet, &buf[..len], budget_permit);
                 }
             }
         }
@@ -663,7 +774,12 @@ impl<'a> UdpRouter<'a> {
                 Poll::Ready(Ok(())) => {
                     session.in_remote_write_queue -= 1;
                     session.last_write = Instant::now();
-                    session.reset_expiry(&mut self.expiry_queue, id, self.expiry_iteration);
+                    session.reset_expiry(
+                        &mut self.expiry_queue,
+                        id,
+                        self.expiry_iteration,
+                        self.limits.session_timeout,
+                    );
                     if !session.in_remote_flush_queue {
                         session.in_remote_flush_queue = true;
                         self.remote_flush_queue.push_back(id);
@@ -772,7 +888,12 @@ impl<'a> UdpRouter<'a> {
                         }
 
                         remote_read_progress = true;
-                        session.reset_expiry(&mut self.expiry_queue, id, self.expiry_iteration);
+                        session.reset_expiry(
+                            &mut self.expiry_queue,
+                            id,
+                            self.expiry_iteration,
+                            self.limits.session_timeout,
+                        );
 
                         match self.server.poll_write_message(
                             cx,
@@ -917,6 +1038,7 @@ impl<'a> UdpRouter<'a> {
             session_id,
             initial_data,
             future: _,
+            budget_permit,
         } = pending;
 
         match result {
@@ -944,13 +1066,17 @@ impl<'a> UdpRouter<'a> {
                 };
                 debug_assert!(matches!(pending_key_state.unwrap(), KeyState::Pending));
 
-                let mut session =
-                    RoutingSession::new(destination, session_id, resolved_addr, lookup_key, remote);
+                let mut session = RoutingSession::new(
+                    destination,
+                    session_id,
+                    resolved_addr,
+                    lookup_key,
+                    remote,
+                    budget_permit,
+                );
 
                 // TODO: part of constructor, we now know the id in advance
-                let expiry_key = self
-                    .expiry_queue
-                    .insert(id, Duration::from_secs(SESSION_TIMEOUT_SECS));
+                let expiry_key = self.expiry_queue.insert(id, self.limits.session_timeout);
                 session.expiry_key = Some(expiry_key);
 
                 // Try to write immediately
@@ -1013,33 +1139,13 @@ impl<'a> UdpRouter<'a> {
         }
     }
 
-    /// Start session creation
-    #[inline]
-    fn start_session_creation(&mut self, cx: &mut Context<'_>, packet: InboundPacket, data: &[u8]) {
-        let InboundPacket {
-            destination,
-            session_id,
-        } = packet;
-
-        let lookup_key = match &mut self.session_lookup {
-            SessionLookup::ByDestination(map) => {
-                map.insert(destination.clone(), KeyState::Pending);
-                LookupKey::Destination(destination.clone())
-            }
-            SessionLookup::BySessionId(map) => {
-                map.insert(packet.session_id, KeyState::Pending);
-                LookupKey::SessionId(packet.session_id)
-            }
-        };
-
-        debug!("Creating session for {}", destination);
-
-        let initial_data = data.to_vec();
+    /// Resolve, judge and connect: how a session gets its remote.
+    fn connect_future(&self, destination: &NetLocation) -> SessionCreateFuture {
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination.clone();
 
-        let future: SessionCreateFuture = Box::pin(async move {
+        Box::pin(async move {
             let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
             // Create ResolvedLocation with pre-resolved address
             let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
@@ -1065,7 +1171,45 @@ impl<'a> UdpRouter<'a> {
                     "Destination blocked by routing rules",
                 )),
             }
-        });
+        })
+    }
+
+    /// Start session creation
+    #[inline]
+    fn start_session_creation(
+        &mut self,
+        cx: &mut Context<'_>,
+        packet: InboundPacket,
+        data: &[u8],
+        budget_permit: Option<OwnedSemaphorePermit>,
+    ) {
+        let InboundPacket {
+            destination,
+            session_id,
+        } = packet;
+
+        let lookup_key = match &mut self.session_lookup {
+            SessionLookup::ByDestination(map) => {
+                map.insert(destination.clone(), KeyState::Pending);
+                LookupKey::Destination(destination.clone())
+            }
+            SessionLookup::BySessionId(map) => {
+                map.insert(packet.session_id, KeyState::Pending);
+                LookupKey::SessionId(packet.session_id)
+            }
+        };
+
+        debug!("Creating session for {}", destination);
+
+        let initial_data = data.to_vec();
+
+        #[cfg(test)]
+        let future = match &self.remote_factory {
+            Some(factory) => factory(&destination),
+            None => self.connect_future(&destination),
+        };
+        #[cfg(not(test))]
+        let future = self.connect_future(&destination);
 
         let index = self.pending_creates.len();
         self.pending_creates.push(PendingSessionCreate {
@@ -1074,6 +1218,7 @@ impl<'a> UdpRouter<'a> {
             session_id,
             initial_data,
             future,
+            budget_permit,
         });
         let _ = self.poll_pending_create(cx, index);
     }
@@ -1103,8 +1248,12 @@ impl<'a> UdpRouter<'a> {
             _ => unreachable!(),
         }
 
-        // Queue remote stream for graceful shutdown
-        self.pending_shutdowns.push_back(session.remote);
+        // Queue remote stream for graceful shutdown. The permit goes with it:
+        // the socket stays open until the shutdown finishes, and a budget
+        // that came back before then would admit a new session while the old
+        // descriptor was still held, which under churn is over the cap.
+        self.pending_shutdowns
+            .push_back((session.remote, session.budget_permit.take()));
     }
 
     /// Process expired sessions
@@ -1321,12 +1470,30 @@ impl UdpRouter<'_> {
 
 /// Run per-destination routing for any server UDP stream type.
 pub async fn run_udp_routing(
-    mut server: ServerStream,
+    server: ServerStream,
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     need_initial_flush: bool,
 ) -> io::Result<()> {
-    let result = UdpRouter::new(&mut server, selector, resolver, need_initial_flush).await;
+    run_udp_routing_with_limits(
+        server,
+        selector,
+        resolver,
+        need_initial_flush,
+        RouterLimits::default(),
+    )
+    .await
+}
+
+/// `run_udp_routing` for a listener with its own session timeout and cap.
+pub async fn run_udp_routing_with_limits(
+    mut server: ServerStream,
+    selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    need_initial_flush: bool,
+    limits: RouterLimits,
+) -> io::Result<()> {
+    let result = UdpRouter::new(&mut server, selector, resolver, need_initial_flush, limits).await;
     let _ = server.shutdown_message().await;
     result
 }
@@ -1482,6 +1649,353 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Hand the router one more packet after it has started, which a fixed
+    /// script cannot do: the cap tests need "and then, later, another".
+    fn push_packet(inner: &Arc<Mutex<ScriptedInner>>, destination: SocketAddr, payload: &[u8]) {
+        let mut inner = inner.lock().unwrap();
+        inner
+            .script
+            .push_back((location(destination), payload.to_vec()));
+        if let Some(waker) = inner.read_waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// "This must not arrive": long enough for a loopback echo to have come
+    /// back many times over, short enough not to be felt in the suite.
+    async fn assert_no_further_reply(inner: &Arc<Mutex<ScriptedInner>>, have: usize) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            inner.lock().unwrap().replies.len(),
+            have,
+            "a datagram over the cap must be dropped, not answered"
+        );
+    }
+
+    /// Holds the router's only slot with a session to `first`, shows that a
+    /// second destination is refused while it lives, and that the slot comes
+    /// back once it has idled past the listener's timeout.
+    async fn cap_then_expiry(first: SocketAddr, first_replies: usize) {
+        let second = spawn_udp_echo().await;
+        // `second` is scripted straight after `first`, so it is judged while
+        // the first session exists or is being created, whichever it is.
+        let (stream, inner) = scripted(
+            vec![
+                (location(first), b"one".to_vec()),
+                (location(second), b"over the cap".to_vec()),
+            ],
+            usize::MAX,
+        );
+        let resolver = test_resolver();
+        // 400 ms against a 150 ms "no reply" window: on a loaded runner the
+        // window may end late, and a first session that had expired by then
+        // would make this test pass for the wrong reason further down.
+        let timeout = Duration::from_millis(400);
+        let limits = RouterLimits {
+            session_timeout: timeout,
+            max_sessions: 1,
+            shared_budget: None,
+        };
+
+        let router = tokio::spawn(run_udp_routing_with_limits(
+            ServerStream::Targeted(Box::new(stream)),
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            limits,
+        ));
+
+        wait_for_replies(&inner, first_replies).await;
+        assert_no_further_reply(&inner, first_replies).await;
+
+        // Let the first session sit idle past its timeout.
+        tokio::time::sleep(timeout).await;
+        push_packet(&inner, second, b"after expiry");
+        wait_for_replies(&inner, first_replies + 1).await;
+        {
+            let inner = inner.lock().unwrap();
+            let last = inner.replies.last().unwrap();
+            assert_eq!(last.0, second);
+            assert_eq!(last.1, b"after expiry");
+        }
+        router.abort();
+    }
+
+    /// A full table drops the new flow and keeps the old one, which is what a
+    /// full conntrack table does; and the slot comes back when the session
+    /// that held it expires, so the cap is a ceiling rather than a latch.
+    ///
+    /// The destination answers, so the session's timer is the one its last
+    /// activity reset.
+    #[tokio::test]
+    async fn test_the_session_cap_refuses_a_new_destination_and_expiry_frees_it() {
+        cap_then_expiry(spawn_udp_echo().await, 1).await;
+    }
+
+    /// The same, against a destination that never answers, which is what most
+    /// of a full table looks like under a scan or a flood: sessions nobody
+    /// replies to. Only the client's own write ever touches this session's
+    /// timer, so it is the write path's use of the listener's timeout that
+    /// frees the slot here, where the test above leans on the read path's.
+    ///
+    /// Neither this test nor the one above can see the timeout a session is
+    /// *created* with: a real socket accepts its first write at once, which
+    /// resets the timer. `..._first_write_stalls_...` below covers that one,
+    /// with a remote that does not.
+    #[tokio::test]
+    async fn test_a_session_that_never_hears_back_expires_on_the_listeners_timeout() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cap_then_expiry(silent.local_addr().unwrap(), 0).await;
+    }
+
+    /// What a test can see of a `FakeRemote`, and the one thing it can do to it.
+    #[derive(Default)]
+    struct FakeRemoteState {
+        writes_stay_pending: bool,
+        shutdown_may_finish: bool,
+        shutdown_polled: bool,
+        dropped: bool,
+        shutdown_waker: Option<Waker>,
+    }
+
+    /// A session remote that never hears back, whose writes and shutdown can
+    /// be held pending. The real connect path cannot produce either, and they
+    /// are exactly where two of the limits' promises are kept or broken.
+    struct FakeRemote(Arc<Mutex<FakeRemoteState>>);
+
+    impl Drop for FakeRemote {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().dropped = true;
+        }
+    }
+
+    impl AsyncReadMessage for FakeRemote {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for FakeRemote {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            if self.0.lock().unwrap().writes_stay_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncFlushMessage for FakeRemote {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for FakeRemote {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut state = self.0.lock().unwrap();
+            state.shutdown_polled = true;
+            if state.shutdown_may_finish {
+                return Poll::Ready(Ok(()));
+            }
+            state.shutdown_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for FakeRemote {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for FakeRemote {}
+
+    /// Run a router whose every session gets a `FakeRemote` sharing `state`.
+    /// Owns the server stream so the whole thing can be spawned.
+    async fn run_with_fake_remotes(
+        mut server: ServerStream,
+        limits: RouterLimits,
+        state: Arc<Mutex<FakeRemoteState>>,
+    ) -> io::Result<()> {
+        let resolver = test_resolver();
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            limits,
+        );
+        router.remote_factory = Some(Box::new(move |_destination| {
+            let remote: Box<dyn AsyncMessageStream> = Box::new(FakeRemote(state.clone()));
+            Box::pin(async move {
+                Ok(SessionCreateResult {
+                    remote,
+                    resolved_addr: "192.0.2.1:9".parse().unwrap(),
+                })
+            })
+        }));
+        router.await
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A session whose first write never completes is never touched again, so
+    /// the only deadline it ever has is the one it was created with. That one
+    /// has to be the listener's timeout too: with the 200-second default left
+    /// there, a destination that accepts nothing holds its slot, and its share
+    /// of the listener's budget, for over three minutes.
+    #[tokio::test]
+    async fn test_a_session_whose_first_write_stalls_expires_on_the_listeners_timeout() {
+        let state = Arc::new(Mutex::new(FakeRemoteState {
+            writes_stay_pending: true,
+            shutdown_may_finish: true,
+            ..Default::default()
+        }));
+        let (stream, _inner) = scripted(
+            vec![(location("192.0.2.1:9".parse().unwrap()), b"one".to_vec())],
+            usize::MAX,
+        );
+        let limits = RouterLimits {
+            session_timeout: Duration::from_millis(100),
+            ..RouterLimits::default()
+        };
+
+        let router = tokio::spawn(run_with_fake_remotes(
+            ServerStream::Targeted(Box::new(stream)),
+            limits,
+            state.clone(),
+        ));
+
+        wait_until(
+            "the stalled session expires and its remote is dropped",
+            || state.lock().unwrap().dropped,
+        )
+        .await;
+        router.abort();
+    }
+
+    /// The budget counts descriptors, and a removed session's remote keeps its
+    /// descriptor until its shutdown completes. Its share must stay taken for
+    /// exactly that long: returned at removal, it admits a new session on top
+    /// of a socket that is still open, and under churn that is over the cap.
+    #[tokio::test]
+    async fn test_a_remote_still_shutting_down_keeps_its_share_of_the_budget() {
+        let state = Arc::new(Mutex::new(FakeRemoteState::default()));
+        let (stream, _inner) = scripted(
+            vec![(location("192.0.2.1:9".parse().unwrap()), b"one".to_vec())],
+            usize::MAX,
+        );
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let limits = RouterLimits {
+            session_timeout: Duration::from_millis(100),
+            shared_budget: Some(budget.clone()),
+            ..RouterLimits::default()
+        };
+
+        let router = tokio::spawn(run_with_fake_remotes(
+            ServerStream::Targeted(Box::new(stream)),
+            limits,
+            state.clone(),
+        ));
+
+        // Expiry removes the session, and the router starts shutting its
+        // remote down; the fake keeps that pending.
+        wait_until("the expired session's remote is being shut down", || {
+            state.lock().unwrap().shutdown_polled
+        })
+        .await;
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "the socket is still open, so its share is still taken"
+        );
+
+        let waker = {
+            let mut state = state.lock().unwrap();
+            state.shutdown_may_finish = true;
+            state.shutdown_waker.take()
+        };
+        waker
+            .expect("a pending shutdown registers its waker")
+            .wake();
+
+        wait_until("the remote is dropped", || state.lock().unwrap().dropped).await;
+        assert_eq!(budget.available_permits(), 1, "and now it is back");
+        router.abort();
+    }
+
+    /// A `tproxy` listener runs one router per LAN client and promises one
+    /// `udp_nat_max` for all of them. The budget is what makes that true, and
+    /// a router that goes away, however it goes, has to give its share back.
+    #[tokio::test]
+    async fn test_routers_sharing_a_budget_are_capped_together() {
+        let first = spawn_udp_echo().await;
+        let second = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let limits = RouterLimits {
+            shared_budget: Some(budget.clone()),
+            ..RouterLimits::default()
+        };
+
+        let (stream_a, inner_a) = scripted(vec![(location(first), b"a".to_vec())], usize::MAX);
+        let router_a = tokio::spawn(run_udp_routing_with_limits(
+            ServerStream::Targeted(Box::new(stream_a)),
+            direct_selector(resolver.clone()),
+            resolver.clone(),
+            false,
+            limits.clone(),
+        ));
+        wait_for_replies(&inner_a, 1).await;
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "the session holds the permit"
+        );
+
+        let (stream_b, inner_b) = scripted(vec![(location(second), b"b".to_vec())], usize::MAX);
+        let router_b = tokio::spawn(run_udp_routing_with_limits(
+            ServerStream::Targeted(Box::new(stream_b)),
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            limits,
+        ));
+        assert_no_further_reply(&inner_b, 0).await;
+
+        // The first client goes away mid-session: no expiry, no clean close.
+        router_a.abort();
+        let _ = router_a.await;
+        assert_eq!(budget.available_permits(), 1, "a dropped router returns it");
+
+        push_packet(&inner_b, second, b"b again");
+        wait_for_replies(&inner_b, 1).await;
+        assert_eq!(inner_b.lock().unwrap().replies[0].1, b"b again");
+        router_b.abort();
     }
 
     #[tokio::test]

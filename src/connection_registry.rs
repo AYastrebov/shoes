@@ -157,7 +157,13 @@ impl<S: AsyncPing + Unpin> AsyncPing for CountingStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for CountingStream<S> {}
+impl<S: AsyncStream> AsyncStream for CountingStream<S> {
+    // The accept loop wraps every stream in this before a handler sees it,
+    // so a `redirect` listener reads its destination through here.
+    fn original_destination(&self) -> Option<std::net::SocketAddr> {
+        self.inner.original_destination()
+    }
+}
 
 /// A per-listener label, made once and kept for the process.
 ///
@@ -642,6 +648,21 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept loop wraps every stream in `counted` before a handler sees
+    /// it. With the registry compiled in that is a `CountingStream`, and if
+    /// it dropped this method a `redirect` listener would refuse every
+    /// connection in a `clash-api` build while working in a default one,
+    /// where `counted` returns the stream untouched.
+    #[test]
+    fn counting_a_stream_keeps_its_original_destination() {
+        use crate::async_stream::testing::RedirectedStream;
+
+        let destination: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let handle = register("10.0.0.5:4000".parse().unwrap(), "test", Network::Tcp);
+        let stream = counted(RedirectedStream::new(Some(destination)), &handle);
+        assert_eq!(stream.original_destination(), Some(destination));
+    }
 
     /// A duplex pipe that satisfies `AsyncStream`, which `counted` requires
     /// and `DuplexStream` does not provide (it has no `AsyncPing`).

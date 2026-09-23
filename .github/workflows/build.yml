@@ -167,7 +167,7 @@ jobs:
 
           configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client"
           case "$RUNNER_OS" in
-            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client" ;;
+            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client transparent_proxy" ;;
             Windows) configs="$configs tun_windows" ;;
             macOS) configs="$configs amneziawg_client tun_macos" ;;
           esac

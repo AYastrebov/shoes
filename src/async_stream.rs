@@ -170,7 +170,18 @@ impl AsyncShutdownMessage for UdpSocket {
     }
 }
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    /// Where a transparently redirected connection was going before the
+    /// kernel sent it here. `Some` only on Linux, and only on a socket that
+    /// NAT `REDIRECT` delivered; a `redirect` listener refuses anything else.
+    ///
+    /// Every wrapper the accept path puts around the socket has to forward
+    /// this, or the handler behind it sees `None` and refuses a connection
+    /// that was redirected perfectly well.
+    fn original_destination(&self) -> Option<SocketAddr> {
+        None
+    }
+}
 
 pub trait AsyncMessageStream:
     AsyncReadMessage
@@ -232,7 +243,24 @@ impl AsyncPing for TcpStream {
     }
 }
 
-impl AsyncStream for TcpStream {}
+impl AsyncStream for TcpStream {
+    #[cfg(target_os = "linux")]
+    fn original_destination(&self) -> Option<SocketAddr> {
+        let destination =
+            crate::tproxy::sys::original_destination(std::os::fd::AsRawFd::as_raw_fd(self))?;
+        // The option answers for any connection conntrack is tracking, not
+        // only a redirected one: a client that dialled this listener
+        // directly gets the listener's own address back. That is exactly the
+        // connection a `redirect` listener must not forward, since it would
+        // dial itself, so "was going here anyway" is reported as `None`.
+        // Canonical forms, because an IPv4 client of a dual-stack listener
+        // has a v4-mapped local address and a plain IPv4 original one.
+        let local = self.local_addr().ok()?;
+        let same = local.port() == destination.port()
+            && local.ip().to_canonical() == destination.ip().to_canonical();
+        (!same).then_some(destination)
+    }
+}
 
 /// A stream that carries its accept-side inflight permit with it.
 ///
@@ -310,7 +338,11 @@ impl<S: AsyncPing + Unpin> AsyncPing for PermitStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for PermitStream<S> {}
+impl<S: AsyncStream> AsyncStream for PermitStream<S> {
+    fn original_destination(&self) -> Option<SocketAddr> {
+        self.inner.original_destination()
+    }
+}
 
 #[cfg(target_family = "unix")]
 impl AsyncPing for UnixStream {
@@ -525,8 +557,16 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
     }
 }
 
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {}
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {}
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+    fn original_destination(&self) -> Option<SocketAddr> {
+        (**self).original_destination()
+    }
+}
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+    fn original_destination(&self) -> Option<SocketAddr> {
+        (**self).original_destination()
+    }
+}
 
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {}
@@ -638,4 +678,119 @@ pub mod testing {
     }
 
     impl AsyncStream for TestStream {}
+
+    /// A stream the kernel claims to have redirected: `TestStream` with an
+    /// original destination to report. The `redirect` handler and every
+    /// wrapper that has to forward the method are tested against this.
+    pub struct RedirectedStream {
+        pub inner: TestStream,
+        pub destination: Option<SocketAddr>,
+    }
+
+    impl RedirectedStream {
+        pub fn new(destination: Option<SocketAddr>) -> Self {
+            // The far half is dropped: nothing here reads or writes.
+            let (near, _far) = tokio::io::duplex(16);
+            Self {
+                inner: TestStream(near),
+                destination,
+            }
+        }
+    }
+
+    impl AsyncRead for RedirectedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for RedirectedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for RedirectedStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for RedirectedStream {
+        fn original_destination(&self) -> Option<SocketAddr> {
+            self.destination
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::RedirectedStream;
+    use super::*;
+
+    fn destination() -> SocketAddr {
+        "93.184.216.34:443".parse().unwrap()
+    }
+
+    /// A socket that was not redirected has no original destination, and a
+    /// listener that forwards to "wherever the kernel said" must see `None`
+    /// rather than its own address. On a host with conntrack loaded the raw
+    /// socket option answers with exactly that address; this test failed on
+    /// one until the comparison with the local address went in.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_plain_socket_reports_no_original_destination() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert_eq!(accepted.original_destination(), None);
+    }
+
+    /// The accept loop wraps the socket in a `PermitStream` and boxes it
+    /// before a handler sees it. Either wrapper dropping the method turns
+    /// every redirected connection into a refused one.
+    #[test]
+    fn the_accept_path_wrappers_forward_the_original_destination() {
+        let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let permitted = PermitStream::new(RedirectedStream::new(Some(destination())), permit);
+        assert_eq!(permitted.original_destination(), Some(destination()));
+
+        let mut boxed: Box<dyn AsyncStream> = Box::new(permitted);
+        assert_eq!(boxed.original_destination(), Some(destination()));
+
+        let borrowed: &mut Box<dyn AsyncStream> = &mut boxed;
+        assert_eq!(
+            AsyncStream::original_destination(&borrowed),
+            Some(destination())
+        );
+    }
 }
