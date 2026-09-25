@@ -264,6 +264,7 @@ pub async fn run_tun_server(
         // crate strips the header in its own reader, which this path does
         // not use, so the stack has to do it itself.
         utun_header: cfg!(any(target_os = "macos", target_os = "ios")),
+        orphan_timeout: std::time::Duration::from_secs(60),
     };
 
     // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the

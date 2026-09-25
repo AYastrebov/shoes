@@ -78,6 +78,11 @@ impl TcpConnectionControl {
         self.inner.lock().recv_buffer.is_full()
     }
 
+    /// Whether the recv buffer holds bytes the connection has not read.
+    pub fn has_unread_data(&self) -> bool {
+        !self.inner.lock().recv_buffer.is_empty()
+    }
+
     /// Enqueue data into recv buffer. Returns bytes written.
     pub fn enqueue_recv_data(&self, data: &[u8]) -> usize {
         self.inner.lock().recv_buffer.enqueue_slice(data)

@@ -222,6 +222,10 @@ struct SocketInfo {
     control: Arc<TcpConnectionControl>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    /// When the app hung up on this connection (its `TcpConnection` was
+    /// dropped), if it has. From then on the peer has `orphan_timeout` to
+    /// close its side before the socket is reset: see the sweep.
+    orphaned_since: Option<std::time::Instant>,
 }
 
 /// Information about a new TCP connection from the stack.
@@ -282,6 +286,13 @@ pub struct TcpStackOptions {
     /// there.
     #[cfg_attr(windows, allow(dead_code))]
     pub utun_header: bool,
+    /// How long a connection the app has dropped may wait for the peer to
+    /// close its side before it is reset. smoltcp has no FIN-WAIT-2 timer,
+    /// and a peer that answers keepalives keeps the idle timeout from ever
+    /// firing, so without this a dropped connection whose peer never closes
+    /// holds its four buffers for as long as the peer likes. Linux's
+    /// `tcp_fin_timeout` is 60 s.
+    pub orphan_timeout: Duration,
 }
 
 /// Longest the stack thread sleeps with nothing to do.
@@ -547,6 +558,7 @@ pub fn run_stack_loop<D: StackDevice>(
     let TcpStackOptions {
         tcp_buffer_size,
         max_connections,
+        orphan_timeout,
         ..
     } = options;
 
@@ -671,6 +683,7 @@ pub fn run_stack_loop<D: StackDevice>(
                                                 control,
                                                 src_addr,
                                                 dst_addr,
+                                                orphaned_since: None,
                                             },
                                         );
                                         active_connections.insert((src_addr, dst_addr));
@@ -680,7 +693,14 @@ pub fn run_stack_loop<D: StackDevice>(
                                         #[cfg(feature = "control-stats")]
                                         super::traffic::connection_opened();
 
-                                        if let Ok(state) = shared_state.try_lock()
+                                        // `lock`, not `try_lock`: the other
+                                        // holders are the setup-time setters
+                                        // and the UDP drain above, all brief,
+                                        // and a `try_lock` that lost the race
+                                        // dropped the connection on the floor.
+                                        // The client saw a handshake followed
+                                        // by a FIN, with nothing logged.
+                                        if let Ok(state) = shared_state.lock()
                                             && let Some(ref tx) = state.new_conn_tx
                                         {
                                             let _ = tx.send(new_conn.new_tcp_conn);
@@ -735,7 +755,10 @@ pub fn run_stack_loop<D: StackDevice>(
 
         sockets_to_remove.clear();
 
-        for (handle, socket_info) in sockets.iter() {
+        // One clock read per sweep, for the orphan timer.
+        let sweep_now = std::time::Instant::now();
+
+        for (handle, socket_info) in sockets.iter_mut() {
             let handle = *handle;
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
@@ -746,6 +769,42 @@ pub fn run_stack_loop<D: StackDevice>(
                 control.set_closed();
                 trace!("socket {:?} closed", handle);
                 continue;
+            }
+
+            // The app hung up on both halves: its `TcpConnection` was
+            // dropped, and nothing will ever read from this socket again.
+            // Only the send half used to be acted on (a FIN once drained,
+            // below); the receive half kept accepting into a buffer nobody
+            // drained, and the socket sat in FIN-WAIT-2 with all four buffers
+            // until the peer chose to close, which a peer that keeps sending
+            // or keeps answering keepalives need never do.
+            //
+            // What Linux does, and what this does: data the app never read,
+            // or data arriving after it hung up, is answered with a reset at
+            // once (RFC 2525 §2.17); a peer that goes quiet without closing
+            // gets `orphan_timeout`, its `tcp_fin_timeout`, and then a reset.
+            // A clean hang-up, with nothing unread and a peer that closes,
+            // still ends in the FIN exchange below.
+            if control.recv_state() == TcpSocketState::Close {
+                let orphaned_since = *socket_info.orphaned_since.get_or_insert(sweep_now);
+                let peer_still_talking = control.has_unread_data() || socket.can_recv();
+                if peer_still_talking || sweep_now.duration_since(orphaned_since) >= orphan_timeout
+                {
+                    trace!(
+                        "socket {:?}: app hung up, {}; reset",
+                        handle,
+                        if peer_still_talking {
+                            "peer still sending"
+                        } else {
+                            "peer never closed"
+                        }
+                    );
+                    // Closed now; the RST goes out on this iteration's poll and
+                    // the socket is removed on the next sweep.
+                    socket.abort();
+                    control.set_closed();
+                    continue;
+                }
             }
 
             // Handle SHUT_WR: Close -> Closing transition
@@ -965,7 +1024,14 @@ fn create_tcp_connection(
     // Matched to netstack-smoltcp settings for optimal performance
     socket.set_congestion_control(CongestionControl::Cubic);
     socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    // 7200s matches Linux default (tcp_keepalive_time) and shadowsocks-rust
+    // smoltcp's `timeout` is not Linux's `tcp_keepalive_time`, though the
+    // value is the same and shadowsocks-rust carries the same FIXME: with
+    // keep-alive on, it aborts when the peer goes this long without sending
+    // anything, probes included. The peer here is this host's own kernel,
+    // which answers a probe at once for as long as the app's socket exists,
+    // so this only ever fires when the device is gone -- and then the loop
+    // is already stopping. A connection the app has dropped is the case that
+    // used to hide behind this figure; the sweep resets those itself.
     socket.set_timeout(Some(SmolDuration::from_secs(7200)));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
@@ -1141,21 +1207,37 @@ pub mod test_util {
     };
 
     /// One IPv4 SYN, checksummed, from 10.0.0.2:`src_port` to
-    /// 93.184.216.34:443.
+    /// 93.184.216.34:443, with initial sequence number 0.
     pub fn syn_packet(src_port: u16) -> Vec<u8> {
+        tcp_packet(src_port, TcpControl::Syn, 0, None, &[])
+    }
+
+    /// A segment from the same client to the same server. `seq` is relative
+    /// to the SYN above (the first data byte is 1); `ack` is absolute.
+    pub fn tcp_packet(
+        src_port: u16,
+        control: TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let tcp = TcpRepr {
             src_port,
             dst_port: 443,
-            control: TcpControl::Syn,
-            seq_number: TcpSeqNumber(0),
-            ack_number: None,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
             window_len: 64240,
             window_scale: None,
-            max_seg_size: Some(1400),
+            max_seg_size: if control == TcpControl::Syn {
+                Some(1400)
+            } else {
+                None
+            },
             sack_permitted: false,
             sack_ranges: [None; 3],
             timestamp: None,
-            payload: &[],
+            payload,
         };
         let src_addr = Ipv4Address::new(10, 0, 0, 2);
         let dst_addr = Ipv4Address::new(93, 184, 216, 34);
@@ -1179,19 +1261,35 @@ pub mod test_util {
         buffer
     }
 
+    /// The TCP flags and sequence number of a packet the stack wrote, if it
+    /// is a segment from 93.184.216.34:443.
+    pub struct Segment {
+        pub syn: bool,
+        pub ack: bool,
+        pub fin: bool,
+        pub rst: bool,
+        pub seq: u32,
+    }
+
+    pub fn segment_from_server(packet: &[u8]) -> Option<Segment> {
+        let ip = Ipv4Packet::new_checked(packet).ok()?;
+        if ip.next_header() != IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        (tcp.src_port() == 443).then(|| Segment {
+            syn: tcp.syn(),
+            ack: tcp.ack(),
+            fin: tcp.fin(),
+            rst: tcp.rst(),
+            seq: tcp.seq_number().0 as u32,
+        })
+    }
+
     /// Whether `packet` is a TCP SYN+ACK from 93.184.216.34:443, which is
     /// what the stack answers `syn_packet` with.
     pub fn is_syn_ack(packet: &[u8]) -> bool {
-        let Ok(ip) = Ipv4Packet::new_checked(packet) else {
-            return false;
-        };
-        if ip.next_header() != IpProtocol::Tcp {
-            return false;
-        }
-        let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
-            return false;
-        };
-        tcp.syn() && tcp.ack() && tcp.src_port() == 443
+        segment_from_server(packet).is_some_and(|s| s.syn && s.ack)
     }
 }
 
@@ -1210,7 +1308,7 @@ mod tests {
 
     use smoltcp::phy::TxToken;
 
-    use super::test_util::{is_syn_ack, syn_packet};
+    use super::test_util::{is_syn_ack, segment_from_server, syn_packet, tcp_packet};
     use super::*;
 
     /// One step of a scripted device's life.
@@ -1350,7 +1448,13 @@ mod tests {
     }
 
     impl Harness {
+        /// With the production orphan timeout, so only a peer still talking
+        /// can get a dropped connection reset inside a test's two seconds.
         fn spawn() -> Self {
+            Self::spawn_with(StdDuration::from_secs(60))
+        }
+
+        fn spawn_with(orphan_timeout: StdDuration) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
@@ -1372,6 +1476,7 @@ mod tests {
                 max_connections: 16,
                 close_fd_on_drop: false,
                 utun_header: false,
+                orphan_timeout,
             };
 
             let shared_state = Arc::new(Mutex::new(SharedState {
@@ -1493,6 +1598,158 @@ mod tests {
 
         harness.wait_for_written("a SYN+ACK", |written| written.iter().any(|p| is_syn_ack(p)));
 
+        harness.stop();
+    }
+
+    impl Harness {
+        /// Find the first written packet that `pick` accepts.
+        fn find_written<T>(&self, pick: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+            self.written.lock().unwrap().iter().find_map(|p| pick(p))
+        }
+
+        /// The full handshake from 10.0.0.2:`src_port`: SYN, SYN+ACK, ACK.
+        /// Returns the connection tokio was handed and the server's initial
+        /// sequence number, so the caller can keep sending in sequence.
+        fn establish(&mut self, src_port: u16) -> (NewTcpConnection, u32) {
+            self.script_tx
+                .send(Script::Packet(syn_packet(src_port)))
+                .unwrap();
+            let conn = recv_within(&mut self.conn_rx, "the connection to reach tokio");
+            self.wait_for_written("a SYN+ACK", |written| written.iter().any(|p| is_syn_ack(p)));
+            let server_isn = self
+                .find_written(|p| segment_from_server(p).filter(|s| s.syn && s.ack))
+                .unwrap()
+                .seq;
+            self.script_tx
+                .send(Script::Packet(tcp_packet(
+                    src_port,
+                    smoltcp::wire::TcpControl::None,
+                    1,
+                    Some(server_isn.wrapping_add(1)),
+                    &[],
+                )))
+                .unwrap();
+            (conn, server_isn)
+        }
+    }
+
+    /// Every test here needs to see the socket go away, and the one
+    /// observable that does not depend on a feature flag is the SYN guard:
+    /// a SYN from a 4-tuple the stack still holds is dropped, so a second
+    /// connection from the same port proves the first is gone.
+    fn assert_tuple_is_free(harness: &mut Harness, src_port: u16) {
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(src_port)))
+            .unwrap();
+        recv_within(
+            &mut harness.conn_rx,
+            "a second connection from the same port, which the stack refuses while it still holds the first",
+        );
+    }
+
+    /// The app drops the connection (an upstream that failed, a rule that
+    /// blocked) with bytes the peer sent still unread. Nobody will read
+    /// them, so the answer is a reset, as it would be from Linux; what it
+    /// must not be is a socket that keeps the peer's data and its own four
+    /// buffers until the peer gives up.
+    #[test]
+    fn dropping_a_connection_with_unread_data_resets_it() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let (conn, server_isn) = harness.establish(20020);
+
+        harness
+            .script_tx
+            .send(Script::Packet(tcp_packet(
+                20020,
+                smoltcp::wire::TcpControl::Psh,
+                1,
+                Some(server_isn.wrapping_add(1)),
+                b"GET / HTTP/1.0\r\n\r\n",
+            )))
+            .unwrap();
+        // Let the stack accept the data before the app hangs up, so this is
+        // the unread-data case and not the peer-still-sending one.
+        harness.wait_for_written("the ACK for the data", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.ack && !s.syn)
+        });
+
+        drop(conn);
+        // Something has to wake the loop; the notifier in the harness is a
+        // no-op, so give it a packet-shaped reason.
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20021)))
+            .unwrap();
+
+        harness.wait_for_written("a RST", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.rst)
+        });
+        assert_tuple_is_free(&mut harness, 20020);
+        harness.stop();
+    }
+
+    /// The app drops a connection nothing is unread on, so the stack sends
+    /// FIN. The peer acknowledges it and then neither closes nor sends:
+    /// FIN-WAIT-2, which smoltcp will hold forever and Linux holds for
+    /// `tcp_fin_timeout`. After the harness's short orphan timeout the
+    /// socket must be reset and its 4-tuple free again.
+    #[test]
+    fn an_orphaned_connection_the_peer_never_closes_is_reset_after_the_timeout() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        // Short enough to wait out; long against the tests' 10 ms polling.
+        let mut harness = Harness::spawn_with(StdDuration::from_millis(300));
+        let (conn, _server_isn) = harness.establish(20030);
+
+        drop(conn);
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20031)))
+            .unwrap();
+        harness.wait_for_written("a FIN", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.fin)
+        });
+        let fin_seq = harness
+            .find_written(|p| segment_from_server(p).filter(|s| s.fin))
+            .unwrap()
+            .seq;
+        // The peer acknowledges the FIN and then says nothing more.
+        harness
+            .script_tx
+            .send(Script::Packet(tcp_packet(
+                20030,
+                smoltcp::wire::TcpControl::None,
+                1,
+                Some(fin_seq.wrapping_add(1)),
+                &[],
+            )))
+            .unwrap();
+
+        // Past the orphan timeout; the loop's own timer wakes it to notice.
+        thread::sleep(StdDuration::from_millis(400));
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20032)))
+            .unwrap();
+        harness.wait_for_written("a RST after the orphan timeout", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.rst)
+        });
+        assert_tuple_is_free(&mut harness, 20030);
         harness.stop();
     }
 

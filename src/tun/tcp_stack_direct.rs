@@ -589,6 +589,7 @@ mod tests {
             max_connections: 16,
             close_fd_on_drop: true,
             utun_header: false,
+            orphan_timeout: Duration::from_secs(60),
         }
     }
 
@@ -707,6 +708,7 @@ mod tests {
                 max_connections: CONNECTIONS * 2,
                 close_fd_on_drop: true,
                 utun_header: false,
+                orphan_timeout: Duration::from_secs(60),
             },
         )
         .unwrap();

@@ -433,6 +433,7 @@ mod tests {
                 max_connections: 16,
                 close_fd_on_drop: false,
                 utun_header: false,
+                orphan_timeout: std::time::Duration::from_secs(60),
             },
         )
         .unwrap();
