@@ -274,6 +274,14 @@ pub struct TcpStackOptions {
     /// something a later change will fix.
     #[cfg_attr(windows, allow(dead_code))]
     pub close_fd_on_drop: bool,
+    /// Whether the device frames every packet with utun's 4-byte address
+    /// family header. True on macOS and iOS, where utun is the only TUN and
+    /// the kernel always frames; false everywhere else. Read by the Unix
+    /// backend, which strips the header on the way in and prepends it on the
+    /// way out; the Windows session has no such header, so nothing reads it
+    /// there.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub utun_header: bool,
 }
 
 /// Longest the stack thread sleeps with nothing to do.
@@ -1170,6 +1178,21 @@ pub mod test_util {
         );
         buffer
     }
+
+    /// Whether `packet` is a TCP SYN+ACK from 93.184.216.34:443, which is
+    /// what the stack answers `syn_packet` with.
+    pub fn is_syn_ack(packet: &[u8]) -> bool {
+        let Ok(ip) = Ipv4Packet::new_checked(packet) else {
+            return false;
+        };
+        if ip.next_header() != IpProtocol::Tcp {
+            return false;
+        }
+        let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+            return false;
+        };
+        tcp.syn() && tcp.ack() && tcp.src_port() == 443
+    }
 }
 
 // Platform-neutral by construction: these drive [`run_stack_loop`] through a
@@ -1187,7 +1210,7 @@ mod tests {
 
     use smoltcp::phy::TxToken;
 
-    use super::test_util::syn_packet;
+    use super::test_util::{is_syn_ack, syn_packet};
     use super::*;
 
     /// One step of a scripted device's life.
@@ -1348,6 +1371,7 @@ mod tests {
                 tcp_buffer_size: 32 * 1024,
                 max_connections: 16,
                 close_fd_on_drop: false,
+                utun_header: false,
             };
 
             let shared_state = Arc::new(Mutex::new(SharedState {
@@ -1416,20 +1440,6 @@ mod tests {
                 let _ = handle.join();
             }
         }
-    }
-
-    /// Whether `packet` is a TCP SYN+ACK from 93.184.216.34:443.
-    fn is_syn_ack(packet: &[u8]) -> bool {
-        let Ok(ip) = Ipv4Packet::new_checked(packet) else {
-            return false;
-        };
-        if ip.next_header() != IpProtocol::Tcp {
-            return false;
-        }
-        let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
-            return false;
-        };
-        tcp.syn() && tcp.ack() && tcp.src_port() == 443
     }
 
     /// Serialise against everything else that reads the process-global

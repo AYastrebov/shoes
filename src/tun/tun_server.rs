@@ -228,10 +228,13 @@ impl TunServerConfig {
         self
     }
 
-    /// Set whether packet information header is present (iOS only).
+    /// What the `tun` crate is told about packet framing when it opens the
+    /// device itself, on iOS.
     ///
-    /// - `true` if using socket FD from `NEPacketTunnelProvider.packetFlow`
-    /// - `false` if using `readPackets`/`writePackets` API
+    /// It does not decide whether utun's 4-byte header is stripped: the stack
+    /// reads the descriptor directly, never through the crate, and strips the
+    /// header on every Apple platform regardless of this field
+    /// (`TcpStackOptions::utun_header`).
     #[allow(dead_code)] // Used on iOS
     pub fn packet_information(mut self, pi: bool) -> Self {
         self.packet_information = pi;

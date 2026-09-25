@@ -46,8 +46,11 @@ shoes reads packets and configures nothing on the host.
 
 ## What has not been verified
 
-The tunnel has not run on macOS. The daemon and the device path below are
-written and unit-tested; the live run -- a real session, `netstat -rn` and
+The tunnel has not run on macOS. Until 2026-09-25 it could not have: the
+stack read the utun descriptor without stripping the kernel's 4-byte packet
+header, so every packet was dropped as not-IP (MOBILE.md, section 8). That is
+fixed and tested through a socketpair, and the first real session is still
+owed. The daemon and the device path below are written and unit-tested; the live run -- a real session, `netstat -rn` and
 `scutil --dns` identical before and after, `kill -9` recovery, and the
 daemon's RSS -- is step 8 of
 [the plan](plans/2026-09-04-macos-privileged-daemon.md). Activating an

@@ -257,6 +257,13 @@ pub async fn run_tun_server(
         // created here, the `tun` crate owns the descriptor instead, and on
         // Windows the session is structurally ours.
         close_fd_on_drop: config.close_fd_on_drop,
+        // utun is the only TUN on Apple platforms and the kernel always
+        // frames its packets, whichever way the descriptor was obtained:
+        // `packetFlow.socket.fileDescriptor` in a Network Extension or a
+        // device the `tun` crate created and handed over as a raw fd. The
+        // crate strips the header in its own reader, which this path does
+        // not use, so the stack has to do it itself.
+        utun_header: cfg!(any(target_os = "macos", target_os = "ios")),
     };
 
     // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the

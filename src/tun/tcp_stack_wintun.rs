@@ -432,6 +432,7 @@ mod tests {
                 tcp_buffer_size: 32 * 1024,
                 max_connections: 16,
                 close_fd_on_drop: false,
+                utun_header: false,
             },
         )
         .unwrap();
