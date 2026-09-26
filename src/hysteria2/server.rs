@@ -265,7 +265,15 @@ async fn auth_connection(
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Received non-hysteria2 auth http3 request: {e}");
+                        // Debug, not error: on an internet-facing listener
+                        // these are probes, continuously, and at error level
+                        // they rotated the real errors out of the log. The
+                        // connection stays open and keeps answering 404, which
+                        // is what apernet/hysteria does (`core/server/server.go`,
+                        // `masqHandler`): a probe must not be able to tell an
+                        // auth failure from a web server. It cannot loop for
+                        // ever: the caller runs this under `AUTH_TIMEOUT`.
+                        debug!("Received non-hysteria2 auth http3 request: {e}");
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::NOT_FOUND)
                             .body(())
