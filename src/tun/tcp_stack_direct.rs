@@ -573,7 +573,7 @@ fn packet_write_outcome(n: isize, len: usize) -> io::Result<()> {
 mod tests {
     use super::super::stack_common::{
         clear_buffer_pool,
-        test_util::{is_syn_ack, syn_packet},
+        test_util::{is_syn_ack, syn_packet, syn6_packet},
     };
     use super::*;
     use std::os::unix::io::IntoRawFd;
@@ -908,8 +908,55 @@ mod tests {
     /// whether each side expects utun's framing. The far end plays the
     /// kernel: it writes what utun would deliver and reads what utun would
     /// accept.
+    /// The length of the IP packet at the start of `bytes`, from its header,
+    /// once enough of the header has arrived to say.
+    fn ip_packet_len(bytes: &[u8]) -> Option<usize> {
+        match bytes.first().map(|b| b >> 4) {
+            Some(4) if bytes.len() >= 4 => Some(u16::from_be_bytes([bytes[2], bytes[3]]) as usize),
+            Some(6) if bytes.len() >= 6 => {
+                Some(40 + u16::from_be_bytes([bytes[4], bytes[5]]) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// Read one utun-framed packet from the far end of the socketpair. A
+    /// stream socket owes nothing about read boundaries: it may hand back
+    /// the frame in pieces, so this reads until the IP header's own length
+    /// says the packet is complete. `None` if nothing arrives within the
+    /// socket's read timeout, or the bytes are not a framed IP packet.
+    fn read_framed(server: &mut UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let n = server.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            got.extend_from_slice(&chunk[..n]);
+            if got.len() >= UTUN_HEADER_LEN
+                && let Some(len) = ip_packet_len(&got[UTUN_HEADER_LEN..])
+            {
+                if len == 0 {
+                    return None;
+                }
+                if got.len() >= UTUN_HEADER_LEN + len {
+                    got.truncate(UTUN_HEADER_LEN + len);
+                    return Some(got);
+                }
+            }
+        }
+    }
+
+    /// Reads and writes through a socketpair, with `utun_header` deciding
+    /// whether each side expects utun's framing. The far end plays the
+    /// kernel: it writes what utun would deliver and reads what utun would
+    /// accept. The answer is read as a framed packet, so a bare answer
+    /// (the stack not prepending) comes back as `None` too.
     fn exchange(options: TcpStackOptions, sent: &[u8], wait: Duration) -> Option<Vec<u8>> {
-        use std::io::{Read, Write};
+        use std::io::Write;
 
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         let stack = TcpStackDirect::new(client.into_raw_fd(), options).unwrap();
@@ -917,8 +964,7 @@ mod tests {
 
         server.write_all(sent).unwrap();
         server.set_read_timeout(Some(wait)).unwrap();
-        let mut buf = [0u8; 2048];
-        let answer = server.read(&mut buf).ok().map(|n| buf[..n].to_vec());
+        let answer = read_framed(&mut server);
         drop(stack);
         answer
     }
@@ -939,6 +985,19 @@ mod tests {
             &UTUN_AF_INET,
             "the answer must carry utun's header"
         );
+        assert!(is_syn_ack(&answer[4..]), "and be the SYN+ACK behind it");
+    }
+
+    /// The same over IPv6, whose family word is 30 and whose header keeps
+    /// its length in a different place: the only two things that differ.
+    #[test]
+    fn a_utun_framed_ipv6_syn_is_answered_with_a_utun_framed_syn_ack() {
+        let mut framed = UTUN_AF_INET6.to_vec();
+        framed.extend_from_slice(&syn6_packet(20012));
+
+        let answer = exchange(utun_options(), &framed, Duration::from_secs(2))
+            .expect("no answer: the framed IPv6 SYN was not understood");
+        assert_eq!(&answer[..4], &UTUN_AF_INET6, "the answer must say AF_INET6");
         assert!(is_syn_ack(&answer[4..]), "and be the SYN+ACK behind it");
     }
 
@@ -968,8 +1027,6 @@ mod tests {
     /// smoltcp's transmit token, and need the same header.
     #[test]
     fn a_udp_response_is_framed_for_utun() {
-        use std::io::Read;
-
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         let mut stack = TcpStackDirect::new(client.into_raw_fd(), utun_options()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -989,10 +1046,9 @@ mod tests {
         server
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut buf = [0u8; 2048];
-        let n = server.read(&mut buf).expect("the response never arrived");
-        assert_eq!(&buf[..4], &UTUN_AF_INET);
-        assert_eq!(&buf[4..n], &response[..]);
+        let got = read_framed(&mut server).expect("the response never arrived");
+        assert_eq!(&got[..4], &UTUN_AF_INET);
+        assert_eq!(&got[4..], &response[..]);
         drop(stack);
     }
 

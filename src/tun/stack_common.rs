@@ -1231,7 +1231,8 @@ fn should_filter_packet(packet: &[u8]) -> bool {
 pub mod test_util {
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
-        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     };
 
     /// One IPv4 SYN, checksummed, from 10.0.0.2:`src_port` to
@@ -1289,8 +1290,47 @@ pub mod test_util {
         buffer
     }
 
+    /// One IPv6 SYN, checksummed, from [2001:db8::2]:`src_port` to
+    /// [2001:db8::1]:443, with initial sequence number 0.
+    pub fn syn6_packet(src_port: u16) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port,
+            dst_port: 443,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(0),
+            ack_number: None,
+            window_len: 64240,
+            window_scale: None,
+            max_seg_size: Some(1380),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let src_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let dst_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let ip = Ipv6Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+
+        let checksums = ChecksumCapabilities::default();
+        let mut buffer = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut buffer));
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buffer[ip.buffer_len()..]),
+            &src_addr.into(),
+            &dst_addr.into(),
+            &checksums,
+        );
+        buffer
+    }
+
     /// The TCP flags and sequence number of a packet the stack wrote, if it
-    /// is a segment from 93.184.216.34:443.
+    /// is a segment from port 443 of either server address above.
     pub struct Segment {
         pub syn: bool,
         pub ack: bool,
@@ -1300,11 +1340,18 @@ pub mod test_util {
     }
 
     pub fn segment_from_server(packet: &[u8]) -> Option<Segment> {
-        let ip = Ipv4Packet::new_checked(packet).ok()?;
-        if ip.next_header() != IpProtocol::Tcp {
-            return None;
-        }
-        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        let tcp_bytes = match packet.first().map(|b| b >> 4) {
+            Some(4) => {
+                let ip = Ipv4Packet::new_checked(packet).ok()?;
+                (ip.next_header() == IpProtocol::Tcp).then(|| ip.payload())?
+            }
+            Some(6) => {
+                let ip = Ipv6Packet::new_checked(packet).ok()?;
+                (ip.next_header() == IpProtocol::Tcp).then(|| ip.payload())?
+            }
+            _ => return None,
+        };
+        let tcp = TcpPacket::new_checked(tcp_bytes).ok()?;
         (tcp.src_port() == 443).then(|| Segment {
             syn: tcp.syn(),
             ack: tcp.ack(),

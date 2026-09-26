@@ -30,9 +30,11 @@
 //!
 //! let config = TunServerConfig::new()
 //!     .raw_fd(fd)
-//!     .packet_information(true)  // Set based on how you obtained the FD
 //!     .mtu(1500);
 //! ```
+//!
+//! utun frames every packet with a 4-byte address family, and the stack
+//! handles that itself on macOS and iOS; nothing needs to be set for it.
 
 use std::net::IpAddr;
 
@@ -98,10 +100,9 @@ pub struct TunServerConfig {
     /// Set to `false` if the FD is owned by the platform (e.g., Android VpnService).
     #[allow(dead_code)] // Used on non-Linux platforms
     pub close_fd_on_drop: bool,
-    /// Enable packet information header.
-    /// - **iOS**: Set to `true` if using socket FD from `NEPacketTunnelProvider.packetFlow`,
-    ///   `false` if using `readPackets`/`writePackets` API
-    /// - **Linux/Android**: Not used
+    /// What the `tun` crate is told about packet framing when it opens the
+    /// device itself, on iOS. Not what decides whether utun's header is
+    /// stripped: see `packet_information()`.
     #[allow(dead_code)] // Used on iOS
     pub packet_information: bool,
     /// Bytes of buffering per direction, per TCP connection.

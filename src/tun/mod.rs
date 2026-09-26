@@ -24,9 +24,13 @@
 //!   VPN configuration (routes, DNS, etc.) is handled by the Android VpnService.
 //!   You must pass the FD via `TunServerConfig::raw_fd()`.
 //!
-//! - **iOS/macOS**: Accepts raw FD from `NEPacketTunnelProvider.packetFlow`.
-//!   Use `TunServerConfig::packet_information(true)` if using the socket FD
-//!   directly, or `false` if using the readPackets/writePackets API.
+//! - **iOS/macOS**: Accepts the raw FD of `NEPacketTunnelProvider.packetFlow`'s
+//!   socket (`packetFlow.value(forKeyPath: "socket.fileDescriptor")`), or on
+//!   macOS creates a utun itself when privileged. Either way the descriptor is
+//!   a utun socket, whose packets the kernel frames with a 4-byte address
+//!   family; the stack strips and prepends that header itself
+//!   (`TcpStackOptions::utun_header`). The `readPackets`/`writePackets` API
+//!   is not supported: there is no descriptor to read.
 
 mod stack_common;
 mod tcp_conn;
