@@ -16,7 +16,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, TxToken},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BUFFER_OVERFLOW, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -134,7 +134,7 @@ impl TcpStackWintun {
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
-    pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
+    pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.handle.take_udp_rx()
     }
 

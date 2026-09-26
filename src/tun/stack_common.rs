@@ -15,7 +15,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -36,7 +36,7 @@ use smoltcp::{
         Ipv6Packet, TcpPacket,
     },
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 
 use crate::util::smol_now;
 
@@ -261,6 +261,25 @@ pub const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iterati
 /// right answer for datagrams either way.
 pub const UDP_RESPONSE_QUEUE: usize = 512;
 
+/// UDP datagrams read off the device and waiting for tokio, the other
+/// direction of the queue above. Bounded for the same reason: a consumer
+/// that stalls, or a sender faster than the outbound can carry, must shed
+/// datagrams rather than queue them without limit, and dropping is what a
+/// full socket buffer would do. Each entry is a pooled buffer of `mtu + 4`
+/// bytes whatever the datagram's size, so the worst case is 256 of those:
+/// about 2.3 MiB at Android's 9000-byte default, 1 MiB at iOS's 4064, 384 KiB
+/// at 1500. Normally it holds a handful.
+pub const UDP_INGRESS_QUEUE: usize = 256;
+
+/// Datagrams dropped because `UDP_INGRESS_QUEUE` was full, over the life of
+/// the process. A counter rather than a log line per drop: a flood is the
+/// case this exists for.
+static UDP_INGRESS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+pub fn udp_ingress_dropped() -> u64 {
+    UDP_INGRESS_DROPPED.load(Ordering::Relaxed)
+}
+
 /// How the stack thread is sized and who owns its descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct TcpStackOptions {
@@ -354,7 +373,7 @@ pub struct StackHandle {
     /// Flag to signal thread shutdown
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
-    udp_rx: Option<UnboundedReceiver<PacketBuffer>>,
+    udp_rx: Option<Receiver<PooledBuffer>>,
     /// Shared state with the stack thread
     shared_state: Arc<Mutex<SharedState>>,
 }
@@ -384,7 +403,7 @@ impl StackHandle {
         D: StackDevice,
         F: FnOnce() -> io::Result<D> + Send + 'static,
     {
-        let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(UDP_INGRESS_QUEUE);
         let running = Arc::new(AtomicBool::new(true));
         let notifier = StackNotifier::new(wake);
         let shared_state = Arc::new(Mutex::new(SharedState {
@@ -433,7 +452,7 @@ impl StackHandle {
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
-    pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
+    pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.udp_rx.take()
     }
 
@@ -548,7 +567,7 @@ pub fn run_stack_thread_guarded(running: Arc<AtomicBool>, f: impl FnOnce()) {
 pub fn run_stack_loop<D: StackDevice>(
     mut device: D,
     options: TcpStackOptions,
-    udp_tx: UnboundedSender<PacketBuffer>,
+    udp_tx: Sender<PooledBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
     notifier: Arc<StackNotifier>,
@@ -720,8 +739,16 @@ pub fn run_stack_loop<D: StackDevice>(
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Udp => {
-                        // UDP goes to tokio - convert to Vec since it leaves our pool
-                        let _ = udp_tx.send(pkt.to_vec());
+                        // UDP goes to tokio in its pooled buffer: the pool is
+                        // process-wide, so the buffer comes back when tokio
+                        // drops it, and nothing is allocated per datagram.
+                        // Full means drop, see `UDP_INGRESS_QUEUE`; closed
+                        // means the handler is gone, and the loop is stopping.
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            udp_tx.try_send(pkt)
+                        {
+                            UDP_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     _ => {
                         trace!("ignoring packet with protocol {:?}", protocol);
@@ -925,9 +952,10 @@ pub fn run_stack_loop<D: StackDevice>(
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
             debug!(
-                "smoltcp stack: polls={}, active_sockets={}",
+                "smoltcp stack: polls={}, active_sockets={}, udp_ingress_dropped={}",
                 poll_count,
-                sockets.len()
+                sockets.len(),
+                udp_ingress_dropped()
             );
             last_log_time = std::time::Instant::now();
         }
@@ -1308,6 +1336,8 @@ mod tests {
 
     use smoltcp::phy::TxToken;
 
+    use tokio::sync::mpsc::UnboundedReceiver;
+
     use super::test_util::{is_syn_ack, segment_from_server, syn_packet, tcp_packet};
     use super::*;
 
@@ -1442,7 +1472,7 @@ mod tests {
         written: Arc<Mutex<Vec<Vec<u8>>>>,
         running: Arc<AtomicBool>,
         conn_rx: UnboundedReceiver<NewTcpConnection>,
-        udp_rx: UnboundedReceiver<PacketBuffer>,
+        udp_rx: Receiver<PooledBuffer>,
         udp_response_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
         handle: Option<thread::JoinHandle<()>>,
     }
@@ -1459,7 +1489,7 @@ mod tests {
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
             let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(UDP_INGRESS_QUEUE);
             let (udp_response_tx, udp_response_rx) = tokio::sync::mpsc::channel(64);
 
             let device = ScriptedDevice {
@@ -1563,23 +1593,29 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Receive with a deadline, so a loop that stops delivering fails the
-    /// test in two seconds instead of hanging the whole suite on a
-    /// `blocking_recv` that nothing will ever satisfy.
-    fn recv_within<T>(rx: &mut UnboundedReceiver<T>, what: &str) -> T {
+    /// Poll `next` until it yields, with a deadline, so a loop that stops
+    /// delivering fails the test in two seconds instead of hanging the whole
+    /// suite on a receive that nothing will ever satisfy.
+    fn poll_within<T>(what: &str, mut next: impl FnMut() -> Option<T>) -> T {
         let start = std::time::Instant::now();
         loop {
-            match rx.try_recv() {
-                Ok(value) => return value,
-                Err(_) => {
-                    assert!(
-                        start.elapsed() < StdDuration::from_secs(2),
-                        "timed out waiting for {what}"
-                    );
-                    thread::sleep(StdDuration::from_millis(10));
-                }
+            if let Some(value) = next() {
+                return value;
             }
+            assert!(
+                start.elapsed() < StdDuration::from_secs(2),
+                "timed out waiting for {what}"
+            );
+            thread::sleep(StdDuration::from_millis(10));
         }
+    }
+
+    fn recv_within<T>(rx: &mut UnboundedReceiver<T>, what: &str) -> T {
+        poll_within(what, || rx.try_recv().ok())
+    }
+
+    fn recv_bounded_within<T>(rx: &mut Receiver<T>, what: &str) -> T {
+        poll_within(what, || rx.try_recv().ok())
     }
 
     #[test]
@@ -1770,8 +1806,50 @@ mod tests {
             .send(Script::Packet(query.clone()))
             .unwrap();
 
-        let forwarded = recv_within(&mut harness.udp_rx, "the UDP packet to reach tokio");
-        assert_eq!(forwarded, query);
+        let forwarded = recv_bounded_within(&mut harness.udp_rx, "the UDP packet to reach tokio");
+        assert_eq!(&forwarded[..], &query[..]);
+
+        harness.stop();
+    }
+
+    /// The hand-off to tokio is the one queue on the packet path that had no
+    /// bound. With the consumer stalled, a burst past the queue's capacity
+    /// must be shed, counted, and must not stop the loop; what was queued
+    /// is still delivered when the consumer returns.
+    #[test]
+    fn udp_past_the_ingress_queue_is_dropped_and_counted_not_queued() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let dropped_before = udp_ingress_dropped();
+        const EXCESS: u64 = 8;
+
+        let query = super::super::udp_handler::build_udp_packet(
+            b"flood",
+            "10.0.0.2:5353".parse().unwrap(),
+            "8.8.8.8:53".parse().unwrap(),
+        )
+        .unwrap();
+        for _ in 0..UDP_INGRESS_QUEUE as u64 + EXCESS {
+            harness
+                .script_tx
+                .send(Script::Packet(query.clone()))
+                .unwrap();
+        }
+
+        poll_within("the excess to be counted as dropped", || {
+            (udp_ingress_dropped() >= dropped_before + EXCESS).then_some(())
+        });
+        assert!(harness.running.load(Ordering::Relaxed));
+
+        let mut delivered = 0;
+        while harness.udp_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered, UDP_INGRESS_QUEUE,
+            "the queue's worth is kept, no more"
+        );
 
         harness.stop();
     }

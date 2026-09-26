@@ -23,7 +23,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, TxToken},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 
 use super::stack_common::{
     MAX_POLL_WAIT_MILLIS, NewTcpConnection, PacketBuffer, PooledBuffer, PooledRxToken, StackDevice,
@@ -147,7 +147,7 @@ impl TcpStackDirect {
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
-    pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
+    pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.handle.take_udp_rx()
     }
 

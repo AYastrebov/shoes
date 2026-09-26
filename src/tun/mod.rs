@@ -593,7 +593,7 @@ where
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
 async fn handle_udp_packets(
-    from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
+    from_stack_rx: mpsc::Receiver<stack_common::PooledBuffer>,
     to_stack_tx: mpsc::Sender<PacketBuffer>,
     waker: stack_common::StackWaker,
     proxy_selector: Arc<ClientProxySelector>,
