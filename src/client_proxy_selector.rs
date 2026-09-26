@@ -323,9 +323,6 @@ pub struct ClientProxySelector {
     cache: Option<RoutingCache>,
 }
 
-unsafe impl Send for ClientProxySelector {}
-unsafe impl Sync for ClientProxySelector {}
-
 #[derive(Debug)]
 pub enum ConnectDecision<'a> {
     Allow {

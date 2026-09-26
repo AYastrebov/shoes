@@ -101,6 +101,11 @@ async fn start_quic_server(
                 let Some(conn) = endpoint.accept().await else {
                     break;
                 };
+                // See `quic_transport::retry_wanted`; the permit taken above
+                // goes back with the `continue`.
+                let Some(conn) = crate::quic_transport::admit_or_retry(conn, &limiter) else {
+                    continue;
+                };
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 let sniff = sniff.clone();
