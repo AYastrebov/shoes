@@ -15,9 +15,9 @@ use std::{
 use etherparse::PacketBuilder;
 use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
-use super::stack_common::StackWaker;
+use super::stack_common::{PooledBuffer, StackWaker};
 
 pub type PacketBuffer = Vec<u8>;
 
@@ -27,7 +27,7 @@ pub type UdpMessage = (Vec<u8>, SocketAddr, SocketAddr);
 /// UDP handler for reading/writing UDP packets from/to TUN.
 pub struct UdpHandler {
     /// Receiver for UDP packets from TUN
-    from_tun_rx: UnboundedReceiver<PacketBuffer>,
+    from_tun_rx: Receiver<PooledBuffer>,
     /// Sender for UDP packets to TUN
     to_tun_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
     /// Wakes the stack thread after a send, so the response is written now
@@ -38,7 +38,7 @@ pub struct UdpHandler {
 impl UdpHandler {
     /// Create a new UDP handler.
     pub fn new(
-        from_tun_rx: UnboundedReceiver<PacketBuffer>,
+        from_tun_rx: Receiver<PooledBuffer>,
         to_tun_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
         waker: StackWaker,
     ) -> Self {
@@ -65,7 +65,7 @@ impl UdpHandler {
 
 /// Read half for receiving UDP packets.
 pub struct UdpReader {
-    from_tun_rx: UnboundedReceiver<PacketBuffer>,
+    from_tun_rx: Receiver<PooledBuffer>,
 }
 
 /// Write half for sending UDP packets.

@@ -1,5 +1,14 @@
 //! The Unix TUN backend: a file descriptor read with `libc::read`, written
-//! with `libc::write`, and waited on with `poll()`.
+//! with `libc::write` (or `writev`, when a header goes in front), and waited
+//! on with `poll()`.
+//!
+//! On macOS and iOS the descriptor is a utun socket, and utun frames every
+//! packet with a 4-byte address family in network byte order: `AF_INET` (2)
+//! or `AF_INET6` (30). The kernel always does this; nothing can turn it off.
+//! A read that does not strip it hands smoltcp a packet whose first byte is
+//! zero, which no IP version has, and a write that does not prepend it is
+//! refused. This backend does both when `TcpStackOptions::utun_header` says
+//! so, and a Linux test can turn that on to see what a Mac sees.
 //!
 //! The smoltcp loop and the manager surface live in `stack_common.rs`; this
 //! file supplies the descriptor-shaped [`StackDevice`] and the wake pipe that
@@ -7,12 +16,14 @@
 
 use std::{cell::RefCell, collections::VecDeque, io, os::unix::io::RawFd};
 
+use bytes::Buf;
+
 use log::{error, trace, warn};
 use smoltcp::{
     phy::{Device, DeviceCapabilities, TxToken},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 
 use super::stack_common::{
     MAX_POLL_WAIT_MILLIS, NewTcpConnection, PacketBuffer, PooledBuffer, PooledRxToken, StackDevice,
@@ -101,7 +112,7 @@ impl TcpStackDirect {
             // Sets fd to non-blocking mode once at startup for performance.
             set_nonblocking(fd)
                 .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
-            Ok(FdDevice::new(fd, wake_rx, options.mtu))
+            Ok(FdDevice::new(fd, wake_rx, options.mtu, options.utun_header))
         }) {
             Ok(handle) => handle,
             Err(e) => {
@@ -136,7 +147,7 @@ impl TcpStackDirect {
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
-    pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
+    pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.handle.take_udp_rx()
     }
 
@@ -206,17 +217,20 @@ struct FdDevice {
     /// Read end of the wake pipe; -1 when the pipe could not be created.
     wake_fd: RawFd,
     mtu: usize,
+    /// See the module documentation and `TcpStackOptions::utun_header`.
+    utun_header: bool,
     /// A whole read batch, queued for smoltcp to drain through `receive` in
     /// one `poll`. Was a single slot polled after each packet.
     pending: VecDeque<PooledBuffer>,
 }
 
 impl FdDevice {
-    fn new(fd: RawFd, wake_fd: RawFd, mtu: usize) -> Self {
+    fn new(fd: RawFd, wake_fd: RawFd, mtu: usize, utun_header: bool) -> Self {
         Self {
             fd,
             wake_fd,
             mtu,
+            utun_header,
             pending: VecDeque::with_capacity(super::stack_common::MAX_PACKET_BATCH),
         }
     }
@@ -233,29 +247,40 @@ impl StackDevice for FdDevice {
             return Ok(Some(pkt));
         }
 
-        // Get a buffer from the pool
-        let mut buffer = PooledBuffer::with_capacity(self.mtu + 4);
-        buffer.resize(self.mtu + 4, 0);
+        loop {
+            // Room for the MTU and the utun header in front of it.
+            let mut buffer = PooledBuffer::with_capacity(self.mtu + UTUN_HEADER_LEN);
+            buffer.resize(self.mtu + UTUN_HEADER_LEN, 0);
 
-        match read_nonblocking(self.fd, &mut buffer) {
-            Ok(n) if n > 0 => {
-                buffer.truncate(n);
-                Ok(Some(buffer))
-            }
-            Ok(_) => {
-                // n == 0 means EOF
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "TUN device closed (EOF)",
-                ))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Buffer is returned to pool when dropped
-                Ok(None)
-            }
-            Err(e) => {
-                // Fatal error
-                Err(e)
+            match read_nonblocking(self.fd, &mut buffer) {
+                Ok(n) if n > 0 => {
+                    buffer.truncate(n);
+                    if self.utun_header {
+                        if n < UTUN_HEADER_LEN {
+                            trace!("utun frame of {n} bytes has no room for a packet; dropped");
+                            continue;
+                        }
+                        // The family word says nothing the IP version nibble
+                        // does not; the packet is judged by that downstream.
+                        buffer.advance(UTUN_HEADER_LEN);
+                    }
+                    return Ok(Some(buffer));
+                }
+                Ok(_) => {
+                    // n == 0 means EOF
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TUN device closed (EOF)",
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Buffer is returned to pool when dropped
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // Fatal error
+                    return Err(e);
+                }
             }
         }
     }
@@ -271,7 +296,17 @@ impl StackDevice for FdDevice {
 
     /// Write a packet to TUN.
     fn write_packet(&self, data: &[u8]) -> io::Result<()> {
-        write_all(self.fd, data)
+        if !self.utun_header {
+            return write_one(self.fd, data);
+        }
+        let Some(header) = utun_header_for(data) else {
+            trace!("UDP response is not an IP packet; dropped");
+            return Ok(());
+        };
+        // Two iovecs rather than a copy into a headed buffer: this is the
+        // UDP reply path, and the datagram already cost one copy leaving
+        // tokio.
+        write_one_with_header(self.fd, &header, data)
     }
 
     fn wait(&self, duration: Option<SmolDuration>) -> io::Result<()> {
@@ -289,7 +324,10 @@ impl Device for FdDevice {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(buffer) = self.pending.pop_front() {
             let rx = PooledRxToken { buffer };
-            let tx = DirectTxToken { fd: self.fd };
+            let tx = DirectTxToken {
+                fd: self.fd,
+                utun_header: self.utun_header,
+            };
             Some((rx, tx))
         } else {
             None
@@ -297,7 +335,10 @@ impl Device for FdDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(DirectTxToken { fd: self.fd })
+        Some(DirectTxToken {
+            fd: self.fd,
+            utun_header: self.utun_header,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -307,6 +348,24 @@ impl Device for FdDevice {
 
 struct DirectTxToken {
     fd: RawFd,
+    utun_header: bool,
+}
+
+/// utun's framing: a 4-byte address family, network byte order. Darwin's
+/// values, deliberately not the host's `libc::AF_INET6` (which is 10 on
+/// Linux), so a Linux test writes and reads exactly what a Mac would.
+const UTUN_HEADER_LEN: usize = 4;
+const UTUN_AF_INET: [u8; 4] = [0, 0, 0, 2];
+const UTUN_AF_INET6: [u8; 4] = [0, 0, 0, 30];
+
+/// The header utun wants in front of `packet`, from its IP version nibble;
+/// `None` for anything that is not an IP packet.
+fn utun_header_for(packet: &[u8]) -> Option<[u8; 4]> {
+    match packet.first().map(|b| b >> 4) {
+        Some(4) => Some(UTUN_AF_INET),
+        Some(6) => Some(UTUN_AF_INET6),
+        _ => None,
+    }
 }
 
 thread_local! {
@@ -326,12 +385,25 @@ impl TxToken for DirectTxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let fd = self.fd;
+        // The header is written into headroom smoltcp never sees, so the
+        // framed packet goes out in one write with no second copy.
+        let headroom = if self.utun_header { UTUN_HEADER_LEN } else { 0 };
         let write = |buffer: &mut Vec<u8>| {
             buffer.clear();
-            buffer.resize(len, 0);
-            let result = f(buffer);
+            buffer.resize(headroom + len, 0);
+            let result = f(&mut buffer[headroom..]);
 
-            if let Err(e) = write_all(fd, buffer) {
+            if headroom > 0 {
+                match utun_header_for(&buffer[headroom..]) {
+                    Some(header) => buffer[..headroom].copy_from_slice(&header),
+                    None => {
+                        trace!("smoltcp emitted a non-IP frame; dropped");
+                        return result;
+                    }
+                }
+            }
+
+            if let Err(e) = write_one(fd, buffer) {
                 warn!("Failed to write to TUN: {}", e);
             }
 
@@ -452,34 +524,57 @@ fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Write all data to a file descriptor.
-fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock
-            {
-                trace!("TUN write {}, packet dropped", err);
-                return Ok(());
-            }
-            return Err(err);
+/// Write one packet with one `write`.
+fn write_one(fd: RawFd, packet: &[u8]) -> io::Result<()> {
+    // SAFETY: `packet` outlives the call and the length is its own.
+    let n = unsafe { libc::write(fd, packet.as_ptr() as *const libc::c_void, packet.len()) };
+    packet_write_outcome(n, packet.len())
+}
+
+/// Write `header` and `packet` as one packet with one `writev`.
+fn write_one_with_header(fd: RawFd, header: &[u8; 4], packet: &[u8]) -> io::Result<()> {
+    let iov = [
+        libc::iovec {
+            iov_base: header.as_ptr() as *mut libc::c_void,
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: packet.as_ptr() as *mut libc::c_void,
+            iov_len: packet.len(),
+        },
+    ];
+    // SAFETY: both slices outlive the call; the iovec array has two entries
+    // and says so.
+    let n = unsafe { libc::writev(fd, iov.as_ptr(), 2) };
+    packet_write_outcome(n, header.len() + packet.len())
+}
+
+/// What one write of a `len`-byte packet came to. A TUN write is a packet,
+/// whole or not at all: a short write cannot be completed with a second call,
+/// since the kernel would take the tail for a packet of its own, so it is a
+/// dropped packet like a full queue is. Neither is an error: for a UDP-shaped
+/// device that is what a full socket buffer does.
+fn packet_write_outcome(n: isize, len: usize) -> io::Result<()> {
+    if n < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock {
+            trace!("TUN write {}, packet dropped", err);
+            return Ok(());
         }
-        written += n as usize;
+        return Err(err);
+    }
+    if (n as usize) < len {
+        trace!("TUN short write, {n} of {len} bytes; packet dropped");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::stack_common::{clear_buffer_pool, test_util::syn_packet};
+    use super::super::stack_common::{
+        clear_buffer_pool,
+        test_util::{is_syn_ack, syn_packet, syn6_packet},
+    };
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::UnixStream;
@@ -493,6 +588,16 @@ mod tests {
             tcp_buffer_size: 32 * 1024,
             max_connections: 16,
             close_fd_on_drop: true,
+            utun_header: false,
+            orphan_timeout: Duration::from_secs(60),
+        }
+    }
+
+    /// The same, for a descriptor that frames packets the way utun does.
+    fn utun_options() -> TcpStackOptions {
+        TcpStackOptions {
+            utun_header: true,
+            ..owning_options()
         }
     }
 
@@ -602,6 +707,8 @@ mod tests {
                 tcp_buffer_size: buffer_size,
                 max_connections: CONNECTIONS * 2,
                 close_fd_on_drop: true,
+                utun_header: false,
+                orphan_timeout: Duration::from_secs(60),
             },
         )
         .unwrap();
@@ -789,6 +896,162 @@ mod tests {
         drop(stack);
     }
 
+    /// A short write is a dropped packet, not a partial one to finish: the
+    /// tail written on its own would be a packet of its own.
+    #[test]
+    fn a_short_write_is_a_dropped_packet_not_a_second_write() {
+        assert!(packet_write_outcome(3, 10).is_ok());
+        assert!(packet_write_outcome(10, 10).is_ok());
+    }
+
+    /// Reads and writes through a socketpair, with `utun_header` deciding
+    /// whether each side expects utun's framing. The far end plays the
+    /// kernel: it writes what utun would deliver and reads what utun would
+    /// accept.
+    /// The length of the IP packet at the start of `bytes`, from its header,
+    /// once enough of the header has arrived to say.
+    fn ip_packet_len(bytes: &[u8]) -> Option<usize> {
+        match bytes.first().map(|b| b >> 4) {
+            Some(4) if bytes.len() >= 4 => Some(u16::from_be_bytes([bytes[2], bytes[3]]) as usize),
+            Some(6) if bytes.len() >= 6 => {
+                Some(40 + u16::from_be_bytes([bytes[4], bytes[5]]) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// Read one utun-framed packet from the far end of the socketpair. A
+    /// stream socket owes nothing about read boundaries: it may hand back
+    /// the frame in pieces, so this reads until the IP header's own length
+    /// says the packet is complete. `None` if nothing arrives within the
+    /// socket's read timeout, or the bytes are not a framed IP packet.
+    fn read_framed(server: &mut UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let n = server.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            got.extend_from_slice(&chunk[..n]);
+            if got.len() >= UTUN_HEADER_LEN
+                && let Some(len) = ip_packet_len(&got[UTUN_HEADER_LEN..])
+            {
+                if len == 0 {
+                    return None;
+                }
+                if got.len() >= UTUN_HEADER_LEN + len {
+                    got.truncate(UTUN_HEADER_LEN + len);
+                    return Some(got);
+                }
+            }
+        }
+    }
+
+    /// Reads and writes through a socketpair, with `utun_header` deciding
+    /// whether each side expects utun's framing. The far end plays the
+    /// kernel: it writes what utun would deliver and reads what utun would
+    /// accept. The answer is read as a framed packet, so a bare answer
+    /// (the stack not prepending) comes back as `None` too.
+    fn exchange(options: TcpStackOptions, sent: &[u8], wait: Duration) -> Option<Vec<u8>> {
+        use std::io::Write;
+
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let stack = TcpStackDirect::new(client.into_raw_fd(), options).unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        server.write_all(sent).unwrap();
+        server.set_read_timeout(Some(wait)).unwrap();
+        let answer = read_framed(&mut server);
+        drop(stack);
+        answer
+    }
+
+    /// The whole Apple path: a SYN framed the way utun delivers it is
+    /// answered with a SYN+ACK framed the way utun requires. Without the
+    /// strip, smoltcp sees a first byte of zero and drops the SYN; without
+    /// the prepend, the kernel refuses the answer.
+    #[test]
+    fn a_utun_framed_syn_is_answered_with_a_utun_framed_syn_ack() {
+        let mut framed = UTUN_AF_INET.to_vec();
+        framed.extend_from_slice(&syn_packet(20010));
+
+        let answer = exchange(utun_options(), &framed, Duration::from_secs(2))
+            .expect("no answer: the framed SYN was not understood");
+        assert_eq!(
+            &answer[..4],
+            &UTUN_AF_INET,
+            "the answer must carry utun's header"
+        );
+        assert!(is_syn_ack(&answer[4..]), "and be the SYN+ACK behind it");
+    }
+
+    /// The same over IPv6, whose family word is 30 and whose header keeps
+    /// its length in a different place: the only two things that differ.
+    #[test]
+    fn a_utun_framed_ipv6_syn_is_answered_with_a_utun_framed_syn_ack() {
+        let mut framed = UTUN_AF_INET6.to_vec();
+        framed.extend_from_slice(&syn6_packet(20012));
+
+        let answer = exchange(utun_options(), &framed, Duration::from_secs(2))
+            .expect("no answer: the framed IPv6 SYN was not understood");
+        assert_eq!(&answer[..4], &UTUN_AF_INET6, "the answer must say AF_INET6");
+        assert!(is_syn_ack(&answer[4..]), "and be the SYN+ACK behind it");
+    }
+
+    /// The flag is honoured in both directions. A device that does not
+    /// frame must not have four bytes taken off its packets, and one that
+    /// does must not have a bare packet mistaken for a framed one. 300 ms is
+    /// long enough for the loopback answer above to have come back many
+    /// times over.
+    #[test]
+    fn the_utun_flag_decides_whether_the_header_is_expected() {
+        let bare = syn_packet(20011);
+        let mut framed = UTUN_AF_INET.to_vec();
+        framed.extend_from_slice(&bare);
+        let wait = Duration::from_millis(300);
+
+        assert!(
+            exchange(owning_options(), &framed, wait).is_none(),
+            "an unframed device must not strip four bytes"
+        );
+        assert!(
+            exchange(utun_options(), &bare, wait).is_none(),
+            "a framed device must not accept a bare packet"
+        );
+    }
+
+    /// UDP replies leave through `write_packet`, a different path from
+    /// smoltcp's transmit token, and need the same header.
+    #[test]
+    fn a_udp_response_is_framed_for_utun() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let mut stack = TcpStackDirect::new(client.into_raw_fd(), utun_options()).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        stack.set_udp_response_tx(rx);
+        let waker = stack.udp_waker();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = super::super::udp_handler::build_udp_packet(
+            b"answer",
+            "8.8.8.8:53".parse().unwrap(),
+            "10.0.0.2:5353".parse().unwrap(),
+        )
+        .unwrap();
+        tx.try_send(response.clone()).unwrap();
+        waker();
+
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let got = read_framed(&mut server).expect("the response never arrived");
+        assert_eq!(&got[..4], &UTUN_AF_INET);
+        assert_eq!(&got[4..], &response[..]);
+        drop(stack);
+    }
+
     #[test]
     fn test_write_all_eagain() {
         // Fill a non-blocking socket's write buffer, then verify write_all
@@ -820,11 +1083,11 @@ mod tests {
             }
         }
 
-        // Now write_all should drop the packet gracefully
-        let result = write_all(writer_fd, &[1, 2, 3]);
+        // Now write_one should drop the packet gracefully
+        let result = write_one(writer_fd, &[1, 2, 3]);
         assert!(
             result.is_ok(),
-            "write_all should return Ok on EAGAIN, got {:?}",
+            "write_one should return Ok on EAGAIN, got {:?}",
             result
         );
 

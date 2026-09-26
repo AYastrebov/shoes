@@ -24,7 +24,7 @@ open and are ordered at the end. Line references were last checked against
 | Network change | `networkChanged()` | `shoes_network_changed()` |
 | Live log level | `setLogLevel()` | `shoes_set_log_level()` |
 | AmneziaWG 2.0/3.0/3.1 | yes | yes |
-| Fake IP / DNS leak | yes, via TUN interception | yes, via TUN interception |
+| Fake IP / DNS leak | yes, via TUN interception | written, not yet shown on a device (section 8, utun) |
 
 The iOS build needs `IPHONEOS_DEPLOYMENT_TARGET=18.0` (the package's floor;
 `aws-lc-sys` itself only needs iOS 13+ for `___chkstk_darwin`).
@@ -481,6 +481,19 @@ once the thread is attached.
 
 ## 8. Smaller items
 
+- **~~utun's packet header was never stripped or prepended.~~ Fixed in code,
+  not yet shown on a device.** On macOS and iOS the descriptor is a utun
+  socket, and the kernel frames every packet with a 4-byte address family.
+  The direct backend read and wrote the descriptor bare, so every inbound
+  packet failed the IP version check and every outbound write was refused:
+  nothing could have carried a packet through the TUN on an Apple device,
+  which is consistent with no such run being recorded here or in
+  `docs/MACOS.md`. `TcpStackOptions::utun_header` (true on Apple by `cfg`)
+  now strips on read and prepends on both write paths, and a Linux test
+  exercises the framing through a socketpair. What remains is the run itself:
+  one iPhone through `ShoesPacketTunnelProvider`, one macOS daemon session,
+  each carrying a TCP connection and a UDP query. Until then the "yes" for
+  iOS in the table above is a claim about the code, not an observation.
 - **~~`libboringtun-*.so` shipped in the AAR.~~ Fixed at the source.**
   `cargo-ndk` copies every cdylib in the dependency graph, and the tunnel
   library's arrived under a hashed filename nothing could load — 315 KB of dead

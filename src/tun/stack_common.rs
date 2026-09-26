@@ -15,7 +15,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -36,7 +36,7 @@ use smoltcp::{
         Ipv6Packet, TcpPacket,
     },
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 
 use crate::util::smol_now;
 
@@ -222,6 +222,10 @@ struct SocketInfo {
     control: Arc<TcpConnectionControl>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    /// When the app hung up on this connection (its `TcpConnection` was
+    /// dropped), if it has. From then on the peer has `orphan_timeout` to
+    /// close its side before the socket is reset: see the sweep.
+    orphaned_since: Option<std::time::Instant>,
 }
 
 /// Information about a new TCP connection from the stack.
@@ -257,6 +261,25 @@ pub const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iterati
 /// right answer for datagrams either way.
 pub const UDP_RESPONSE_QUEUE: usize = 512;
 
+/// UDP datagrams read off the device and waiting for tokio, the other
+/// direction of the queue above. Bounded for the same reason: a consumer
+/// that stalls, or a sender faster than the outbound can carry, must shed
+/// datagrams rather than queue them without limit, and dropping is what a
+/// full socket buffer would do. Each entry is a pooled buffer of `mtu + 4`
+/// bytes whatever the datagram's size, so the worst case is 256 of those:
+/// about 2.3 MiB at Android's 9000-byte default, 1 MiB at iOS's 4064, 384 KiB
+/// at 1500. Normally it holds a handful.
+pub const UDP_INGRESS_QUEUE: usize = 256;
+
+/// Datagrams dropped because `UDP_INGRESS_QUEUE` was full, over the life of
+/// the process. A counter rather than a log line per drop: a flood is the
+/// case this exists for.
+static UDP_INGRESS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+pub fn udp_ingress_dropped() -> u64 {
+    UDP_INGRESS_DROPPED.load(Ordering::Relaxed)
+}
+
 /// How the stack thread is sized and who owns its descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct TcpStackOptions {
@@ -274,6 +297,21 @@ pub struct TcpStackOptions {
     /// something a later change will fix.
     #[cfg_attr(windows, allow(dead_code))]
     pub close_fd_on_drop: bool,
+    /// Whether the device frames every packet with utun's 4-byte address
+    /// family header. True on macOS and iOS, where utun is the only TUN and
+    /// the kernel always frames; false everywhere else. Read by the Unix
+    /// backend, which strips the header on the way in and prepends it on the
+    /// way out; the Windows session has no such header, so nothing reads it
+    /// there.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub utun_header: bool,
+    /// How long a connection the app has dropped may wait for the peer to
+    /// close its side before it is reset. smoltcp has no FIN-WAIT-2 timer,
+    /// and a peer that answers keepalives keeps the idle timeout from ever
+    /// firing, so without this a dropped connection whose peer never closes
+    /// holds its four buffers for as long as the peer likes. Linux's
+    /// `tcp_fin_timeout` is 60 s.
+    pub orphan_timeout: Duration,
 }
 
 /// Longest the stack thread sleeps with nothing to do.
@@ -335,7 +373,7 @@ pub struct StackHandle {
     /// Flag to signal thread shutdown
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
-    udp_rx: Option<UnboundedReceiver<PacketBuffer>>,
+    udp_rx: Option<Receiver<PooledBuffer>>,
     /// Shared state with the stack thread
     shared_state: Arc<Mutex<SharedState>>,
 }
@@ -365,7 +403,7 @@ impl StackHandle {
         D: StackDevice,
         F: FnOnce() -> io::Result<D> + Send + 'static,
     {
-        let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(UDP_INGRESS_QUEUE);
         let running = Arc::new(AtomicBool::new(true));
         let notifier = StackNotifier::new(wake);
         let shared_state = Arc::new(Mutex::new(SharedState {
@@ -414,7 +452,7 @@ impl StackHandle {
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
-    pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
+    pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.udp_rx.take()
     }
 
@@ -529,7 +567,7 @@ pub fn run_stack_thread_guarded(running: Arc<AtomicBool>, f: impl FnOnce()) {
 pub fn run_stack_loop<D: StackDevice>(
     mut device: D,
     options: TcpStackOptions,
-    udp_tx: UnboundedSender<PacketBuffer>,
+    udp_tx: Sender<PooledBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
     notifier: Arc<StackNotifier>,
@@ -539,6 +577,7 @@ pub fn run_stack_loop<D: StackDevice>(
     let TcpStackOptions {
         tcp_buffer_size,
         max_connections,
+        orphan_timeout,
         ..
     } = options;
 
@@ -663,6 +702,7 @@ pub fn run_stack_loop<D: StackDevice>(
                                                 control,
                                                 src_addr,
                                                 dst_addr,
+                                                orphaned_since: None,
                                             },
                                         );
                                         active_connections.insert((src_addr, dst_addr));
@@ -672,7 +712,14 @@ pub fn run_stack_loop<D: StackDevice>(
                                         #[cfg(feature = "control-stats")]
                                         super::traffic::connection_opened();
 
-                                        if let Ok(state) = shared_state.try_lock()
+                                        // `lock`, not `try_lock`: the other
+                                        // holders are the setup-time setters
+                                        // and the UDP drain above, all brief,
+                                        // and a `try_lock` that lost the race
+                                        // dropped the connection on the floor.
+                                        // The client saw a handshake followed
+                                        // by a FIN, with nothing logged.
+                                        if let Ok(state) = shared_state.lock()
                                             && let Some(ref tx) = state.new_conn_tx
                                         {
                                             let _ = tx.send(new_conn.new_tcp_conn);
@@ -692,8 +739,16 @@ pub fn run_stack_loop<D: StackDevice>(
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Udp => {
-                        // UDP goes to tokio - convert to Vec since it leaves our pool
-                        let _ = udp_tx.send(pkt.to_vec());
+                        // UDP goes to tokio in its pooled buffer: the pool is
+                        // process-wide, so the buffer comes back when tokio
+                        // drops it, and nothing is allocated per datagram.
+                        // Full means drop, see `UDP_INGRESS_QUEUE`; closed
+                        // means the handler is gone, and the loop is stopping.
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                            udp_tx.try_send(pkt)
+                        {
+                            UDP_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     _ => {
                         trace!("ignoring packet with protocol {:?}", protocol);
@@ -727,7 +782,10 @@ pub fn run_stack_loop<D: StackDevice>(
 
         sockets_to_remove.clear();
 
-        for (handle, socket_info) in sockets.iter() {
+        // One clock read per sweep, for the orphan timer.
+        let sweep_now = std::time::Instant::now();
+
+        for (handle, socket_info) in sockets.iter_mut() {
             let handle = *handle;
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
@@ -738,6 +796,42 @@ pub fn run_stack_loop<D: StackDevice>(
                 control.set_closed();
                 trace!("socket {:?} closed", handle);
                 continue;
+            }
+
+            // The app hung up on both halves: its `TcpConnection` was
+            // dropped, and nothing will ever read from this socket again.
+            // Only the send half used to be acted on (a FIN once drained,
+            // below); the receive half kept accepting into a buffer nobody
+            // drained, and the socket sat in FIN-WAIT-2 with all four buffers
+            // until the peer chose to close, which a peer that keeps sending
+            // or keeps answering keepalives need never do.
+            //
+            // What Linux does, and what this does: data the app never read,
+            // or data arriving after it hung up, is answered with a reset at
+            // once (RFC 2525 §2.17); a peer that goes quiet without closing
+            // gets `orphan_timeout`, its `tcp_fin_timeout`, and then a reset.
+            // A clean hang-up, with nothing unread and a peer that closes,
+            // still ends in the FIN exchange below.
+            if control.recv_state() == TcpSocketState::Close {
+                let orphaned_since = *socket_info.orphaned_since.get_or_insert(sweep_now);
+                let peer_still_talking = control.has_unread_data() || socket.can_recv();
+                if peer_still_talking || sweep_now.duration_since(orphaned_since) >= orphan_timeout
+                {
+                    trace!(
+                        "socket {:?}: app hung up, {}; reset",
+                        handle,
+                        if peer_still_talking {
+                            "peer still sending"
+                        } else {
+                            "peer never closed"
+                        }
+                    );
+                    // Closed now; the RST goes out on this iteration's poll and
+                    // the socket is removed on the next sweep.
+                    socket.abort();
+                    control.set_closed();
+                    continue;
+                }
             }
 
             // Handle SHUT_WR: Close -> Closing transition
@@ -858,9 +952,10 @@ pub fn run_stack_loop<D: StackDevice>(
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
             debug!(
-                "smoltcp stack: polls={}, active_sockets={}",
+                "smoltcp stack: polls={}, active_sockets={}, udp_ingress_dropped={}",
                 poll_count,
-                sockets.len()
+                sockets.len(),
+                udp_ingress_dropped()
             );
             last_log_time = std::time::Instant::now();
         }
@@ -957,7 +1052,14 @@ fn create_tcp_connection(
     // Matched to netstack-smoltcp settings for optimal performance
     socket.set_congestion_control(CongestionControl::Cubic);
     socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    // 7200s matches Linux default (tcp_keepalive_time) and shadowsocks-rust
+    // smoltcp's `timeout` is not Linux's `tcp_keepalive_time`, though the
+    // value is the same and shadowsocks-rust carries the same FIXME: with
+    // keep-alive on, it aborts when the peer goes this long without sending
+    // anything, probes included. The peer here is this host's own kernel,
+    // which answers a probe at once for as long as the app's socket exists,
+    // so this only ever fires when the device is gone -- and then the loop
+    // is already stopping. A connection the app has dropped is the case that
+    // used to hide behind this figure; the sweep resets those itself.
     socket.set_timeout(Some(SmolDuration::from_secs(7200)));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
@@ -1129,25 +1231,42 @@ fn should_filter_packet(packet: &[u8]) -> bool {
 pub mod test_util {
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
-        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+        IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     };
 
     /// One IPv4 SYN, checksummed, from 10.0.0.2:`src_port` to
-    /// 93.184.216.34:443.
+    /// 93.184.216.34:443, with initial sequence number 0.
     pub fn syn_packet(src_port: u16) -> Vec<u8> {
+        tcp_packet(src_port, TcpControl::Syn, 0, None, &[])
+    }
+
+    /// A segment from the same client to the same server. `seq` is relative
+    /// to the SYN above (the first data byte is 1); `ack` is absolute.
+    pub fn tcp_packet(
+        src_port: u16,
+        control: TcpControl,
+        seq: u32,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let tcp = TcpRepr {
             src_port,
             dst_port: 443,
-            control: TcpControl::Syn,
-            seq_number: TcpSeqNumber(0),
-            ack_number: None,
+            control,
+            seq_number: TcpSeqNumber(seq as i32),
+            ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
             window_len: 64240,
             window_scale: None,
-            max_seg_size: Some(1400),
+            max_seg_size: if control == TcpControl::Syn {
+                Some(1400)
+            } else {
+                None
+            },
             sack_permitted: false,
             sack_ranges: [None; 3],
             timestamp: None,
-            payload: &[],
+            payload,
         };
         let src_addr = Ipv4Address::new(10, 0, 0, 2);
         let dst_addr = Ipv4Address::new(93, 184, 216, 34);
@@ -1170,6 +1289,83 @@ pub mod test_util {
         );
         buffer
     }
+
+    /// One IPv6 SYN, checksummed, from [2001:db8::2]:`src_port` to
+    /// [2001:db8::1]:443, with initial sequence number 0.
+    pub fn syn6_packet(src_port: u16) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port,
+            dst_port: 443,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(0),
+            ack_number: None,
+            window_len: 64240,
+            window_scale: None,
+            max_seg_size: Some(1380),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let src_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let dst_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let ip = Ipv6Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+
+        let checksums = ChecksumCapabilities::default();
+        let mut buffer = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut buffer));
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buffer[ip.buffer_len()..]),
+            &src_addr.into(),
+            &dst_addr.into(),
+            &checksums,
+        );
+        buffer
+    }
+
+    /// The TCP flags and sequence number of a packet the stack wrote, if it
+    /// is a segment from port 443 of either server address above.
+    pub struct Segment {
+        pub syn: bool,
+        pub ack: bool,
+        pub fin: bool,
+        pub rst: bool,
+        pub seq: u32,
+    }
+
+    pub fn segment_from_server(packet: &[u8]) -> Option<Segment> {
+        let tcp_bytes = match packet.first().map(|b| b >> 4) {
+            Some(4) => {
+                let ip = Ipv4Packet::new_checked(packet).ok()?;
+                (ip.next_header() == IpProtocol::Tcp).then(|| ip.payload())?
+            }
+            Some(6) => {
+                let ip = Ipv6Packet::new_checked(packet).ok()?;
+                (ip.next_header() == IpProtocol::Tcp).then(|| ip.payload())?
+            }
+            _ => return None,
+        };
+        let tcp = TcpPacket::new_checked(tcp_bytes).ok()?;
+        (tcp.src_port() == 443).then(|| Segment {
+            syn: tcp.syn(),
+            ack: tcp.ack(),
+            fin: tcp.fin(),
+            rst: tcp.rst(),
+            seq: tcp.seq_number().0 as u32,
+        })
+    }
+
+    /// Whether `packet` is a TCP SYN+ACK from 93.184.216.34:443, which is
+    /// what the stack answers `syn_packet` with.
+    pub fn is_syn_ack(packet: &[u8]) -> bool {
+        segment_from_server(packet).is_some_and(|s| s.syn && s.ack)
+    }
 }
 
 // Platform-neutral by construction: these drive [`run_stack_loop`] through a
@@ -1187,7 +1383,9 @@ mod tests {
 
     use smoltcp::phy::TxToken;
 
-    use super::test_util::syn_packet;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use super::test_util::{is_syn_ack, segment_from_server, syn_packet, tcp_packet};
     use super::*;
 
     /// One step of a scripted device's life.
@@ -1321,18 +1519,24 @@ mod tests {
         written: Arc<Mutex<Vec<Vec<u8>>>>,
         running: Arc<AtomicBool>,
         conn_rx: UnboundedReceiver<NewTcpConnection>,
-        udp_rx: UnboundedReceiver<PacketBuffer>,
+        udp_rx: Receiver<PooledBuffer>,
         udp_response_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl Harness {
+        /// With the production orphan timeout, so only a peer still talking
+        /// can get a dropped connection reset inside a test's two seconds.
         fn spawn() -> Self {
+            Self::spawn_with(StdDuration::from_secs(60))
+        }
+
+        fn spawn_with(orphan_timeout: StdDuration) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
             let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (udp_tx, udp_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(UDP_INGRESS_QUEUE);
             let (udp_response_tx, udp_response_rx) = tokio::sync::mpsc::channel(64);
 
             let device = ScriptedDevice {
@@ -1348,6 +1552,8 @@ mod tests {
                 tcp_buffer_size: 32 * 1024,
                 max_connections: 16,
                 close_fd_on_drop: false,
+                utun_header: false,
+                orphan_timeout,
             };
 
             let shared_state = Arc::new(Mutex::new(SharedState {
@@ -1418,20 +1624,6 @@ mod tests {
         }
     }
 
-    /// Whether `packet` is a TCP SYN+ACK from 93.184.216.34:443.
-    fn is_syn_ack(packet: &[u8]) -> bool {
-        let Ok(ip) = Ipv4Packet::new_checked(packet) else {
-            return false;
-        };
-        if ip.next_header() != IpProtocol::Tcp {
-            return false;
-        }
-        let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
-            return false;
-        };
-        tcp.syn() && tcp.ack() && tcp.src_port() == 443
-    }
-
     /// Serialise against everything else that reads the process-global
     /// connection counter: a SYN increments it and the loop's exit path
     /// resets it, so any harness test can zero another test's count.
@@ -1448,23 +1640,29 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Receive with a deadline, so a loop that stops delivering fails the
-    /// test in two seconds instead of hanging the whole suite on a
-    /// `blocking_recv` that nothing will ever satisfy.
-    fn recv_within<T>(rx: &mut UnboundedReceiver<T>, what: &str) -> T {
+    /// Poll `next` until it yields, with a deadline, so a loop that stops
+    /// delivering fails the test in two seconds instead of hanging the whole
+    /// suite on a receive that nothing will ever satisfy.
+    fn poll_within<T>(what: &str, mut next: impl FnMut() -> Option<T>) -> T {
         let start = std::time::Instant::now();
         loop {
-            match rx.try_recv() {
-                Ok(value) => return value,
-                Err(_) => {
-                    assert!(
-                        start.elapsed() < StdDuration::from_secs(2),
-                        "timed out waiting for {what}"
-                    );
-                    thread::sleep(StdDuration::from_millis(10));
-                }
+            if let Some(value) = next() {
+                return value;
             }
+            assert!(
+                start.elapsed() < StdDuration::from_secs(2),
+                "timed out waiting for {what}"
+            );
+            thread::sleep(StdDuration::from_millis(10));
         }
+    }
+
+    fn recv_within<T>(rx: &mut UnboundedReceiver<T>, what: &str) -> T {
+        poll_within(what, || rx.try_recv().ok())
+    }
+
+    fn recv_bounded_within<T>(rx: &mut Receiver<T>, what: &str) -> T {
+        poll_within(what, || rx.try_recv().ok())
     }
 
     #[test]
@@ -1486,6 +1684,158 @@ mod tests {
         harness.stop();
     }
 
+    impl Harness {
+        /// Find the first written packet that `pick` accepts.
+        fn find_written<T>(&self, pick: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+            self.written.lock().unwrap().iter().find_map(|p| pick(p))
+        }
+
+        /// The full handshake from 10.0.0.2:`src_port`: SYN, SYN+ACK, ACK.
+        /// Returns the connection tokio was handed and the server's initial
+        /// sequence number, so the caller can keep sending in sequence.
+        fn establish(&mut self, src_port: u16) -> (NewTcpConnection, u32) {
+            self.script_tx
+                .send(Script::Packet(syn_packet(src_port)))
+                .unwrap();
+            let conn = recv_within(&mut self.conn_rx, "the connection to reach tokio");
+            self.wait_for_written("a SYN+ACK", |written| written.iter().any(|p| is_syn_ack(p)));
+            let server_isn = self
+                .find_written(|p| segment_from_server(p).filter(|s| s.syn && s.ack))
+                .unwrap()
+                .seq;
+            self.script_tx
+                .send(Script::Packet(tcp_packet(
+                    src_port,
+                    smoltcp::wire::TcpControl::None,
+                    1,
+                    Some(server_isn.wrapping_add(1)),
+                    &[],
+                )))
+                .unwrap();
+            (conn, server_isn)
+        }
+    }
+
+    /// Every test here needs to see the socket go away, and the one
+    /// observable that does not depend on a feature flag is the SYN guard:
+    /// a SYN from a 4-tuple the stack still holds is dropped, so a second
+    /// connection from the same port proves the first is gone.
+    fn assert_tuple_is_free(harness: &mut Harness, src_port: u16) {
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(src_port)))
+            .unwrap();
+        recv_within(
+            &mut harness.conn_rx,
+            "a second connection from the same port, which the stack refuses while it still holds the first",
+        );
+    }
+
+    /// The app drops the connection (an upstream that failed, a rule that
+    /// blocked) with bytes the peer sent still unread. Nobody will read
+    /// them, so the answer is a reset, as it would be from Linux; what it
+    /// must not be is a socket that keeps the peer's data and its own four
+    /// buffers until the peer gives up.
+    #[test]
+    fn dropping_a_connection_with_unread_data_resets_it() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let (conn, server_isn) = harness.establish(20020);
+
+        harness
+            .script_tx
+            .send(Script::Packet(tcp_packet(
+                20020,
+                smoltcp::wire::TcpControl::Psh,
+                1,
+                Some(server_isn.wrapping_add(1)),
+                b"GET / HTTP/1.0\r\n\r\n",
+            )))
+            .unwrap();
+        // Let the stack accept the data before the app hangs up, so this is
+        // the unread-data case and not the peer-still-sending one.
+        harness.wait_for_written("the ACK for the data", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.ack && !s.syn)
+        });
+
+        drop(conn);
+        // Something has to wake the loop; the notifier in the harness is a
+        // no-op, so give it a packet-shaped reason.
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20021)))
+            .unwrap();
+
+        harness.wait_for_written("a RST", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.rst)
+        });
+        assert_tuple_is_free(&mut harness, 20020);
+        harness.stop();
+    }
+
+    /// The app drops a connection nothing is unread on, so the stack sends
+    /// FIN. The peer acknowledges it and then neither closes nor sends:
+    /// FIN-WAIT-2, which smoltcp will hold forever and Linux holds for
+    /// `tcp_fin_timeout`. After the harness's short orphan timeout the
+    /// socket must be reset and its 4-tuple free again.
+    #[test]
+    fn an_orphaned_connection_the_peer_never_closes_is_reset_after_the_timeout() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        // Short enough to wait out; long against the tests' 10 ms polling.
+        let mut harness = Harness::spawn_with(StdDuration::from_millis(300));
+        let (conn, _server_isn) = harness.establish(20030);
+
+        drop(conn);
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20031)))
+            .unwrap();
+        harness.wait_for_written("a FIN", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.fin)
+        });
+        let fin_seq = harness
+            .find_written(|p| segment_from_server(p).filter(|s| s.fin))
+            .unwrap()
+            .seq;
+        // The peer acknowledges the FIN and then says nothing more.
+        harness
+            .script_tx
+            .send(Script::Packet(tcp_packet(
+                20030,
+                smoltcp::wire::TcpControl::None,
+                1,
+                Some(fin_seq.wrapping_add(1)),
+                &[],
+            )))
+            .unwrap();
+
+        // Past the orphan timeout; the loop's own timer wakes it to notice.
+        thread::sleep(StdDuration::from_millis(400));
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20032)))
+            .unwrap();
+        harness.wait_for_written("a RST after the orphan timeout", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.rst)
+        });
+        assert_tuple_is_free(&mut harness, 20030);
+        harness.stop();
+    }
+
     #[test]
     fn udp_is_forwarded_to_tokio_not_smoltcp() {
         #[cfg(feature = "control-stats")]
@@ -1503,8 +1853,50 @@ mod tests {
             .send(Script::Packet(query.clone()))
             .unwrap();
 
-        let forwarded = recv_within(&mut harness.udp_rx, "the UDP packet to reach tokio");
-        assert_eq!(forwarded, query);
+        let forwarded = recv_bounded_within(&mut harness.udp_rx, "the UDP packet to reach tokio");
+        assert_eq!(&forwarded[..], &query[..]);
+
+        harness.stop();
+    }
+
+    /// The hand-off to tokio is the one queue on the packet path that had no
+    /// bound. With the consumer stalled, a burst past the queue's capacity
+    /// must be shed, counted, and must not stop the loop; what was queued
+    /// is still delivered when the consumer returns.
+    #[test]
+    fn udp_past_the_ingress_queue_is_dropped_and_counted_not_queued() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let dropped_before = udp_ingress_dropped();
+        const EXCESS: u64 = 8;
+
+        let query = super::super::udp_handler::build_udp_packet(
+            b"flood",
+            "10.0.0.2:5353".parse().unwrap(),
+            "8.8.8.8:53".parse().unwrap(),
+        )
+        .unwrap();
+        for _ in 0..UDP_INGRESS_QUEUE as u64 + EXCESS {
+            harness
+                .script_tx
+                .send(Script::Packet(query.clone()))
+                .unwrap();
+        }
+
+        poll_within("the excess to be counted as dropped", || {
+            (udp_ingress_dropped() >= dropped_before + EXCESS).then_some(())
+        });
+        assert!(harness.running.load(Ordering::Relaxed));
+
+        let mut delivered = 0;
+        while harness.udp_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered, UDP_INGRESS_QUEUE,
+            "the queue's worth is kept, no more"
+        );
 
         harness.stop();
     }

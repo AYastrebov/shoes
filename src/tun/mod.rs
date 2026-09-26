@@ -24,9 +24,13 @@
 //!   VPN configuration (routes, DNS, etc.) is handled by the Android VpnService.
 //!   You must pass the FD via `TunServerConfig::raw_fd()`.
 //!
-//! - **iOS/macOS**: Accepts raw FD from `NEPacketTunnelProvider.packetFlow`.
-//!   Use `TunServerConfig::packet_information(true)` if using the socket FD
-//!   directly, or `false` if using the readPackets/writePackets API.
+//! - **iOS/macOS**: Accepts the raw FD of `NEPacketTunnelProvider.packetFlow`'s
+//!   socket (`packetFlow.value(forKeyPath: "socket.fileDescriptor")`), or on
+//!   macOS creates a utun itself when privileged. Either way the descriptor is
+//!   a utun socket, whose packets the kernel frames with a 4-byte address
+//!   family; the stack strips and prepends that header itself
+//!   (`TcpStackOptions::utun_header`). The `readPackets`/`writePackets` API
+//!   is not supported: there is no descriptor to read.
 
 mod stack_common;
 mod tcp_conn;
@@ -257,6 +261,14 @@ pub async fn run_tun_server(
         // created here, the `tun` crate owns the descriptor instead, and on
         // Windows the session is structurally ours.
         close_fd_on_drop: config.close_fd_on_drop,
+        // utun is the only TUN on Apple platforms and the kernel always
+        // frames its packets, whichever way the descriptor was obtained:
+        // `packetFlow.socket.fileDescriptor` in a Network Extension or a
+        // device the `tun` crate created and handed over as a raw fd. The
+        // crate strips the header in its own reader, which this path does
+        // not use, so the stack has to do it itself.
+        utun_header: cfg!(any(target_os = "macos", target_os = "ios")),
+        orphan_timeout: std::time::Duration::from_secs(60),
     };
 
     // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the
@@ -585,7 +597,7 @@ where
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
 async fn handle_udp_packets(
-    from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
+    from_stack_rx: mpsc::Receiver<stack_common::PooledBuffer>,
     to_stack_tx: mpsc::Sender<PacketBuffer>,
     waker: stack_common::StackWaker,
     proxy_selector: Arc<ClientProxySelector>,
