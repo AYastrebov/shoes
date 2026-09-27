@@ -234,12 +234,20 @@ pub(crate) fn percent_decode(raw: &str, plus_is_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `*` when no origins are configured, which is what a dashboard served
-/// from elsewhere needs; otherwise the request's origin if it is allowed,
-/// and nothing at all if it is not.
-fn cors_origin(headers: &HeaderMap, allow: &[String]) -> Option<String> {
+/// The origin a response may be read from in a browser, or none.
+///
+/// With origins configured, the request's origin if it is on the list. With
+/// none configured, `*`, which a dashboard served from elsewhere needs --
+/// but only when a secret is set. A controller with no secret relies on the
+/// browser's same-origin policy to keep other sites' scripts out, and `*`
+/// is exactly the header that switches that policy off: any page the user
+/// had open could then read the connection table from `127.0.0.1:9090` and
+/// send the `PUT`s and `DELETE`s that preflight would otherwise refuse. So
+/// no secret and no list means no CORS header at all, and a dashboard on
+/// another origin needs a secret first.
+fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Option<String> {
     if allow.is_empty() {
-        return Some("*".to_string());
+        return has_secret.then(|| "*".to_string());
     }
     let origin = headers.get(hyper::header::ORIGIN)?.to_str().ok()?;
     allow
@@ -308,7 +316,11 @@ pub(crate) async fn read_body(req: Request<Incoming>) -> Result<Bytes, Response<
 }
 
 pub(crate) async fn route(req: Request<Incoming>, state: Arc<ApiState>) -> Response<ApiBody> {
-    let origin = cors_origin(req.headers(), &state.config.allow_origins);
+    let origin = cors_origin(
+        req.headers(),
+        &state.config.allow_origins,
+        state.config.secret.is_some(),
+    );
 
     // Preflight carries no credentials by definition, so it is answered
     // before the secret is checked.
@@ -524,23 +536,38 @@ mod tests {
     }
 
     #[test]
-    fn cors_allows_everything_by_default_and_only_the_listed_otherwise() {
+    fn cors_allows_everything_by_default_with_a_secret_and_only_the_listed_otherwise() {
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::ORIGIN, "http://a.example".parse().unwrap());
 
-        assert_eq!(cors_origin(&headers, &[]).as_deref(), Some("*"));
+        assert_eq!(cors_origin(&headers, &[], true).as_deref(), Some("*"));
         assert_eq!(
-            cors_origin(&headers, &["http://a.example".to_string()]).as_deref(),
+            cors_origin(&headers, &["http://a.example".to_string()], true).as_deref(),
             Some("http://a.example")
         );
         assert_eq!(
-            cors_origin(&headers, &["http://b.example".to_string()]),
+            cors_origin(&headers, &["http://b.example".to_string()], true),
             None
         );
         // No Origin header at all, with a list configured: nothing to allow.
         assert_eq!(
-            cors_origin(&HeaderMap::new(), &["http://a.example".to_string()]),
+            cors_origin(&HeaderMap::new(), &["http://a.example".to_string()], true),
             None
+        );
+    }
+
+    /// Without a secret the browser's same-origin policy is the only thing
+    /// between another site's script and the controller, and `*` would turn
+    /// it off. An explicit list is still honoured: the operator chose it.
+    #[test]
+    fn cors_never_answers_star_without_a_secret() {
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::ORIGIN, "http://a.example".parse().unwrap());
+
+        assert_eq!(cors_origin(&headers, &[], false), None);
+        assert_eq!(
+            cors_origin(&headers, &["http://a.example".to_string()], false).as_deref(),
+            Some("http://a.example")
         );
     }
 }

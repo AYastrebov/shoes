@@ -14,6 +14,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
   - [Protocol sniffing](#protocol-sniffing)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
+- [Clash API](#clash-api)
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
 
@@ -26,6 +27,7 @@ A configuration file is a YAML array containing one or more configuration entrie
 - **Client Config Group** - Defines reusable upstream proxy configurations
 - **Rule Config Group** - Defines reusable routing rules
 - **Named PEM** - Defines reusable certificate/key data
+- **Clash API** - A controller for dashboards, one per config
 
 ```yaml
 # Server configs have 'address' or 'path'
@@ -48,6 +50,10 @@ A configuration file is a YAML array containing one or more configuration entrie
 # Named PEMs have 'pem'
 - pem: my-cert
   path: /path/to/cert.pem
+
+# The Clash API controller has 'clash_api'
+- clash_api:
+    listen: 127.0.0.1:9090
 ```
 
 ## Server Config
@@ -1203,6 +1209,49 @@ Define certificates once and reference throughout configuration.
         protocol:
           type: http
 ```
+
+## Clash API
+
+An HTTP controller speaking the Clash API that mihomo dashboards (yacd,
+metacubexd, zashboard) and awg-manager use: `/version`, `/connections`,
+`/logs`, `/metrics` and the rest are listed in
+`docs/specs/2026-09-09-clash-api.md`. Compiled in with the `clash-api`
+feature; a build without it accepts the block, logs one warning naming the
+feature and ignores it, so one config serves both.
+
+```yaml
+- clash_api:
+    listen: 127.0.0.1:9090       # Required
+    secret: change-me            # Optional on loopback; required elsewhere
+    allow_origins: []            # Default: empty (see below)
+    max_tracked_connections: 4096 # Default: 4096
+    state_file: /var/lib/shoes/clash-api.json  # Optional; where selections persist
+```
+
+- **`listen`** is where the controller binds. Off loopback, `secret` is
+  required and the config is refused without it: the controller closes
+  connections and, once selection lands, redirects every connection on the
+  machine, so it is a control plane and the secret is its whole access
+  control. On loopback a secret is optional, for the dashboard tunnelled
+  over SSH, and a warning is logged when it is missing.
+- **`secret`** is the bearer token every request must carry
+  (`Authorization: Bearer <secret>`, or `?token=` on a WebSocket, which a
+  browser cannot set a header on). An empty string is refused.
+- **`allow_origins`** decides which origins a browser may read responses
+  from. Listed origins are answered with themselves. Empty means `*`, which
+  a dashboard served from another host needs, **only when a secret is
+  set**; with no secret, empty means no CORS header at all. Without a secret
+  the browser's same-origin policy is the only thing keeping other sites'
+  scripts out of the controller, and `*` is the header that switches that
+  policy off. A dashboard on another origin therefore needs a secret first.
+- **`max_tracked_connections`** bounds the connection registry. Past it a
+  connection is served and not tracked, and the omission is reported in
+  `/connections`.
+- **`state_file`** is where a proxy selection survives a restart. Its own
+  setting rather than a path beside the config, because a router's config
+  directory is often read-only.
+
+Only one `clash_api` block is allowed across the loaded files.
 
 ## Advanced Features
 

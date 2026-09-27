@@ -28,9 +28,11 @@ pub struct ClashApiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
-    /// Origins allowed to read a response from a browser. Empty means `*`,
-    /// which is what a dashboard served from elsewhere needs and what mihomo
-    /// does; the secret is the access control either way.
+    /// Origins allowed to read a response from a browser. Empty means `*`
+    /// when a secret is set, which is what a dashboard served from elsewhere
+    /// needs and what mihomo does; without a secret, empty means no CORS
+    /// header at all, since `*` would let any page the user has open read
+    /// and drive the controller. See `clash_api::cors_origin`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
 
@@ -75,6 +77,17 @@ impl ClashApiConfig {
                     self.listen
                 ),
             ));
+        }
+
+        if self.listen.ip().is_loopback() && self.secret.is_none() {
+            // Allowed, as the SSH-tunnelled dashboard case wants, but not
+            // silently: anything on the machine can drive the controller,
+            // and a dashboard on another origin will find CORS closed.
+            log::warn!(
+                "clash_api on {} has no secret: any local process can control it, and a \
+                 browser dashboard on another origin needs a secret before CORS opens",
+                self.listen
+            );
         }
 
         if self.max_tracked_connections == 0 {
