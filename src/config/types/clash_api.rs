@@ -32,9 +32,11 @@ pub struct ClashApiConfig {
     /// when a secret is set, which is what a dashboard served from elsewhere
     /// needs and what mihomo does; without a secret, empty means no CORS
     /// header at all, since `*` would let any page the user has open read
-    /// and drive the controller, and a request naming any other origin is
-    /// refused, since a WebSocket needs no CORS header to be read. See
-    /// `clash_api::cors_origin` and `clash_api::origin_permitted`.
+    /// and drive the controller, and a request naming any other origin, or
+    /// reaching the listener by a name that is not its own, is refused: a
+    /// WebSocket needs no CORS header to be read, and DNS rebinding makes a
+    /// foreign page same-origin. See `clash_api::cors_origin` and
+    /// `clash_api::browser_permitted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
 
@@ -87,7 +89,8 @@ impl ClashApiConfig {
             // and a dashboard on another origin will find CORS closed.
             log::warn!(
                 "clash_api on {} has no secret: any local process can control it, and a \
-                 browser dashboard on another origin needs a secret before CORS opens",
+                 browser dashboard on another origin needs a secret or its origin in \
+                 allow_origins",
                 self.listen
             );
         }

@@ -20,6 +20,7 @@ pub mod streams;
 pub mod ws;
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full};
@@ -244,7 +245,7 @@ pub(crate) fn percent_decode(raw: &str, plus_is_space: bool) -> String {
 /// had open could then read the connection table from `127.0.0.1:9090` and
 /// send the `PUT`s and `DELETE`s that preflight would otherwise refuse. So
 /// no secret and no list means no CORS header at all, and a dashboard on
-/// another origin needs a secret first. `origin_permitted` is the other
+/// another origin needs a secret first. `browser_permitted` is the other
 /// half of that policy, for the requests CORS does not cover.
 fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Option<String> {
     if allow.is_empty() {
@@ -257,17 +258,48 @@ fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Optio
         .then(|| origin.to_string())
 }
 
-/// Whether a request that names an origin may reach a controller that has
-/// no secret. Withholding the CORS header (`cors_origin`) keeps a page on
-/// another origin from reading a `fetch`, but a WebSocket is not subject to
-/// the same-origin policy: the browser opens it to any origin and hands the
-/// page every frame, so without this any page could stream `/connections`
-/// or `/logs` from `127.0.0.1:9090`. Hence one rule for every request
-/// without a secret: an `Origin` must be on `allow_origins` or be the
-/// controller's own, which is the same set CORS would answer. A request
-/// with no `Origin` is not a browser's -- a dashboard tunnelled over SSH,
-/// awg-manager, `curl` -- and passes. With a secret the secret decides.
-fn origin_permitted(headers: &HeaderMap, allow: &[String]) -> bool {
+/// Whether a request may reach a controller that has no secret.
+///
+/// Withholding the CORS header (`cors_origin`) keeps a page on another
+/// origin from reading a `fetch`, but that is not enough on its own:
+///
+/// - A WebSocket is not subject to the same-origin policy. The browser
+///   opens one to any origin and hands the page every frame, so without an
+///   origin check any page could stream `/connections` or `/logs`.
+/// - DNS rebinding turns a foreign page into a same-origin one. A page
+///   served from `evil.example` whose name is then resolved to `127.0.0.1`
+///   reaches the loopback listener with `Host: evil.example:9090`, and its
+///   same-origin `GET` carries no `Origin` at all. So an `Origin` that
+///   matches `Host` proves nothing, and neither does the absence of one.
+///
+/// Hence two rules, checked on every request without a secret. The `Host`
+/// must be one of the controller's own names: the listen address, or
+/// `localhost` or a loopback literal with its port -- a rebinding page
+/// cannot produce those, and a secretless listener is loopback by
+/// validation. Then an `Origin`, if there is one, must be on
+/// `allow_origins` or be the controller's own, which after the first rule
+/// is a page the controller served itself. A request with no `Origin` is a
+/// non-browser client (awg-manager, `curl`, a tunnelled dashboard's
+/// server) or a same-origin one, and passes; one with no `Host` is not a
+/// browser's either. The set this admits is the set `cors_origin` would
+/// answer, so no working dashboard loses anything. With a secret the
+/// secret decides, and none of this runs.
+fn browser_permitted(headers: &HeaderMap, listen: SocketAddr, allow: &[String]) -> bool {
+    if let Some(host) = headers.get(hyper::header::HOST) {
+        let Ok(host) = host.to_str() else {
+            return false;
+        };
+        let port = listen.port();
+        let own = [
+            listen.to_string(),
+            format!("localhost:{port}"),
+            format!("127.0.0.1:{port}"),
+            format!("[::1]:{port}"),
+        ];
+        if !own.iter().any(|o| o.eq_ignore_ascii_case(host)) {
+            return false;
+        }
+    }
     let Some(origin) = headers.get(hyper::header::ORIGIN) else {
         return true;
     };
@@ -277,9 +309,9 @@ fn origin_permitted(headers: &HeaderMap, allow: &[String]) -> bool {
     if allow.iter().any(|a| a == origin) {
         return true;
     }
-    // The controller's own origin: a page it served itself, whose origin's
-    // authority is this request's `Host`. Nothing else can carry it, since
-    // a browser sets both headers and a page cannot.
+    // The controller's own origin, now that `Host` is known to be its own
+    // name: a page it served itself. Nothing else can carry it, since a
+    // browser sets both headers and a page cannot.
     let Some(host) = headers
         .get(hyper::header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -357,25 +389,29 @@ pub(crate) async fn route(req: Request<Incoming>, state: Arc<ApiState>) -> Respo
         state.config.secret.is_some(),
     );
 
+    // Without a secret the browser rules are the access control, and they
+    // apply to a preflight too: an origin refused here is one `cors_origin`
+    // would not have answered, so the refusal carries no CORS header.
+    if state.config.secret.is_none()
+        && !browser_permitted(
+            req.headers(),
+            state.config.listen,
+            &state.config.allow_origins,
+        )
+    {
+        return error(StatusCode::FORBIDDEN, "Forbidden");
+    }
+
     // Preflight carries no credentials by definition, so it is answered
     // before the secret is checked.
     if req.method() == Method::OPTIONS {
         return with_cors(empty(StatusCode::NO_CONTENT), origin);
     }
 
-    match &state.config.secret {
-        Some(secret) => {
-            if !authorized(&req, secret) {
-                return with_cors(error(StatusCode::UNAUTHORIZED, "Unauthorized"), origin);
-            }
-        }
-        // No CORS header on the refusal: an origin this refuses is one
-        // `cors_origin` would not have answered either.
-        None => {
-            if !origin_permitted(req.headers(), &state.config.allow_origins) {
-                return error(StatusCode::FORBIDDEN, "Forbidden");
-            }
-        }
+    if let Some(secret) = &state.config.secret
+        && !authorized(&req, secret)
+    {
+        return with_cors(error(StatusCode::UNAUTHORIZED, "Unauthorized"), origin);
     }
 
     let path = req.uri().path().trim_end_matches('/').to_string();
@@ -615,10 +651,12 @@ mod tests {
         );
     }
 
-    /// Without a secret, an origin is admitted when it is listed or is the
-    /// controller's own; a request with no origin is not a browser's.
+    /// Without a secret, `Host` must be one of the controller's own names
+    /// and an origin must be listed or the controller's own; a request
+    /// with no origin is not a browser's, or is a same-origin one.
     #[test]
-    fn without_a_secret_only_a_listed_or_own_origin_is_permitted() {
+    fn without_a_secret_only_an_own_host_and_a_listed_or_own_origin_pass() {
+        let listen: SocketAddr = "127.0.0.1:9090".parse().unwrap();
         let allow = vec!["http://a.example".to_string()];
         let with = |origin: Option<&str>, host: Option<&str>| {
             let mut headers = HeaderMap::new();
@@ -630,40 +668,40 @@ mod tests {
             }
             headers
         };
+        let ok = |origin, host| browser_permitted(&with(origin, host), listen, &allow);
 
-        assert!(origin_permitted(
-            &with(None, Some("127.0.0.1:9090")),
-            &allow
-        ));
-        assert!(origin_permitted(
-            &with(Some("http://a.example"), Some("127.0.0.1:9090")),
-            &allow
-        ));
-        assert!(origin_permitted(
-            &with(Some("http://127.0.0.1:9090"), Some("127.0.0.1:9090")),
-            &allow
-        ));
-        assert!(!origin_permitted(
+        // Non-browser clients, and the names a browser reaches loopback by.
+        assert!(ok(None, None));
+        assert!(ok(None, Some("127.0.0.1:9090")));
+        assert!(ok(None, Some("localhost:9090")));
+        assert!(ok(None, Some("LOCALHOST:9090")));
+        assert!(ok(None, Some("[::1]:9090")));
+        // A listed origin, and the controller's own.
+        assert!(ok(Some("http://a.example"), Some("127.0.0.1:9090")));
+        assert!(ok(Some("http://127.0.0.1:9090"), Some("127.0.0.1:9090")));
+        assert!(ok(Some("http://localhost:9090"), Some("localhost:9090")));
+
+        // A foreign origin, listed or not.
+        assert!(!ok(Some("http://b.example"), Some("127.0.0.1:9090")));
+        assert!(!browser_permitted(
             &with(Some("http://b.example"), Some("127.0.0.1:9090")),
-            &allow
-        ));
-        assert!(!origin_permitted(
-            &with(Some("http://b.example"), Some("127.0.0.1:9090")),
+            listen,
             &[]
         ));
-        // A page's own origin is `http`; a controller serves no TLS, so an
-        // `https` origin with the same authority is another site.
-        assert!(!origin_permitted(
-            &with(Some("https://127.0.0.1:9090"), Some("127.0.0.1:9090")),
-            &[]
+        // A controller serves no TLS, so an `https` origin with its own
+        // authority is another site.
+        assert!(!ok(Some("https://127.0.0.1:9090"), Some("127.0.0.1:9090")));
+        assert!(!ok(Some("null"), Some("127.0.0.1:9090")));
+        // DNS rebinding: a foreign name resolved to loopback. The origin
+        // matches the host, and the same-origin GET has no origin at all;
+        // the host gives both away.
+        assert!(!ok(
+            Some("http://evil.example:9090"),
+            Some("evil.example:9090")
         ));
-        assert!(!origin_permitted(
-            &with(Some("null"), Some("127.0.0.1:9090")),
-            &[]
-        ));
-        assert!(!origin_permitted(
-            &with(Some("http://127.0.0.1:9090"), None),
-            &[]
-        ));
+        assert!(!ok(None, Some("evil.example:9090")));
+        // Another port on loopback is another origin, not this controller.
+        assert!(!ok(None, Some("127.0.0.1:9091")));
+        assert!(!ok(Some("http://127.0.0.1:9090"), None));
     }
 }

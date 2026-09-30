@@ -1241,13 +1241,16 @@ feature and ignores it, so one config serves both.
   from. Listed origins are answered with themselves. Empty means `*`, which
   a dashboard served from another host needs, **only when a secret is
   set**; with no secret, empty means no CORS header at all, and a request
-  that names any origin other than a listed one or the controller's own is
-  refused with `403`. Without a secret the browser's same-origin policy is
-  the only thing keeping other sites' scripts out of the controller: `*` is
-  the header that switches that policy off, and a WebSocket is not covered
-  by it at all, so the streaming routes have to refuse the origin outright.
-  A dashboard on another origin therefore needs a secret, or its origin
-  listed here.
+  is refused with `403` when it names any origin other than a listed one
+  or the controller's own, or reaches the listener under a `Host` that is
+  not one of its own names (the listen address, `localhost` or a loopback
+  literal with its port). Without a secret the browser's same-origin
+  policy is the only thing keeping other sites' scripts out of the
+  controller, and it is not enough on its own: `*` is the header that
+  switches it off, a WebSocket is not covered by it at all, and DNS
+  rebinding turns a foreign page into a same-origin one, which the `Host`
+  check catches. Non-browser clients are unaffected. A dashboard on
+  another origin therefore needs a secret, or its origin listed here.
 - **`max_tracked_connections`** bounds the connection registry. Past it a
   connection is served and not tracked, and the omission is reported in
   `/connections`.
