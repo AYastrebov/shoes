@@ -481,12 +481,18 @@ struct FragmentedPacket {
 const MAX_REASSEMBLED_LEN: usize = 65535;
 
 /// How long an incomplete packet is kept waiting for its missing fragments.
-/// The cache is an LRU of `MAX_FRAGMENT_CACHE_SIZE` entries, so a stale entry
-/// is evicted by the 256th newer one anyway; this evicts it sooner when the
-/// connection is quiet, one entry per insertion, so the check stays O(1).
-/// It also bounds what a fragment may be joined to: the 16-bit packet id
-/// comes round, and a fragment arriving under an id whose entry has expired
-/// belongs to a new packet, not to the fragments left waiting under it.
+///
+/// What it guarantees is that no fragment joins an entry older than this:
+/// the 16-bit packet id comes round, and a fragment arriving under an id
+/// whose entry has expired belongs to a new packet, so `push_fragment` drops
+/// the expired entry before accepting it. Memory is bounded elsewhere, by
+/// `MAX_FRAGMENT_CACHE_SIZE` entries of at most `MAX_REASSEMBLED_LEN` each.
+/// Within that bound the sweep is opportunistic: each new packet evicts the
+/// least-recently-used entry if it has expired, which frees an abandoned
+/// entry on a quiet connection without scanning the cache on the packet
+/// path. An expired entry that was touched more recently than the LRU one
+/// waits for its id to come round or for the LRU to push it out, which is
+/// where it would have waited without the TTL at all.
 const FRAGMENT_TTL: Duration = Duration::from_secs(30);
 
 /// One fragment into the connection's reassembly cache. Returns the completed
