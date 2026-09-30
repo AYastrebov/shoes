@@ -218,14 +218,23 @@ impl Socks5UdpRelayStream {
         let (tx, rx) = mpsc::channel(64);
         let recv_socket = socket.clone();
         let reader_task = tokio::spawn(async move {
-            // One growing buffer, split per datagram: `recv_buf_from` appends
-            // into spare capacity without zeroing it, `split_to(n).freeze()`
-            // hands the consumer an owned `Bytes` without a copy, and
-            // `reserve` allocates a fresh block only when the current one is
-            // spent. Was a `to_vec` per datagram.
-            let mut buf = BytesMut::with_capacity(MAX_UDP_SIZE);
+            // One growing block, split per datagram: `recv_buf_from` appends
+            // into spare capacity without zeroing it, and `split_to(n).freeze()`
+            // hands the consumer an owned `Bytes` without a copy. The block
+            // holds several datagrams and is replenished only once its spare
+            // capacity could no longer take a maximal one, so a fresh
+            // allocation comes every few dozen typical packets. `reserve` is
+            // "at least this much spare capacity", so asking for a whole
+            // datagram after every split would allocate on every packet, which
+            // is what this replaced (a `to_vec` per datagram). Once the
+            // consumer has dropped every `Bytes` cut from a block, `reserve`
+            // reuses the block instead of allocating.
+            const RECV_BLOCK: usize = 4 * MAX_UDP_SIZE;
+            let mut buf = BytesMut::with_capacity(RECV_BLOCK);
             loop {
-                buf.reserve(MAX_UDP_SIZE);
+                if buf.capacity() < MAX_UDP_SIZE {
+                    buf.reserve(RECV_BLOCK);
+                }
                 match recv_socket.recv_buf_from(&mut buf).await {
                     Ok((n, from_addr)) => {
                         log::debug!("SOCKS5 UDP relay: received {} bytes from {}", n, from_addr);
