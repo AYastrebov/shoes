@@ -484,6 +484,9 @@ const MAX_REASSEMBLED_LEN: usize = 65535;
 /// The cache is an LRU of `MAX_FRAGMENT_CACHE_SIZE` entries, so a stale entry
 /// is evicted by the 256th newer one anyway; this evicts it sooner when the
 /// connection is quiet, one entry per insertion, so the check stays O(1).
+/// It also bounds what a fragment may be joined to: the 16-bit packet id
+/// comes round, and a fragment arriving under an id whose entry has expired
+/// belongs to a new packet, not to the fragments left waiting under it.
 const FRAGMENT_TTL: Duration = Duration::from_secs(30);
 
 /// One fragment into the connection's reassembly cache. Returns the completed
@@ -500,6 +503,16 @@ fn push_fragment(
     payload_fragment: &[u8],
 ) -> std::io::Result<Option<(NetLocation, Vec<u8>)>> {
     let (assoc_id, packet_id) = key;
+
+    // An entry that has outlived the TTL is not this fragment's packet: the
+    // id has been reused. Drop it, so the old fragments are not glued to
+    // the new packet's.
+    if cache
+        .peek(&key)
+        .is_some_and(|p| p.first_seen.elapsed() > FRAGMENT_TTL)
+    {
+        cache.pop(&key);
+    }
 
     if !cache.contains(&key) {
         // Insert new fragmented packet entry. First, one expired entry out.
@@ -1579,5 +1592,35 @@ mod fragment_tests {
         );
         assert!(!cache.contains(&(1, 9)), "the stale entry is gone");
         assert!(cache.contains(&(1, 10)));
+    }
+
+    /// A fragment under an id whose entry has expired starts a new packet.
+    /// Otherwise the TTL bounds nothing: a packet id reused after the
+    /// wraparound would complete with a fragment left over from thirty
+    /// seconds ago.
+    #[test]
+    fn a_fragment_for_an_expired_entry_starts_a_new_packet() {
+        let mut cache = cache();
+        cache.put(
+            (1, 9),
+            FragmentedPacket {
+                fragment_count: 2,
+                fragment_received: 1,
+                packet_len: 5,
+                received: vec![Some(Bytes::from_static(b"stale")), None],
+                remote_location: addr(),
+                first_seen: std::time::Instant::now() - FRAGMENT_TTL - Duration::from_secs(1),
+            },
+        );
+        assert!(
+            push_fragment(&mut cache, (1, 9), 2, 1, &None, b"world")
+                .unwrap()
+                .is_none(),
+            "the stale fragment must not complete the new packet"
+        );
+        let (_, payload) = push_fragment(&mut cache, (1, 9), 2, 0, &addr(), b"hello ")
+            .unwrap()
+            .expect("complete");
+        assert_eq!(payload, b"hello world");
     }
 }
