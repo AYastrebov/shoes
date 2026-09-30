@@ -244,7 +244,8 @@ pub(crate) fn percent_decode(raw: &str, plus_is_space: bool) -> String {
 /// had open could then read the connection table from `127.0.0.1:9090` and
 /// send the `PUT`s and `DELETE`s that preflight would otherwise refuse. So
 /// no secret and no list means no CORS header at all, and a dashboard on
-/// another origin needs a secret first.
+/// another origin needs a secret first. `origin_permitted` is the other
+/// half of that policy, for the requests CORS does not cover.
 fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Option<String> {
     if allow.is_empty() {
         return has_secret.then(|| "*".to_string());
@@ -254,6 +255,40 @@ fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Optio
         .iter()
         .any(|a| a == origin)
         .then(|| origin.to_string())
+}
+
+/// Whether a request that names an origin may reach a controller that has
+/// no secret. Withholding the CORS header (`cors_origin`) keeps a page on
+/// another origin from reading a `fetch`, but a WebSocket is not subject to
+/// the same-origin policy: the browser opens it to any origin and hands the
+/// page every frame, so without this any page could stream `/connections`
+/// or `/logs` from `127.0.0.1:9090`. Hence one rule for every request
+/// without a secret: an `Origin` must be on `allow_origins` or be the
+/// controller's own, which is the same set CORS would answer. A request
+/// with no `Origin` is not a browser's -- a dashboard tunnelled over SSH,
+/// awg-manager, `curl` -- and passes. With a secret the secret decides.
+fn origin_permitted(headers: &HeaderMap, allow: &[String]) -> bool {
+    let Some(origin) = headers.get(hyper::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if allow.iter().any(|a| a == origin) {
+        return true;
+    }
+    // The controller's own origin: a page it served itself, whose origin's
+    // authority is this request's `Host`. Nothing else can carry it, since
+    // a browser sets both headers and a page cannot.
+    let Some(host) = headers
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        scheme.eq_ignore_ascii_case("http") && authority.eq_ignore_ascii_case(host)
+    })
 }
 
 fn with_cors(mut response: Response<ApiBody>, origin: Option<String>) -> Response<ApiBody> {
@@ -328,10 +363,19 @@ pub(crate) async fn route(req: Request<Incoming>, state: Arc<ApiState>) -> Respo
         return with_cors(empty(StatusCode::NO_CONTENT), origin);
     }
 
-    if let Some(secret) = &state.config.secret
-        && !authorized(&req, secret)
-    {
-        return with_cors(error(StatusCode::UNAUTHORIZED, "Unauthorized"), origin);
+    match &state.config.secret {
+        Some(secret) => {
+            if !authorized(&req, secret) {
+                return with_cors(error(StatusCode::UNAUTHORIZED, "Unauthorized"), origin);
+            }
+        }
+        // No CORS header on the refusal: an origin this refuses is one
+        // `cors_origin` would not have answered either.
+        None => {
+            if !origin_permitted(req.headers(), &state.config.allow_origins) {
+                return error(StatusCode::FORBIDDEN, "Forbidden");
+            }
+        }
     }
 
     let path = req.uri().path().trim_end_matches('/').to_string();
@@ -569,5 +613,57 @@ mod tests {
             cors_origin(&headers, &["http://a.example".to_string()], false).as_deref(),
             Some("http://a.example")
         );
+    }
+
+    /// Without a secret, an origin is admitted when it is listed or is the
+    /// controller's own; a request with no origin is not a browser's.
+    #[test]
+    fn without_a_secret_only_a_listed_or_own_origin_is_permitted() {
+        let allow = vec!["http://a.example".to_string()];
+        let with = |origin: Option<&str>, host: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(origin) = origin {
+                headers.insert(hyper::header::ORIGIN, origin.parse().unwrap());
+            }
+            if let Some(host) = host {
+                headers.insert(hyper::header::HOST, host.parse().unwrap());
+            }
+            headers
+        };
+
+        assert!(origin_permitted(
+            &with(None, Some("127.0.0.1:9090")),
+            &allow
+        ));
+        assert!(origin_permitted(
+            &with(Some("http://a.example"), Some("127.0.0.1:9090")),
+            &allow
+        ));
+        assert!(origin_permitted(
+            &with(Some("http://127.0.0.1:9090"), Some("127.0.0.1:9090")),
+            &allow
+        ));
+        assert!(!origin_permitted(
+            &with(Some("http://b.example"), Some("127.0.0.1:9090")),
+            &allow
+        ));
+        assert!(!origin_permitted(
+            &with(Some("http://b.example"), Some("127.0.0.1:9090")),
+            &[]
+        ));
+        // A page's own origin is `http`; a controller serves no TLS, so an
+        // `https` origin with the same authority is another site.
+        assert!(!origin_permitted(
+            &with(Some("https://127.0.0.1:9090"), Some("127.0.0.1:9090")),
+            &[]
+        ));
+        assert!(!origin_permitted(
+            &with(Some("null"), Some("127.0.0.1:9090")),
+            &[]
+        ));
+        assert!(!origin_permitted(
+            &with(Some("http://127.0.0.1:9090"), None),
+            &[]
+        ));
     }
 }

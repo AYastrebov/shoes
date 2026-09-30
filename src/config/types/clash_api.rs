@@ -32,7 +32,9 @@ pub struct ClashApiConfig {
     /// when a secret is set, which is what a dashboard served from elsewhere
     /// needs and what mihomo does; without a secret, empty means no CORS
     /// header at all, since `*` would let any page the user has open read
-    /// and drive the controller. See `clash_api::cors_origin`.
+    /// and drive the controller, and a request naming any other origin is
+    /// refused, since a WebSocket needs no CORS header to be read. See
+    /// `clash_api::cors_origin` and `clash_api::origin_permitted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
 

@@ -1240,16 +1240,21 @@ feature and ignores it, so one config serves both.
 - **`allow_origins`** decides which origins a browser may read responses
   from. Listed origins are answered with themselves. Empty means `*`, which
   a dashboard served from another host needs, **only when a secret is
-  set**; with no secret, empty means no CORS header at all. Without a secret
-  the browser's same-origin policy is the only thing keeping other sites'
-  scripts out of the controller, and `*` is the header that switches that
-  policy off. A dashboard on another origin therefore needs a secret first.
+  set**; with no secret, empty means no CORS header at all, and a request
+  that names any origin other than a listed one or the controller's own is
+  refused with `403`. Without a secret the browser's same-origin policy is
+  the only thing keeping other sites' scripts out of the controller: `*` is
+  the header that switches that policy off, and a WebSocket is not covered
+  by it at all, so the streaming routes have to refuse the origin outright.
+  A dashboard on another origin therefore needs a secret, or its origin
+  listed here.
 - **`max_tracked_connections`** bounds the connection registry. Past it a
   connection is served and not tracked, and the omission is reported in
   `/connections`.
-- **`state_file`** is where a proxy selection survives a restart. Its own
-  setting rather than a path beside the config, because a router's config
-  directory is often read-only.
+- **`state_file`** is where a proxy selection will survive a restart once
+  selecting a proxy exists; until then the field is accepted and unused.
+  Its own setting rather than a path beside the config, because a router's
+  config directory is often read-only.
 
 Only one `clash_api` block is allowed across the loaded files.
 
