@@ -80,6 +80,8 @@ changes below against the build after, alternated in one sitting.
 | Hysteria2 + salamander, up / down | 1.8 / 1.9 Gbit/s | 4.3 / 4.6 Gbit/s |
 | SOCKS to direct, up / down | 21 / 22 Gbit/s | 37 / 37 Gbit/s |
 | TUN on Linux, MTU left to the default, up / down | 9.0 / 6.5 Gbit/s | 17.8 / 11.7 Gbit/s |
+| One TUN download with 500 idle connections open | 1.0 Gbit/s | 5.3 Gbit/s |
+| One TUN upload with 500 idle connections open | 2.4 Gbit/s | 6.7 Gbit/s |
 | TUN UDP upload at 100 Mbit/s offered, loss | 0.5% | 0 |
 | TUN UDP upload at 1 Gbit/s offered, loss | 7.7% | 0.12% |
 
@@ -102,16 +104,14 @@ What changed:
   (8 behind a TUN connection).
 - **TUN.** Linux defaults to an MTU of 9000, as Android already did. UDP
   flow queues hold 512 datagrams off the constrained platforms, up from 64.
+- **Idle TUN connections.** smoltcp searches every socket for each packet
+  and scans every socket on each poll, so idle connections taxed busy ones.
+  A socket quiet for a second is now parked in a second set that is polled
+  only for its timers, and comes back when either side does anything.
+  sing-box's system stack, for scale, holds 5.4 Gbit/s at any count.
 
 ## Known and not fixed
 
-- **The TUN stack's cost grows with open connections.** With 500 idle
-  connections one busy download falls from 6.6 to 1.0 Gbit/s. The profile
-  puts it inside smoltcp: its per-packet search for the socket a segment
-  belongs to, and its scan of every socket on every poll for something to
-  send. A cheaper sweep on our side measured no gain and was not kept. The
-  fix is to keep idle sockets out of the set that is polled, which is a
-  change to the stack loop of its own.
 - **One system call per packet through the TUN.** The profile shows the stack
   thread inside `write`, which runs the kernel's TCP receive path inline.
   A larger MTU is the lever that exists today; Linux `IFF_VNET_HDR` with

@@ -15,7 +15,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -27,6 +27,7 @@ use log::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
+    socket::Socket as AnySmolSocket,
     socket::tcp::{
         CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     },
@@ -91,6 +92,12 @@ pub struct StackNotifier {
     /// The backend's real wake primitive: the Unix wake-pipe write, the
     /// Windows `SetEvent`. Called only when `armed`.
     wake: StackWaker,
+    /// A connection whose socket is parked has done something. The sweep
+    /// does not visit parked sockets, so this is how the stack thread learns
+    /// it has to look through them; see `PARK_IDLE_AFTER`.
+    parked_touched: AtomicBool,
+    /// How many sockets are parked, for the periodic log line and for tests.
+    parked_sockets: AtomicUsize,
 }
 
 impl StackNotifier {
@@ -99,7 +106,24 @@ impl StackNotifier {
             pending: AtomicBool::new(false),
             armed: AtomicBool::new(false),
             wake,
+            parked_touched: AtomicBool::new(false),
+            parked_sockets: AtomicUsize::new(0),
         })
+    }
+
+    /// A parked connection acted. Follow with [`Self::notify`].
+    pub fn note_parked_touch(&self) {
+        self.parked_touched.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a parked connection has acted since the last call.
+    pub(crate) fn take_parked_touch(&self) -> bool {
+        self.parked_touched.swap(false, Ordering::SeqCst)
+    }
+
+    /// Sockets currently held out of the polled set.
+    pub fn parked_sockets(&self) -> usize {
+        self.parked_sockets.load(Ordering::Relaxed)
     }
 
     /// Ask the stack thread to run an iteration. Two atomics and no syscall
@@ -226,6 +250,137 @@ struct SocketInfo {
     /// dropped), if it has. From then on the peer has `orphan_timeout` to
     /// close its side before the socket is reset: see the sweep.
     orphaned_since: Option<std::time::Instant>,
+    /// Whether the last full sweep left work owed to this connection; see
+    /// `TcpConnectionControl::owed_work`.
+    owed_work: bool,
+    /// Since when the sweep has found nothing to do for this connection and
+    /// nothing of its in flight. Past `PARK_IDLE_AFTER`, it is parked.
+    quiet_since: Option<std::time::Instant>,
+}
+
+/// How long a connection has to be quiet before its socket is taken out of
+/// the set smoltcp polls.
+///
+/// smoltcp looks through every socket in the set for each packet that
+/// arrives, to find the one it belongs to, and again on every poll, to ask
+/// each whether it has anything to send. So the cost of carrying one busy
+/// connection grew with the number of idle ones beside it: through a real
+/// Linux TUN one download ran at 6.6 Gbit/s alone, 3.2 with a hundred idle
+/// connections open and 1.0 with five hundred -- a browser's keep-alives, a
+/// messenger's long poll. On a phone that is battery.
+///
+/// A parked socket lives in a second set that is polled only for its timers
+/// (the keepalive, mostly). It comes back the moment either side does
+/// anything: a packet for it is recognised by its addresses before smoltcp
+/// sees the batch, and the connection flags its own reads, writes and close.
+/// One second is long enough that a connection in the middle of an exchange
+/// is not moved back and forth, and short next to how long idle connections
+/// stay idle.
+#[cfg(not(test))]
+const PARK_IDLE_AFTER: Duration = Duration::from_secs(1);
+/// Short under test, so every harness test crosses the parking path too.
+#[cfg(test)]
+const PARK_IDLE_AFTER: Duration = Duration::from_millis(100);
+
+/// The shortest interval between two polls of the parked set. Its timers are
+/// keepalives tens of seconds apart; with many sockets parked one or another
+/// is always nearly due, and this keeps that from becoming a poll per
+/// iteration.
+const PARKED_POLL_MIN_MILLIS: u64 = 50;
+
+/// Where a connection's socket currently lives.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// In the set polled on every iteration.
+    Active,
+    /// In the parked set.
+    Parked(SocketHandle),
+}
+
+type ConnectionKey = (SocketAddr, SocketAddr);
+
+/// Whether the sweep has anything to do for a connection this iteration.
+///
+/// An established socket has nothing for the sweep unless one of these holds:
+/// the connection did something (`touched`), smoltcp holds bytes for it
+/// (`can_recv`), or the last full pass left work owed. Everything else that
+/// can happen to it -- a FIN, a reset, a timeout -- takes the socket out of
+/// `Established`, and any other state gets the full pass.
+fn needs_service(state: TcpState, can_recv: bool, touched: bool, owed_work: bool) -> bool {
+    state != TcpState::Established || can_recv || touched || owed_work
+}
+
+/// The two socket sets and the bookkeeping that says which one a connection
+/// is in.
+struct Sockets {
+    /// Polled on every iteration.
+    active_set: SocketSet<'static>,
+    active: HashMap<SocketHandle, SocketInfo>,
+    /// Polled only for timers; see `PARK_IDLE_AFTER`.
+    parked_set: SocketSet<'static>,
+    parked: HashMap<SocketHandle, SocketInfo>,
+    /// Every connection, by its addresses.
+    connections: rustc_hash::FxHashMap<ConnectionKey, Slot>,
+}
+
+impl Sockets {
+    fn new() -> Self {
+        Self {
+            active_set: SocketSet::new(vec![]),
+            active: HashMap::new(),
+            parked_set: SocketSet::new(vec![]),
+            parked: HashMap::new(),
+            connections: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.active.len() + self.parked.len()
+    }
+
+    /// Take a quiet socket out of the polled set. Returns false, and leaves
+    /// it where it is, if its connection acted in the meantime.
+    fn park(&mut self, handle: SocketHandle, notifier: &StackNotifier) -> bool {
+        let Some(info) = self.active.get_mut(&handle) else {
+            return false;
+        };
+        // In this order, against the connection's "store touched, load
+        // parked": see `TcpConnectionControl::set_parked`.
+        info.control.set_parked(true);
+        if info.control.is_touched() {
+            info.control.set_parked(false);
+            info.quiet_since = None;
+            return false;
+        }
+        let info = self.active.remove(&handle).expect("checked above");
+        let AnySmolSocket::Tcp(socket) = self.active_set.remove(handle) else {
+            unreachable!("the stack only ever adds TCP sockets");
+        };
+        let parked_handle = self.parked_set.add(socket);
+        self.connections
+            .insert((info.src_addr, info.dst_addr), Slot::Parked(parked_handle));
+        self.parked.insert(parked_handle, info);
+        notifier.parked_sockets.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Put a parked socket back into the polled set, owed a full sweep.
+    fn promote(&mut self, parked_handle: SocketHandle, notifier: &StackNotifier) {
+        let Some(mut info) = self.parked.remove(&parked_handle) else {
+            return;
+        };
+        let AnySmolSocket::Tcp(socket) = self.parked_set.remove(parked_handle) else {
+            unreachable!("the stack only ever adds TCP sockets");
+        };
+        let handle = self.active_set.add(socket);
+        info.control.set_parked(false);
+        info.quiet_since = None;
+        info.owed_work = true;
+        self.connections
+            .insert((info.src_addr, info.dst_addr), Slot::Active);
+        self.active.insert(handle, info);
+        notifier.parked_sockets.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Information about a new TCP connection from the stack.
@@ -610,10 +765,9 @@ pub fn run_stack_loop<D: StackDevice>(
 
     iface.set_any_ip(true);
 
-    let mut socket_set = SocketSet::new(vec![]);
-    let mut sockets: HashMap<SocketHandle, SocketInfo> = HashMap::new();
-    let mut active_connections: std::collections::HashSet<(SocketAddr, SocketAddr)> =
-        std::collections::HashSet::new();
+    let mut sockets = Sockets::new();
+    // When the parked set's timers are next looked at.
+    let mut next_parked_poll = std::time::Instant::now();
 
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
@@ -626,6 +780,8 @@ pub fn run_stack_loop<D: StackDevice>(
     // batch is an allocation per batch.
     let mut tcp_packets: Vec<PooledBuffer> = Vec::with_capacity(MAX_PACKET_BATCH);
     let mut sockets_to_remove: Vec<SocketHandle> = Vec::new();
+    let mut sockets_to_park: Vec<SocketHandle> = Vec::new();
+    let mut sockets_to_promote: Vec<SocketHandle> = Vec::new();
 
     info!("smoltcp stack thread started, entering main loop");
 
@@ -644,6 +800,9 @@ pub fn run_stack_loop<D: StackDevice>(
         // Reads packets from TUN and filters by protocol (batch processing).
         tcp_packets.clear();
         let mut packets_read = 0;
+        // Whether a parked socket came back this iteration, in which case
+        // there is work for the next one and the loop must not sleep first.
+        let mut promoted = false;
 
         while packets_read < MAX_PACKET_BATCH {
             let pkt = match device.try_recv() {
@@ -674,7 +833,15 @@ pub fn run_stack_loop<D: StackDevice>(
                         match extract_tcp_info(&pkt) {
                             Some((src_addr, dst_addr, is_syn)) => {
                                 trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
-                                if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
+                                let slot = sockets.connections.get(&(src_addr, dst_addr)).copied();
+                                if let Some(Slot::Parked(parked_handle)) = slot {
+                                    // Before smoltcp sees the packet: it
+                                    // answers a segment for a socket it
+                                    // cannot find with a reset.
+                                    sockets.promote(parked_handle, &notifier);
+                                    promoted = true;
+                                }
+                                if is_syn && slot.is_none() {
                                     // Check connection limit
                                     if sockets.len() >= max_connections {
                                         warn!(
@@ -693,19 +860,23 @@ pub fn run_stack_loop<D: StackDevice>(
                                         src_addr,
                                         dst_addr,
                                         tcp_buffer_size,
-                                        &mut socket_set,
+                                        &mut sockets.active_set,
                                         &notifier,
                                     ) {
-                                        sockets.insert(
+                                        sockets.active.insert(
                                             new_conn.handle,
                                             SocketInfo {
                                                 control,
                                                 src_addr,
                                                 dst_addr,
                                                 orphaned_since: None,
+                                                owed_work: true,
+                                                quiet_since: None,
                                             },
                                         );
-                                        active_connections.insert((src_addr, dst_addr));
+                                        sockets
+                                            .connections
+                                            .insert((src_addr, dst_addr), Slot::Active);
                                         // On a SYN, not per packet, so a
                                         // relaxed atomic here is not
                                         // measurable.
@@ -777,18 +948,57 @@ pub fn run_stack_loop<D: StackDevice>(
             device.store_packet(pkt);
         }
 
+        // A parked connection read, wrote or closed: bring it back so the
+        // sweep below acts on it.
+        if notifier.take_parked_touch() {
+            sockets_to_promote.clear();
+            sockets_to_promote.extend(
+                sockets
+                    .parked
+                    .iter()
+                    .filter(|(_, info)| info.control.is_touched())
+                    .map(|(handle, _)| *handle),
+            );
+            for handle in sockets_to_promote.drain(..) {
+                sockets.promote(handle, &notifier);
+            }
+        }
+
         let now = smol_now();
-        iface.poll(now, &mut device, &mut socket_set);
+        iface.poll(now, &mut device, &mut sockets.active_set);
 
         sockets_to_remove.clear();
+        sockets_to_park.clear();
 
         // One clock read per sweep, for the orphan timer.
         let sweep_now = std::time::Instant::now();
 
-        for (handle, socket_info) in sockets.iter_mut() {
+        for (handle, socket_info) in sockets.active.iter_mut() {
             let handle = *handle;
             let control = &socket_info.control;
-            let socket = socket_set.get_mut::<TcpSocket>(handle);
+            let socket = sockets.active_set.get_mut::<TcpSocket>(handle);
+
+            // `take_touched` unconditionally: it is what clears the flag.
+            let touched = control.take_touched();
+            if !needs_service(
+                socket.state(),
+                socket.can_recv(),
+                touched,
+                socket_info.owed_work,
+            ) {
+                // Nothing to do for it. With nothing of its in flight
+                // either, it is on its way to being parked.
+                if socket.send_queue() == 0 {
+                    let since = *socket_info.quiet_since.get_or_insert(sweep_now);
+                    if sweep_now.duration_since(since) >= PARK_IDLE_AFTER {
+                        sockets_to_park.push(handle);
+                    }
+                } else {
+                    socket_info.quiet_since = None;
+                }
+                continue;
+            }
+            socket_info.quiet_since = None;
 
             // Remove socket only when smoltcp reports Closed state
             if socket.state() == TcpState::Closed {
@@ -934,11 +1144,19 @@ pub fn run_stack_loop<D: StackDevice>(
             if wake_sender {
                 control.wake_sender();
             }
+
+            socket_info.owed_work = control.owed_work();
+        }
+
+        for handle in sockets_to_park.drain(..) {
+            sockets.park(handle, &notifier);
         }
 
         for handle in sockets_to_remove.drain(..) {
-            if let Some(socket_info) = sockets.remove(&handle) {
-                active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
+            if let Some(socket_info) = sockets.active.remove(&handle) {
+                sockets
+                    .connections
+                    .remove(&(socket_info.src_addr, socket_info.dst_addr));
                 #[cfg(feature = "control-stats")]
                 super::traffic::connection_closed();
                 trace!(
@@ -946,15 +1164,16 @@ pub fn run_stack_loop<D: StackDevice>(
                     socket_info.src_addr, socket_info.dst_addr
                 );
             }
-            socket_set.remove(handle);
+            sockets.active_set.remove(handle);
         }
 
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
             debug!(
-                "smoltcp stack: polls={}, active_sockets={}, udp_ingress_dropped={}",
+                "smoltcp stack: polls={}, sockets={} ({} parked), udp_ingress_dropped={}",
                 poll_count,
                 sockets.len(),
+                notifier.parked_sockets(),
                 udp_ingress_dropped()
             );
             last_log_time = std::time::Instant::now();
@@ -962,11 +1181,44 @@ pub fn run_stack_loop<D: StackDevice>(
 
         // Polls again after data transfer (critical for performance).
         let after_transfer = smol_now();
-        iface.poll(after_transfer, &mut device, &mut socket_set);
+        iface.poll(after_transfer, &mut device, &mut sockets.active_set);
+
+        // The parked sockets' timers. Only with nothing queued on the device:
+        // a poll hands smoltcp whatever is queued, and a segment for an active
+        // socket polled against this set would be answered with a reset. The
+        // poll above drained the queue, so this holds unless something is
+        // very wrong, in which case the timers wait a round.
+        if !sockets.parked.is_empty()
+            && std::time::Instant::now() >= next_parked_poll
+            && !device.has_pending()
+        {
+            let parked_now = smol_now();
+            iface.poll(parked_now, &mut device, &mut sockets.parked_set);
+
+            // A timer can end a connection (the keepalive gave up); any
+            // change of state goes back to the sweep, which owns closing.
+            sockets_to_promote.clear();
+            for handle in sockets.parked.keys() {
+                let socket = sockets.parked_set.get::<TcpSocket>(*handle);
+                if socket.state() != TcpState::Established || socket.can_recv() {
+                    sockets_to_promote.push(*handle);
+                }
+            }
+            for handle in sockets_to_promote.drain(..) {
+                sockets.promote(handle, &notifier);
+                promoted = true;
+            }
+
+            let delay = iface
+                .poll_delay(parked_now, &sockets.parked_set)
+                .map_or(MAX_POLL_WAIT_MILLIS, |d| d.total_millis())
+                .clamp(PARKED_POLL_MIN_MILLIS, MAX_POLL_WAIT_MILLIS);
+            next_parked_poll = std::time::Instant::now() + Duration::from_millis(delay);
+        }
 
         // Wait for data using the platform's readiness primitive - this is
         // the key for event-driven I/O
-        if !has_tcp_packet && !device.has_pending() {
+        if !has_tcp_packet && !promoted && !device.has_pending() {
             // Sleep until smoltcp's own next deadline — a retransmit, a
             // keepalive, a closing timer — or, when it has none, until the
             // one-second dead-device backstop below. What is gone is the old
@@ -983,9 +1235,17 @@ pub fn run_stack_loop<D: StackDevice>(
             // `MAX_POLL_WAIT_MILLIS` too, so a `None` deadline already becomes
             // the one-second wait. Capping here as well keeps the backstop true
             // of any future backend whose `wait` forgets to.
-            let wait_duration = iface
-                .poll_delay(after_transfer, &socket_set)
-                .map(|d| SmolDuration::from_millis(d.total_millis().min(MAX_POLL_WAIT_MILLIS)));
+            let mut wait_millis = iface
+                .poll_delay(after_transfer, &sockets.active_set)
+                .map(|d| d.total_millis().min(MAX_POLL_WAIT_MILLIS));
+            // Not past the parked set's next look either.
+            if !sockets.parked.is_empty() {
+                let until_parked = next_parked_poll
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u64;
+                wait_millis = Some(wait_millis.map_or(until_parked, |w| w.min(until_parked)));
+            }
+            let wait_duration = wait_millis.map(SmolDuration::from_millis);
 
             if notifier.arm() {
                 notifier.disarm();
@@ -1521,6 +1781,7 @@ mod tests {
         conn_rx: UnboundedReceiver<NewTcpConnection>,
         udp_rx: Receiver<PooledBuffer>,
         udp_response_tx: tokio::sync::mpsc::Sender<PacketBuffer>,
+        notifier: Arc<StackNotifier>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
@@ -1569,6 +1830,7 @@ mod tests {
 
             let handle = {
                 let running = running.clone();
+                let notifier = notifier.clone();
                 thread::spawn(move || {
                     run_stack_loop(device, options, udp_tx, running, shared_state, notifier);
                 })
@@ -1581,6 +1843,7 @@ mod tests {
                 conn_rx,
                 udp_rx,
                 udp_response_tx,
+                notifier,
                 handle: Some(handle),
             }
         }
@@ -1834,6 +2097,157 @@ mod tests {
         });
         assert_tuple_is_free(&mut harness, 20030);
         harness.stop();
+    }
+
+    impl Harness {
+        /// Run the loop until `count` sockets are parked. The harness's
+        /// notifier wakes nothing and an idle loop sleeps a second at a
+        /// time, so this keeps it turning with packets it ignores.
+        fn wait_for_parked(&self, count: usize) {
+            poll_within("the idle connection to be parked", || {
+                let _ = self.script_tx.send(Script::Packet(vec![0u8]));
+                (self.notifier.parked_sockets() == count).then_some(())
+            });
+        }
+
+        fn no_reset_was_written(&self) -> bool {
+            !self
+                .written
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.rst)
+        }
+    }
+
+    /// A quiet connection's socket leaves the polled set, and a segment for
+    /// it brings it back before smoltcp sees the segment. If it did not,
+    /// smoltcp would find no socket for the segment and answer with a reset,
+    /// which is the failure this test is here for.
+    #[test]
+    fn a_segment_for_a_parked_connection_is_delivered_not_reset() {
+        use tokio::io::AsyncRead;
+
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let (mut conn, server_isn) = harness.establish(20100);
+        harness.wait_for_parked(1);
+
+        harness
+            .script_tx
+            .send(Script::Packet(tcp_packet(
+                20100,
+                smoltcp::wire::TcpControl::Psh,
+                1,
+                Some(server_isn.wrapping_add(1)),
+                b"hello",
+            )))
+            .unwrap();
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let received = poll_within("the data to reach the connection", || {
+            let mut storage = [0u8; 16];
+            let mut buf = tokio::io::ReadBuf::new(&mut storage);
+            match std::pin::Pin::new(&mut conn.connection).poll_read(&mut cx, &mut buf) {
+                std::task::Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
+                    Some(buf.filled().to_vec())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(received, b"hello");
+        assert_eq!(
+            harness.notifier.parked_sockets(),
+            0,
+            "it is back in the polled set"
+        );
+        assert!(harness.no_reset_was_written());
+        harness.stop();
+    }
+
+    /// The other way back: the app writes to a connection whose socket is
+    /// parked. The sweep no longer visits it, so the connection has to say
+    /// so, and the bytes have to go out.
+    #[test]
+    fn a_write_to_a_parked_connection_goes_out() {
+        use tokio::io::AsyncWrite;
+
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let (mut conn, _server_isn) = harness.establish(20110);
+        harness.wait_for_parked(1);
+        let written_before = harness.written.lock().unwrap().len();
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::pin::Pin::new(&mut conn.connection).poll_write(&mut cx, b"response"),
+            std::task::Poll::Ready(Ok(8))
+        ));
+        // The harness's notifier wakes nothing; a packet the stack ignores
+        // gets the loop to its next iteration.
+        harness.script_tx.send(Script::Packet(vec![0u8])).unwrap();
+
+        harness.wait_for_written("the written bytes as a segment", |written| {
+            written[written_before..]
+                .iter()
+                .any(|p| p.windows(8).any(|w| w == b"response"))
+        });
+        assert!(harness.no_reset_was_written());
+        harness.stop();
+    }
+
+    /// A parked connection the app drops still gets closed: the drop brings
+    /// the socket back, and the sweep sends the FIN it owes.
+    #[test]
+    fn dropping_a_parked_connection_closes_it() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn();
+        let (conn, _server_isn) = harness.establish(20120);
+        harness.wait_for_parked(1);
+
+        drop(conn);
+        harness.script_tx.send(Script::Packet(vec![0u8])).unwrap();
+
+        harness.wait_for_written("a FIN", |written| {
+            written
+                .iter()
+                .filter_map(|p| segment_from_server(p))
+                .any(|s| s.fin)
+        });
+        assert_eq!(harness.notifier.parked_sockets(), 0);
+        harness.stop();
+    }
+
+    /// The sweep's fast path must pass over nothing that needs it. An
+    /// established socket is skipped only when nothing at all is pending;
+    /// every other state is the socket announcing something.
+    #[test]
+    fn the_sweep_skips_only_an_established_socket_with_nothing_pending() {
+        assert!(!needs_service(TcpState::Established, false, false, false));
+        assert!(needs_service(TcpState::Established, true, false, false));
+        assert!(needs_service(TcpState::Established, false, true, false));
+        assert!(needs_service(TcpState::Established, false, false, true));
+        for state in [
+            TcpState::Closed,
+            TcpState::Listen,
+            TcpState::SynSent,
+            TcpState::SynReceived,
+            TcpState::FinWait1,
+            TcpState::FinWait2,
+            TcpState::CloseWait,
+            TcpState::Closing,
+            TcpState::LastAck,
+            TcpState::TimeWait,
+        ] {
+            assert!(
+                needs_service(state, false, false, false),
+                "{state:?} must always get the full pass"
+            );
+        }
     }
 
     #[test]
