@@ -10,6 +10,11 @@
 //! refused. This backend does both when `TcpStackOptions::utun_header` says
 //! so, and a Linux test can turn that on to see what a Mac sees.
 //!
+//! On Linux a descriptor opened with `IFF_VNET_HDR` frames every packet with a
+//! `virtio_net_hdr` instead, and can then carry several TCP segments in one
+//! read or write. The device asks the descriptor which kind it is; `vnet.rs`
+//! has the packet logic and the reasons.
+//!
 //! The smoltcp loop and the manager surface live in `stack_common.rs`; this
 //! file supplies the descriptor-shaped [`StackDevice`] and the wake pipe that
 //! gets an idle thread out of `poll()` at shutdown.
@@ -29,6 +34,8 @@ use super::stack_common::{
     MAX_POLL_WAIT_MILLIS, NewTcpConnection, PacketBuffer, PooledBuffer, PooledRxToken, StackDevice,
     StackHandle, StackWaker, TcpStackOptions, ip_capabilities,
 };
+#[cfg(target_os = "linux")]
+use super::vnet::{MAX_OFFLOAD_PACKET, TxCoalescer, VNET_HDR_LEN};
 
 /// Direct TCP Stack Manager.
 ///
@@ -89,6 +96,22 @@ impl TcpStackDirect {
     /// This spawns a dedicated OS thread for running the smoltcp interface.
     /// The thread uses `poll()` on the fd for efficient event-driven I/O.
     pub fn new(fd: RawFd, options: TcpStackOptions) -> io::Result<Self> {
+        // Here rather than on the stack thread, where a failure would only be
+        // logged: a descriptor framed in a way this file cannot read is a
+        // start that fails, not a stack that comes up and garbles packets.
+        #[cfg(target_os = "linux")]
+        let vnet = match probe_vnet(fd) {
+            Ok(vnet) => vnet,
+            Err(e) => {
+                if options.close_fd_on_drop {
+                    // SAFETY: the descriptor is ours to close, and nothing
+                    // else has been handed it yet.
+                    unsafe { libc::close(fd) };
+                }
+                return Err(e);
+            }
+        };
+
         // A shutdown that the stack thread can see while it is asleep. Both
         // ends stay open for the life of the stack; the thread only ever reads,
         // and Drop only ever writes.
@@ -112,7 +135,13 @@ impl TcpStackDirect {
             // Sets fd to non-blocking mode once at startup for performance.
             set_nonblocking(fd)
                 .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
-            Ok(FdDevice::new(fd, wake_rx, options.mtu, options.utun_header))
+            Ok(FdDevice::new(
+                fd,
+                wake_rx,
+                &options,
+                #[cfg(target_os = "linux")]
+                vnet,
+            ))
         }) {
             Ok(handle) => handle,
             Err(e) => {
@@ -222,18 +251,208 @@ struct FdDevice {
     /// A whole read batch, queued for smoltcp to drain through `receive` in
     /// one `poll`. Was a single slot polled after each packet.
     pending: VecDeque<PooledBuffer>,
+    /// Whether every packet carries a `virtio_net_hdr`: the descriptor was
+    /// opened with `IFF_VNET_HDR`.
+    #[cfg(target_os = "linux")]
+    vnet_header: bool,
+    /// The outgoing batch, when the kernel has agreed to cut joined segments
+    /// apart; `None` writes each packet as smoltcp emits it.
+    #[cfg(target_os = "linux")]
+    tx_batch: Option<TxCoalescer>,
 }
 
 impl FdDevice {
-    fn new(fd: RawFd, wake_fd: RawFd, mtu: usize, utun_header: bool) -> Self {
+    fn new(
+        fd: RawFd,
+        wake_fd: RawFd,
+        options: &TcpStackOptions,
+        #[cfg(target_os = "linux")] (vnet_header, offload): (bool, bool),
+    ) -> Self {
+        let TcpStackOptions {
+            mtu, utun_header, ..
+        } = *options;
         Self {
             fd,
             wake_fd,
             mtu,
             utun_header,
             pending: VecDeque::with_capacity(super::stack_common::MAX_PACKET_BATCH),
+            #[cfg(target_os = "linux")]
+            vnet_header,
+            #[cfg(target_os = "linux")]
+            tx_batch: offload.then(|| TxCoalescer::new(MAX_OFFLOAD_PACKET)),
         }
     }
+
+    /// Read one packet off a descriptor that frames with `virtio_net_hdr`.
+    ///
+    /// Into the buffer's spare capacity rather than a zero-filled slice: with
+    /// offload on, a read may be 64 KiB or it may be a 52-byte ACK, and
+    /// clearing 64 KiB for each ACK would cost more than the read.
+    #[cfg(target_os = "linux")]
+    fn try_recv_vnet(&mut self) -> io::Result<Option<PooledBuffer>> {
+        // With offload agreed the kernel hands segments over uncut, up to the
+        // largest IP packet there is; without it, one MTU.
+        let largest = if self.tx_batch.is_some() {
+            MAX_OFFLOAD_PACKET
+        } else {
+            self.mtu
+        };
+        loop {
+            let mut buffer = PooledBuffer::with_capacity(VNET_HDR_LEN + largest);
+            let spare = buffer.spare_capacity_mut();
+            // SAFETY: `spare` is writable for its whole length, and `read`
+            // initialises exactly the `n` bytes it reports.
+            let n = unsafe {
+                libc::read(
+                    self.fd,
+                    spare.as_mut_ptr() as *mut libc::c_void,
+                    spare.len().min(VNET_HDR_LEN + largest),
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                return if e.kind() == io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TUN device closed (EOF)",
+                ));
+            }
+            let n = n as usize;
+            let filled = buffer.len() + n;
+            // SAFETY: the kernel wrote `n` bytes at the start of the spare
+            // capacity, which begins where the buffer's length ends.
+            unsafe { buffer.set_len(filled) };
+            if n <= VNET_HDR_LEN {
+                trace!("vnet frame of {n} bytes has no room for a packet; dropped");
+                continue;
+            }
+            // What the header says -- that the checksum is unfinished, that
+            // this is several segments -- needs no action here: smoltcp does
+            // not verify checksums on the way in, and takes a segment of any
+            // size its window allows.
+            buffer.advance(VNET_HDR_LEN);
+            return Ok(Some(buffer));
+        }
+    }
+}
+
+/// Ask a descriptor whether it is a TUN opened with `IFF_VNET_HDR`, and if it
+/// is, ask the kernel to do checksums and TCP segmentation across it.
+///
+/// Returns (frames with the header, offload agreed). Anything that is not
+/// such a TUN -- another kind of descriptor, a test's socketpair, an Android
+/// VPN descriptor -- answers (false, false) and is read as it always was.
+///
+/// Fails for a TUN whose header is not the one this file reads and writes;
+/// see [`check_vnet_framing`].
+#[cfg(target_os = "linux")]
+fn probe_vnet(fd: RawFd) -> io::Result<(bool, bool)> {
+    // SAFETY: an all-zero `ifreq` is a valid one, and TUNGETIFF only writes
+    // into it.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    // SAFETY: `request` outlives the call; a descriptor that is not a TUN
+    // fails the ioctl, which is the answer wanted.
+    if unsafe { libc::ioctl(fd, libc::TUNGETIFF as _, &mut request) } != 0 {
+        return Ok((false, false));
+    }
+    // SAFETY: TUNGETIFF filled in the flags member of the union.
+    let flags = unsafe { request.ifr_ifru.ifru_flags } as libc::c_int;
+    if flags & libc::IFF_VNET_HDR == 0 {
+        return Ok((false, false));
+    }
+    check_vnet_framing(fd)?;
+
+    let features = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6;
+    // SAFETY: TUNSETOFFLOAD takes its argument by value.
+    let agreed =
+        unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD as _, features as libc::c_ulong) } == 0;
+    if agreed {
+        log::info!("TUN segmentation offload is on");
+    } else {
+        warn!(
+            "TUN has a virtio header but the kernel refused offload ({}); packets go one at a time",
+            io::Error::last_os_error()
+        );
+    }
+    Ok((true, agreed))
+}
+
+/// Refuse a TUN whose `virtio_net_hdr` is not the kernel's default: 10 bytes,
+/// in the host's byte order. That default is what the read, coalescing and
+/// write paths here assume, and what a device shoes opens itself has.
+///
+/// A descriptor handed in through `device_fd` may have been changed by
+/// whoever opened it. `TUNSETVNETHDRSZ` makes the header longer, and
+/// `TUNSETVNETLE`/`TUNSETVNETBE` set its byte order (`drivers/net/tun_vnet.h`
+/// upstream: `tun_vnet_ioctl`, `tun_vnet_is_little_endian`). Reading such a
+/// device as the default would leave header bytes in front of every packet
+/// and misframe every write, so it is a startup error instead.
+#[cfg(target_os = "linux")]
+fn check_vnet_framing(fd: RawFd) -> io::Result<()> {
+    let query = |request: libc::Ioctl| -> io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        // SAFETY: each of these requests writes one int through the pointer,
+        // and `value` outlives the call.
+        if unsafe { libc::ioctl(fd, request as _, &mut value) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    };
+    let refuse = |what: String| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "TUN descriptor has {what}; only the default {VNET_HDR_LEN}-byte virtio header \
+                 in host byte order is supported"
+            ),
+        ))
+    };
+
+    let size = query(libc::TUNGETVNETHDRSZ)
+        .map_err(|e| io::Error::other(format!("read the TUN's virtio header size: {e}")))?;
+    if usize::try_from(size).ok() != Some(VNET_HDR_LEN) {
+        return refuse(format!("a {size}-byte virtio header"));
+    }
+
+    let little_endian_flag = query(libc::TUNGETVNETLE)
+        .map_err(|e| io::Error::other(format!("read the TUN's virtio byte order: {e}")))?
+        != 0;
+    // EINVAL from a kernel built without CONFIG_TUN_VNET_CROSS_LE, where the
+    // big-endian flag cannot have been set.
+    let big_endian_flag = match query(libc::TUNGETVNETBE) {
+        Ok(value) => value != 0,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => false,
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "read the TUN's virtio byte order: {e}"
+            )));
+        }
+    };
+    if vnet_is_little_endian(
+        little_endian_flag,
+        big_endian_flag,
+        cfg!(target_endian = "little"),
+    ) != cfg!(target_endian = "little")
+    {
+        return refuse("a virtio header in the opposite byte order to the host's".to_string());
+    }
+    Ok(())
+}
+
+/// The byte order the kernel uses for a TUN's virtio header:
+/// `tun_vnet_is_little_endian` in `drivers/net/tun_vnet.h`. Little-endian
+/// when `TUN_VNET_LE` is set; otherwise the host's own order, unless
+/// `TUN_VNET_BE` is set.
+#[cfg(target_os = "linux")]
+fn vnet_is_little_endian(le_flag: bool, be_flag: bool, host_is_little_endian: bool) -> bool {
+    le_flag || (!be_flag && host_is_little_endian)
 }
 
 impl StackDevice for FdDevice {
@@ -245,6 +464,11 @@ impl StackDevice for FdDevice {
     fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
         if let Some(pkt) = self.pending.pop_front() {
             return Ok(Some(pkt));
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.vnet_header {
+            return self.try_recv_vnet();
         }
 
         loop {
@@ -296,6 +520,11 @@ impl StackDevice for FdDevice {
 
     /// Write a packet to TUN.
     fn write_packet(&self, data: &[u8]) -> io::Result<()> {
+        // An empty header: one whole packet, checksums finished.
+        #[cfg(target_os = "linux")]
+        if self.vnet_header {
+            return write_one_with_header(self.fd, &[0u8; VNET_HDR_LEN], data);
+        }
         if !self.utun_header {
             return write_one(self.fd, data);
         }
@@ -312,33 +541,32 @@ impl StackDevice for FdDevice {
     fn wait(&self, duration: Option<SmolDuration>) -> io::Result<()> {
         wait_readable(self.fd, self.wake_fd, duration)
     }
+
+    #[cfg(target_os = "linux")]
+    fn flush(&mut self) {
+        let fd = self.fd;
+        if let Some(batch) = self.tx_batch.as_mut()
+            && let Err(e) = batch.flush(|packet| write_one(fd, packet))
+        {
+            warn!("Failed to write to TUN: {}", e);
+        }
+    }
 }
 
 impl Device for FdDevice {
     type RxToken<'a> = PooledRxToken;
-    type TxToken<'a> = DirectTxToken;
+    type TxToken<'a> = DirectTxToken<'a>;
 
     fn receive(
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending.pop_front() {
-            let rx = PooledRxToken { buffer };
-            let tx = DirectTxToken {
-                fd: self.fd,
-                utun_header: self.utun_header,
-            };
-            Some((rx, tx))
-        } else {
-            None
-        }
+        let buffer = self.pending.pop_front()?;
+        Some((PooledRxToken { buffer }, self.tx_token()))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(DirectTxToken {
-            fd: self.fd,
-            utun_header: self.utun_header,
-        })
+        Some(self.tx_token())
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -346,9 +574,30 @@ impl Device for FdDevice {
     }
 }
 
-struct DirectTxToken {
+impl FdDevice {
+    fn tx_token(&mut self) -> DirectTxToken<'_> {
+        DirectTxToken {
+            fd: self.fd,
+            utun_header: self.utun_header,
+            #[cfg(target_os = "linux")]
+            vnet_header: self.vnet_header,
+            #[cfg(target_os = "linux")]
+            batch: self.tx_batch.as_mut(),
+            _device: std::marker::PhantomData,
+        }
+    }
+}
+
+struct DirectTxToken<'a> {
     fd: RawFd,
     utun_header: bool,
+    #[cfg(target_os = "linux")]
+    vnet_header: bool,
+    /// Where the packet goes instead of straight to the descriptor, when the
+    /// device is batching; see `FdDevice::tx_batch`.
+    #[cfg(target_os = "linux")]
+    batch: Option<&'a mut TxCoalescer>,
+    _device: std::marker::PhantomData<&'a mut ()>,
 }
 
 /// utun's framing: a 4-byte address family, network byte order. Darwin's
@@ -379,23 +628,44 @@ thread_local! {
     static TX_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-impl TxToken for DirectTxToken {
+impl TxToken for DirectTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let fd = self.fd;
+
+        // Batching: the packet is held, joined with its neighbours where it
+        // can be, and written when the device is flushed after the poll.
+        #[cfg(target_os = "linux")]
+        if let Some(batch) = self.batch {
+            let result = batch.push(len, f);
+            if batch.is_full()
+                && let Err(e) = batch.flush(|packet| write_one(fd, packet))
+            {
+                warn!("Failed to write to TUN: {}", e);
+            }
+            return result;
+        }
+
         // The header is written into headroom smoltcp never sees, so the
-        // framed packet goes out in one write with no second copy.
-        let headroom = if self.utun_header { UTUN_HEADER_LEN } else { 0 };
+        // framed packet goes out in one write with no second copy. A virtio
+        // header for a lone packet is all zeroes, which the `resize` below
+        // has already written.
+        #[cfg(target_os = "linux")]
+        let vnet_headroom = if self.vnet_header { VNET_HDR_LEN } else { 0 };
+        #[cfg(not(target_os = "linux"))]
+        let vnet_headroom = 0;
+        let utun_headroom = if self.utun_header { UTUN_HEADER_LEN } else { 0 };
+        let headroom = vnet_headroom + utun_headroom;
         let write = |buffer: &mut Vec<u8>| {
             buffer.clear();
             buffer.resize(headroom + len, 0);
             let result = f(&mut buffer[headroom..]);
 
-            if headroom > 0 {
+            if utun_headroom > 0 {
                 match utun_header_for(&buffer[headroom..]) {
-                    Some(header) => buffer[..headroom].copy_from_slice(&header),
+                    Some(header) => buffer[vnet_headroom..headroom].copy_from_slice(&header),
                     None => {
                         trace!("smoltcp emitted a non-IP frame; dropped");
                         return result;
@@ -532,7 +802,7 @@ fn write_one(fd: RawFd, packet: &[u8]) -> io::Result<()> {
 }
 
 /// Write `header` and `packet` as one packet with one `writev`.
-fn write_one_with_header(fd: RawFd, header: &[u8; 4], packet: &[u8]) -> io::Result<()> {
+fn write_one_with_header(fd: RawFd, header: &[u8], packet: &[u8]) -> io::Result<()> {
     let iov = [
         libc::iovec {
             iov_base: header.as_ptr() as *mut libc::c_void,
@@ -580,6 +850,76 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::Duration;
+
+    /// The kernel's rule, case by case: `TUN_VNET_LE` wins, otherwise the
+    /// host's order unless `TUN_VNET_BE` overrides it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_virtio_byte_order_follows_the_kernel() {
+        // A little-endian host.
+        assert!(vnet_is_little_endian(false, false, true));
+        assert!(vnet_is_little_endian(true, false, true));
+        assert!(!vnet_is_little_endian(false, true, true));
+        assert!(vnet_is_little_endian(true, true, true));
+        // A big-endian host.
+        assert!(!vnet_is_little_endian(false, false, false));
+        assert!(vnet_is_little_endian(true, false, false));
+        assert!(!vnet_is_little_endian(false, true, false));
+    }
+
+    /// Open a TUN with a virtio header, or `None` where this process may
+    /// not create one (no CAP_NET_ADMIN), in which case the caller skips.
+    /// Run under `unshare -rn` to get one without root.
+    #[cfg(target_os = "linux")]
+    fn open_vnet_tun() -> Option<RawFd> {
+        // SAFETY: a plain open of a device node; the descriptor is checked.
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: an all-zero `ifreq` is valid; the kernel names the device.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        request.ifr_ifru.ifru_flags =
+            (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
+        // SAFETY: `request` outlives the call.
+        if unsafe { libc::ioctl(fd, libc::TUNSETIFF as _, &mut request) } != 0 {
+            // SAFETY: ours, and not handed to anything.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(fd)
+    }
+
+    /// A descriptor whose virtio header is longer than the default is
+    /// refused, rather than read with header bytes left in front of every
+    /// packet. The default one is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tun_with_a_longer_virtio_header_is_refused() {
+        let Some(fd) = open_vnet_tun() else {
+            eprintln!("skipped: cannot create a TUN device here");
+            return;
+        };
+        let (header, _offload) = probe_vnet(fd).expect("the default framing is accepted");
+        assert!(header);
+
+        let longer: libc::c_int = 12;
+        // SAFETY: TUNSETVNETHDRSZ reads one int through the pointer.
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::TUNSETVNETHDRSZ as _, &longer) },
+            0
+        );
+        let err = probe_vnet(fd).expect_err("a 12-byte header must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("12-byte"), "{err}");
+
+        // Through the constructor too: the start fails, it does not come up.
+        let options = TcpStackOptions {
+            close_fd_on_drop: true,
+            ..owning_options()
+        };
+        assert!(TcpStackDirect::new(fd, options).is_err());
+    }
 
     /// Stack options for a test that hands its descriptor over to the stack.
     fn owning_options() -> TcpStackOptions {

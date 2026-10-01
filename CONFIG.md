@@ -405,6 +405,12 @@ tcp_buffer_size: int?          # Bytes per direction per connection.
                                # Default: 32768 (mobile), 65536 (elsewhere)
 max_connections: int?          # Concurrent TCP connections before SYNs are dropped.
                                # Default: 256 (mobile), 1024 (elsewhere)
+segmentation_offload: bool?    # Linux only: let the kernel pass TCP segments several at a
+                               # time instead of one system call per packet.
+                               # Default: true. Refused elsewhere and with device_fd,
+                               # whose framing its opener chose. A device_fd opened
+                               # with IFF_VNET_HDR must use the default 10-byte
+                               # header in host byte order.
 
 # Fake IP (optional, off by default)
 fake_ip:

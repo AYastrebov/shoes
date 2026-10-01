@@ -152,6 +152,16 @@ pub struct TunConfig {
     /// Default: 256 on iOS and Android, 1024 elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
+
+    /// Linux only: open the device with segmentation offload, so the kernel
+    /// hands over and takes TCP segments several at a time instead of one
+    /// system call per packet. Set to false to get one packet per call back,
+    /// should a kernel or a driver in the path mishandle the large ones.
+    ///
+    /// Default: true. Refused on other platforms and with `device_fd`, whose
+    /// framing is chosen by the process that opened it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segmentation_offload: Option<bool>,
 }
 
 fn default_fake_ip_network() -> String {
