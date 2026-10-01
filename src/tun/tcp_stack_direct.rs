@@ -848,6 +848,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
+        // `is_running` goes false inside the loop, on the read that saw
+        // EOF; the count is cleared after the loop. Between the two the
+        // thread is still alive, and an assert here used to win that race
+        // on a slow runner. The join is what "the thread exited" means.
+        drop(stack);
+
         assert_eq!(
             super::super::traffic::active_connections(),
             0,
