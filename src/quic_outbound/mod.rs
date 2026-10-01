@@ -118,9 +118,9 @@ impl QuicOutboundSettings {
             max_idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(10),
             mtu: self.effective_mtu(),
-            // The hopping socket reports one segment per transmit, so asking
-            // quinn to coalesce would only produce transmits it has to refuse.
-            enable_segmentation_offload: self.obfs.is_none() && self.port_hopping.is_none(),
+            // Every socket here takes a batch: the obfuscating one scrambles
+            // each segment on its own, the hopping one passes it through.
+            enable_segmentation_offload: true,
         };
         client_config.transport_config(Arc::new(transport.build()));
 
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_obfuscated_endpoint_reports_no_segmentation() {
+    async fn test_obfuscated_endpoint_builds() {
         let mut s = settings();
         s.obfs = Some(Arc::new(Salamander::new(b"a password").unwrap()));
         // Raising it at all is the check: the obfuscated socket is wrapped by

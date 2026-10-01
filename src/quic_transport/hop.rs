@@ -273,21 +273,14 @@ impl AsyncUdpSocket for HoppingUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
-        // max_transmit_segments() is 1, so quinn must never batch. If that
-        // promise breaks, sending the batch as one datagram would put several
-        // packets on the wire glued together.
-        if transmit.segment_size.is_some() {
-            return Err(std::io::Error::other(
-                "hopping sockets cannot send segmented transmits",
-            ));
-        }
-
+        // A segmented transmit goes through as it is: every segment of it is
+        // bound for the one destination this socket has at this moment.
         let state = self.state.read();
         state.current.try_send(&Transmit {
             destination: state.destination,
             ecn: transmit.ecn,
             contents: transmit.contents,
-            segment_size: None,
+            segment_size: transmit.segment_size,
             // The socket quinn believes it is using is not the one carrying
             // this datagram, so its source hint is stale.
             src_ip: None,
@@ -341,12 +334,19 @@ impl AsyncUdpSocket for HoppingUdpSocket {
         self.state.read().current.may_fragment()
     }
 
+    // Whatever the socket underneath offers. Every socket the factory
+    // makes is the same kind, so the answer does not change across a hop.
+    //
+    // Both used to be 1. For receive that was not a safe answer: quinn's own
+    // socket underneath asks the kernel to coalesce regardless, quinn sized
+    // its buffers for one packet on the strength of the 1, and a coalesced
+    // read was cut off at the first.
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.state.read().current.max_transmit_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
-        1
+        self.state.read().current.max_receive_segments()
     }
 }
 
@@ -480,23 +480,23 @@ mod tests {
         );
     }
 
-    /// We report max_transmit_segments() == 1, so quinn must never hand us a
-    /// batch. Sending one anyway would put several packets on the wire glued
-    /// together.
+    /// The hopping socket offers what the socket underneath offers, for
+    /// both directions. It reported 1 for both, and for receive that was
+    /// wrong rather than merely slow: see `max_receive_segments`.
     #[tokio::test]
-    async fn test_a_segmented_transmit_is_refused() {
+    async fn test_offload_is_whatever_the_socket_underneath_offers() {
         let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let socket = fixed_socket(peer);
-        let err = socket
-            .try_send(&Transmit {
-                destination: peer,
-                ecn: None,
-                contents: b"batched",
-                segment_size: Some(4),
-                src_ip: None,
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("segmented"), "{err}");
+        let plain = quinn::Runtime::wrap_udp_socket(
+            &quinn::TokioRuntime,
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            socket.max_transmit_segments(),
+            plain.max_transmit_segments()
+        );
+        assert_eq!(socket.max_receive_segments(), plain.max_receive_segments());
     }
 
     /// A factory that counts its calls and fails once it has made `budget`

@@ -12,9 +12,9 @@ use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 
 use super::Obfuscator;
 
-/// Initial size of the send scratch buffer. Larger datagrams grow it; QUIC
-/// datagrams are far below this in practice.
-const SCRATCH_CAPACITY: usize = 2048;
+/// Initial size of the send scratch buffer: a batch of ten full-size QUIC
+/// packets, which is the most quinn sends at once. Anything larger grows it.
+const SCRATCH_CAPACITY: usize = 16 * 1024;
 
 thread_local! {
     /// Scratch space for the send path. `Transmit::contents` is an immutable
@@ -23,15 +23,17 @@ thread_local! {
     static SEND_SCRATCH: RefCell<Vec<u8>> = RefCell::new(vec![0u8; SCRATCH_CAPACITY]);
 }
 
-/// Deobfuscate the first `count` datagrams of a received batch in place,
+/// Deobfuscate the first `count` buffers of a received batch in place,
 /// dropping any that is not ours and compacting the survivors to the front.
 ///
-/// Returns how many datagrams survived. Buffers past the returned count are
-/// left as they are; quinn only reads the first `kept` entries.
+/// A buffer holds one datagram, or several of one size laid end to end when
+/// the kernel has coalesced them (`stride` is that size, the last may be
+/// shorter). Each is deobfuscated on its own -- it carries its own salt --
+/// and the results are packed back end to end, so what quinn sees is the
+/// same layout with a stride `overhead` bytes smaller.
 ///
-/// `deobfuscate` reads and writes different offsets of the same logical packet,
-/// and the borrow checker will not allow one buffer to be both, so it goes
-/// through a scratch Vec.
+/// Returns how many buffers survived. Buffers past the returned count are
+/// left as they are; quinn only reads the first `kept` entries.
 fn deobfuscate_batch(
     obfs: &dyn Obfuscator,
     bufs: &mut [IoSliceMut<'_>],
@@ -41,48 +43,78 @@ fn deobfuscate_batch(
     let mut kept = 0;
     for i in 0..count {
         let len = meta[i].len;
-
-        // We report max_receive_segments() == 1, so a buffer holding more than
-        // one datagram means GRO coalesced them behind our back. Deobfuscating
-        // that as a single packet would corrupt all of them, so drop it.
-        if meta[i].stride != len {
+        let Some((decoded_len, decoded_stride)) =
+            deobfuscate_segments(obfs, &mut bufs[i][..len], meta[i].stride)
+        else {
             log::debug!(
-                "dropping a {len}-byte coalesced datagram from {} (stride {})",
-                meta[i].addr,
-                meta[i].stride
+                "dropping {len} bytes from {} that are not obfuscated for us",
+                meta[i].addr
             );
             continue;
-        }
+        };
 
-        match obfs.deobfuscate_in_place(&mut bufs[i][..len]) {
-            Some(decoded_len) => {
-                // quinn pairs meta[n] with bufs[n], so a survivor that moves
-                // forward in the metadata must have its bytes move with it.
-                if kept != i {
-                    meta[kept] = meta[i];
-                    let (left, right) = bufs.split_at_mut(i);
-                    left[kept][..decoded_len].copy_from_slice(&right[0][..decoded_len]);
-                }
-                meta[kept].len = decoded_len;
-                meta[kept].stride = decoded_len;
-                kept += 1;
-            }
-            None => {
-                log::debug!(
-                    "dropping {len}-byte datagram from {} that is not obfuscated for us",
-                    meta[i].addr
-                );
-            }
+        // quinn pairs meta[n] with bufs[n], so a survivor that moves forward
+        // in the metadata must have its bytes move with it.
+        if kept != i {
+            meta[kept] = meta[i];
+            let (left, right) = bufs.split_at_mut(i);
+            left[kept][..decoded_len].copy_from_slice(&right[0][..decoded_len]);
         }
+        meta[kept].len = decoded_len;
+        meta[kept].stride = decoded_stride;
+        kept += 1;
     }
     kept
 }
 
+/// Deobfuscate the datagrams in one received buffer, `stride` bytes each,
+/// and pack the payloads at its front. Returns the bytes now in use and the
+/// stride they are laid out at, or None if nothing in it was ours.
+fn deobfuscate_segments(
+    obfs: &dyn Obfuscator,
+    buf: &mut [u8],
+    stride: usize,
+) -> Option<(usize, usize)> {
+    let len = buf.len();
+    if stride == 0 || stride >= len {
+        // One datagram: the common case off Linux, and for a lone packet.
+        let decoded = obfs.deobfuscate_in_place(buf)?;
+        return Some((decoded, decoded));
+    }
+
+    // Every segment but the last is `stride` long and must decode to the
+    // same length, or the layout quinn splits on no longer holds.
+    let decoded_stride = stride.checked_sub(obfs.overhead()).filter(|n| *n > 0)?;
+    let mut out = 0;
+    let mut start = 0;
+    while start < len {
+        let end = (start + stride).min(len);
+        match obfs.deobfuscate_in_place(&mut buf[start..end]) {
+            Some(decoded) if end - start < stride || decoded == decoded_stride => {
+                buf.copy_within(start..start + decoded, out);
+                out += decoded;
+            }
+            // A short tail that is not a packet is dropped on its own; the
+            // full segments before it are still good.
+            None if end == len && out > 0 => {}
+            _ => return None,
+        }
+        start = end;
+    }
+    (out > 0).then_some((out, decoded_stride))
+}
+
 /// Wraps quinn's own UDP socket and applies an obfuscator to every datagram.
 ///
-/// Segmentation and receive offload are reported as unavailable. With GSO a
-/// single `sendmsg` carries several QUIC packets, and an obfuscator that treats
-/// the buffer as one unit produces something the peer cannot split apart again.
+/// Segmentation and receive offload pass through. With GSO a single `sendmsg`
+/// carries several QUIC packets of one size, and the kernel splits them apart
+/// again; each is obfuscated on its own here, so they stay one size, larger
+/// by the obfuscator's overhead. Receive coalescing is the same in reverse.
+///
+/// Both used to be reported as unavailable, which cost a system call per
+/// packet -- 2.0 Gbit/s against 5 for the same transfer unobfuscated -- and
+/// was not safe either: quinn's own socket underneath asks the kernel to
+/// coalesce regardless, and a coalesced buffer was then dropped whole.
 #[derive(Debug)]
 pub struct ObfuscatedUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
@@ -106,32 +138,51 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
-        // We report max_transmit_segments() == 1, so quinn must never hand us a
-        // batched transmit. If that promise is ever broken, scrambling the
-        // whole buffer as one unit would corrupt every packet in it silently,
-        // so refuse instead.
-        if transmit.segment_size.is_some() {
-            return Err(std::io::Error::other(
-                "obfuscated sockets cannot send segmented transmits",
-            ));
-        }
+        let overhead = self.obfs.overhead();
+        // One segment unless quinn batched several of `segment_size` each,
+        // the last possibly shorter.
+        let segment = transmit
+            .segment_size
+            .unwrap_or(transmit.contents.len())
+            .max(1);
 
         SEND_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
-            let needed = transmit.contents.len() + self.obfs.overhead();
+            let segments = transmit.contents.len().div_ceil(segment).max(1);
+            let needed = transmit.contents.len() + segments * overhead;
             if scratch.len() < needed {
                 scratch.resize(needed, 0);
             }
-            let written = self
-                .obfs
-                .obfuscate(transmit.contents, &mut scratch)
-                .ok_or_else(|| std::io::Error::other("obfuscation buffer too small"))?;
+
+            let too_small = || std::io::Error::other("obfuscation buffer too small");
+            let mut written = 0;
+            if transmit.contents.is_empty() {
+                written = self
+                    .obfs
+                    .obfuscate(transmit.contents, &mut scratch)
+                    .ok_or_else(too_small)?;
+            }
+            for chunk in transmit.contents.chunks(segment) {
+                let n = self
+                    .obfs
+                    .obfuscate(chunk, &mut scratch[written..])
+                    .ok_or_else(too_small)?;
+                // The kernel cuts the buffer every `segment + overhead`
+                // bytes; an obfuscator that added anything else would have
+                // its packets cut in the wrong places.
+                if n != chunk.len() + overhead {
+                    return Err(std::io::Error::other(
+                        "obfuscator did not add its declared overhead",
+                    ));
+                }
+                written += n;
+            }
 
             self.inner.try_send(&Transmit {
                 destination: transmit.destination,
                 ecn: transmit.ecn,
                 contents: &scratch[..written],
-                segment_size: None,
+                segment_size: transmit.segment_size.map(|size| size + overhead),
                 src_ip: transmit.src_ip,
             })
         })
@@ -164,11 +215,11 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.inner.max_transmit_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
-        1
+        self.inner.max_receive_segments()
     }
 }
 
@@ -242,26 +293,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_offload_is_disabled() {
-        let a = wrap(bind());
-        assert_eq!(a.max_transmit_segments(), 1);
-        assert_eq!(a.max_receive_segments(), 1);
+    async fn test_offload_is_whatever_the_socket_underneath_offers() {
+        let std_socket = bind();
+        let plain = TokioRuntime
+            .wrap_udp_socket(std_socket.try_clone().unwrap())
+            .unwrap();
+        let a = wrap(std_socket);
+        assert_eq!(a.max_transmit_segments(), plain.max_transmit_segments());
+        assert_eq!(a.max_receive_segments(), plain.max_receive_segments());
     }
 
+    /// A segmented transmit is several packets of one size; each is
+    /// obfuscated on its own and arrives as its own packet, whether the
+    /// kernel delivers them one by one or coalesced.
     #[tokio::test]
-    async fn test_segmented_transmit_is_refused() {
+    async fn test_segmented_transmit_arrives_as_its_packets() {
         let a = wrap(bind());
-        let b_addr = wrap(bind()).local_addr().unwrap();
-        let err = a
-            .try_send(&Transmit {
+        if a.max_transmit_segments() < 3 {
+            // No segmentation offload on this platform; quinn will never
+            // hand this socket a segmented transmit.
+            return;
+        }
+        let b = wrap(bind());
+        let b_addr = b.local_addr().unwrap();
+
+        let mut contents = Vec::new();
+        contents.extend_from_slice(&[1u8; 1200]);
+        contents.extend_from_slice(&[2u8; 1200]);
+        contents.extend_from_slice(&[3u8; 700]);
+        let mut poller = a.clone().create_io_poller();
+        loop {
+            match a.try_send(&Transmit {
                 destination: b_addr,
                 ecn: None,
-                contents: &[0u8; 100],
-                segment_size: Some(50),
+                contents: &contents,
+                segment_size: Some(1200),
                 src_ip: None,
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("segmented"), "{err}");
+            }) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                        .await
+                        .unwrap();
+                }
+                Err(e) => panic!("try_send failed: {e}"),
+            }
+        }
+
+        // Read until all three have arrived, in however many buffers.
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        while received.len() < 3 {
+            let mut buf = vec![0u8; 65536];
+            let mut meta = [RecvMeta::default()];
+            let count = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| {
+                    let mut bufs = [IoSliceMut::new(&mut buf)];
+                    b.poll_recv(cx, &mut bufs, &mut meta)
+                }),
+            )
+            .await
+            .expect("the segments never arrived")
+            .unwrap();
+            assert_eq!(count, 1);
+            for packet in buf[..meta[0].len].chunks(meta[0].stride.max(1)) {
+                received.push(packet.to_vec());
+            }
+        }
+        assert_eq!(received[0], vec![1u8; 1200]);
+        assert_eq!(received[1], vec![2u8; 1200]);
+        assert_eq!(received[2], vec![3u8; 700]);
     }
 
     #[tokio::test]
@@ -358,16 +459,52 @@ mod tests {
         );
     }
 
+    /// A coalesced buffer is several datagrams of one size end to end, the
+    /// last possibly shorter. Each carries its own salt, so each is decoded
+    /// on its own, and the payloads come back packed at the smaller stride.
+    /// This buffer used to be dropped whole.
     #[test]
-    fn test_batch_drops_a_coalesced_datagram() {
+    fn test_batch_decodes_each_datagram_of_a_coalesced_buffer() {
         let obfs = obfuscator();
-        let packets = vec![wire(&obfs, b"coalesced")];
-        let (mut storage, mut meta) = batch(&packets);
-        // GRO would report a buffer longer than one datagram's stride.
-        meta[0].stride = meta[0].len / 2;
+        let coalesced: Vec<u8> = [
+            wire(&obfs, &[1u8; 100]),
+            wire(&obfs, &[2u8; 100]),
+            wire(&obfs, &[3u8; 40]),
+        ]
+        .concat();
+        let (mut storage, mut meta) = batch(&[coalesced]);
+        meta[0].stride = 100 + obfs.overhead();
         let mut bufs: Vec<IoSliceMut<'_>> =
             storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
 
+        let kept = deobfuscate_batch(&obfs, &mut bufs, &mut meta, 1);
+
+        assert_eq!(kept, 1);
+        assert_eq!(meta[0].stride, 100);
+        assert_eq!(meta[0].len, 240);
+        let payloads: Vec<&[u8]> = bufs[0][..meta[0].len].chunks(meta[0].stride).collect();
+        assert_eq!(payloads, [&[1u8; 100][..], &[2u8; 100][..], &[3u8; 40][..]]);
+    }
+
+    /// A tail too short to be a packet is dropped on its own; a buffer
+    /// whose stride cannot hold a packet at all is dropped whole.
+    #[test]
+    fn test_batch_handles_a_coalesced_buffer_that_is_partly_or_wholly_garbage() {
+        let obfs = obfuscator();
+
+        let mut with_runt = [wire(&obfs, &[1u8; 100]), wire(&obfs, &[2u8; 100])].concat();
+        with_runt.extend_from_slice(&[0u8; 3]);
+        let (mut storage, mut meta) = batch(&[with_runt]);
+        meta[0].stride = 100 + obfs.overhead();
+        let mut bufs: Vec<IoSliceMut<'_>> =
+            storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+        assert_eq!(deobfuscate_batch(&obfs, &mut bufs, &mut meta, 1), 1);
+        assert_eq!((meta[0].len, meta[0].stride), (200, 100));
+
+        let (mut storage, mut meta) = batch(&[vec![0u8; 64]]);
+        meta[0].stride = obfs.overhead();
+        let mut bufs: Vec<IoSliceMut<'_>> =
+            storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
         assert_eq!(deobfuscate_batch(&obfs, &mut bufs, &mut meta, 1), 0);
     }
 
