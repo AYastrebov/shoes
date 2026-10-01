@@ -168,6 +168,45 @@ fn build_server_endpoint(
     }
 }
 
+/// Whether an incoming connection whose source address quinn has not yet
+/// validated should be answered with a Retry instead of accepted.
+///
+/// A Retry makes the client prove it can receive at the address it claims
+/// before the server spends a handshake on it, which is the defence against
+/// a flood of spoofed Initials, each of which would otherwise hold a permit,
+/// a TLS handshake and its buffers until the handshake timed out. It costs
+/// every genuine client one round trip, so it is not done by default:
+/// apernet/hysteria leaves quic-go's validation off and quinn's default is
+/// the same. It is done once the listener is a quarter from its inflight
+/// cap, which a flood reaches and normal traffic does not.
+pub fn retry_wanted(validated: bool, available_permits: usize) -> bool {
+    !validated && available_permits <= crate::util::MAX_INFLIGHT_PER_LISTENER / 4
+}
+
+/// Apply [`retry_wanted`] to one incoming connection: the connection to
+/// accept, or `None` after a Retry has been sent (or could not be, which
+/// quinn reports only for a connection that already came back from one, and
+/// is then accepted).
+pub fn admit_or_retry(
+    incoming: quinn::Incoming,
+    limiter: &tokio::sync::Semaphore,
+) -> Option<quinn::Incoming> {
+    if !retry_wanted(
+        incoming.remote_address_validated(),
+        limiter.available_permits(),
+    ) {
+        return Some(incoming);
+    }
+    if !incoming.may_retry() {
+        return Some(incoming);
+    }
+    let remote = incoming.remote_address();
+    if let Err(e) = incoming.retry() {
+        log::debug!("QUIC retry to {remote} failed: {e}");
+    }
+    None
+}
+
 /// Raise `num_endpoints` listening endpoints and accept on each of them,
 /// handing every incoming connection to `handle_connection`.
 ///
@@ -225,6 +264,11 @@ where
                 let Some(conn) = endpoint.accept().await else {
                     break;
                 };
+                // Under pressure, unvalidated sources get a Retry; the permit
+                // taken above goes back with the `continue`.
+                let Some(conn) = admit_or_retry(conn, &limiter) else {
+                    continue;
+                };
                 let handle_connection = handle_connection.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -253,6 +297,19 @@ mod tests {
     /// An address in TEST-NET-1, which is not assigned to this host, so binding
     /// it fails immediately with EADDRNOTAVAIL rather than waiting on anything.
     const UNBINDABLE: &str = "192.0.2.1:1";
+
+    /// A Retry costs every client a round trip, so it must not happen while
+    /// the listener has room, and must happen for an unvalidated source
+    /// once it is nearly full; a validated source is never sent back.
+    #[test]
+    fn retry_only_for_unvalidated_sources_under_pressure() {
+        let cap = crate::util::MAX_INFLIGHT_PER_LISTENER;
+        assert!(!retry_wanted(false, cap));
+        assert!(!retry_wanted(false, cap / 2));
+        assert!(retry_wanted(false, cap / 4));
+        assert!(retry_wanted(false, 0));
+        assert!(!retry_wanted(true, 0));
+    }
 
     fn listener(bind_address: SocketAddr) -> QuicListenerSettings {
         let cert = generate_certificate();

@@ -20,6 +20,17 @@ use crate::util::allocate_vec;
 
 const DEFAULT_BUF_SIZE: usize = 16384;
 
+/// Rounds of read-then-write one `poll_copy` may run before it yields to the
+/// runtime whether or not either side has returned `Pending`.
+///
+/// The budget check at the top of `poll_copy` is charged once per poll, and
+/// tokio's own sockets charge it again inside their reads, so with those on
+/// both ends the loop is already cut short. A pair of streams that never
+/// return `Pending` and never charge the budget -- in-memory ones, a wrapper
+/// that buffers -- would keep one task on the thread until the transfer
+/// ended. Eight rounds of a full buffer is plenty of work for one poll.
+const MAX_ROUNDS_PER_POLL: usize = 8;
+
 #[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
@@ -60,7 +71,15 @@ impl CopyBuffer {
         // allowing other tasks (like QUIC keepalives) to run.
         let coop = ready!(tokio::task::coop::poll_proceed(cx));
 
+        let mut rounds = 0;
         loop {
+            rounds += 1;
+            if rounds > MAX_ROUNDS_PER_POLL {
+                // Not done and nothing pending: come straight back, but let
+                // the runtime run someone else first.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             let mut read_pending = false;
             let mut write_pending = false;
 
@@ -349,4 +368,134 @@ where
         sleep_future,
     }
     .await
+}
+
+#[cfg(test)]
+mod starvation_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::*;
+    use crate::async_stream::AsyncPing;
+
+    /// Reads zeros for ever and is never pending: the reader half of a pair
+    /// that would keep `poll_copy` on the thread until the heat death of
+    /// the runtime.
+    struct Firehose;
+
+    /// Accepts everything, is never pending, and counts. Past `limit` it
+    /// panics, so a copy loop that does not yield fails this test instead
+    /// of hanging it.
+    struct Sink {
+        written: usize,
+        limit: usize,
+    }
+
+    impl AsyncRead for Firehose {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = buf.remaining();
+            buf.put_slice(&vec![0u8; n]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Firehose {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            unreachable!("nothing writes to the firehose")
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for Sink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            unreachable!("nothing reads from the sink")
+        }
+    }
+
+    impl AsyncWrite for Sink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written += buf.len();
+            assert!(
+                self.written <= self.limit,
+                "the copy loop wrote {} bytes in one poll without yielding",
+                self.written
+            );
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for Firehose {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncPing for Sink {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for Firehose {}
+    impl AsyncStream for Sink {}
+
+    /// One poll over a pair that is never pending must still come back.
+    /// Without the round cap this runs until the sink's limit panics.
+    #[tokio::test]
+    async fn a_never_pending_pair_still_yields_within_one_poll() {
+        let size = 1024;
+        let mut buf = CopyBuffer::new(size, false);
+        let mut reader = Firehose;
+        let mut sink = Sink {
+            written: 0,
+            limit: 4 * MAX_ROUNDS_PER_POLL * size,
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Inside a runtime so the coop budget exists; a fresh task has a
+        // full one, so the budget is not what stops this.
+        let result = buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut sink));
+        assert!(
+            result.is_pending(),
+            "the loop must yield, not finish or spin"
+        );
+        assert!(
+            sink.written >= size,
+            "and it must have done real work first: {} bytes",
+            sink.written
+        );
+    }
 }

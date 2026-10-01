@@ -470,6 +470,143 @@ struct FragmentedPacket {
     packet_len: usize,
     received: Vec<Option<Bytes>>,
     remote_location: Option<NetLocation>,
+    /// When the first fragment arrived; see `FRAGMENT_TTL`.
+    first_seen: std::time::Instant,
+}
+
+/// A reassembled packet is one UDP datagram, and a datagram's payload cannot
+/// exceed this. A sender whose fragments add up to more is not sending a
+/// datagram, and the entry would otherwise be allowed to grow to 255 fragments
+/// of whatever size the stream carried.
+const MAX_REASSEMBLED_LEN: usize = 65535;
+
+/// How long an incomplete packet is kept waiting for its missing fragments.
+///
+/// What it guarantees is that no fragment joins an entry older than this:
+/// the 16-bit packet id comes round, and a fragment arriving under an id
+/// whose entry has expired belongs to a new packet, so `push_fragment` drops
+/// the expired entry before accepting it. Memory is bounded elsewhere, by
+/// `MAX_FRAGMENT_CACHE_SIZE` entries of at most `MAX_REASSEMBLED_LEN` each.
+/// Within that bound the sweep is opportunistic: each new packet evicts the
+/// least-recently-used entry if it has expired, which frees an abandoned
+/// entry on a quiet connection without scanning the cache on the packet
+/// path. An expired entry that was touched more recently than the LRU one
+/// waits for its id to come round or for the LRU to push it out, which is
+/// where it would have waited without the TTL at all.
+const FRAGMENT_TTL: Duration = Duration::from_secs(30);
+
+/// One fragment into the connection's reassembly cache. Returns the completed
+/// packet with its address, `None` while fragments are still outstanding, or
+/// an error for a fragment that does not belong; an error has already removed
+/// the entry. Synchronous, so the caller holds the cache lock across nothing
+/// that awaits.
+fn push_fragment(
+    cache: &mut LruCache<(u16, u16), FragmentedPacket>,
+    key: (u16, u16),
+    frag_total: u8,
+    frag_id: u8,
+    remote_location: &Option<NetLocation>,
+    payload_fragment: &[u8],
+) -> std::io::Result<Option<(NetLocation, Vec<u8>)>> {
+    let (assoc_id, packet_id) = key;
+
+    // An entry that has outlived the TTL is not this fragment's packet: the
+    // id has been reused. Drop it, so the old fragments are not glued to
+    // the new packet's.
+    if cache
+        .peek(&key)
+        .is_some_and(|p| p.first_seen.elapsed() > FRAGMENT_TTL)
+    {
+        cache.pop(&key);
+    }
+
+    if !cache.contains(&key) {
+        // Insert new fragmented packet entry. First, one expired entry out.
+        if let Some((_, oldest)) = cache.peek_lru()
+            && oldest.first_seen.elapsed() > FRAGMENT_TTL
+        {
+            cache.pop_lru();
+        }
+        cache.put(
+            key,
+            FragmentedPacket {
+                fragment_count: frag_total,
+                fragment_received: 0,
+                packet_len: 0,
+                received: vec![None; frag_total as usize],
+                remote_location: remote_location.clone(),
+                first_seen: std::time::Instant::now(),
+            },
+        );
+    }
+
+    let packet = match cache.get_mut(&key) {
+        Some(p) => p,
+        None => {
+            // This shouldn't happen since we just inserted it
+            return Err(std::io::Error::other("Fragment cache error"));
+        }
+    };
+
+    // The address rides only on the first fragment; adopt it whenever fragment 0
+    // arrives (which may be after a later fragment created the entry).
+    if frag_id == 0 && packet.remote_location.is_none() {
+        if remote_location.is_none() {
+            cache.pop(&key);
+            return Err(std::io::Error::other(format!(
+                "Ignoring packet with empty first fragment address for session {assoc_id}"
+            )));
+        }
+        packet.remote_location = remote_location.clone();
+    }
+
+    if packet.fragment_count != frag_total {
+        cache.pop(&key);
+        return Err(std::io::Error::other(format!(
+            "Mismatched fragment count for session {assoc_id} packet {packet_id}"
+        )));
+    }
+    if packet.received[frag_id as usize].is_some() {
+        cache.pop(&key);
+        return Err(std::io::Error::other(format!(
+            "Duplicate fragment for session {assoc_id} packet {packet_id}"
+        )));
+    }
+    if packet.packet_len + payload_fragment.len() > MAX_REASSEMBLED_LEN {
+        cache.pop(&key);
+        return Err(std::io::Error::other(format!(
+            "Fragments for session {assoc_id} packet {packet_id} exceed a datagram; dropped"
+        )));
+    }
+
+    packet.fragment_received += 1;
+    packet.packet_len += payload_fragment.len();
+    packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
+
+    if packet.fragment_received != packet.fragment_count {
+        return Ok(None);
+    }
+
+    // All fragments received - remove from cache and assemble.
+    let FragmentedPacket {
+        remote_location,
+        received,
+        packet_len,
+        ..
+    } = cache.pop(&key).unwrap();
+    let remote_location = match remote_location {
+        Some(loc) => loc,
+        None => {
+            return Err(std::io::Error::other(format!(
+                "Reassembled packet for session {assoc_id} has no address"
+            )));
+        }
+    };
+    let mut complete_payload = Vec::with_capacity(packet_len);
+    for frag in received.iter() {
+        complete_payload.extend_from_slice(frag.as_ref().unwrap());
+    }
+    Ok(Some((remote_location, complete_payload)))
 }
 
 impl UdpSession {
@@ -1149,85 +1286,16 @@ async fn process_udp_packet(
         // Reassembly touches only the shared cache and is fully synchronous, so the
         // lock is taken here and released before any `.await` below. The block yields
         // the completed packet, or `None` while fragments are still outstanding.
-        let key = (assoc_id, packet_id);
-        let assembled: Option<(NetLocation, Vec<u8>)> = {
+        let assembled = {
             let mut cache = fragments.lock();
-
-            if !cache.contains(&key) {
-                // Insert new fragmented packet entry
-                cache.put(
-                    key,
-                    FragmentedPacket {
-                        fragment_count: frag_total,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; frag_total as usize],
-                        remote_location: remote_location.clone(),
-                    },
-                );
-            }
-
-            let packet = match cache.get_mut(&key) {
-                Some(p) => p,
-                None => {
-                    // This shouldn't happen since we just inserted it
-                    return Err(std::io::Error::other("Fragment cache error"));
-                }
-            };
-
-            // The address rides only on the first fragment; adopt it whenever fragment 0
-            // arrives (which may be after a later fragment created the entry).
-            if frag_id == 0 && packet.remote_location.is_none() {
-                if remote_location.is_none() {
-                    cache.pop(&key);
-                    return Err(std::io::Error::other(format!(
-                        "Ignoring packet with empty first fragment address for session {assoc_id}"
-                    )));
-                }
-                packet.remote_location = remote_location.clone();
-            }
-
-            if packet.fragment_count != frag_total {
-                cache.pop(&key);
-                return Err(std::io::Error::other(format!(
-                    "Mismatched fragment count for session {assoc_id} packet {packet_id}"
-                )));
-            }
-            if packet.received[frag_id as usize].is_some() {
-                cache.pop(&key);
-                return Err(std::io::Error::other(format!(
-                    "Duplicate fragment for session {assoc_id} packet {packet_id}"
-                )));
-            }
-
-            packet.fragment_received += 1;
-            packet.packet_len += payload_fragment.len();
-            packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-            if packet.fragment_received != packet.fragment_count {
-                None
-            } else {
-                // All fragments received - remove from cache and assemble.
-                let FragmentedPacket {
-                    remote_location,
-                    received,
-                    packet_len,
-                    ..
-                } = cache.pop(&key).unwrap();
-                let remote_location = match remote_location {
-                    Some(loc) => loc,
-                    None => {
-                        return Err(std::io::Error::other(format!(
-                            "Reassembled packet for session {assoc_id} has no address"
-                        )));
-                    }
-                };
-                let mut complete_payload = Vec::with_capacity(packet_len);
-                for frag in received.iter() {
-                    complete_payload.extend_from_slice(frag.as_ref().unwrap());
-                }
-                Some((remote_location, complete_payload))
-            }
+            push_fragment(
+                &mut cache,
+                (assoc_id, packet_id),
+                frag_total,
+                frag_id,
+                &remote_location,
+                payload_fragment,
+            )?
         };
 
         let (remote_location, complete_payload) = match assembled {
@@ -1456,4 +1524,109 @@ pub async fn start_tuic_server(
             .await
         }
     })
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    fn cache() -> LruCache<(u16, u16), FragmentedPacket> {
+        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap())
+    }
+
+    fn addr() -> Option<NetLocation> {
+        Some(NetLocation::new(
+            Address::Ipv4(Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+        ))
+    }
+
+    #[test]
+    fn fragments_reassemble_in_order_with_the_first_fragments_address() {
+        let mut cache = cache();
+        // The second fragment first: the entry is created without an address
+        // and adopts it when fragment 0 arrives.
+        assert!(
+            push_fragment(&mut cache, (1, 7), 2, 1, &None, b"world")
+                .unwrap()
+                .is_none()
+        );
+        let (location, payload) = push_fragment(&mut cache, (1, 7), 2, 0, &addr(), b"hello ")
+            .unwrap()
+            .expect("complete");
+        assert_eq!(location, addr().unwrap());
+        assert_eq!(payload, b"hello world");
+        assert!(cache.is_empty(), "a completed packet leaves the cache");
+    }
+
+    /// Two fragments that add up to more than a datagram can hold are not a
+    /// datagram. The entry goes, so the sender cannot keep it growing.
+    #[test]
+    fn fragments_past_a_datagrams_worth_are_rejected_and_the_entry_dropped() {
+        let mut cache = cache();
+        let big = vec![0u8; 60_000];
+        assert!(
+            push_fragment(&mut cache, (1, 8), 2, 0, &addr(), &big)
+                .unwrap()
+                .is_none()
+        );
+        let err = push_fragment(&mut cache, (1, 8), 2, 1, &None, &big).unwrap_err();
+        assert!(err.to_string().contains("exceed a datagram"), "{err}");
+        assert!(cache.is_empty());
+    }
+
+    /// An entry that has waited longer than the TTL is evicted when the next
+    /// packet starts, rather than only when 256 newer ones have pushed it out.
+    #[test]
+    fn a_stale_entry_is_evicted_when_a_new_packet_starts() {
+        let mut cache = cache();
+        cache.put(
+            (1, 9),
+            FragmentedPacket {
+                fragment_count: 2,
+                fragment_received: 1,
+                packet_len: 5,
+                received: vec![Some(Bytes::from_static(b"stale")), None],
+                remote_location: addr(),
+                first_seen: std::time::Instant::now() - FRAGMENT_TTL - Duration::from_secs(1),
+            },
+        );
+        assert!(
+            push_fragment(&mut cache, (1, 10), 2, 0, &addr(), b"fresh")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!cache.contains(&(1, 9)), "the stale entry is gone");
+        assert!(cache.contains(&(1, 10)));
+    }
+
+    /// A fragment under an id whose entry has expired starts a new packet.
+    /// Otherwise the TTL bounds nothing: a packet id reused after the
+    /// wraparound would complete with a fragment left over from thirty
+    /// seconds ago.
+    #[test]
+    fn a_fragment_for_an_expired_entry_starts_a_new_packet() {
+        let mut cache = cache();
+        cache.put(
+            (1, 9),
+            FragmentedPacket {
+                fragment_count: 2,
+                fragment_received: 1,
+                packet_len: 5,
+                received: vec![Some(Bytes::from_static(b"stale")), None],
+                remote_location: addr(),
+                first_seen: std::time::Instant::now() - FRAGMENT_TTL - Duration::from_secs(1),
+            },
+        );
+        assert!(
+            push_fragment(&mut cache, (1, 9), 2, 1, &None, b"world")
+                .unwrap()
+                .is_none(),
+            "the stale fragment must not complete the new packet"
+        );
+        let (_, payload) = push_fragment(&mut cache, (1, 9), 2, 0, &addr(), b"hello ")
+            .unwrap()
+            .expect("complete");
+        assert_eq!(payload, b"hello world");
+    }
 }

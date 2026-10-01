@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::{Bytes, BytesMut};
 use futures::ready;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
@@ -195,7 +196,7 @@ pub struct Socks5UdpRelayStream {
     /// valid packet" (the hint was absent or unspecified, as most clients send).
     expected_client_ip: Option<IpAddr>,
     /// Receiver for incoming packets from the socket reader task.
-    receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
+    receiver: mpsc::Receiver<(Bytes, SocketAddr)>,
     /// Handle to the socket reader task.
     reader_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -217,12 +218,27 @@ impl Socks5UdpRelayStream {
         let (tx, rx) = mpsc::channel(64);
         let recv_socket = socket.clone();
         let reader_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            // One growing block, split per datagram: `recv_buf_from` appends
+            // into spare capacity without zeroing it, and `split_to(n).freeze()`
+            // hands the consumer an owned `Bytes` without a copy. The block
+            // holds several datagrams and is replenished only once its spare
+            // capacity could no longer take a maximal one, so a fresh
+            // allocation comes every few dozen typical packets. `reserve` is
+            // "at least this much spare capacity", so asking for a whole
+            // datagram after every split would allocate on every packet, which
+            // is what this replaced (a `to_vec` per datagram). Once the
+            // consumer has dropped every `Bytes` cut from a block, `reserve`
+            // reuses the block instead of allocating.
+            const RECV_BLOCK: usize = 4 * MAX_UDP_SIZE;
+            let mut buf = BytesMut::with_capacity(RECV_BLOCK);
             loop {
-                match recv_socket.recv_from(&mut buf).await {
+                if buf.capacity() < MAX_UDP_SIZE {
+                    buf.reserve(RECV_BLOCK);
+                }
+                match recv_socket.recv_buf_from(&mut buf).await {
                     Ok((n, from_addr)) => {
                         log::debug!("SOCKS5 UDP relay: received {} bytes from {}", n, from_addr);
-                        let packet = buf[..n].to_vec().into_boxed_slice();
+                        let packet = buf.split_to(n).freeze();
                         if tx.send((packet, from_addr)).await.is_err() {
                             // Channel closed, stop reading
                             log::debug!("SOCKS5 UDP relay: channel closed, stopping reader");
