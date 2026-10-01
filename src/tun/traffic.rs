@@ -40,7 +40,7 @@ pub fn connection_opened() {
 pub fn connection_closed() {
     // Saturating rather than wrapping: a close without a matching open would
     // otherwise show a host 18 quintillion live connections.
-    let _ = ACTIVE_CONNECTIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    let _ = ACTIVE_CONNECTIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_sub(1))
     });
 }
