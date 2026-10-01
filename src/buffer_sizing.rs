@@ -276,6 +276,26 @@ pub const fn default_inbound_queue_depth() -> usize {
     256
 }
 
+/// Datagrams one TUN UDP flow may have queued on each hop toward its
+/// destination before the next one is dropped.
+///
+/// The stack thread reads the device in batches of 64 and hands each batch
+/// over without waiting, so a queue of 64 is full after one batch that the
+/// task on the other side has not yet been scheduled to drain. Through a real
+/// Linux TUN that lost 0.5% of a 100 Mbit/s upload and 7.7% of a 1 Gbit/s
+/// one; at 512 it lost none and 0.12% (`scripts/bench/README.md`). Entries are
+/// datagram-sized, so a full queue of MTU-sized ones is under a megabyte.
+///
+/// The constrained platforms keep 64: up to 256 flows each hold two of
+/// these, and there the memory is the scarcer thing.
+pub const fn default_udp_flow_queue_depth() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        64
+    } else {
+        512
+    }
+}
+
 /// Connections a virtual TCP stack accepts before it refuses more.
 ///
 /// This is the multiplier on every size above, so it moves with them: a
