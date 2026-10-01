@@ -50,7 +50,8 @@ use tun::{Configuration as TunConfiguration, Device};
 #[derive(Clone, Debug)]
 pub struct TunServerConfig {
     /// MTU size for the TUN interface.
-    /// Default: platform-specific (iOS: 4064, Android: 9000, others: 1500)
+    /// Default: platform-specific (iOS: 4064, Android and Linux: 9000,
+    /// others: 1500)
     pub mtu: u16,
     /// Enable TCP connection handling.
     /// Default: true
