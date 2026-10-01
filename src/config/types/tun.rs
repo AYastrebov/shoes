@@ -90,7 +90,7 @@ pub struct TunConfig {
     pub destination: Option<IpAddr>,
 
     /// MTU size for the TUN interface.
-    /// Default: 1500
+    /// Default: 9000 (Linux, Android), 4064 (iOS), 1500 elsewhere
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 
