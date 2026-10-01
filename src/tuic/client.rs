@@ -13,6 +13,7 @@ use crate::config::{ClientQuicConfig, TuicUdpRelayMode};
 use crate::quic_outbound::QuicOutboundSettings;
 use crate::quic_outbound::connection::{ConnectionAuthenticator, LiveConnection};
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::CongestionControl;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
@@ -118,6 +119,8 @@ impl TuicConnector {
             // setting would offer something no real server understands.
             port_hopping: None,
             default_alpn: "h3",
+            // TUIC's default, unlike Hysteria2's.
+            congestion: CongestionControl::Cubic,
         };
 
         Ok(Self {
@@ -275,6 +278,16 @@ mod tests {
         .unwrap();
 
         bind_address
+    }
+
+    /// TUIC's client keeps Cubic, its reference's default.
+    #[test]
+    fn test_the_connector_asks_for_cubic() {
+        let connector = connector(reserve_udp_port(), TEST_UUID, "pw");
+        assert_eq!(
+            connector.connection.settings().congestion,
+            CongestionControl::Cubic
+        );
     }
 
     fn connector(server: SocketAddr, uuid: &str, password: &str) -> TuicConnector {

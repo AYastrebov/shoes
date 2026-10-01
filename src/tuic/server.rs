@@ -21,8 +21,10 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::obfs::Obfuscator;
 use crate::quic_transport::{
-    QuicListenerSettings, QuicTransportParams, effective_mtu, start_quic_listeners,
+    CongestionControl, QuicListenerSettings, QuicTransportParams, effective_mtu,
+    start_quic_listeners,
 };
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
@@ -1486,15 +1488,9 @@ async fn run_datagram_loop(
     }
 }
 
-pub async fn start_tuic_server(
-    listener: QuicListenerSettings,
-    uuid: &'static [u8],
-    password: &'static str,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    zero_rtt_handshake: bool,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let params = QuicTransportParams {
+/// The transport parameters of a TUIC listener.
+fn transport_params(obfs: Option<&Arc<dyn Obfuscator>>) -> QuicTransportParams {
+    QuicTransportParams {
         max_concurrent_bidi_streams: 4096,
         // The `quic` UDP relay mode carries every packet fragment on its own
         // client-opened uni stream, so this has to be generous.
@@ -1503,9 +1499,22 @@ pub async fn start_tuic_server(
         keep_alive_interval: Duration::from_secs(15),
         // MTU per the official TUIC reference, less whatever an obfuscator
         // takes out of every datagram.
-        mtu: effective_mtu(listener.obfs.as_ref().map(|o| o.overhead())),
-        enable_segmentation_offload: listener.obfs.is_none(),
-    };
+        mtu: effective_mtu(obfs.map(|o| o.overhead())),
+        enable_segmentation_offload: obfs.is_none(),
+        // TUIC's default, unlike Hysteria2's.
+        congestion: CongestionControl::Cubic,
+    }
+}
+
+pub async fn start_tuic_server(
+    listener: QuicListenerSettings,
+    uuid: &'static [u8],
+    password: &'static str,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    zero_rtt_handshake: bool,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let params = transport_params(listener.obfs.as_ref());
 
     let inbound = crate::connection_registry::intern(format!("tuic@{}", listener.bind_address));
     start_quic_listeners(listener, params, move |conn| {
@@ -1524,6 +1533,24 @@ pub async fn start_tuic_server(
             .await
         }
     })
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// TUIC keeps Cubic, its reference's default, where Hysteria2 runs BBR.
+    #[test]
+    fn test_the_listener_runs_cubic() {
+        assert_eq!(transport_params(None).congestion, CongestionControl::Cubic);
+        let salamander: Arc<dyn Obfuscator> = Arc::new(
+            crate::quic_transport::obfs::Salamander::new(b"obfuscation password").unwrap(),
+        );
+        assert_eq!(
+            transport_params(Some(&salamander)).congestion,
+            CongestionControl::Cubic
+        );
+    }
 }
 
 #[cfg(test)]

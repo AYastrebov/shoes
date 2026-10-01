@@ -920,6 +920,10 @@ client_chain:
       verify: true
 ```
 
+Congestion control is not configurable. Hysteria2 runs BBR at both ends, which
+is what upstream falls back to whenever Brutal is not negotiated; TUIC runs
+Cubic, its reference's default.
+
 Not implemented on the client side, and rejected rather than ignored where a
 configuration can ask for them: Brutal congestion control and bandwidth
 negotiation, `gecko` obfuscation, port hopping, and TUIC's `zero_rtt_handshake`.

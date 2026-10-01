@@ -12,7 +12,7 @@ use crate::address::NetLocation;
 use crate::config::ClientQuicConfig;
 use crate::quic_transport::hop::{HopSettings, HoppingUdpSocket, SocketFactory, spawn_hop_task};
 use crate::quic_transport::obfs::{ObfuscatedUdpSocket, Obfuscator};
-use crate::quic_transport::{QuicTransportParams, effective_mtu};
+use crate::quic_transport::{CongestionControl, QuicTransportParams, effective_mtu};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::new_udp_socket;
 
@@ -35,6 +35,8 @@ pub struct QuicOutboundSettings {
     pub port_hopping: Option<HopSettings>,
     /// ALPN used when the configuration does not name one.
     pub default_alpn: &'static str,
+    /// Per protocol, as on the server; see [`CongestionControl`].
+    pub congestion: CongestionControl,
 }
 
 impl std::fmt::Debug for QuicOutboundSettings {
@@ -121,6 +123,7 @@ impl QuicOutboundSettings {
             // Every socket here takes a batch: the obfuscating one scrambles
             // each segment on its own, the hopping one passes it through.
             enable_segmentation_offload: true,
+            congestion: self.congestion,
         };
         client_config.transport_config(Arc::new(transport.build()));
 
@@ -200,6 +203,7 @@ mod tests {
             obfs: None,
             port_hopping: None,
             default_alpn: "h3",
+            congestion: crate::quic_transport::CongestionControl::Cubic,
         }
     }
 

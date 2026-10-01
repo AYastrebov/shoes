@@ -68,6 +68,20 @@ pub fn build_obfuscator(
     }
 }
 
+/// The congestion controller a connection runs.
+///
+/// Per protocol, because the references differ. Hysteria2 falls back to BBR
+/// whenever Brutal is not negotiated (`core/internal/congestion/utils.go` in
+/// `apernet/hysteria`), which for us is always; TUIC defaults to Cubic. A
+/// loss-based controller on Hysteria2 carried single-digit Mbit/s over a
+/// 50 ms path with 0.5% loss, where BBR carried 500. See
+/// `docs/specs/2026-10-01-hysteria2-bbr.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionControl {
+    Bbr,
+    Cubic,
+}
+
 /// The transport parameters that differ between protocols.
 ///
 /// Everything not named here is identical across all of them and is applied by
@@ -93,6 +107,7 @@ pub struct QuicTransportParams {
     /// GSO batches several QUIC packets into one `sendmsg`. Off for a socket
     /// that cannot take a batch; none of ours is one today.
     pub enable_segmentation_offload: bool,
+    pub congestion: CongestionControl,
 }
 
 impl QuicTransportParams {
@@ -119,6 +134,14 @@ impl QuicTransportParams {
             .enable_segmentation_offload(self.enable_segmentation_offload)
             // A lower initial estimate grows the initial window sooner.
             .initial_rtt(Duration::from_millis(100));
+        // Cubic is quinn's default too, but set here so that the choice is
+        // made where the other parameters are, and does not follow quinn's.
+        let controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+            match self.congestion {
+                CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+                CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+            };
+        transport.congestion_controller_factory(controller);
         transport
     }
 }
@@ -329,6 +352,83 @@ mod tests {
             keep_alive_interval: Duration::from_secs(10),
             mtu: BASE_MTU,
             enable_segmentation_offload: true,
+            congestion: CongestionControl::Cubic,
+        }
+    }
+
+    /// Whether a live connection runs BBR, asked of quinn rather than of our
+    /// own configuration.
+    fn runs_bbr(conn: &quinn::Connection) -> bool {
+        conn.congestion_state()
+            .into_any()
+            .downcast::<quinn::congestion::Bbr>()
+            .is_ok()
+    }
+
+    /// The controller `build` is asked for is the one both ends of a real
+    /// connection run, through the production listener and dialer. Hysteria2
+    /// needs BBR to carry anything over a lossy path; TUIC keeps Cubic.
+    #[tokio::test]
+    async fn test_both_ends_run_the_congestion_controller_asked_for() {
+        for congestion in [CongestionControl::Bbr, CongestionControl::Cubic] {
+            let bind = reserve_udp_port();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+            let handles = start_quic_listeners(
+                listener(bind),
+                QuicTransportParams {
+                    congestion,
+                    ..params()
+                },
+                move |incoming| {
+                    let tx = tx.clone();
+                    async move {
+                        let conn = incoming.await.map_err(std::io::Error::other)?;
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(runs_bbr(&conn));
+                        }
+                        conn.closed().await;
+                        Ok(())
+                    }
+                },
+            )
+            .expect("loopback must bind");
+
+            let client = crate::quic_outbound::QuicOutboundSettings {
+                server: bind.into(),
+                quic: crate::quic_outbound::testing::client_quic_config(),
+                bind_interface: None,
+                obfs: None,
+                port_hopping: None,
+                default_alpn: "h3",
+                congestion,
+            }
+            .build_endpoint(false)
+            .unwrap();
+            let conn = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.connect(bind, "localhost").unwrap(),
+            )
+            .await
+            .expect("the handshake never finished")
+            .unwrap();
+
+            let expected = congestion == CongestionControl::Bbr;
+            assert_eq!(
+                runs_bbr(&conn),
+                expected,
+                "client, asked for {congestion:?}"
+            );
+            let server = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("the server never saw the connection")
+                .unwrap();
+            assert_eq!(server, expected, "server, asked for {congestion:?}");
+
+            conn.close(0u32.into(), b"done");
+            for handle in handles {
+                handle.abort();
+            }
         }
     }
 
