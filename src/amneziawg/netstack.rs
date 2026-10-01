@@ -278,6 +278,11 @@ const MAX_TCP_SOCKETS: usize = crate::buffer_sizing::default_max_connections();
 /// simply left out of it, so a QUIC-heavy page could allocate without limit.
 const MAX_UDP_SOCKETS: usize = MAX_TCP_SOCKETS / 4;
 
+/// Inbound packets the loop takes per pass before it polls. The inbound
+/// channel holds 256, so this is a bound on how long one pass can run, not
+/// on what gets through.
+const INBOUND_BATCH: usize = 64;
+
 // ---------------------------------------------------------------------------
 // VirtualNetStack
 // ---------------------------------------------------------------------------
@@ -297,6 +302,17 @@ pub struct VirtualNetStack {
     /// because a counter the drain loop increments stops when the drain
     /// loop does. See the field doc on `TunnelRuntime::outbound_offered`.
     outbound_offered: Arc<AtomicUsize>,
+    /// What the streams ring when they have given this loop something to do:
+    /// bytes to send, room to receive into, a close. One for the whole stack,
+    /// and `notify_one`, which leaves a permit behind when nobody is waiting
+    /// yet -- so a ring that lands while the loop is busy polling is not lost.
+    ///
+    /// The streams used to call `notify_waiters` on a `Notify` of their own
+    /// that nothing ever waited on. A write to a quiet connection then sat in
+    /// its buffer until the loop's sleep ran out, up to 10 ms later: measured
+    /// on loopback, a one-byte request and its reply took 13.8 ms through
+    /// this stack against 0.19 ms through sing-box's.
+    wake: Arc<Notify>,
 }
 
 impl VirtualNetStack {
@@ -359,6 +375,7 @@ impl VirtualNetStack {
             active_tcp: HashMap::new(),
             active_udp: HashMap::new(),
             outbound_offered,
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -367,6 +384,7 @@ impl VirtualNetStack {
     // ------------------------------------------------------------------
 
     pub async fn run(mut self, mut conn_rx: mpsc::Receiver<NetStackRequest>) {
+        let wake = self.wake.clone();
         loop {
             // Use smoltcp's poll_delay to determine how long to sleep,
             // capped at 10ms to balance CPU usage vs throughput (matches
@@ -423,38 +441,24 @@ impl VirtualNetStack {
                         }
                     }
                 }
+                // A stream has work for this loop; see `Self::wake`.
+                _ = wake.notified() => {}
                 _ = sleep => {}
             }
 
-            // Poll smoltcp. The budget hands the device the channel's free
-            // slots, less what earlier polls already emitted and the channel
-            // has not yet accepted; `transmit` refuses tokens past it.
-            self.device.tx_budget = self.ip_to_tunnel.capacity();
-            let now = crate::util::smol_now();
-            self.iface.poll(now, &mut self.device, &mut self.sockets);
-
-            // Flush outbound IP packets to the tunnel. What the channel will
-            // not take stays queued for the next pass rather than being
-            // dropped: a drop here is invisible to the peer, so smoltcp's
-            // congestion control would read it as path loss and collapse --
-            // the bimodal upload ROADMAP.md records. Each attempt counts as
-            // demand (a deferred packet counts again when retried), which is
-            // what keeps the liveness watchdog seeing an active tunnel while
-            // the channel is jammed.
-            {
-                let mut tx_queue = self.device.tx_queue.borrow_mut();
-                while let Some(packet) = tx_queue.pop_front() {
-                    self.outbound_offered.fetch_add(1, Ordering::Relaxed);
-                    match self.ip_to_tunnel.try_send(packet) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(packet)) => {
-                            tx_queue.push_front(packet);
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    }
+            // Take what else has already arrived, so one pass of the poll
+            // and the socket sweeps below -- each of them a walk over every
+            // socket -- serves a burst rather than a single packet.
+            while self.device.rx_queue.len() < INBOUND_BATCH {
+                match self.ip_from_tunnel.try_recv() {
+                    Ok(packet) => self.device.rx_queue.push_back(packet),
+                    // Empty, or closed: the select above sees a close on the
+                    // next pass and stops the loop there.
+                    Err(_) => break,
                 }
             }
+
+            self.poll_and_flush();
 
             // Service TCP connections
             self.service_pending_tcp();
@@ -462,6 +466,46 @@ impl VirtualNetStack {
 
             // Service UDP sockets
             self.service_active_udp();
+
+            // Again, for what the servicing above has just handed smoltcp:
+            // bytes a stream wrote, a datagram, a window that reopened.
+            // Without this they were only sent on the next pass of the
+            // loop, which meant after another trip through the timer --
+            // 1.6 ms on a request that should have left at once.
+            self.poll_and_flush();
+        }
+    }
+
+    /// One smoltcp poll, and what it emitted offered to the tunnel.
+    fn poll_and_flush(&mut self) {
+        // Poll smoltcp. The budget hands the device the channel's free
+        // slots, less what earlier polls already emitted and the channel
+        // has not yet accepted; `transmit` refuses tokens past it.
+        self.device.tx_budget = self.ip_to_tunnel.capacity();
+        let now = crate::util::smol_now();
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+
+        // Flush outbound IP packets to the tunnel. What the channel will
+        // not take stays queued for the next pass rather than being
+        // dropped: a drop here is invisible to the peer, so smoltcp's
+        // congestion control would read it as path loss and collapse --
+        // the bimodal upload ROADMAP.md records. Each attempt counts as
+        // demand (a deferred packet counts again when retried), which is
+        // what keeps the liveness watchdog seeing an active tunnel while
+        // the channel is jammed.
+        {
+            let mut tx_queue = self.device.tx_queue.borrow_mut();
+            while let Some(packet) = tx_queue.pop_front() {
+                self.outbound_offered.fetch_add(1, Ordering::Relaxed);
+                match self.ip_to_tunnel.try_send(packet) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(packet)) => {
+                        tx_queue.push_front(packet);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
         }
     }
 
@@ -513,7 +557,7 @@ impl VirtualNetStack {
             recv_closed: false,
             dropped: false,
         }));
-        let notify = Arc::new(Notify::new());
+        let notify = self.wake.clone();
 
         let handle = self.sockets.add(socket);
         self.pending_tcp.insert(
@@ -720,6 +764,7 @@ impl VirtualNetStack {
         let stream = VirtualUdpStream {
             send_tx: outgoing_tx,
             recv_rx: incoming_rx,
+            wake: self.wake.clone(),
         };
 
         let _ = reply.send(Ok(stream));
@@ -776,6 +821,7 @@ impl VirtualNetStack {
 
 pub struct VirtualTcpStream {
     control: Arc<Mutex<TcpControl>>,
+    /// The stack's wake handle; see `VirtualNetStack::wake`.
     notify: Arc<Notify>,
 }
 
@@ -784,6 +830,7 @@ pub struct VirtualTcpStream {
 impl Drop for VirtualTcpStream {
     fn drop(&mut self) {
         self.control.lock().dropped = true;
+        self.notify.notify_one();
     }
 }
 
@@ -801,7 +848,7 @@ impl AsyncRead for VirtualTcpStream {
             buf.advance(n);
             // Notify netstack that buffer space is available
             drop(ctrl);
-            self.notify.notify_waiters();
+            self.notify.notify_one();
             return Poll::Ready(Ok(()));
         }
 
@@ -830,7 +877,7 @@ impl AsyncWrite for VirtualTcpStream {
         if !ctrl.send_buf.is_full() {
             let n = ctrl.send_buf.enqueue_slice(buf);
             drop(ctrl);
-            self.notify.notify_waiters();
+            self.notify.notify_one();
             return Poll::Ready(Ok(n));
         }
 
@@ -846,7 +893,7 @@ impl AsyncWrite for VirtualTcpStream {
         let mut ctrl = self.control.lock();
         ctrl.send_closed = true;
         drop(ctrl);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
         Poll::Ready(Ok(()))
     }
 }
@@ -871,6 +918,9 @@ impl AsyncStream for VirtualTcpStream {}
 pub struct VirtualUdpStream {
     send_tx: mpsc::Sender<Vec<u8>>,
     recv_rx: mpsc::Receiver<Vec<u8>>,
+    /// The stack's wake handle; see `VirtualNetStack::wake`. Without it a
+    /// datagram -- a DNS query, usually -- waited out the loop's sleep.
+    wake: Arc<Notify>,
 }
 
 impl AsyncReadMessage for VirtualUdpStream {
@@ -902,7 +952,10 @@ impl AsyncWriteMessage for VirtualUdpStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         match this.send_tx.try_send(buf.to_vec()) {
-            Ok(()) => Poll::Ready(Ok(())),
+            Ok(()) => {
+                this.wake.notify_one();
+                Poll::Ready(Ok(()))
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // Drop the packet — UDP is lossy
                 warn!("AmneziaWG: UDP send buffer full, dropping packet");
@@ -1095,7 +1148,7 @@ mod tests {
                         recv_closed: false,
                         dropped: false,
                     })),
-                    notify: Arc::new(Notify::new()),
+                    notify: stack.wake.clone(),
                     reply: {
                         let (tx, _) = tokio::sync::oneshot::channel();
                         tx
@@ -1114,5 +1167,103 @@ mod tests {
             .map(|_| ())
             .expect_err("over budget, so it cannot succeed");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    /// A stream that has given the stack something to do rings its wake
+    /// handle, and the ring is kept until the loop next waits. These were
+    /// `notify_waiters` on a `Notify` nothing waited on, so a write sat in
+    /// its buffer until the loop's sleep ran out.
+    #[test]
+    fn a_stream_write_leaves_a_wake_for_the_stack() {
+        use std::future::Future;
+
+        let wake = Arc::new(Notify::new());
+        let mut stream = VirtualTcpStream {
+            control: Arc::new(Mutex::new(TcpControl {
+                send_buf: smoltcp::storage::RingBuffer::new(vec![0u8; 64]),
+                send_waker: None,
+                send_closed: false,
+                recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; 64]),
+                recv_waker: None,
+                recv_closed: false,
+                dropped: false,
+            })),
+            notify: wake.clone(),
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let rung = |cx: &mut Context<'_>| {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.poll(cx).is_ready()
+        };
+
+        assert!(!rung(&mut cx), "nothing has happened yet");
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"hello"),
+            Poll::Ready(Ok(5))
+        ));
+        assert!(rung(&mut cx), "a write must wake the stack");
+        assert!(!rung(&mut cx), "and the wake is consumed by being seen");
+
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_ready());
+        assert!(rung(&mut cx), "a shutdown must wake the stack");
+
+        drop(stream);
+        assert!(rung(&mut cx), "a drop must wake the stack");
+    }
+
+    /// The loop acts on a datagram when it is written, not when its sleep
+    /// next runs out. The median of many, because one sample can be late
+    /// for reasons that are not this code's; before the wake existed every
+    /// sample waited for the tick, and the median was most of 10 ms.
+    #[tokio::test]
+    async fn a_datagram_leaves_the_stack_without_waiting_for_the_tick() {
+        // Built here rather than by `stack()`: that drops the inbound
+        // sender, which a running loop rightly takes as the tunnel going
+        // away, and stops.
+        let (to_tunnel_tx, mut tunnel_rx) = mpsc::channel(16);
+        let (_from_tunnel_tx, from_tunnel_rx) = mpsc::channel::<Vec<u8>>(16);
+        let stack = VirtualNetStack::new(
+            &[("10.0.0.2".parse().unwrap(), 32)],
+            1400,
+            to_tunnel_tx,
+            from_tunnel_rx,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let run = tokio::spawn(stack.run(conn_rx));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        conn_tx
+            .send(NetStackRequest::ConnectUdp {
+                target: "192.0.2.1:53".parse().unwrap(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let mut udp = reply_rx.await.unwrap().unwrap();
+
+        let mut waits = Vec::new();
+        for _ in 0..41 {
+            // Let the loop reach its wait, so that each sample starts from
+            // a sleeping stack -- the case that used to be slow.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let sent = std::time::Instant::now();
+            std::future::poll_fn(|cx| Pin::new(&mut udp).poll_write_message(cx, b"query"))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), tunnel_rx.recv())
+                .await
+                .expect("the datagram never left the stack")
+                .expect("the stack is running");
+            waits.push(sent.elapsed());
+        }
+        waits.sort();
+        let median = waits[waits.len() / 2];
+        assert!(
+            median < std::time::Duration::from_millis(3),
+            "a written datagram waited {median:?} (median) to leave the stack"
+        );
+        run.abort();
     }
 }
