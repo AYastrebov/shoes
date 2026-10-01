@@ -767,6 +767,31 @@ async fn without_a_secret_a_foreign_origin_or_host_is_refused_on_sockets_too() {
         "reached as localhost: {status}"
     );
 
+    // Behind a port forward the client names the forwarded port, and on
+    // port 80 it names none. The name is what a foreign page cannot forge,
+    // so the name decides and the port does not.
+    for host in ["localhost:9999", "127.0.0.1", "localhost"] {
+        let status = status_line(addr, "GET", "/version", host, None, false).await;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "reached as {host}: {status}"
+        );
+    }
+    // A page served from another loopback port is still another origin.
+    let status = status_line(
+        addr,
+        "GET",
+        "/connections",
+        &own,
+        Some("http://localhost:3000"),
+        true,
+    )
+    .await;
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "a page on another loopback port: {status}"
+    );
+
     // DNS rebinding: the page's own name resolved to loopback. Its origin
     // matches its host, and its same-origin GET carries no origin at all.
     let rebound = format!("evil.example:{}", addr.port());

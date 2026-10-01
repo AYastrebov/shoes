@@ -437,8 +437,9 @@ fn main() {
                 let (configs, _) = config::convert_cert_paths(configs)
                     .await
                     .map_err(|e| format!("Failed to load cert files: {e}"))?;
-                config::create_server_configs(configs)
+                let validated = config::create_server_configs(configs)
                     .map_err(|e| format!("Failed to create server configs: {e}"))?;
+                report_clash_api(validated.clash_api.as_ref());
                 Ok::<(), String>(())
             }
             .await;
@@ -890,6 +891,36 @@ struct PreparedServers {
     clash_api: Option<config::ClashApiConfig>,
 }
 
+/// What an operator should hear about the `clash_api` block, on stdout and
+/// in every run that loads a config, a dry run included.
+///
+/// Not through the logger: its default level is `error`, so a `warn!` is a
+/// warning nobody sees.
+fn report_clash_api(clash_api: Option<&config::ClashApiConfig>) {
+    let Some(api) = clash_api else {
+        return;
+    };
+    // A block this binary cannot serve is a config that silently does less
+    // than it says. Parsed and validated in every build so a config file
+    // means one thing everywhere; served only where the feature is on.
+    #[cfg(not(feature = "clash-api"))]
+    println!(
+        "WARNING: config declares clash_api on {}, but this build has no \
+         `clash-api` feature; it will not be served",
+        api.listen
+    );
+    // Allowed, for the dashboard tunnelled over SSH, but not silently.
+    #[cfg(feature = "clash-api")]
+    if api.secret.is_none() {
+        println!(
+            "WARNING: clash_api on {} has no secret: any local process can control it, \
+             and a browser dashboard on another origin needs a secret or its origin in \
+             allow_origins",
+            api.listen
+        );
+    }
+}
+
 /// Load, validate, and resolve a configuration without touching the servers
 /// that may be running -- the reload path decides what to do with the result.
 /// The error is the full message to print.
@@ -932,17 +963,7 @@ async fn prepare_servers(
     } = config::create_server_configs(configs)
         .map_err(|e| format!("Failed to create server configs: {e}"))?;
 
-    // A block this binary cannot serve is a config that silently does less
-    // than it says. Parsed and validated in every build so a config file
-    // means one thing everywhere; served only where the feature is on.
-    #[cfg(not(feature = "clash-api"))]
-    if let Some(api) = &clash_api {
-        println!(
-            "WARNING: config declares clash_api on {}, but this build has no \
-             `clash-api` feature; it will not be served",
-            api.listen
-        );
-    }
+    report_clash_api(clash_api.as_ref());
 
     // Build DNS registry from expanded groups (async - resolves hostnames)
     let dns_registry = dns::build_dns_registry(dns_groups)

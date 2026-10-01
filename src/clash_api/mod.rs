@@ -258,6 +258,41 @@ fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Optio
         .then(|| origin.to_string())
 }
 
+/// Whether a `Host` header names the controller: `localhost`, a loopback
+/// literal or the listen address, with any port or none.
+fn host_names_controller(host: &str, listen: SocketAddr) -> bool {
+    // `[v6]`, `[v6]:port`, `name` or `name:port`; what follows the name is
+    // a port or nothing. Anything else is not a host a client would send,
+    // and is refused rather than guessed at.
+    let (name, rest, bracketed) = match host.strip_prefix('[') {
+        Some(inner) => match inner.split_once(']') {
+            Some((name, rest)) => (name, rest, true),
+            None => return false,
+        },
+        None => match host.find(':') {
+            Some(colon) => (&host[..colon], &host[colon..], false),
+            None => (host, "", false),
+        },
+    };
+    let port_ok = match rest.strip_prefix(':') {
+        Some(port) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+        None => rest.is_empty(),
+    };
+    if !port_ok {
+        return false;
+    }
+    let own = |ip: std::net::IpAddr| ip.is_loopback() || ip == listen.ip();
+    if bracketed {
+        return name
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| own(ip.into()));
+    }
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| own(ip.into()))
+}
+
 /// Whether a request may reach a controller that has no secret.
 ///
 /// Withholding the CORS header (`cors_origin`) keeps a page on another
@@ -273,12 +308,16 @@ fn cors_origin(headers: &HeaderMap, allow: &[String], has_secret: bool) -> Optio
 ///   matches `Host` proves nothing, and neither does the absence of one.
 ///
 /// Hence two rules, checked on every request without a secret. The `Host`
-/// must be one of the controller's own names: the listen address, or
-/// `localhost` or a loopback literal with its port -- a rebinding page
-/// cannot produce those, and a secretless listener is loopback by
-/// validation. Then an `Origin`, if there is one, must be on
+/// must name the controller: `localhost`, a loopback literal or the listen
+/// address -- a rebinding page cannot produce those, and a secretless
+/// listener is loopback by validation. The name only, whatever the port: a
+/// client behind a port forward (`ssh -L 9999:127.0.0.1:9090`) says
+/// `localhost:9999`, one talking to port 80 says no port at all, and the
+/// port adds nothing to the defence, since it is the name a foreign page
+/// cannot forge. Then an `Origin`, if there is one, must be on
 /// `allow_origins` or be the controller's own, which after the first rule
-/// is a page the controller served itself. A request with no `Origin` is a
+/// is a page the controller served itself; a page from another loopback
+/// port has another origin and stops here. A request with no `Origin` is a
 /// non-browser client (awg-manager, `curl`, a tunnelled dashboard's
 /// server) or a same-origin one, and passes; one with no `Host` is not a
 /// browser's either. The set this admits is the set `cors_origin` would
@@ -289,14 +328,7 @@ fn browser_permitted(headers: &HeaderMap, listen: SocketAddr, allow: &[String]) 
         let Ok(host) = host.to_str() else {
             return false;
         };
-        let port = listen.port();
-        let own = [
-            listen.to_string(),
-            format!("localhost:{port}"),
-            format!("127.0.0.1:{port}"),
-            format!("[::1]:{port}"),
-        ];
-        if !own.iter().any(|o| o.eq_ignore_ascii_case(host)) {
+        if !host_names_controller(host, listen) {
             return false;
         }
     }
@@ -700,8 +732,27 @@ mod tests {
             Some("evil.example:9090")
         ));
         assert!(!ok(None, Some("evil.example:9090")));
-        // Another port on loopback is another origin, not this controller.
-        assert!(!ok(None, Some("127.0.0.1:9091")));
+        // The name decides, not the port: a client behind a port forward
+        // names the forwarded port, and one on port 80 names none.
+        assert!(ok(None, Some("localhost:9999")));
+        assert!(ok(None, Some("127.0.0.1")));
+        assert!(ok(None, Some("localhost")));
+        assert!(ok(None, Some("[::1]")));
+        assert!(ok(Some("http://localhost:9999"), Some("localhost:9999")));
+        assert!(ok(Some("http://a.example"), Some("localhost:9999")));
+        // A page on another loopback port is another origin, and is still
+        // refused: its `Origin` is not the `Host` it reached.
+        assert!(!ok(Some("http://localhost:3000"), Some("localhost:9090")));
+        // A foreign name is foreign on any port, and a host that is not a
+        // host is refused rather than guessed at.
+        assert!(!ok(None, Some("evil.example")));
+        assert!(!ok(None, Some("localhost.evil.example:9090")));
+        assert!(!ok(None, Some("localhost:9090@evil.example")));
+        assert!(!ok(None, Some("localhost:")));
+        assert!(!ok(None, Some("[::1]x")));
+        assert!(!ok(None, Some("[::1")));
+        assert!(!ok(None, Some("[localhost]:9090")));
+        assert!(!ok(None, Some("192.0.2.1:9090")));
         assert!(!ok(Some("http://127.0.0.1:9090"), None));
     }
 }

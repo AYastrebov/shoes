@@ -83,17 +83,9 @@ impl ClashApiConfig {
             ));
         }
 
-        if self.listen.ip().is_loopback() && self.secret.is_none() {
-            // Allowed, as the SSH-tunnelled dashboard case wants, but not
-            // silently: anything on the machine can drive the controller,
-            // and a dashboard on another origin will find CORS closed.
-            log::warn!(
-                "clash_api on {} has no secret: any local process can control it, and a \
-                 browser dashboard on another origin needs a secret or its origin in \
-                 allow_origins",
-                self.listen
-            );
-        }
+        // Loopback with no secret is allowed, as the SSH-tunnelled dashboard
+        // wants. The binary says so on stdout when it loads such a config
+        // (`report_clash_api`); validation itself stays silent.
 
         if self.max_tracked_connections == 0 {
             return Err(std::io::Error::new(

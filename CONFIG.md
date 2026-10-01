@@ -1233,7 +1233,7 @@ feature and ignores it, so one config serves both.
   connections and, once selection lands, redirects every connection on the
   machine, so it is a control plane and the secret is its whole access
   control. On loopback a secret is optional, for the dashboard tunnelled
-  over SSH, and a warning is logged when it is missing.
+  over SSH, and a `WARNING:` line is printed at start-up when it is missing.
 - **`secret`** is the bearer token every request must carry
   (`Authorization: Bearer <secret>`, or `?token=` on a WebSocket, which a
   browser cannot set a header on). An empty string is refused.
@@ -1243,14 +1243,17 @@ feature and ignores it, so one config serves both.
   set**; with no secret, empty means no CORS header at all, and a request
   is refused with `403` when it names any origin other than a listed one
   or the controller's own, or reaches the listener under a `Host` that is
-  not one of its own names (the listen address, `localhost` or a loopback
-  literal with its port). Without a secret the browser's same-origin
-  policy is the only thing keeping other sites' scripts out of the
-  controller, and it is not enough on its own: `*` is the header that
+  not one of its own names (`localhost`, a loopback literal or the listen
+  address; the port is not compared, so a port forward such as
+  `ssh -L 9999:127.0.0.1:9090` works). Without a secret the browser's
+  same-origin policy is the only thing keeping other sites' scripts out of
+  the controller, and it is not enough on its own: `*` is the header that
   switches it off, a WebSocket is not covered by it at all, and DNS
   rebinding turns a foreign page into a same-origin one, which the `Host`
-  check catches. Non-browser clients are unaffected. A dashboard on
-  another origin therefore needs a secret, or its origin listed here.
+  check catches. Non-browser clients are unaffected unless they reach the
+  controller under another name, as through a reverse proxy; that needs a
+  secret. A dashboard on another origin likewise needs a secret, or its
+  origin listed here.
 - **`max_tracked_connections`** bounds the connection registry. Past it a
   connection is served and not tracked, and the omission is reported in
   `/connections`.
