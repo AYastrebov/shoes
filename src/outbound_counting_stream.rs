@@ -280,6 +280,41 @@ mod tests {
         assert_eq!(all[0].upload_bytes, 3, "a write must count as upload");
     }
 
+    /// The same directions when the relay splices past the stream and
+    /// reports the byte counts itself: what the socket received is
+    /// download, what it sent is upload. The two counts differ, so a
+    /// transposition fails.
+    // The guard is held across awaits on purpose; see above.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_spliced_read_is_download_and_a_spliced_write_is_upload() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let counters = installed("Frankfurt", "fra1.example:443");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (socket, _accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let counting = OutboundCountingStream::new(socket.unwrap(), counters);
+        let plain = counting
+            .plain_tcp()
+            .expect("a counted TCP stream offers its socket");
+        plain.count_read(9);
+        plain.count_written(3);
+
+        let all = snapshot_all();
+        assert_eq!(
+            all[0].download_bytes, 9,
+            "a spliced read must count as download"
+        );
+        assert_eq!(
+            all[0].upload_bytes, 3,
+            "a spliced write must count as upload"
+        );
+    }
+
     // The guard is held across awaits on purpose. `#[tokio::test]` runs a
     // current-thread runtime, so there is no other task on this thread to
     // starve, and no test takes this lock twice -- it exists precisely to stop
