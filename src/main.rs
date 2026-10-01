@@ -73,6 +73,8 @@ mod socket_protector;
 mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;
+#[cfg(target_os = "linux")]
+mod splice;
 mod stream_reader;
 mod sync_adapter;
 mod tcp;

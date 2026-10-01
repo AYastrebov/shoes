@@ -102,9 +102,24 @@ impl<S: AsyncPing + Unpin> AsyncPing for OutboundCountingStream<S> {
     }
 }
 
-impl<S> AsyncStream for OutboundCountingStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + AsyncPing + Unpin + Send + Sync
-{
+impl<S: AsyncStream> AsyncStream for OutboundCountingStream<S> {
+    fn plain_tcp(&self) -> Option<crate::async_stream::PlainTcp<'_>> {
+        let mut plain = self.inner.plain_tcp()?;
+        plain.counters.push(&*self.counters);
+        Some(plain)
+    }
+}
+
+/// The same directions the stream counts in: a read is what the server
+/// sent, which is download.
+impl crate::async_stream::TransferCounter for OutboundCounters {
+    fn bytes_read(&self, bytes: u64) {
+        self.add_download(bytes);
+    }
+
+    fn bytes_written(&self, bytes: u64) {
+        self.add_upload(bytes);
+    }
 }
 
 pin_project_lite::pin_project! {

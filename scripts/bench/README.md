@@ -82,7 +82,9 @@ changes below against the build after, alternated in one sitting.
 | Hysteria2 upload to a slow destination | connection dies | holds |
 | Hysteria2 upload, shoes to shoes | dies in some runs | 5.3 Gbit/s |
 | Hysteria2 + salamander, up / down | 1.8 / 1.9 Gbit/s | 4.3 / 4.6 Gbit/s |
-| SOCKS to direct, up / down | 21 / 22 Gbit/s | 37 / 37 Gbit/s |
+| SOCKS to direct, up / down | 21 / 22 Gbit/s | 33-62 / 49-66 Gbit/s |
+| SOCKS to direct, CPU-seconds per gigabyte | 0.39 | 0.10 |
+| SOCKS to direct, one byte each way | 69 us | 36 us |
 | TUN on Linux, MTU left to the default, up / down | 9.0 / 6.5 Gbit/s | 17.8 / 11.7 Gbit/s |
 | One TUN download with 500 idle connections open | 1.0 Gbit/s | 8.1 Gbit/s |
 | One TUN upload with 500 idle connections open | 2.4 Gbit/s | 18.6 Gbit/s |
@@ -108,7 +110,12 @@ What changed:
   working on each segment of a batch. The port-hopping socket passes both
   through as well.
 - **Relay.** 64 KiB copy buffers off the constrained platforms, up from 16
-  (8 behind a TUN connection).
+  (8 behind a TUN connection), which took SOCKS to direct to 37 Gbit/s at
+  0.23 CPU-seconds per gigabyte. Then, on Linux, two ends that are each
+  nothing more than a TCP socket are spliced inside the kernel
+  (`src/splice.rs`), which is where the figures in the table come from.
+  sing-box, which also splices, measured 48-62 up and 62-63 down at 0.09 to
+  0.11 in the same runs: level, within what this machine can tell apart.
 - **TUN.** Linux defaults to an MTU of 9000, as Android already did. UDP
   flow queues hold 512 datagrams off the constrained platforms, up from 64.
 - **Idle TUN connections.** smoltcp searches every socket for each packet
@@ -135,7 +142,5 @@ What changed:
   downloads 40% for nothing measurable on one.
 - **UDP download through the TUN loses packets at 1 Gbit/s offered**, between
   0.6% and 9% from run to run, with or without offload.
-- **The relay is still half of sing-box's**, which splices between sockets
-  in the kernel on Linux.
 - **WireGuard throughput** is level with sing-box's at half the CPU, and
   bounded by one task and one lock around the cipher state.
