@@ -127,12 +127,17 @@ impl Default for TunServerConfig {
         // - iOS Network Extension: 4064 max (4096 - 32 byte UTUN_IF_HEADROOM_SIZE)
         //   Performance drops significantly above this value
         // - Android: 9000 (some devices report ENOBUFS with 65535)
-        // - Other platforms: 1500 (standard Ethernet MTU)
+        // - Linux: 9000. Every packet through the device is one system
+        //   call each way, so throughput follows the MTU: through a real
+        //   TUN, about 10 Gbit/s up and 7 down at 1500 against 18 and 15 at
+        //   9000 (scripts/bench/README.md). The link behind the proxy keeps
+        //   its own MTU; this one is only between the kernel and shoes.
+        // - Other platforms: 1500 (standard Ethernet MTU), unmeasured
         #[cfg(target_os = "ios")]
         let default_mtu = 4064;
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let default_mtu = 9000;
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        #[cfg(not(any(target_os = "ios", target_os = "android", target_os = "linux")))]
         let default_mtu = 1500;
 
         // Shared with the AmneziaWG virtual stack, which allocates the same
