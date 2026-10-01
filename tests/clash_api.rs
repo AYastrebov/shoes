@@ -83,7 +83,7 @@ pub async fn try_request(
 ) -> Option<Reply> {
     let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
     for (k, v) in headers {
@@ -493,7 +493,7 @@ fn json(reply: &Reply) -> serde_json::Value {
 pub async fn ws_open(addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).await.unwrap();
@@ -665,20 +665,30 @@ async fn traffic_streams_and_a_token_query_authorises_a_socket() {
     );
 }
 
-#[tokio::test]
-async fn a_socket_without_the_token_is_refused() {
-    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+/// The status line a request is answered with, given the exact `Host` and
+/// `Origin` a browser would send. The status line only: a refused upgrade
+/// is answered on a connection that stays open, so reading to EOF would
+/// wait for a close that a keep-alive response never sends.
+pub async fn status_line(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    host: &str,
+    origin: Option<&str>,
+    upgrade: bool,
+) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(
-            b"GET /traffic HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        )
-        .await
-        .unwrap();
-    // The status line only: a refused upgrade is answered on a connection
-    // that stays open, so reading to EOF would wait for a close that a
-    // keep-alive response never sends.
+    let origin = origin
+        .map(|o| format!("Origin: {o}\r\n"))
+        .unwrap_or_default();
+    let upgrade = if upgrade {
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+    } else {
+        ""
+    };
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}{upgrade}\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n") {
@@ -691,11 +701,169 @@ async fn a_socket_without_the_token_is_refused() {
         .unwrap();
         head.push(byte[0]);
     }
+    String::from_utf8_lossy(&head).trim_end().to_string()
+}
+
+/// A WebSocket handshake's status line, `Host` set to the controller's
+/// address as a browser reaching it directly would.
+pub async fn ws_handshake_status(addr: SocketAddr, path: &str, origin: Option<&str>) -> String {
+    status_line(addr, "GET", path, &addr.to_string(), origin, true).await
+}
+
+#[tokio::test]
+async fn a_socket_without_the_token_is_refused() {
+    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+    let status = ws_handshake_status(addr, "/traffic", None).await;
     assert!(
-        String::from_utf8_lossy(&head).starts_with("HTTP/1.1 401"),
-        "an unauthorised upgrade must not become a socket: {}",
-        String::from_utf8_lossy(&head)
+        status.starts_with("HTTP/1.1 401"),
+        "an unauthorised upgrade must not become a socket: {status}"
     );
+}
+
+/// Withholding the CORS header keeps a foreign page from reading a `fetch`,
+/// but a WebSocket is not subject to the same-origin policy, and DNS
+/// rebinding makes a foreign page same-origin. So without a secret a
+/// request is served only when `Host` is one of the controller's own names
+/// and any `Origin` is listed or the controller's own; a browser client
+/// with no `Origin` passes, and so does one on a listed origin.
+#[tokio::test]
+async fn without_a_secret_a_foreign_origin_or_host_is_refused_on_sockets_too() {
+    let (addr, _stop) = spawn(None, vec!["http://dash.example".to_string()]).await;
+    let own = addr.to_string();
+
+    for path in ["/connections", "/logs?level=info", "/traffic", "/memory"] {
+        let status = ws_handshake_status(addr, path, Some("http://evil.example")).await;
+        assert!(
+            status.starts_with("HTTP/1.1 403"),
+            "{path} from a foreign origin must not become a socket: {status}"
+        );
+    }
+    let status = ws_handshake_status(addr, "/traffic", Some("http://dash.example")).await;
+    assert!(
+        status.starts_with("HTTP/1.1 101"),
+        "a listed origin: {status}"
+    );
+    let status = ws_handshake_status(addr, "/traffic", Some(&format!("http://{own}"))).await;
+    assert!(
+        status.starts_with("HTTP/1.1 101"),
+        "the controller's own origin: {status}"
+    );
+    let status = ws_handshake_status(addr, "/traffic", None).await;
+    assert!(
+        status.starts_with("HTTP/1.1 101"),
+        "no origin at all: {status}"
+    );
+    let status = status_line(
+        addr,
+        "GET",
+        "/traffic",
+        &format!("localhost:{}", addr.port()),
+        None,
+        true,
+    )
+    .await;
+    assert!(
+        status.starts_with("HTTP/1.1 101"),
+        "reached as localhost: {status}"
+    );
+
+    // Behind a port forward the client names the forwarded port, and on
+    // port 80 it names none. The name is what a foreign page cannot forge,
+    // so the name decides and the port does not.
+    for host in ["localhost:9999", "127.0.0.1", "localhost"] {
+        let status = status_line(addr, "GET", "/version", host, None, false).await;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "reached as {host}: {status}"
+        );
+    }
+    // A page served from another loopback port is still another origin.
+    let status = status_line(
+        addr,
+        "GET",
+        "/connections",
+        &own,
+        Some("http://localhost:3000"),
+        true,
+    )
+    .await;
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "a page on another loopback port: {status}"
+    );
+
+    // DNS rebinding: the page's own name resolved to loopback. Its origin
+    // matches its host, and its same-origin GET carries no origin at all.
+    let rebound = format!("evil.example:{}", addr.port());
+    let status = status_line(
+        addr,
+        "GET",
+        "/connections",
+        &rebound,
+        Some(&format!("http://{rebound}")),
+        true,
+    )
+    .await;
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "rebound socket: {status}"
+    );
+    let status = status_line(addr, "GET", "/connections", &rebound, None, false).await;
+    assert!(
+        status.starts_with("HTTP/1.1 403"),
+        "rebound same-origin GET: {status}"
+    );
+
+    // The plain routes answer the same way, and the refusal carries no CORS
+    // header for the page to read it with. A preflight is refused too, so
+    // the answer a browser sees is consistent with the request's.
+    let reply = request(
+        addr,
+        "GET",
+        "/connections",
+        &[("Origin", "http://evil.example")],
+        "",
+    )
+    .await;
+    assert_eq!(reply.code, 403);
+    assert!(reply.header("access-control-allow-origin").is_none());
+    let reply = request(
+        addr,
+        "DELETE",
+        "/connections/1",
+        &[("Origin", "http://evil.example")],
+        "",
+    )
+    .await;
+    assert_eq!(reply.code, 403, "a write is refused, not just unreadable");
+    let reply = request(
+        addr,
+        "OPTIONS",
+        "/connections",
+        &[("Origin", "http://evil.example")],
+        "",
+    )
+    .await;
+    assert_eq!(reply.code, 403, "a preflight from a foreign origin");
+    let reply = request(
+        addr,
+        "OPTIONS",
+        "/connections",
+        &[("Origin", "http://dash.example")],
+        "",
+    )
+    .await;
+    assert_eq!(reply.code, 204, "a preflight from a listed origin");
+    assert_eq!(get(addr, "/connections", None).await.code, 200);
+
+    // With a secret the secret decides, as before: CORS is `*`, a foreign
+    // origin holding the token is a dashboard the user configured, and a
+    // host the controller does not know is a reverse proxy in front of it.
+    let (addr, _stop) = spawn(Some("s"), vec![]).await;
+    let status = ws_handshake_status(addr, "/traffic?token=s", Some("http://evil.example")).await;
+    assert!(status.starts_with("HTTP/1.1 101"), "{status}");
+    let status = status_line(addr, "GET", "/traffic?token=s", "proxy.example", None, true).await;
+    assert!(status.starts_with("HTTP/1.1 101"), "{status}");
 }
 
 #[tokio::test]
@@ -718,7 +886,7 @@ async fn a_plain_get_streams_json_lines() {
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(b"GET /traffic HTTP/1.1\r\nHost: x\r\n\r\n")
+        .write_all(format!("GET /traffic HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
         .await
         .unwrap();
 

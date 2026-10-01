@@ -28,9 +28,15 @@ pub struct ClashApiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
-    /// Origins allowed to read a response from a browser. Empty means `*`,
-    /// which is what a dashboard served from elsewhere needs and what mihomo
-    /// does; the secret is the access control either way.
+    /// Origins allowed to read a response from a browser. Empty means `*`
+    /// when a secret is set, which is what a dashboard served from elsewhere
+    /// needs and what mihomo does; without a secret, empty means no CORS
+    /// header at all, since `*` would let any page the user has open read
+    /// and drive the controller, and a request naming any other origin, or
+    /// reaching the listener by a name that is not its own, is refused: a
+    /// WebSocket needs no CORS header to be read, and DNS rebinding makes a
+    /// foreign page same-origin. See `clash_api::cors_origin` and
+    /// `clash_api::browser_permitted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_origins: Vec<String>,
 
@@ -76,6 +82,10 @@ impl ClashApiConfig {
                 ),
             ));
         }
+
+        // Loopback with no secret is allowed, as the SSH-tunnelled dashboard
+        // wants. The binary says so on stdout when it loads such a config
+        // (`report_clash_api`); validation itself stays silent.
 
         if self.max_tracked_connections == 0 {
             return Err(std::io::Error::new(

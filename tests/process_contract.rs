@@ -199,6 +199,35 @@ fn check_on_a_missing_file_is_an_exit_code_not_a_panic() {
     );
 }
 
+/// A `clash_api` block the operator should hear about -- no secret, or a
+/// build that cannot serve it -- is reported on stdout by `check`, at the
+/// default log level. It was a `warn!`, which the default level hides.
+#[test]
+fn check_warns_about_a_clash_api_block_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "- clash_api:\n    listen: 127.0.0.1:9090\n{}",
+            socks_config(1080)
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new(shoes_bin())
+        .arg("check")
+        .arg(&config)
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("WARNING") && stdout.contains("clash_api on 127.0.0.1:9090"),
+        "stdout was:\n{stdout}"
+    );
+}
+
 #[test]
 fn version_prints_the_crate_version() {
     let out = std::process::Command::new(shoes_bin())

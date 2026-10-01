@@ -1,0 +1,17 @@
+# A Clash API controller beside a SOCKS5 listener.
+#
+# Dashboards (yacd, metacubexd, zashboard) and awg-manager talk to the
+# controller on `listen`. Needs the `clash-api` feature; a build without it
+# accepts this block, logs a warning naming the feature and ignores it.
+#
+# The secret is optional on loopback and required anywhere else. It is also
+# what opens CORS: with a secret and no `allow_origins`, any origin may read
+# responses; without a secret no CORS header is sent, so a dashboard served
+# from another origin does not work until a secret is set.
+- clash_api:
+    listen: 127.0.0.1:9090
+    secret: change-me
+
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks

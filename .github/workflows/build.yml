@@ -165,7 +165,7 @@ jobs:
           bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
           "$bin" --version
 
-          configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client"
+          configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client clash_api"
           case "$RUNNER_OS" in
             Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client transparent_proxy" ;;
             Windows) configs="$configs tun_windows" ;;
