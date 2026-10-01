@@ -16,6 +16,7 @@ scripts/bench/run-linux.sh build              # release build into a volume
 scripts/bench/run-linux.sh tunnels            # tunnels.py: U and D, one stream
 scripts/bench/run-linux.sh tunnels MODES=P    # round-trip latency
 scripts/bench/run-linux.sh tunnels MODES=S ONLY="-> shoes"   # slow destination
+scripts/bench/run-linux.sh tunnels NETEM="delay 25ms loss 0.5%" # a lossy 50 ms path
 scripts/bench/run-linux.sh tun                # tun_linux.py: a real TUN device
 scripts/bench/run-linux.sh tun CASES=idle PERF=1             # with a profile
 scripts/bench/run-linux.sh tun SINGBOX=system                 # sing-box's TUN instead
@@ -70,6 +71,11 @@ expensive is working too hard.
   `VNET=0` to compare against one.
 - One stream on loopback has no loss and no delay. These numbers are about
   cost per byte and per packet, not about congestion control on a real path.
+  `NETEM` puts a path between each tunnel client and its server: `tc netem`
+  delay and loss on the tunnel leg only, in each direction. It drops one
+  datagram at a time even when QUIC or WireGuard sent a batch in one buffer,
+  which a qdisc on loopback's egress would not: there netem drops the whole
+  batch, and 1% loss arrives as bursts of 64.
 
 ## Results, 2026-10-01
 
