@@ -170,7 +170,58 @@ impl AsyncShutdownMessage for UdpSocket {
     }
 }
 
+/// Told how many bytes crossed a socket by a relay that moved them without
+/// passing them through the stream; see [`AsyncStream::plain_tcp`].
+// Only Linux has a relay that uses this; see `crate::splice`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub trait TransferCounter: Send + Sync {
+    /// Bytes read from the socket.
+    fn bytes_read(&self, bytes: u64);
+    /// Bytes written to the socket.
+    fn bytes_written(&self, bytes: u64);
+}
+
+/// A stream that is a TCP socket and nothing more, with whoever wants to
+/// know how much crosses it.
+// Only Linux has a relay that uses this; see `crate::splice`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct PlainTcp<'a> {
+    pub socket: &'a TcpStream,
+    pub counters: Vec<&'a dyn TransferCounter>,
+}
+
+// Only Linux has a relay that uses this; see `crate::splice`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PlainTcp<'_> {
+    pub fn count_read(&self, bytes: usize) {
+        for counter in &self.counters {
+            counter.bytes_read(bytes as u64);
+        }
+    }
+
+    pub fn count_written(&self, bytes: usize) {
+        for counter in &self.counters {
+            counter.bytes_written(bytes as u64);
+        }
+    }
+}
+
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    /// The socket underneath, if this stream is that socket and nothing
+    /// more: every byte read is a byte the socket received, every byte
+    /// written goes to it unchanged, and nothing is held in between.
+    ///
+    /// A relay between two such streams can then move the bytes inside the
+    /// kernel instead of through this process (`crate::splice`). The default
+    /// is `None`, which is the right answer for anything that encrypts,
+    /// frames, pads or buffers. A wrapper that only watches -- a counter, a
+    /// permit -- forwards its inner stream's answer, adding itself to
+    /// `counters` if it counts, since the bytes will no longer pass through
+    /// its `poll_read` and `poll_write`.
+    fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
+        None
+    }
+
     /// Where a transparently redirected connection was going before the
     /// kernel sent it here. `Some` only on Linux, and only on a socket that
     /// NAT `REDIRECT` delivered; a `redirect` listener refuses anything else.
@@ -244,6 +295,13 @@ impl AsyncPing for TcpStream {
 }
 
 impl AsyncStream for TcpStream {
+    fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
+        Some(PlainTcp {
+            socket: self,
+            counters: Vec::new(),
+        })
+    }
+
     #[cfg(target_os = "linux")]
     fn original_destination(&self) -> Option<SocketAddr> {
         let destination =
@@ -341,6 +399,10 @@ impl<S: AsyncPing + Unpin> AsyncPing for PermitStream<S> {
 impl<S: AsyncStream> AsyncStream for PermitStream<S> {
     fn original_destination(&self) -> Option<SocketAddr> {
         self.inner.original_destination()
+    }
+
+    fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
+        self.inner.plain_tcp()
     }
 }
 
@@ -561,10 +623,18 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
     fn original_destination(&self) -> Option<SocketAddr> {
         (**self).original_destination()
     }
+
+    fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
+        (**self).plain_tcp()
+    }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
     fn original_destination(&self) -> Option<SocketAddr> {
         (**self).original_destination()
+    }
+
+    fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
+        (**self).plain_tcp()
     }
 }
 
@@ -792,5 +862,30 @@ mod tests {
             AsyncStream::original_destination(&borrowed),
             Some(destination())
         );
+    }
+
+    /// The same wrappers must pass the socket through for the spliced relay,
+    /// and a stream that is not a socket must not claim to be one: a relay
+    /// that spliced past a stream which transforms its bytes would send the
+    /// peer the wrong ones.
+    #[tokio::test]
+    async fn the_accept_path_wrappers_pass_a_plain_socket_through() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let local = accepted.local_addr().unwrap();
+
+        let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let mut boxed: Box<dyn AsyncStream> = Box::new(PermitStream::new(accepted, permit));
+        let borrowed: &mut Box<dyn AsyncStream> = &mut boxed;
+        let plain = AsyncStream::plain_tcp(&borrowed).expect("still a plain socket");
+        assert_eq!(plain.socket.local_addr().unwrap(), local);
+        assert!(plain.counters.is_empty());
+
+        let not_a_socket: Box<dyn AsyncStream> = Box::new(RedirectedStream::new(None));
+        assert!(not_a_socket.plain_tcp().is_none());
     }
 }

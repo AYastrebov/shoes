@@ -144,7 +144,7 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
     // to go. Without the registry `closed()` never resolves, so the select
     // costs a branch that is never taken.
     let copy_result = {
-        let copy = copy_bidirectional(
+        let copy = relay(
             &mut server_stream,
             &mut client_stream,
             server_need_initial_flush,
@@ -166,6 +166,32 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
 
     copy_result?;
     Ok(())
+}
+
+/// Carry bytes between the two sides until both directions have finished.
+///
+/// On Linux, two streams that are each nothing more than a TCP socket are
+/// spliced inside the kernel; see `crate::splice`. Everything else is copied
+/// through a buffer.
+async fn relay(
+    server_stream: &mut Box<dyn AsyncStream>,
+    client_stream: &mut Box<dyn AsyncStream>,
+    server_need_initial_flush: bool,
+    client_need_initial_flush: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let (Some(server), Some(client)) = (server_stream.plain_tcp(), client_stream.plain_tcp()) {
+        // Nothing to flush first: a socket has no buffer of its own to hold
+        // what was written to it.
+        return crate::splice::splice_bidirectional(server, client).await;
+    }
+    copy_bidirectional(
+        server_stream,
+        client_stream,
+        server_need_initial_flush,
+        client_need_initial_flush,
+    )
+    .await
 }
 
 /// Judge the destination and open the client side of the connection.

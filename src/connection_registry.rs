@@ -163,6 +163,24 @@ impl<S: AsyncStream> AsyncStream for CountingStream<S> {
     fn original_destination(&self) -> Option<std::net::SocketAddr> {
         self.inner.original_destination()
     }
+
+    fn plain_tcp(&self) -> Option<crate::async_stream::PlainTcp<'_>> {
+        let mut plain = self.inner.plain_tcp()?;
+        plain.counters.push(&*self.counters);
+        Some(plain)
+    }
+}
+
+/// The same directions `CountingStream` counts in: a read is what the client
+/// sent.
+impl crate::async_stream::TransferCounter for ConnectionCounters {
+    fn bytes_read(&self, bytes: u64) {
+        self.up.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn bytes_written(&self, bytes: u64) {
+        self.down.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 /// A per-listener label, made once and kept for the process.
@@ -662,6 +680,33 @@ mod tests {
         let handle = register("10.0.0.5:4000".parse().unwrap(), "test", Network::Tcp);
         let stream = counted(RedirectedStream::new(Some(destination)), &handle);
         assert_eq!(stream.original_destination(), Some(destination));
+    }
+
+    /// A spliced relay moves bytes past the counting wrapper, so the wrapper
+    /// hands over its counters with the socket, and they count in the
+    /// wrapper's own directions: what was read from the client is `up`.
+    #[cfg(feature = "control-connections")]
+    #[tokio::test]
+    async fn a_counted_socket_is_still_a_plain_one_and_brings_its_counters() {
+        // The process totals are global, and other tests here assert on
+        // exact differences in them.
+        let _guard = REGISTRY_TEST_LOCK.lock().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+
+        let handle = register(peer, "test", Network::Tcp);
+        let stream = counted(accepted, &handle);
+        let plain = stream.plain_tcp().expect("still a plain socket");
+        assert_eq!(plain.counters.len(), 1);
+        plain.count_read(700);
+        plain.count_written(30);
+
+        let counters = handle.counters().expect("tracked");
+        assert_eq!(counters.up.load(Ordering::Relaxed), 700);
+        assert_eq!(counters.down.load(Ordering::Relaxed), 30);
     }
 
     /// A duplex pipe that satisfies `AsyncStream`, which `counted` requires
