@@ -18,6 +18,7 @@ scripts/bench/run-linux.sh tunnels MODES=P    # round-trip latency
 scripts/bench/run-linux.sh tunnels MODES=S ONLY="-> shoes"   # slow destination
 scripts/bench/run-linux.sh tun                # tun_linux.py: a real TUN device
 scripts/bench/run-linux.sh tun CASES=idle PERF=1             # with a profile
+scripts/bench/run-linux.sh tun SINGBOX=system                 # sing-box's TUN instead
 ```
 
 `VAR=value` arguments are passed to the script; each script's header lists

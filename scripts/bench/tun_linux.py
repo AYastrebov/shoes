@@ -10,6 +10,9 @@ Environment:
   SECS    seconds per run          (default: 5)
   CASES   base,defaultmtu,mtu,buf,idle,conns,udp
   NCONNS  connection counts for the `conns` case, e.g. 2,4,8
+  SINGBOX gvisor, system or mixed: measure sing-box's TUN instead of shoes'
+          (cases that pass shoes options, such as tcp_buffer_size, then
+          only differ by MTU)
   STATS   print tun0 and TCP counters after each case
   PERF    record and print a perf profile of shoes for each run
 """
@@ -21,6 +24,7 @@ B = os.path.dirname(os.path.abspath(__file__)); SHOES = os.environ.get("SHOES", 
 sh = lambda c, **k: subprocess.run(c, shell=True, check=True, **k)
 IP = subprocess.check_output("hostname -i", shell=True).decode().split()[0]
 SECS = float(os.environ.get("SECS", "5"))
+SINGBOX = os.environ.get("SINGBOX", "")  # a sing-box TUN stack name, to measure it instead of shoes
 def cpu(pid):
     f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
     return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
@@ -38,6 +42,30 @@ def setup(mtu, extra=""):
     open(cfg, "w").write(f"- device_fd: {tun}\n{mtu_line}  tcp_enabled: true\n  udp_enabled: true\n  icmp_enabled: true\n{extra}  rules:\n    - masks: \"0.0.0.0/0\"\n      action: allow\n      client_chain:\n        - protocol:\n            type: direct\n")
     p = subprocess.Popen([SHOES, "--no-reload", cfg], pass_fds=[tun], stdout=open("/tmp/shoes-tun.log", "w"), stderr=subprocess.STDOUT)
     os.close(tun); time.sleep(1.0); return p
+def setup_singbox(mtu, stack):
+    """sing-box's TUN in place of ours, the way it runs on a desktop: inside
+    the namespace with its device, its own outbound marked so that policy
+    routing sends it out a veth instead of back into the tunnel. Everything
+    unmarked takes the default route into tun0. The sink is reached at the
+    veth's far end, in the main namespace."""
+    import json
+    global IP
+    subprocess.run("ip netns del cli 2>/dev/null; ip link del veth0 2>/dev/null", shell=True)
+    sh("ip netns add cli; ip link add veth0 type veth peer name veth1; ip link set veth1 netns cli")
+    sh("ip addr add 10.77.0.1/24 dev veth0; ip link set veth0 up")
+    sh("ip netns exec cli sh -c 'ip link set lo up; ip addr add 10.77.0.2/24 dev veth1; ip link set veth1 up'")
+    IP = "10.77.0.1"
+    cfg = f"/tmp/sb-tun-{mtu}-{stack}.json"
+    json.dump({"log": {"level": "warn"},
+               "inbounds": [{"type": "tun", "tag": "tun-in", "interface_name": "tun0", "address": ["10.0.0.1/30"],
+                             "mtu": mtu, "auto_route": False, "stack": stack}],
+               "outbounds": [{"type": "direct", "tag": "direct", "routing_mark": 563}], "route": {"final": "direct"}}, open(cfg, "w"))
+    p = subprocess.Popen(["ip", "netns", "exec", "cli", "sing-box", "run", "-c", cfg], stdout=open("/tmp/shoes-tun.log", "w"), stderr=subprocess.STDOUT)
+    for _ in range(50):
+        if subprocess.run("ip netns exec cli ip link show tun0", shell=True, capture_output=True).returncode == 0: break
+        time.sleep(0.1)
+    sh("ip netns exec cli sh -c 'ip rule add fwmark 563 lookup main pref 100; ip route add default dev tun0 table 100; ip rule add lookup 100 pref 200'")
+    time.sleep(0.5); return p
 def load(mode, conns=1):
     out = subprocess.run(f"ip netns exec cli python3 {B}/load.py client --target {IP}:25201 --mode {mode} --secs {SECS} --conns {conns}", shell=True, capture_output=True, text=True, timeout=SECS + 30)
     return out.stdout.strip() or out.stderr.strip()[-200:]
@@ -46,7 +74,11 @@ def idle_conns(n):
     p = subprocess.Popen(["ip", "netns", "exec", "cli", "python3", "-c", code], stdout=subprocess.PIPE, text=True)
     p.stdout.readline(); return p
 def case(label, mtu, extra="", conns=1, idle=0, modes=("U", "D")):
-    p = setup(mtu, extra); ih = idle_conns(idle) if idle else None
+    if SINGBOX:
+        label = f"sing-box {SINGBOX}: {label}"; p = setup_singbox(mtu, SINGBOX)
+    else:
+        p = setup(mtu, extra)
+    ih = idle_conns(idle) if idle else None
     for m in modes:
         pf = subprocess.Popen(f"perf record -F 1999 -g -p {p.pid} -o /tmp/perf-{m}.data -- sleep {SECS - 1} >/dev/null 2>&1", shell=True) if os.environ.get("PERF") else None
         c0 = cpu(p.pid); g = load(m, conns)
@@ -54,7 +86,7 @@ def case(label, mtu, extra="", conns=1, idle=0, modes=("U", "D")):
             pf.wait()
             o = subprocess.run(f"perf report -i /tmp/perf-{m}.data --no-children --sort symbol --stdio -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -28", shell=True, capture_output=True, text=True).stdout
             print(o[:2600], flush=True)
-        try: gg = float(g); print(f"{label:<44} {m} x{conns:<2} {gg:7.3f} Gbps  shoes cpu-s/GB={(cpu(p.pid) - c0) / (gg * SECS / 8):.2f}", flush=True)
+        try: gg = float(g); print(f"{label:<44} {m} x{conns:<2} {gg:7.3f} Gbps  cpu-s/GB={(cpu(p.pid) - c0) / (gg * SECS / 8):.2f}", flush=True)
         except ValueError: print(f"{label:<44} {m} x{conns:<2} {g}", flush=True)
     if ih: ih.kill()
     if os.environ.get("STATS"):
@@ -66,7 +98,7 @@ def udp(p, label, rate, size=1200):
         c0 = cpu(p.pid)
         o = subprocess.run(f"ip netns exec cli iperf3 -c {IP} -p 25301 -u -b {rate} -l {size} -t 4 {rev}", shell=True, capture_output=True, text=True).stdout
         m = re.search(r"([\d.]+ [MGK]bits/sec)\s+[\d.]+ ms\s+(\d+/\d+ \([\d.e+-]+%\))\s+receiver", o)
-        print(f"{label:<44} udp {rate} {'down' if rev else 'up  '} -> {m.group(1) + '  lost ' + m.group(2) if m else o[-300:]}  shoes cpu={cpu(p.pid) - c0:.2f}s", flush=True)
+        print(f"{label:<44} udp {rate} {'down' if rev else 'up  '} -> {m.group(1) + '  lost ' + m.group(2) if m else o[-300:]}  cpu={cpu(p.pid) - c0:.2f}s", flush=True)
 sink = subprocess.Popen([sys.executable, f"{B}/load.py", "server", "--port", "25201"])
 ip3 = subprocess.Popen(["iperf3", "-s", "-p", "25301"], stdout=subprocess.DEVNULL)
 time.sleep(0.5)
@@ -95,8 +127,8 @@ try:
         for n in [int(x) for x in os.environ.get("NIDLE", "100,500").split(",")]:
             case(f"tun mtu 1500, {n} idle connections", 1500, idle=n).kill()
     if "udp" in which:
-        p = setup(1500)
-        for r in ("100M", "1G", "0"): udp(p, "tun mtu 1500", r)
+        p = setup_singbox(1500, SINGBOX) if SINGBOX else setup(1500)
+        for r in ("100M", "1G", "0"): udp(p, (f"sing-box {SINGBOX}: " if SINGBOX else "") + "tun mtu 1500", r)
         p.kill()
 finally:
     sink.kill(); ip3.kill()
