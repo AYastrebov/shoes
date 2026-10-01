@@ -54,6 +54,10 @@ struct Pipe {
 
 impl Pipe {
     fn take() -> io::Result<Self> {
+        #[cfg(test)]
+        if tests::NO_PIPES.get() {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
         if let Some(pipe) = POOL.lock().unwrap().pop() {
             return Ok(pipe);
         }
@@ -172,7 +176,17 @@ async fn burst(src: &PlainTcp<'_>, dst: &PlainTcp<'_>, pipe: &Pipe) -> io::Resul
 async fn one_way(src: &PlainTcp<'_>, dst: &PlainTcp<'_>) -> io::Result<()> {
     loop {
         src.socket.readable().await?;
-        let pipe = Pipe::take()?;
+        // Out of descriptors, or past the user's pipe budget: each busy
+        // connection holds up to two pipes, so this comes with load. It costs
+        // this direction the splice, not the connection.
+        let pipe = match Pipe::take() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                log::debug!("no pipe for the splice relay ({e}); copying instead");
+                copy_one_way(src, dst).await?;
+                break;
+            }
+        };
         // An error leaves bytes in the pipe, so it is dropped, not returned;
         // so is one this future is cancelled while holding.
         match burst(src, dst, &pipe).await? {
@@ -193,11 +207,17 @@ async fn one_way(src: &PlainTcp<'_>, dst: &PlainTcp<'_>) -> io::Result<()> {
 }
 
 /// The same direction with a buffer, for a socket the kernel will not splice
-/// from. Not expected on any kernel this runs on; here so that such a kernel
-/// costs speed rather than the connection.
+/// from, or when no pipe can be had. The first is not expected on any kernel
+/// this runs on; either way it costs speed rather than the connection.
 async fn copy_one_way(src: &PlainTcp<'_>, dst: &PlainTcp<'_>) -> io::Result<()> {
     let mut buf = vec![0u8; crate::buffer_sizing::default_relay_buffer_size()];
+    let mut rounds = 0;
     loop {
+        // As in `burst`: readiness does not charge the cooperative budget.
+        rounds += 1;
+        if rounds % ROUNDS_PER_YIELD == 0 {
+            tokio::task::yield_now().await;
+        }
         src.socket.readable().await?;
         let n = match src.socket.try_read(&mut buf) {
             Ok(0) => return Ok(()),
@@ -278,12 +298,32 @@ mod tests {
             .collect()
     }
 
+    thread_local! {
+        /// Makes [`Pipe::take`] fail as an exhausted system would. Per
+        /// thread, and a `#[tokio::test]` runs its tasks on its own thread,
+        /// so no other test sees it.
+        pub(super) static NO_PIPES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// The relay between two connections: everything written at one far end
     /// arrives at the other, in both directions at once, a finish is passed
     /// on while the other direction keeps running, and the counters see
     /// every byte.
     #[tokio::test]
     async fn bytes_cross_both_ways_and_a_finish_is_passed_on() {
+        relay_both_ways_and_check().await;
+    }
+
+    /// With no pipe to be had -- descriptors or the pipe budget exhausted --
+    /// the relay copies instead, and the connection is none the wiser.
+    #[tokio::test]
+    async fn without_a_pipe_the_relay_copies_instead() {
+        NO_PIPES.set(true);
+        relay_both_ways_and_check().await;
+        NO_PIPES.set(false);
+    }
+
+    async fn relay_both_ways_and_check() {
         let (mut client, relay_client_side) = pair().await;
         let (relay_server_side, mut server) = pair().await;
         let (near, far) = (Counted::default(), Counted::default());
