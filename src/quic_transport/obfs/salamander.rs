@@ -57,13 +57,13 @@ impl Salamander {
 /// a remainder in it, and on a profile of a 2 Gbit/s transfer that loop cost
 /// three to four times what the AES-GCM of the same packets did.
 fn xor_with_key(buf: &mut [u8], key: &[u8; KEY_LEN]) {
-    let mut blocks = buf.chunks_exact_mut(KEY_LEN);
-    for block in &mut blocks {
+    let (blocks, remainder) = buf.as_chunks_mut::<KEY_LEN>();
+    for block in blocks {
         for (byte, k) in block.iter_mut().zip(key) {
             *byte ^= k;
         }
     }
-    for (byte, k) in blocks.into_remainder().iter_mut().zip(key) {
+    for (byte, k) in remainder.iter_mut().zip(key) {
         *byte ^= k;
     }
 }
