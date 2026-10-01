@@ -296,6 +296,25 @@ pub const fn default_udp_flow_queue_depth() -> usize {
     }
 }
 
+/// UDP datagrams read off a TUN and waiting for the task that relays them.
+///
+/// The stack thread reads the device in batches of 64 and does not wait for
+/// the other side, so this is how many batches the relay may fall behind --
+/// a scheduling delay, usually -- before datagrams are dropped. At 256 a
+/// 1 Gbit/s upload through a real Linux TUN lost 1% to 4% here, with nothing
+/// dropped anywhere the kernel could count; at 2048, none in two runs of
+/// three and 0.4% in the third.
+///
+/// The constrained platforms keep 256: an entry there is a whole read buffer
+/// of one MTU, 9000 bytes on Android.
+pub const fn default_udp_ingress_queue_depth() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        256
+    } else {
+        2048
+    }
+}
+
 /// Receive buffer asked for on an outbound UDP socket, or `None` to leave the
 /// system's default.
 ///

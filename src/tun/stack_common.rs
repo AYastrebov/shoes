@@ -227,6 +227,24 @@ impl PooledBuffer {
     }
 }
 
+impl PooledBuffer {
+    /// The same bytes in a buffer no larger than they need, if this one is
+    /// much larger; otherwise this one.
+    ///
+    /// For a packet that is about to sit in a queue. With segmentation
+    /// offload every read buffer has room for 64 KiB, and a queue of
+    /// 1200-byte datagrams each holding one would pin fifty times what it
+    /// carries. The large buffer goes back to the pool for the next read.
+    pub fn fitted(self) -> Self {
+        if self.buffer.capacity() <= 2 * self.buffer.len() + 2048 {
+            return self;
+        }
+        Self {
+            buffer: BytesMut::from(&self.buffer[..]),
+        }
+    }
+}
+
 impl Deref for PooledBuffer {
     type Target = BytesMut;
 
@@ -420,11 +438,14 @@ pub const UDP_RESPONSE_QUEUE: usize = 512;
 /// direction of the queue above. Bounded for the same reason: a consumer
 /// that stalls, or a sender faster than the outbound can carry, must shed
 /// datagrams rather than queue them without limit, and dropping is what a
-/// full socket buffer would do. Each entry is a pooled buffer of `mtu + 4`
-/// bytes whatever the datagram's size, so the worst case is 256 of those:
-/// about 2.3 MiB at Android's 9000-byte default, 1 MiB at iOS's 4064, 384 KiB
-/// at 1500. Normally it holds a handful.
-pub const UDP_INGRESS_QUEUE: usize = 256;
+/// full socket buffer would do.
+///
+/// How deep is per platform; see `default_udp_ingress_queue_depth`. An entry
+/// holds its datagram and little more: a read buffer much larger than what
+/// was read into it is swapped for one that fits before it is queued
+/// (`PooledBuffer::fitted`), so the worst case is this many datagrams, not
+/// this many read buffers.
+pub const UDP_INGRESS_QUEUE: usize = crate::buffer_sizing::default_udp_ingress_queue_depth();
 
 /// Datagrams dropped because `UDP_INGRESS_QUEUE` was full, over the life of
 /// the process. A counter rather than a log line per drop: a flood is the
@@ -921,7 +942,7 @@ pub fn run_stack_loop<D: StackDevice>(
                         // Full means drop, see `UDP_INGRESS_QUEUE`; closed
                         // means the handler is gone, and the loop is stopping.
                         if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                            udp_tx.try_send(pkt)
+                            udp_tx.try_send(pkt.fitted())
                         {
                             UDP_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2256,6 +2277,25 @@ mod tests {
                 "{state:?} must always get the full pass"
             );
         }
+    }
+
+    /// A datagram queued for tokio must not take a 64 KiB read buffer with
+    /// it; a buffer already about the right size is left alone.
+    #[test]
+    fn a_queued_packet_is_fitted_to_its_bytes() {
+        let mut large = PooledBuffer::with_capacity(65_545);
+        large.extend_from_slice(&[7u8; 1200]);
+        let fitted = large.fitted();
+        assert_eq!(&fitted[..], &[7u8; 1200][..]);
+        assert!(fitted.capacity() < 4096, "capacity {}", fitted.capacity());
+
+        let mut snug = PooledBuffer {
+            buffer: BytesMut::with_capacity(1504),
+        };
+        snug.extend_from_slice(&[9u8; 1200]);
+        let pointer = snug.as_ptr();
+        let kept = snug.fitted();
+        assert_eq!(kept.as_ptr(), pointer, "a snug buffer is not copied");
     }
 
     #[test]
