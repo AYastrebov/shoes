@@ -19,6 +19,11 @@ Environment:
   LOGS    print the last N lines of each shoes process's output at the end
   PERF    record and print a perf profile of each shoes process (Linux);
           PERF_SORT picks the key (symbol, tid, ...), PERF_TOP the rows
+  NETEM   a path between client and server, as `tc netem` arguments, e.g.
+          "delay 25ms loss 0.5%" (Linux, root). Applied to each direction of
+          the tunnel leg only, so "delay 25ms" is a 50 ms round trip, and
+          the SOCKS and sink legs, and the no-tunnel cases, stay on clean
+          loopback. "limit 1000000" is added unless the value sets a limit.
 
 The sink address is deliberately not 127.0.0.1: a WireGuard peer's netstack
 treats a loopback destination as a martian and drops it.
@@ -150,6 +155,42 @@ def wait_port(p, t=10):
         if s.connect_ex(("127.0.0.1", p)) == 0: s.close(); return True
         s.close(); time.sleep(0.1)
     return False
+# The ports the tunnel servers listen on; the netem path is between these
+# and their clients.
+TUNNEL_PORTS = (24431, 24432, 24433, 24434, 25182)
+
+
+def netem():
+    """Delay and loss on the tunnel leg, applied one packet at a time.
+
+    Not a qdisc on lo's egress: netem drops a GSO buffer whole
+    (`netem_enqueue` in net/sched/sch_netem.c splits one only to corrupt
+    it), and QUIC and WireGuard send up to 64 datagrams in one buffer, so
+    "1% loss" would arrive as bursts of 64. Instead lo stops offloading UDP
+    segmentation, which splits each buffer before delivery, and the tunnel
+    ports' packets are redirected on lo's ingress, already one per datagram,
+    through netem on an ifb device. TCP keeps its offload, so the sink leg
+    is unchanged."""
+    spec = os.environ.get("NETEM")
+    if not spec:
+        return
+    if " limit " not in f" {spec} ":
+        # netem's default of 1000 packets is under one bandwidth-delay
+        # product at these rates, and would drop as a full queue.
+        spec += " limit 1000000"
+    sh = lambda c: subprocess.run(c, shell=True, check=True)
+    sh("ethtool -K lo tx-udp-segmentation off >/dev/null")
+    sh("ip link add shoes-netem type ifb && ip link set shoes-netem up")
+    atexit.register(lambda: subprocess.run("tc qdisc del dev lo ingress; ip link del shoes-netem; ethtool -K lo tx-udp-segmentation on", shell=True, stderr=subprocess.DEVNULL))
+    sh("tc qdisc add dev lo handle ffff: ingress")
+    for port in TUNNEL_PORTS:
+        for side in ("dport", "sport"):
+            sh(f"tc filter add dev lo parent ffff: protocol ip prio 1 u32 match ip {side} {port} 0xffff action mirred egress redirect dev shoes-netem")
+    sh(f"tc qdisc add dev shoes-netem root netem {spec}")
+    print(f"netem on the tunnel leg, each direction: {spec}", flush=True)
+
+
+netem()
 start("sink", [sys.executable, f"{HERE}/load.py", "server", "--port", str(SINK)])
 start("shoes_srv", [SHOES, "--no-reload", f"{B}/shoes-server.yaml"])
 start("sb_srv", ["sing-box", "run", "-c", f"{B}/sb-server.json"])
