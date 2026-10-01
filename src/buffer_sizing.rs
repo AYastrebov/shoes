@@ -120,6 +120,41 @@ pub const fn default_local_buffer_size() -> usize {
     }
 }
 
+/// Bytes per direction a relay's copy loop holds, and so moves per pass.
+///
+/// A relay between two kernel sockets spends its time in the read and the
+/// write, so the buffer is the unit of work per pair of system calls. On
+/// Linux loopback a SOCKS-to-direct relay carried 21 Gbit/s at 0.4
+/// CPU-seconds per gigabyte with 16 KiB, and 37 at 0.23 with 64 KiB.
+/// sing-box, which splices in the kernel, carried 65 to 80 at 0.09. See
+/// `scripts/bench/README.md`.
+///
+/// The constrained platforms keep 16 KiB: this is allocated twice per
+/// connection for the connection's whole life, and there the count of
+/// connections is what the memory budget is spent on.
+pub const fn default_relay_buffer_size() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        16 * 1024
+    } else {
+        64 * 1024
+    }
+}
+
+/// The same, for the relay behind a TUN connection, where one side is the
+/// stack's ring buffer rather than a socket.
+///
+/// Each write into that ring wakes the stack thread, so a small buffer means
+/// a wake per few packets. The constrained platforms keep tokio's 8 KiB, which
+/// is what this path has always used there: a TUN connection already owns
+/// four buffers of [`default_local_buffer_size`].
+pub const fn default_tun_relay_buffer_size() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        8 * 1024
+    } else {
+        64 * 1024
+    }
+}
+
 /// Bytes of receive window for a connection whose far end is across the
 /// internet, reached through the AmneziaWG tunnel.
 ///

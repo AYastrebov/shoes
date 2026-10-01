@@ -546,7 +546,13 @@ where
                     // this connection to go; without the registry the second
                     // future never resolves.
                     let result = {
-                        let copy = tokio::io::copy_bidirectional(&mut counting, &mut remote);
+                        let relay_buf = crate::buffer_sizing::default_tun_relay_buffer_size();
+                        let copy = tokio::io::copy_bidirectional_with_sizes(
+                            &mut counting,
+                            &mut remote,
+                            relay_buf,
+                            relay_buf,
+                        );
                         tokio::pin!(copy);
                         tokio::select! {
                             result = &mut copy => result,
