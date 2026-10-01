@@ -176,20 +176,44 @@ impl StackNotifier {
 ///
 /// Each holds one MTU plus the four-byte packet-information header, so the pool
 /// retains 64 * (mtu + 4): about 576 KiB at Android's 9000-byte default and
-/// 260 KiB at iOS's 4064. It is cleared when a tunnel stops, since a mobile app
-/// outlives its tunnel and has no use for the memory in between.
+/// 260 KiB at iOS's 4064. `FITTED_POOL` has the same bound and its buffers are
+/// no larger, so the two together hold at most twice that. Both are cleared
+/// when a tunnel stops, since a mobile app outlives its tunnel and has no use
+/// for the memory in between.
 const BUFFER_POOL_MAX_SIZE: usize = 64;
 
 static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// Buffers made by [`PooledBuffer::fitted`], pooled apart from the read
+/// buffers and bounded the same way. Datagram-sized, so the pool holds at most
+/// as much as `BUFFER_POOL` does.
+///
+/// In one shared pool, a fitted buffer would be drawn for the next read and
+/// grown back to a read buffer's size, and the next fitted datagram would
+/// allocate again: a fresh allocation per datagram, both ways.
+static FITTED_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
 /// Pooled buffer that returns to pool on drop instead of deallocating.
 pub struct PooledBuffer {
     buffer: BytesMut,
+    /// Made by `fitted`, and so goes back to `FITTED_POOL`.
+    fitted: bool,
+}
+
+impl PooledBuffer {
+    /// The pool this buffer goes back to.
+    fn home(&self) -> &'static Mutex<Vec<BytesMut>> {
+        if self.fitted {
+            &FITTED_POOL
+        } else {
+            &BUFFER_POOL
+        }
+    }
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Ok(mut pool) = BUFFER_POOL.lock()
+        if let Ok(mut pool) = self.home().lock()
             && pool.len() < BUFFER_POOL_MAX_SIZE
         {
             let empty = BytesMut::new();
@@ -206,9 +230,11 @@ impl Drop for PooledBuffer {
 /// allocating per packet, which is worth a few hundred kilobytes while a tunnel
 /// runs and nothing at all once it has stopped.
 pub fn clear_buffer_pool() {
-    if let Ok(mut pool) = BUFFER_POOL.lock() {
-        pool.clear();
-        pool.shrink_to_fit();
+    for pool in [&BUFFER_POOL, &FITTED_POOL] {
+        if let Ok(mut pool) = pool.lock() {
+            pool.clear();
+            pool.shrink_to_fit();
+        }
     }
 }
 
@@ -219,10 +245,14 @@ impl PooledBuffer {
             && let Some(mut buffer) = pool.pop()
         {
             buffer.reserve(cap);
-            return Self { buffer };
+            return Self {
+                buffer,
+                fitted: false,
+            };
         }
         Self {
             buffer: BytesMut::with_capacity(cap),
+            fitted: false,
         }
     }
 }
@@ -234,13 +264,24 @@ impl PooledBuffer {
     /// For a packet that is about to sit in a queue. With segmentation
     /// offload every read buffer has room for 64 KiB, and a queue of
     /// 1200-byte datagrams each holding one would pin fifty times what it
-    /// carries. The large buffer goes back to the pool for the next read.
+    /// carries. The large buffer goes back to the pool for the next read,
+    /// and the fitted one comes from, and returns to, a pool of its own, so
+    /// in a steady flow neither is allocated per datagram.
     pub fn fitted(self) -> Self {
         if self.buffer.capacity() <= 2 * self.buffer.len() + 2048 {
             return self;
         }
+        let mut buffer = FITTED_POOL
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop())
+            .unwrap_or_default();
+        // Grows a pooled buffer only for a datagram larger than any it has
+        // held, so the pool settles at the flow's largest datagram.
+        buffer.extend_from_slice(&self.buffer);
         Self {
-            buffer: BytesMut::from(&self.buffer[..]),
+            buffer,
+            fitted: true,
         }
     }
 }
@@ -939,12 +980,16 @@ pub fn run_stack_loop<D: StackDevice>(
                         // UDP goes to tokio in its pooled buffer: the pool is
                         // process-wide, so the buffer comes back when tokio
                         // drops it, and nothing is allocated per datagram.
-                        // Full means drop, see `UDP_INGRESS_QUEUE`; closed
-                        // means the handler is gone, and the loop is stopping.
-                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                            udp_tx.try_send(pkt.fitted())
-                        {
-                            UDP_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        // The slot is taken before the datagram is fitted, so
+                        // one about to be dropped is not copied first. Full
+                        // means drop, see `UDP_INGRESS_QUEUE`; closed means
+                        // the handler is gone, and the loop is stopping.
+                        match udp_tx.try_reserve() {
+                            Ok(slot) => slot.send(pkt.fitted()),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                                UDP_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {}
                         }
                     }
                     _ => {
@@ -2291,11 +2336,24 @@ mod tests {
 
         let mut snug = PooledBuffer {
             buffer: BytesMut::with_capacity(1504),
+            fitted: false,
         };
         snug.extend_from_slice(&[9u8; 1200]);
         let pointer = snug.as_ptr();
         let kept = snug.fitted();
         assert_eq!(kept.as_ptr(), pointer, "a snug buffer is not copied");
+    }
+
+    /// A fitted buffer goes back to a pool of its own. In the read pool it
+    /// would be drawn for the next read and grown to 64 KiB, and the next
+    /// fitted datagram would allocate again.
+    #[test]
+    fn a_fitted_buffer_goes_back_to_its_own_pool() {
+        let mut large = PooledBuffer::with_capacity(65_545);
+        assert!(std::ptr::eq(large.home(), &*BUFFER_POOL));
+        large.extend_from_slice(&[7u8; 1200]);
+        let fitted = large.fitted();
+        assert!(std::ptr::eq(fitted.home(), &*FITTED_POOL));
     }
 
     #[test]
