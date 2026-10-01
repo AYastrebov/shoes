@@ -296,6 +296,21 @@ pub const fn default_udp_flow_queue_depth() -> usize {
     }
 }
 
+/// Receive buffer asked for on an outbound UDP socket, or `None` to leave the
+/// system's default.
+///
+/// A limit on what may queue, not memory held: a socket nothing is queued on
+/// costs nothing for it. The constrained platforms keep the default, where a
+/// burst that large is not coming and a queue that deep is memory the
+/// extension does not have.
+pub const fn default_udp_receive_buffer_size() -> Option<usize> {
+    if in_network_extension() || cfg!(target_os = "android") {
+        None
+    } else {
+        Some(2 * 1024 * 1024)
+    }
+}
+
 /// Connections a virtual TCP stack accepts before it refuses more.
 ///
 /// This is the multiplier on every size above, so it moves with them: a
