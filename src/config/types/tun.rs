@@ -158,7 +158,8 @@ pub struct TunConfig {
     /// system call per packet. Set to false to get one packet per call back,
     /// should a kernel or a driver in the path mishandle the large ones.
     ///
-    /// Default: true. Ignored on other platforms and for `device_fd`.
+    /// Default: true. Refused on other platforms and with `device_fd`, whose
+    /// framing is chosen by the process that opened it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segmentation_offload: Option<bool>,
 }
