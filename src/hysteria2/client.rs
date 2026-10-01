@@ -11,6 +11,7 @@ use crate::config::ClientQuicConfig;
 use crate::quic_outbound::QuicOutboundSettings;
 use crate::quic_outbound::connection::LiveConnection;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::CongestionControl;
 use crate::quic_transport::hop::HopSettings;
 use crate::quic_transport::obfs::Obfuscator;
 use crate::resolver::Resolver;
@@ -58,6 +59,9 @@ impl Hysteria2Connector {
             obfs,
             port_hopping,
             default_alpn: "h3",
+            // What upstream's client installs whenever it does not negotiate
+            // Brutal, which we never do.
+            congestion: CongestionControl::Bbr,
         };
         Self {
             connection: LiveConnection::new(
@@ -278,6 +282,17 @@ mod tests {
             obfs,
             None,
         )
+    }
+
+    /// The client runs BBR, as upstream's does whenever it does not
+    /// negotiate Brutal, which we never do.
+    #[test]
+    fn test_the_connector_asks_for_bbr() {
+        let connector = connector(reserve_udp_port(), SERVER_PASSWORD, None);
+        assert_eq!(
+            connector.connection.settings().congestion,
+            CongestionControl::Bbr
+        );
     }
 
     fn target(addr: SocketAddr) -> ResolvedLocation {

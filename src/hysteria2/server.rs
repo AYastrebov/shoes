@@ -43,8 +43,10 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
 use crate::quic_transport::fragments::Defragmenter;
+use crate::quic_transport::obfs::Obfuscator;
 use crate::quic_transport::{
-    QuicListenerSettings, QuicTransportParams, effective_mtu, start_quic_listeners,
+    CongestionControl, QuicListenerSettings, QuicTransportParams, effective_mtu,
+    start_quic_listeners,
 };
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
@@ -1150,6 +1152,24 @@ async fn process_tcp_stream(
     Ok(())
 }
 
+/// The transport parameters of a Hysteria2 listener.
+fn transport_params(obfs: Option<&Arc<dyn Obfuscator>>) -> QuicTransportParams {
+    QuicTransportParams {
+        max_concurrent_bidi_streams: 4096,
+        // HTTP/3 QPACK updates arrive on client-opened uni streams.
+        max_concurrent_uni_streams: 1024,
+        max_idle_timeout: Duration::from_secs(30),
+        keep_alive_interval: Duration::from_secs(10),
+        mtu: effective_mtu(obfs.map(|o| o.overhead())),
+        // With or without obfuscation: the obfuscating socket scrambles
+        // each segment of a batch on its own.
+        enable_segmentation_offload: true,
+        // Upstream's server installs BBR unless it negotiates Brutal, and we
+        // never negotiate Brutal: our answer is `Hysteria-CC-RX: auto`.
+        congestion: CongestionControl::Bbr,
+    }
+}
+
 pub async fn start_hysteria2_server(
     listener: QuicListenerSettings,
     hysteria2_password: &'static str,
@@ -1157,17 +1177,7 @@ pub async fn start_hysteria2_server(
     resolver: Arc<dyn Resolver>,
     udp_enabled: bool,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let params = QuicTransportParams {
-        max_concurrent_bidi_streams: 4096,
-        // HTTP/3 QPACK updates arrive on client-opened uni streams.
-        max_concurrent_uni_streams: 1024,
-        max_idle_timeout: Duration::from_secs(30),
-        keep_alive_interval: Duration::from_secs(10),
-        mtu: effective_mtu(listener.obfs.as_ref().map(|o| o.overhead())),
-        // With or without obfuscation: the obfuscating socket scrambles
-        // each segment of a batch on its own.
-        enable_segmentation_offload: true,
-    };
+    let params = transport_params(listener.obfs.as_ref());
 
     let inbound =
         crate::connection_registry::intern(format!("hysteria2@{}", listener.bind_address));
@@ -1191,6 +1201,20 @@ pub async fn start_hysteria2_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our server never negotiates Brutal, and upstream's server installs
+    /// BBR in every case that does not, obfuscated or not.
+    #[test]
+    fn test_the_listener_runs_bbr() {
+        assert_eq!(transport_params(None).congestion, CongestionControl::Bbr);
+        let salamander: Arc<dyn Obfuscator> = Arc::new(
+            crate::quic_transport::obfs::Salamander::new(b"obfuscation password").unwrap(),
+        );
+        assert_eq!(
+            transport_params(Some(&salamander)).congestion,
+            CongestionControl::Bbr
+        );
+    }
 
     fn auth_request(password: &str) -> http::Request<()> {
         http::Request::post("https://hysteria/auth")
