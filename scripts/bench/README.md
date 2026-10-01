@@ -142,5 +142,13 @@ What changed:
   downloads 40% for nothing measurable on one.
 - **UDP download through the TUN loses packets at 1 Gbit/s offered**, between
   0.6% and 9% from run to run, with or without offload.
-- **WireGuard throughput** is level with sing-box's at half the CPU, and
-  bounded by one task and one lock around the cipher state.
+- **WireGuard throughput is set by the peer in these tests, not by shoes.**
+  A download through shoes' client measured 1.8 to 2.0 Gbit/s against 2.1
+  to 2.3 through sing-box's, with sing-box's server on the far end using
+  over three cores either way. No stage of shoes is near a full core, and
+  nothing is dropped: no queue overflows, no kernel UDP errors. Run with
+  `SHOES_CLI_ARGS="-t 1"`, the whole client on one thread carries the same
+  2 Gbit/s at 3.0 CPU-seconds per gigabyte, against 4.5 to 6.5 on the
+  default thread count -- the receive, netstack and send tasks waking each
+  other across threads is most of the difference. Folding them into one
+  task would save that at the price of one core per tunnel; not done.

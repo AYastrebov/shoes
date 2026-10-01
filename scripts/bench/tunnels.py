@@ -12,7 +12,11 @@ Environment:
   MODES   U,D,P: upload, download, ping  (default: U,D)
   CONNS   connection counts, e.g. 1,8    (default: 1)
   ONLY    substring of a case label, to run just those
-  PERF    record and print a perf profile of each shoes process (Linux)
+  SHOES_CLI_ARGS  extra arguments for the shoes client process, e.g. "-t 2"
+  NSTAT   print the kernel's UDP and TCP counters for each run (Linux)
+  LOGS    print the last N lines of each shoes process's output at the end
+  PERF    record and print a perf profile of each shoes process (Linux);
+          PERF_SORT picks the key (symbol, tid, ...), PERF_TOP the rows
 
 The sink address is deliberately not 127.0.0.1: a WireGuard peer's netstack
 treats a loopback destination as a martian and drops it.
@@ -148,12 +152,13 @@ start("sink", [sys.executable, f"{HERE}/load.py", "server", "--port", str(SINK)]
 start("shoes_srv", [SHOES, "--no-reload", f"{B}/shoes-server.yaml"])
 start("sb_srv", ["sing-box", "run", "-c", f"{B}/sb-server.json"])
 time.sleep(1.5)
-start("shoes_cli", [SHOES, "--no-reload", f"{B}/shoes-client.yaml"])
+start("shoes_cli", [SHOES, "--no-reload"] + os.environ.get("SHOES_CLI_ARGS", "").split() + [f"{B}/shoes-client.yaml"])
 start("sb_cli", ["sing-box", "run", "-c", f"{B}/sb-client.json"])
 for p in (SINK, 21080, 21086): assert wait_port(p), p
 time.sleep(1)
 SECS = float(os.environ.get("SECS", "6"))
 def run(label, socks, involved, mode, conns=1):
+    if os.environ.get("NSTAT"): subprocess.run("nstat -n >/dev/null 2>&1", shell=True)
     before = {n: cpu(n) for n in involved}
     cmd = [sys.executable, f"{HERE}/load.py", "client", "--target", f"{LAN}:{SINK}", "--mode", mode, "--secs", str(SECS), "--conns", str(conns)]
     if socks: cmd += ["--socks", f"127.0.0.1:{socks}"]
@@ -166,10 +171,13 @@ def run(label, socks, involved, mode, conns=1):
     except subprocess.TimeoutExpired: out = "TIMEOUT"
     for n, pf in perfs:
         pf.wait()
-        rep = subprocess.run(f"perf report -i /tmp/perf-{n}.data --no-children --sort symbol --stdio -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -{os.environ.get('PERF_TOP', '14')}", shell=True, capture_output=True, text=True).stdout
+        rep = subprocess.run(f"perf report -i /tmp/perf-{n}.data {os.environ.get('PERF_REPORT', '--no-children')} --sort {os.environ.get('PERF_SORT', 'symbol')} --stdio -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | {os.environ.get('PERF_GREP', 'cat')} | head -{os.environ.get('PERF_TOP', '14')}", shell=True, capture_output=True, text=True).stdout
         print(f"--- perf {n} ({label}, {mode})\n{rep}", flush=True)
     time.sleep(0.3)
     used = {n: cpu(n) - before[n] for n in involved}
+    if os.environ.get("NSTAT"):
+        o = subprocess.run("nstat -z UdpInDatagrams UdpOutDatagrams UdpRcvbufErrors UdpSndbufErrors UdpInErrors TcpRetransSegs 2>/dev/null | tail -n +2", shell=True, capture_output=True, text=True).stdout
+        print("    " + " ".join(f"{l.split()[0]}={l.split()[1]}" for l in o.splitlines() if l.split()), flush=True)
     try:
         g = float(out); cpus = " ".join(f"{n}={used[n] / (g * SECS / 8):.2f}" for n in involved)  # cpu-seconds per GB
         print(f"{label:<34} {mode} x{conns:<2} {g:7.3f} Gbps   cpu-s/GB: {cpus}", flush=True)
@@ -201,3 +209,8 @@ try:
     print("RSS MB: " + " ".join(f"{n}={rss(n):.0f}" for n in procs if n != "sink"))
 finally:
     for p in procs.values(): p.kill()
+    if os.environ.get("LOGS"):
+        for n in procs:
+            if n.startswith("shoes"):
+                tail = open(f"{B}/{n}.log").read().splitlines()[-int(os.environ["LOGS"]):]
+                print(f"--- {n} log\n" + "\n".join(tail), flush=True)
