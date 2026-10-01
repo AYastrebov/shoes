@@ -165,6 +165,12 @@ notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+# Not used directly; this is a floor under quinn's own dependency. Through
+# 0.11.17 a stream whose reader fell about 2.4 MB behind -- an upload to a slow
+# destination does it -- ended the whole connection with "too many gaps in
+# stream buffer": full-size chunks were counted against a limit of 1024 and
+# never merged. 0.11.18 merges them.
+quinn-proto = { version = "0.11.18", default-features = false }
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
