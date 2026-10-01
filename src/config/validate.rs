@@ -2131,6 +2131,28 @@ fn validate_tun_config(
         }
     }
 
+    // Refused rather than ignored where it cannot be honoured. Offload is a
+    // flag shoes sets when it opens a Linux device itself. A descriptor
+    // handed in was opened by someone else, who chose its framing, so
+    // `segmentation_offload: false` there would not turn offload off.
+    if let Some(enabled) = config.segmentation_offload {
+        if !cfg!(target_os = "linux") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN 'segmentation_offload' is only supported on Linux",
+            ));
+        }
+        if config.device_fd.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "TUN 'segmentation_offload: {enabled}' cannot apply to 'device_fd': the \
+                     process that opened the descriptor chose its framing"
+                ),
+            ));
+        }
+    }
+
     // Validate that we have either Linux config (device_name/address) or mobile config (device_fd)
     #[cfg(target_os = "linux")]
     {
@@ -3941,6 +3963,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv4"), "{err}");
+    }
+
+    /// `segmentation_offload` is honoured only where shoes opens a Linux
+    /// device itself; anywhere else an explicit value is refused rather
+    /// than silently doing nothing.
+    #[tokio::test]
+    async fn test_tun_segmentation_offload_is_refused_where_it_cannot_apply() {
+        let mut tun_config = tun_config_with_fake_ip(fake_ip_config("198.18.0.0/16"));
+        tun_config.fake_ip = None;
+        tun_config.segmentation_offload = Some(false);
+        let result = validate_configs_test(vec![Config::TunServer(tun_config.clone())]).await;
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok(), "{:?}", result.err());
+
+            tun_config.device_name = None;
+            tun_config.address = None;
+            tun_config.device_fd = Some(42);
+            let err = validate_configs_test(vec![Config::TunServer(tun_config)])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("device_fd"), "{err}");
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("only supported on Linux"), "{err}");
+        }
     }
 
     #[tokio::test]

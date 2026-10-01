@@ -407,6 +407,14 @@ mod tests {
     /// WouldBlock until the socket says it is writable, and the poller is how
     /// that is asked. Going through it here also exercises the poller.
     async fn send(socket: &Arc<HoppingUdpSocket>, payload: &[u8]) {
+        send_segmented(socket, payload, None).await
+    }
+
+    async fn send_segmented(
+        socket: &Arc<HoppingUdpSocket>,
+        payload: &[u8],
+        segment_size: Option<usize>,
+    ) {
         // The destination quinn asks for is deliberately wrong: the socket
         // must ignore it and use the one it chose.
         let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -419,7 +427,7 @@ mod tests {
                 destination: bogus,
                 ecn: None,
                 contents: payload,
-                segment_size: None,
+                segment_size,
                 src_ip: None,
             }) {
                 Ok(()) => return,
@@ -497,6 +505,35 @@ mod tests {
             plain.max_transmit_segments()
         );
         assert_eq!(socket.max_receive_segments(), plain.max_receive_segments());
+    }
+
+    /// A segmented transmit is passed down whole, and every segment reaches
+    /// the destination the socket chose as its own datagram. Dropping
+    /// `segment_size` on the way down would put all three on the wire as one
+    /// datagram.
+    #[tokio::test]
+    async fn test_segmented_transmit_arrives_as_its_packets() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let socket = fixed_socket(peer.local_addr().unwrap());
+        if socket.max_transmit_segments() < 3 {
+            // No segmentation offload on this platform; quinn will never
+            // hand this socket a segmented transmit.
+            return;
+        }
+
+        let mut contents = Vec::new();
+        contents.extend_from_slice(&[1u8; 1200]);
+        contents.extend_from_slice(&[2u8; 1200]);
+        contents.extend_from_slice(&[3u8; 700]);
+        send_segmented(&socket, &contents, Some(1200)).await;
+
+        // A plain socket without GRO receives each segment on its own.
+        let mut buf = [0u8; 65536];
+        for expected in [&[1u8; 1200][..], &[2u8; 1200][..], &[3u8; 700][..]] {
+            let (n, _) = peer.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], expected);
+        }
     }
 
     /// A factory that counts its calls and fails once it has made `budget`

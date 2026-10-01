@@ -87,7 +87,7 @@ fn main() {
     let chunk = vec![0u8; 1 << 16];
 
     if mode == "UDP" {
-        // conns = payload size here; send as fast as the echo comes back within a window of 64 in flight
+        // conns = payload size here; send as fast as the echo comes back within a window of 256 in flight
         let size = conns.max(16);
         let mk = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 2048], vec![0u8; 4 << 20]);
         let h = sockets.add(udp::Socket::new(mk(), mk()));

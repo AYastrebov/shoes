@@ -21,6 +21,9 @@
   address: "10.0.0.1"
   netmask: "255.255.255.0"
   mtu: 1500
+  # Linux only, and the default: the kernel passes TCP segments several at
+  # a time. Set false if something in the path mishandles the large ones.
+  segmentation_offload: true
   tcp_enabled: true
   udp_enabled: true
   icmp_enabled: true

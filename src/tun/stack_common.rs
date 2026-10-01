@@ -347,6 +347,15 @@ const PARK_IDLE_AFTER: Duration = Duration::from_millis(100);
 /// iteration.
 const PARKED_POLL_MIN_MILLIS: u64 = 50;
 
+/// Whole milliseconds from `now` until `deadline`, rounded up, so a wait for
+/// it does not end before it. Truncating would turn the last fraction of a
+/// millisecond into a wait of zero, and the loop would spin until the
+/// deadline arrived.
+fn millis_until(deadline: std::time::Instant, now: std::time::Instant) -> u64 {
+    let micros = deadline.saturating_duration_since(now).as_micros();
+    u64::try_from(micros.div_ceil(1000)).unwrap_or(u64::MAX)
+}
+
 /// Where a connection's socket currently lives.
 #[derive(Clone, Copy)]
 enum Slot {
@@ -1314,9 +1323,7 @@ pub fn run_stack_loop<D: StackDevice>(
                 .map(|d| d.total_millis().min(MAX_POLL_WAIT_MILLIS));
             // Not past the parked set's next look either.
             if !sockets.parked.is_empty() {
-                let until_parked = next_parked_poll
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_millis() as u64;
+                let until_parked = millis_until(next_parked_poll, std::time::Instant::now());
                 wait_millis = Some(wait_millis.map_or(until_parked, |w| w.min(until_parked)));
             }
             let wait_duration = wait_millis.map(SmolDuration::from_millis);
@@ -1395,6 +1402,10 @@ fn create_tcp_connection(
     // is already stopping. A connection the app has dropped is the case that
     // used to hide behind this figure; the sweep resets those itself.
     socket.set_timeout(Some(SmolDuration::from_secs(7200)));
+    #[cfg(test)]
+    if let Some(timeout) = tests::TCP_TIMEOUT.get() {
+        socket.set_timeout(Some(timeout));
+    }
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
 
@@ -1722,6 +1733,15 @@ mod tests {
     use super::test_util::{is_syn_ack, segment_from_server, syn_packet, tcp_packet};
     use super::*;
 
+    thread_local! {
+        /// The TCP timeout given to new sockets in place of the production
+        /// two hours. Per thread, and only the stack thread of the harness
+        /// that asked for it sets it, so no other test running at the same
+        /// time is affected.
+        pub(super) static TCP_TIMEOUT: std::cell::Cell<Option<SmolDuration>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     /// One step of a scripted device's life.
     enum Script {
         /// A packet arrives from the TUN.
@@ -1867,6 +1887,13 @@ mod tests {
         }
 
         fn spawn_with(orphan_timeout: StdDuration) -> Self {
+            Self::spawn_with_tcp_timeout(orphan_timeout, None)
+        }
+
+        fn spawn_with_tcp_timeout(
+            orphan_timeout: StdDuration,
+            tcp_timeout: Option<SmolDuration>,
+        ) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
@@ -1906,6 +1933,7 @@ mod tests {
                 let running = running.clone();
                 let notifier = notifier.clone();
                 thread::spawn(move || {
+                    TCP_TIMEOUT.set(tcp_timeout);
                     run_stack_loop(device, options, udp_tx, running, shared_state, notifier);
                 })
             };
@@ -2294,6 +2322,48 @@ mod tests {
         });
         assert_eq!(harness.notifier.parked_sockets(), 0);
         harness.stop();
+    }
+
+    /// A parked socket's own timer can end it, and the change of state must
+    /// bring it back to the sweep, which owns closing. Left parked, a closed
+    /// socket is never polled for anything but timers it no longer has, and
+    /// its connection is never released.
+    #[test]
+    fn a_timer_that_ends_a_parked_connection_brings_it_back() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        // Long enough to park first (`PARK_IDLE_AFTER` is 100 ms under
+        // test), short enough to keep the test quick. The peer then says
+        // nothing, so smoltcp aborts the connection while it is parked.
+        let mut harness = Harness::spawn_with_tcp_timeout(
+            StdDuration::from_secs(60),
+            Some(SmolDuration::from_millis(400)),
+        );
+        let (_conn, _server_isn) = harness.establish(20130);
+        harness.wait_for_parked(1);
+
+        poll_within("the timed-out connection to leave the parked set", || {
+            let _ = harness.script_tx.send(Script::Packet(vec![0u8]));
+            (harness.notifier.parked_sockets() == 0).then_some(())
+        });
+        harness.stop();
+    }
+
+    /// A wait for the parked set's next poll never ends early: a fraction
+    /// of a millisecond left is a millisecond, not zero, which would make
+    /// the loop spin until the deadline.
+    #[test]
+    fn the_wait_until_a_deadline_rounds_up() {
+        let now = std::time::Instant::now();
+        assert_eq!(millis_until(now, now), 0);
+        assert_eq!(millis_until(now, now + StdDuration::from_millis(5)), 0);
+        assert_eq!(millis_until(now + StdDuration::from_micros(1), now), 1);
+        assert_eq!(millis_until(now + StdDuration::from_micros(999), now), 1);
+        assert_eq!(millis_until(now + StdDuration::from_millis(50), now), 50);
+        assert_eq!(
+            millis_until(now + StdDuration::from_micros(50_001), now),
+            51
+        );
     }
 
     /// The sweep's fast path must pass over nothing that needs it. An

@@ -9,7 +9,9 @@ Environment:
   SHOES   path to the shoes binary       (default: target/release/shoes)
   LAN     address the sink is reached at (default: the first non-loopback one)
   SECS    seconds per run                (default: 6)
-  MODES   U,D,P: upload, download, ping  (default: U,D)
+  MODES   U,D,S,P: upload, download, slow, ping (default: U,D). S uploads
+          to a destination that reads about 10 Mbit/s, which backs a relay
+          up into its tunnel's flow control
   CONNS   connection counts, e.g. 1,8    (default: 1)
   ONLY    substring of a case label, to run just those
   SHOES_CLI_ARGS  extra arguments for the shoes client process, e.g. "-t 2"
