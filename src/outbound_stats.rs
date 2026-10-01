@@ -215,11 +215,11 @@ mod registry {
         /// Floors at zero: cleanup paths can run more than once for one
         /// stream, and a wrapped count would read as billions of connections.
         pub fn connection_closed(&self) {
-            let _ =
-                self.active_connections
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        Some(n.saturating_sub(1))
-                    });
+            let _ = self
+                .active_connections
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
         }
     }
 
