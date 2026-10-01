@@ -3830,7 +3830,15 @@ mod tests {
         match &configs[0] {
             Config::TunServer(tun) => {
                 // Check defaults
-                assert_eq!(tun.mtu, 1500); // default
+                // The default is per platform; see `default_mtu`.
+                let expected = if cfg!(target_os = "ios") {
+                    4064
+                } else if cfg!(any(target_os = "android", target_os = "linux")) {
+                    9000
+                } else {
+                    1500
+                };
+                assert_eq!(tun.mtu, expected);
                 assert!(tun.tcp_enabled); // default true
                 assert!(tun.udp_enabled); // default true
                 assert!(tun.icmp_enabled); // default true

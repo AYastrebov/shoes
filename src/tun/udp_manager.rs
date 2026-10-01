@@ -35,8 +35,9 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum number of sessions (LRU eviction when exceeded)
 const MAX_SESSIONS: usize = 256;
 
-/// Channel buffer size for session and destination packets
-const CHANNEL_SIZE: usize = 64;
+/// Datagrams queued per flow on the way out: manager to session, and
+/// session to destination. See `default_udp_flow_queue_depth`.
+const CHANNEL_SIZE: usize = crate::buffer_sizing::default_udp_flow_queue_depth();
 
 /// Response channel buffer size. Bounds memory growth when destination
 /// tasks produce responses faster than the manager can write to TUN.

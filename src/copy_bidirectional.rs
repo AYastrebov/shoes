@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
-const DEFAULT_BUF_SIZE: usize = 16384;
+const DEFAULT_BUF_SIZE: usize = crate::buffer_sizing::default_relay_buffer_size();
 
 /// Rounds of read-then-write one `poll_copy` may run before it yields to the
 /// runtime whether or not either side has returned `Pending`.

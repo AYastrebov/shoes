@@ -35,12 +35,14 @@ fn default_mtu() -> u16 {
     // - iOS Network Extension: 4064 max (4096 - 32 byte UTUN_IF_HEADROOM_SIZE)
     //   Performance drops significantly above this value
     // - Android: 9000 (some devices report ENOBUFS with 65535)
+    // - Linux: 9000, where one system call per packet makes throughput
+    //   follow the MTU; see `TunServerConfig::default`
     // - Other platforms: 1500 (standard Ethernet MTU)
     #[cfg(target_os = "ios")]
     return 4064;
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     return 9000;
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_os = "linux")))]
     return 1500;
 }
 
@@ -88,7 +90,7 @@ pub struct TunConfig {
     pub destination: Option<IpAddr>,
 
     /// MTU size for the TUN interface.
-    /// Default: 1500
+    /// Default: 9000 (Linux, Android), 4064 (iOS), 1500 elsewhere
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 

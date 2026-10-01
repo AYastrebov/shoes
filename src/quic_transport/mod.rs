@@ -90,8 +90,8 @@ pub struct QuicTransportParams {
     pub keep_alive_interval: Duration,
     /// See [`effective_mtu`].
     pub mtu: u16,
-    /// GSO batches several QUIC packets into one `sendmsg`, which an obfuscator
-    /// cannot scramble as a unit, so it is off whenever one is installed.
+    /// GSO batches several QUIC packets into one `sendmsg`. Off for a socket
+    /// that cannot take a batch; none of ours is one today.
     pub enable_segmentation_offload: bool,
 }
 

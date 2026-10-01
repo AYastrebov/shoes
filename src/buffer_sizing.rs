@@ -120,6 +120,41 @@ pub const fn default_local_buffer_size() -> usize {
     }
 }
 
+/// Bytes per direction a relay's copy loop holds, and so moves per pass.
+///
+/// A relay between two kernel sockets spends its time in the read and the
+/// write, so the buffer is the unit of work per pair of system calls. On
+/// Linux loopback a SOCKS-to-direct relay carried 21 Gbit/s at 0.4
+/// CPU-seconds per gigabyte with 16 KiB, and 37 at 0.23 with 64 KiB.
+/// sing-box, which splices in the kernel, carried 65 to 80 at 0.09. See
+/// `scripts/bench/README.md`.
+///
+/// The constrained platforms keep 16 KiB: this is allocated twice per
+/// connection for the connection's whole life, and there the count of
+/// connections is what the memory budget is spent on.
+pub const fn default_relay_buffer_size() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        16 * 1024
+    } else {
+        64 * 1024
+    }
+}
+
+/// The same, for the relay behind a TUN connection, where one side is the
+/// stack's ring buffer rather than a socket.
+///
+/// Each write into that ring wakes the stack thread, so a small buffer means
+/// a wake per few packets. The constrained platforms keep tokio's 8 KiB, which
+/// is what this path has always used there: a TUN connection already owns
+/// four buffers of [`default_local_buffer_size`].
+pub const fn default_tun_relay_buffer_size() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        8 * 1024
+    } else {
+        64 * 1024
+    }
+}
+
 /// Bytes of receive window for a connection whose far end is across the
 /// internet, reached through the AmneziaWG tunnel.
 ///
@@ -239,6 +274,26 @@ pub const fn default_outbound_queue_depth() -> usize {
 /// scheduling jitter. Download saturates the path at this depth.
 pub const fn default_inbound_queue_depth() -> usize {
     256
+}
+
+/// Datagrams one TUN UDP flow may have queued on each hop toward its
+/// destination before the next one is dropped.
+///
+/// The stack thread reads the device in batches of 64 and hands each batch
+/// over without waiting, so a queue of 64 is full after one batch that the
+/// task on the other side has not yet been scheduled to drain. Through a real
+/// Linux TUN that lost 0.5% of a 100 Mbit/s upload and 7.7% of a 1 Gbit/s
+/// one; at 512 it lost none and 0.12% (`scripts/bench/README.md`). Entries are
+/// datagram-sized, so a full queue of MTU-sized ones is under a megabyte.
+///
+/// The constrained platforms keep 64: up to 256 flows each hold two of
+/// these, and there the memory is the scarcer thing.
+pub const fn default_udp_flow_queue_depth() -> usize {
+    if in_network_extension() || cfg!(target_os = "android") {
+        64
+    } else {
+        512
+    }
 }
 
 /// Connections a virtual TCP stack accepts before it refuses more.

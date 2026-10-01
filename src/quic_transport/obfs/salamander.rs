@@ -50,6 +50,24 @@ impl Salamander {
     }
 }
 
+/// XOR `buf` with `key` repeated: byte `i` with `key[i % KEY_LEN]`.
+///
+/// A key-sized block at a time, which the compiler turns into two vector
+/// XORs. Written as `buf[i] ^= key[i % KEY_LEN]` it stayed a byte loop with
+/// a remainder in it, and on a profile of a 2 Gbit/s transfer that loop cost
+/// three to four times what the AES-GCM of the same packets did.
+fn xor_with_key(buf: &mut [u8], key: &[u8; KEY_LEN]) {
+    let (blocks, remainder) = buf.as_chunks_mut::<KEY_LEN>();
+    for block in blocks {
+        for (byte, k) in block.iter_mut().zip(key) {
+            *byte ^= k;
+        }
+    }
+    for (byte, k) in remainder.iter_mut().zip(key) {
+        *byte ^= k;
+    }
+}
+
 impl Obfuscator for Salamander {
     fn obfuscate(&self, input: &[u8], out: &mut [u8]) -> Option<usize> {
         let out_len = input.len() + SALT_LEN;
@@ -61,9 +79,8 @@ impl Obfuscator for Salamander {
         let key = self.derive_key(&salt);
 
         out[..SALT_LEN].copy_from_slice(&salt);
-        for (i, byte) in input.iter().enumerate() {
-            out[i + SALT_LEN] = byte ^ key[i % KEY_LEN];
-        }
+        out[SALT_LEN..out_len].copy_from_slice(input);
+        xor_with_key(&mut out[SALT_LEN..out_len], &key);
         Some(out_len)
     }
 
@@ -75,11 +92,9 @@ impl Obfuscator for Salamander {
         let salt: [u8; SALT_LEN] = buf[..SALT_LEN].try_into().ok()?;
         let key = self.derive_key(&salt);
 
-        // Byte i of the payload is read from i + SALT_LEN and written to i, so
-        // every write lands behind the read that produced it.
-        for i in 0..out_len {
-            buf[i] = buf[i + SALT_LEN] ^ key[i % KEY_LEN];
-        }
+        // Slide the payload over the salt, then unmask it where it lies.
+        buf.copy_within(SALT_LEN.., 0);
+        xor_with_key(&mut buf[..out_len], &key);
         Some(out_len)
     }
 
@@ -168,5 +183,24 @@ mod tests {
 
         let read = obfs.deobfuscate_in_place(&mut wire).unwrap();
         assert_eq!(&wire[..read], payload);
+    }
+
+    /// The block-wise XOR against the definition, byte `i` with
+    /// `key[i % 32]`, at every length around the block boundaries.
+    #[test]
+    fn the_block_xor_matches_the_definition_at_every_length() {
+        let key: [u8; KEY_LEN] =
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        for len in 0..=(3 * KEY_LEN + 5) {
+            let input: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(13)).collect();
+            let expected: Vec<u8> = input
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % KEY_LEN])
+                .collect();
+            let mut actual = input.clone();
+            xor_with_key(&mut actual, &key);
+            assert_eq!(actual, expected, "length {len}");
+        }
     }
 }

@@ -395,7 +395,7 @@ device_fd: int                 # FD from VpnService (Android) or NEPacketTunnelP
                                # Not supported on Windows: shoes creates the adapter itself
 
 # Common settings
-mtu: 1500                      # Default: 1500 (Linux/Windows), 9000 (Android), 4064 (iOS)
+mtu: 1500                      # Default: 9000 (Linux, Android), 4064 (iOS), 1500 elsewhere
 tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true

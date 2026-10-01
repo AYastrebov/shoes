@@ -1164,7 +1164,9 @@ pub async fn start_hysteria2_server(
         max_idle_timeout: Duration::from_secs(30),
         keep_alive_interval: Duration::from_secs(10),
         mtu: effective_mtu(listener.obfs.as_ref().map(|o| o.overhead())),
-        enable_segmentation_offload: listener.obfs.is_none(),
+        // With or without obfuscation: the obfuscating socket scrambles
+        // each segment of a batch on its own.
+        enable_segmentation_offload: true,
     };
 
     let inbound =

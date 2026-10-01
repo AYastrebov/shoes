@@ -289,7 +289,7 @@ mod imp {
         network: Network,
     ) -> ConnectionHandle {
         let cap = CAP.load(Ordering::Relaxed);
-        let admitted = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+        let admitted = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
             (live < cap).then_some(live + 1)
         });
         if admitted.is_err() {
@@ -389,7 +389,7 @@ mod imp {
             // Floors at zero for the reason the inbound counter below gives,
             // and more so: an underflow here would refuse every connection
             // the cap from then on.
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
             let up = e.counters.up.load(Ordering::Relaxed);
@@ -401,7 +401,7 @@ mod imp {
                 // a cleanup path that ran twice would read as billions.
                 let _ = per
                     .active
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
                     });
                 per.up.fetch_add(up, Ordering::Relaxed);
