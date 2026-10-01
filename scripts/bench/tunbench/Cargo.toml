@@ -1,0 +1,12 @@
+[package]
+name = "tunbench"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+libc = "0.2"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-tcp-cubic"] }
+[profile.release]
+opt-level = 3
+
+# Standalone: not a member of the shoes package.
+[workspace]
