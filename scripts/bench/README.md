@@ -19,6 +19,7 @@ scripts/bench/run-linux.sh tunnels MODES=S ONLY="-> shoes"   # slow destination
 scripts/bench/run-linux.sh tun                # tun_linux.py: a real TUN device
 scripts/bench/run-linux.sh tun CASES=idle PERF=1             # with a profile
 scripts/bench/run-linux.sh tun SINGBOX=system                 # sing-box's TUN instead
+scripts/bench/run-linux.sh tun CASES=verify,named             # integrity, and a device shoes creates
 ```
 
 `VAR=value` arguments are passed to the script; each script's header lists
@@ -64,6 +65,9 @@ expensive is working too hard.
   unconnected UDP send about thirty times dearer (87 us against 3 us with
   Tailscale connected). It caps every QUIC run near 100 Mbit/s and says
   nothing about shoes. Disconnect it, or measure on Linux.
+- `tun_linux.py` creates its device with `IFF_VNET_HDR`. A build from before
+  segmentation offload cannot read that framing and carries nothing: pass
+  `VNET=0` to compare against one.
 - One stream on loopback has no loss and no delay. These numbers are about
   cost per byte and per packet, not about congestion control on a real path.
 
@@ -80,8 +84,11 @@ changes below against the build after, alternated in one sitting.
 | Hysteria2 + salamander, up / down | 1.8 / 1.9 Gbit/s | 4.3 / 4.6 Gbit/s |
 | SOCKS to direct, up / down | 21 / 22 Gbit/s | 37 / 37 Gbit/s |
 | TUN on Linux, MTU left to the default, up / down | 9.0 / 6.5 Gbit/s | 17.8 / 11.7 Gbit/s |
-| One TUN download with 500 idle connections open | 1.0 Gbit/s | 5.3 Gbit/s |
-| One TUN upload with 500 idle connections open | 2.4 Gbit/s | 6.7 Gbit/s |
+| One TUN download with 500 idle connections open | 1.0 Gbit/s | 8.1 Gbit/s |
+| One TUN upload with 500 idle connections open | 2.4 Gbit/s | 18.6 Gbit/s |
+| Eight TUN downloads at once, MTU 1500 | 1.9 Gbit/s | 17.5 Gbit/s |
+| One TUN upload, MTU 1500 | 10.0 Gbit/s | 20.9 Gbit/s |
+| One TUN download, MTU 1500 | 7.4 Gbit/s | 9.7 Gbit/s |
 | TUN UDP upload at 100 Mbit/s offered, loss | 0.5% | 0 |
 | TUN UDP upload at 1 Gbit/s offered, loss | 7.7% | 0.12% |
 
@@ -108,16 +115,26 @@ What changed:
   and scans every socket on each poll, so idle connections taxed busy ones.
   A socket quiet for a second is now parked in a second set that is polled
   only for its timers, and comes back when either side does anything.
-  sing-box's system stack, for scale, holds 5.4 Gbit/s at any count.
+  sing-box's system stack, for scale, holds 5.4 Gbit/s at any count. Parking
+  alone took the 500-idle download from 1.0 to 5.3 Gbit/s.
+- **TUN segmentation offload on Linux.** A device opened with
+  `IFF_VNET_HDR` passes TCP segments several at a time: the kernel's arrive
+  uncut, and the stack joins what smoltcp emits before writing it
+  (`src/tun/vnet.rs`). shoes opens its own devices that way and asks a
+  descriptor it is handed which kind it is. sing-box, for scale: 5.0 Gbit/s
+  for the eight downloads on its system stack, 8.7 on gVisor.
 
 ## Known and not fixed
 
-- **One system call per packet through the TUN.** The profile shows the stack
-  thread inside `write`, which runs the kernel's TCP receive path inline.
-  A larger MTU is the lever that exists today; Linux `IFF_VNET_HDR` with
-  segmentation offload is the one that does not yet.
-- **Eight downloads through the TUN at once** carry about 2 to 3 Gbit/s
-  together against 6.6 for one, for the same reason.
+- **A single TUN connection is bounded by its buffer once offload is on.**
+  A whole 64 KiB window leaves in one write and is acknowledged once, so the
+  connection sends a window and waits. `tcp_buffer_size: 262144` measured
+  34 Gbit/s up and 20 down for one stream, against 20 and 9.7 at the default;
+  the default stays because it is paid four times per connection. Capping the
+  joined packet at a quarter of the window was tried and cost eight
+  downloads 40% for nothing measurable on one.
+- **UDP download through the TUN loses packets at 1 Gbit/s offered**, between
+  0.6% and 9% from run to run, with or without offload.
 - **The relay is still half of sing-box's**, which splices between sockets
   in the kernel on Linux.
 - **WireGuard throughput** is level with sing-box's at half the CPU, and

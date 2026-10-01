@@ -42,6 +42,10 @@ pub mod traffic;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
+// The packet logic is plain Rust and is tested everywhere; only Linux has a
+// device that speaks it.
+#[cfg(any(target_os = "linux", test))]
+mod vnet;
 #[cfg(windows)]
 mod wintun_device;
 
@@ -692,6 +696,9 @@ pub async fn run_tun_from_config(
 
     if let Some(size) = config.tcp_buffer_size {
         tun_server_config = tun_server_config.tcp_buffer_size(size);
+    }
+    if let Some(enabled) = config.segmentation_offload {
+        tun_server_config = tun_server_config.segmentation_offload(enabled);
     }
     if let Some(max) = config.max_connections {
         tun_server_config = tun_server_config.max_connections(max);

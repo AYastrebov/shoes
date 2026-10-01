@@ -3867,6 +3867,7 @@ mod tests {
             sniff: None,
             tcp_buffer_size: None,
             max_connections: None,
+            segmentation_offload: None,
         };
 
         let configs = vec![Config::TunServer(tun_config)];
@@ -3898,6 +3899,7 @@ mod tests {
             sniff: None,
             tcp_buffer_size: None,
             max_connections: None,
+            segmentation_offload: None,
         }
     }
 

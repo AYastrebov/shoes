@@ -7,13 +7,17 @@ Modes, chosen by the first byte the client sends:
   D  download: the server sends, the client discards
   S  upload to a slow destination (the server reads about 10 Mbit/s), which
      is what backs a relay up into its tunnel's flow control
+  E  echo: SECS megabytes of random data in uneven writes go out and must
+     come back identical; reports intact or CORRUPT
   P  ping-pong: one byte each way, reports round-trip p50 and p99
 """
 import socket, sys, time, struct, threading, multiprocessing as mp, argparse
 CH = 1 << 18
 def serve(port):
-    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("0.0.0.0", port)); ls.listen(256)
+    # One socket for both families.
+    ls = socket.socket(socket.AF_INET6); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    ls.bind(("::", port)); ls.listen(256)
     def h(c):
         try:
             c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -27,6 +31,12 @@ def serve(port):
             elif m == b"D":
                 data = bytes(CH)
                 while True: c.sendall(data)
+            elif m == b"E":   # echo everything back
+                buf = bytearray(CH)
+                while True:
+                    k = c.recv_into(buf)
+                    if not k: break
+                    c.sendall(memoryview(buf)[:k])
             elif m == b"P":   # ping-pong latency: echo 1 byte
                 while True:
                     b = c.recv(1)
@@ -66,6 +76,26 @@ def worker(socks, target, mode, secs, q):
                 k = s.recv_into(buf)
                 if not k: break
                 n += k
+        elif mode == "E":
+            # Integrity: a stream nothing can guess goes out, comes back, and
+            # has to be the same stream. Sizes vary so segments are not all
+            # full ones.
+            import hashlib, os as _os, random
+            total = int(secs * (1 << 20)); sent = hashlib.sha256(); got = hashlib.sha256()
+            def reader():
+                left = total; buf = bytearray(CH)
+                while left:
+                    k = s.recv_into(buf, min(left, CH))
+                    if not k: break
+                    got.update(memoryview(buf)[:k]); left -= k
+            t = threading.Thread(target=reader); t.start()
+            left = total; rng = random.Random(1)
+            while left:
+                chunk = _os.urandom(min(left, rng.choice((1, 100, 1400, 9000, 65536, 200000))))
+                sent.update(chunk); s.sendall(chunk); left -= len(chunk)
+            t.join()
+            ok = sent.digest() == got.digest()
+            q.put(("V", total if ok else -1, time.time() - t0, 0)); s.close(); return
         elif mode == "P":
             lat = []
             while time.time() < end:
@@ -83,14 +113,17 @@ if __name__ == "__main__":
     else:
         socks = None
         if a.socks: h, p = a.socks.split(":"); socks = (h, int(p))
-        h, p = a.target.split(":"); q = mp.Queue()
+        h, p = a.target.rsplit(":", 1); h = h.strip("[]"); q = mp.Queue()
         ps = [mp.Process(target=worker, args=(socks, (h, int(p)), a.mode, a.secs, q)) for _ in range(a.conns)]
         for p_ in ps: p_.start()
         res = [q.get() for _ in ps]
         for p_ in ps: p_.join()
         errs = [r for r in res if r[0] == "E"]
         if errs: print("ERROR", errs[0][1]); sys.exit(1)
-        if a.mode == "P":
+        if a.mode == "E":
+            bad = [r for r in res if r[1] < 0]
+            print("CORRUPT" if bad else f"intact ({sum(r[1] for r in res) >> 20} MiB echoed)")
+        elif a.mode == "P":
             print(f"rtt_p50_us={res[0][2]*1e6:.0f} rtt_p99_us={res[0][3]*1e6:.0f} n={res[0][1]}")
         else:
             gbps = sum(r[1] * 8 / r[2] for r in res) / 1e9

@@ -405,6 +405,9 @@ tcp_buffer_size: int?          # Bytes per direction per connection.
                                # Default: 32768 (mobile), 65536 (elsewhere)
 max_connections: int?          # Concurrent TCP connections before SYNs are dropped.
                                # Default: 256 (mobile), 1024 (elsewhere)
+segmentation_offload: bool?    # Linux only: let the kernel pass TCP segments several at a
+                               # time instead of one system call per packet.
+                               # Default: true. Ignored for device_fd.
 
 # Fake IP (optional, off by default)
 fake_ip:

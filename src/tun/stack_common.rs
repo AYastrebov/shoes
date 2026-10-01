@@ -509,6 +509,11 @@ pub trait StackDevice: Device {
     /// Sleep until the device is readable, the backend's shutdown signal
     /// fires, or `duration` elapses. `None` waits [`MAX_POLL_WAIT_MILLIS`].
     fn wait(&self, duration: Option<SmolDuration>) -> io::Result<()>;
+
+    /// Write out whatever the device held back during a poll. Called after
+    /// every poll; a device that writes each packet as it is emitted has
+    /// nothing to do.
+    fn flush(&mut self) {}
 }
 
 /// The platform-neutral half of a stack manager: the thread, the running
@@ -966,6 +971,7 @@ pub fn run_stack_loop<D: StackDevice>(
 
         let now = smol_now();
         iface.poll(now, &mut device, &mut sockets.active_set);
+        device.flush();
 
         sockets_to_remove.clear();
         sockets_to_park.clear();
@@ -1182,6 +1188,7 @@ pub fn run_stack_loop<D: StackDevice>(
         // Polls again after data transfer (critical for performance).
         let after_transfer = smol_now();
         iface.poll(after_transfer, &mut device, &mut sockets.active_set);
+        device.flush();
 
         // The parked sockets' timers. Only with nothing queued on the device:
         // a poll hands smoltcp whatever is queued, and a segment for an active
@@ -1194,6 +1201,7 @@ pub fn run_stack_loop<D: StackDevice>(
         {
             let parked_now = smol_now();
             iface.poll(parked_now, &mut device, &mut sockets.parked_set);
+            device.flush();
 
             // A timer can end a connection (the keepalive gave up); any
             // change of state goes back to the sweep, which owns closing.

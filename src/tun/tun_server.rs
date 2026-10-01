@@ -119,6 +119,13 @@ pub struct TunServerConfig {
     ///
     /// Default: 256 on iOS and Android, 1024 elsewhere.
     pub max_connections: usize,
+    /// Whether a device this process creates on Linux is opened with
+    /// `IFF_VNET_HDR`, which is what lets the kernel hand over and take TCP
+    /// segments several at a time. See `vnet.rs`. No effect on a device
+    /// handed in by descriptor: that one is asked what it is.
+    ///
+    /// Default: true.
+    pub segmentation_offload: bool,
 }
 
 impl Default for TunServerConfig {
@@ -160,6 +167,7 @@ impl Default for TunServerConfig {
             packet_information: false,
             tcp_buffer_size: default_buffer_size,
             max_connections: default_max_connections,
+            segmentation_offload: true,
         }
     }
 }
@@ -234,6 +242,12 @@ impl TunServerConfig {
         self
     }
 
+    /// Whether to open a Linux device with segmentation offload.
+    pub fn segmentation_offload(mut self, enabled: bool) -> Self {
+        self.segmentation_offload = enabled;
+        self
+    }
+
     /// What the `tun` crate is told about packet framing when it opens the
     /// device itself, on iOS.
     ///
@@ -290,8 +304,12 @@ impl TunServerConfig {
             if let Some(dest) = self.destination {
                 config.destination(dest);
             }
+            let vnet_hdr = self.segmentation_offload;
             config.platform_config(|p| {
                 p.ensure_root_privileges(true);
+                // The stack reads the descriptor itself and asks it whether
+                // this took; see `probe_vnet`.
+                p.vnet_hdr(vnet_hdr);
             });
             config.up();
         }
