@@ -29,8 +29,45 @@ pub fn new_udp_socket(
     )?;
 
     protect_outbound(&socket)?;
+    raise_receive_buffer(&socket);
 
     into_tokio_udp_socket(socket)
+}
+
+/// Give an outbound UDP socket room to hold a burst.
+///
+/// What is behind such a socket handles one datagram at a time, and the
+/// system's default buffer is a couple of hundred kilobytes: about a hundred
+/// and fifty full datagrams. A download relayed at 1 Gbit/s overflowed it,
+/// and the kernel counted the drops (`UdpRcvbufErrors`) where nothing in this
+/// process could see them.
+///
+/// Best effort. The plain option is capped at `net.core.rmem_max`, which is
+/// that same default on most systems; a privileged process -- one that owns
+/// a TUN is -- may exceed the cap, so that is tried first.
+fn raise_receive_buffer(socket: &socket2::Socket) {
+    let Some(size) = crate::buffer_sizing::default_udp_receive_buffer_size() else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let value = size as libc::c_int;
+        // SAFETY: the option takes an int by pointer, and `value` outlives
+        // the call.
+        let forced = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                (&raw const value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if forced == 0 {
+            return;
+        }
+    }
+    let _ = socket.set_recv_buffer_size(size);
 }
 
 /// Exclude a socket from the VPN route before it carries anything.

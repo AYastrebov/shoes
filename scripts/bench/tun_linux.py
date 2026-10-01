@@ -123,10 +123,14 @@ def case(label, mtu, extra="", conns=1, idle=0, modes=("U", "D")):
     return p
 def udp(p, label, rate, size=1200):
     for rev in ("", "-R"):
-        c0 = cpu(p.pid)
-        o = subprocess.run(f"ip netns exec cli iperf3 -c {IP} -p 25301 -u -b {rate} -l {size} -t 4 {rev}", shell=True, capture_output=True, text=True).stdout
+        c0 = cpu(p.pid); subprocess.run("NSTAT_HISTORY=/tmp/nstat.main nstat -n >/dev/null 2>&1; NSTAT_HISTORY=/tmp/nstat.cli ip netns exec cli nstat -n >/dev/null 2>&1", shell=True)
+        o = subprocess.run(f"ip netns exec cli iperf3 -c {IP} -p 25301 -u -b {rate} -l {size} -w 2M -t 4 {rev}", shell=True, capture_output=True, text=True).stdout
         m = re.search(r"([\d.]+ [MGK]bits/sec)\s+[\d.]+ ms\s+(\d+/\d+ \([\d.e+-]+%\))\s+receiver", o)
         print(f"{label:<44} udp {rate} {'down' if rev else 'up  '} -> {m.group(1) + '  lost ' + m.group(2) if m else o[-300:]}  cpu={cpu(p.pid) - c0:.2f}s", flush=True)
+        if os.environ.get("STATS"):
+            for where, prefix in (("main", "NSTAT_HISTORY=/tmp/nstat.main "), ("cli", "NSTAT_HISTORY=/tmp/nstat.cli ip netns exec cli ")):
+                st = subprocess.run(prefix + "nstat -z UdpInDatagrams UdpRcvbufErrors UdpSndbufErrors UdpInErrors UdpNoPorts 2>/dev/null | tail -n +2", shell=True, capture_output=True, text=True).stdout
+                print(f"    {where}: " + " ".join(f"{l.split()[0]}={l.split()[1]}" for l in st.splitlines() if l.split()), flush=True)
 sink = subprocess.Popen([sys.executable, f"{B}/load.py", "server", "--port", "25201"])
 ip3 = subprocess.Popen(["iperf3", "-s", "-p", "25301"], stdout=subprocess.DEVNULL)
 time.sleep(0.5)

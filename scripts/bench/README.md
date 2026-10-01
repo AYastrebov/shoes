@@ -92,7 +92,8 @@ changes below against the build after, alternated in one sitting.
 | One TUN upload, MTU 1500 | 10.0 Gbit/s | 20.9 Gbit/s |
 | One TUN download, MTU 1500 | 7.4 Gbit/s | 9.7 Gbit/s |
 | TUN UDP upload at 100 Mbit/s offered, loss | 0.5% | 0 |
-| TUN UDP upload at 1 Gbit/s offered, loss | 7.7% | 0.12% |
+| TUN UDP upload at 1 Gbit/s offered, loss | 7.7% | 0.6% |
+| TUN UDP download at 1 Gbit/s offered, loss | 2.9-8.3% | 0.1% |
 
 For scale, on the same machine: sing-box WireGuard is 0.2 ms and about
 2.2 Gbit/s; sing-box Hysteria2 to itself about 4.5 Gbit/s; sing-box SOCKS to
@@ -118,6 +119,14 @@ What changed:
   0.11 in the same runs: level, within what this machine can tell apart.
 - **TUN.** Linux defaults to an MTU of 9000, as Android already did. UDP
   flow queues hold 512 datagrams off the constrained platforms, up from 64.
+- **UDP through the TUN.** Download was being dropped at shoes' own outbound
+  socket, whose receive buffer was the system default; it asks for 2 MiB
+  now. Upload was being dropped in the queue between the stack thread and
+  the relay, 256 deep; it is 2048 off the constrained platforms, and a
+  queued datagram no longer holds a whole read buffer. sing-box at 1 Gbit/s
+  offered, for scale: 29% up and 2.7% down on its system stack, 5% and 1.9%
+  on gVisor. (An earlier version of this harness lost packets in iperf3's
+  own default socket buffers; it passes `-w 2M` now.)
 - **Idle TUN connections.** smoltcp searches every socket for each packet
   and scans every socket on each poll, so idle connections taxed busy ones.
   A socket quiet for a second is now parked in a second set that is polled
@@ -140,8 +149,6 @@ What changed:
   the default stays because it is paid four times per connection. Capping the
   joined packet at a quarter of the window was tried and cost eight
   downloads 40% for nothing measurable on one.
-- **UDP download through the TUN loses packets at 1 Gbit/s offered**, between
-  0.6% and 9% from run to run, with or without offload.
 - **WireGuard throughput is set by the peer in these tests, not by shoes.**
   A download through shoes' client measured 1.8 to 2.0 Gbit/s against 2.1
   to 2.3 through sing-box's, with sing-box's server on the far end using
