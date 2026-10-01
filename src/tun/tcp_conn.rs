@@ -10,6 +10,7 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -39,6 +40,17 @@ pub enum TcpSocketState {
 /// Shared between the async connection handle and the stack thread.
 pub struct TcpConnectionControl {
     inner: Mutex<TcpConnectionInner>,
+    /// Set by the connection whenever it gives the stack thread something to
+    /// act on -- bytes written, bytes read (room freed), a shutdown, a drop
+    /// -- and taken by the stack's sweep. With the socket's own state it is
+    /// what tells the sweep a connection is idle without taking the lock
+    /// above. Starts set, so a new connection's first sweep is a full one.
+    touched: AtomicBool,
+    /// Set by the stack thread while it holds this connection's socket out
+    /// of the polled set (see `PARK_IDLE_AFTER` in `stack_common`). A
+    /// connection that acts while parked has to say so more loudly, since
+    /// the sweep no longer looks at it.
+    parked: AtomicBool,
 }
 
 struct TcpConnectionInner {
@@ -68,7 +80,42 @@ impl TcpConnectionControl {
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
             }),
+            touched: AtomicBool::new(true),
+            parked: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the connection has done anything since the last call.
+    pub fn take_touched(&self) -> bool {
+        self.touched.swap(false, Ordering::SeqCst)
+    }
+
+    /// Whether the connection has done anything the sweep has not yet seen.
+    pub fn is_touched(&self) -> bool {
+        self.touched.load(Ordering::SeqCst)
+    }
+
+    /// Stack thread only: mark the socket as parked, or as back in the
+    /// polled set.
+    ///
+    /// Parking is `set_parked(true)` and then a check of `is_touched`; the
+    /// connection stores `touched` and then loads `parked`. Both sequentially
+    /// consistent, so of a touch racing a park one side sees the other:
+    /// either the park is called off or the connection reports the touch.
+    pub fn set_parked(&self, parked: bool) {
+        self.parked.store(parked, Ordering::SeqCst);
+    }
+
+    /// Whether the stack still owes this connection work that no change in
+    /// the smoltcp socket's state would announce: bytes waiting in the send
+    /// buffer for the socket to take, or a half that is no longer `Normal`
+    /// (a close in progress, an orphan on its timer). One lock, at the end
+    /// of a full sweep, so that an idle connection's sweeps need none.
+    pub fn owed_work(&self) -> bool {
+        let inner = self.inner.lock();
+        !inner.send_buffer.is_empty()
+            || inner.send_state != TcpSocketState::Normal
+            || inner.recv_state != TcpSocketState::Normal
     }
 
     // --- Methods called by stack thread ---
@@ -185,6 +232,11 @@ impl TcpConnection {
     /// never saw because it parks in `poll()`, not `thread::park()`; the write
     /// then waited out the loop's timer tick. See [`StackNotifier`].
     fn notify(&self) {
+        // Before the wake, so the iteration it causes sees the flag.
+        self.control.touched.store(true, Ordering::SeqCst);
+        if self.control.parked.load(Ordering::SeqCst) {
+            self.notifier.note_parked_touch();
+        }
         self.notifier.notify();
     }
 }
@@ -312,6 +364,56 @@ impl AsyncWrite for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What lets the stack leave an idle connection alone: nothing is
+    /// flagged until the connection acts, every way it can act flags it,
+    /// work the socket cannot announce is reported as owed, and a parked
+    /// connection that acts says so to the whole stack.
+    #[test]
+    fn a_connection_flags_what_it_does_and_the_control_reports_what_is_owed() {
+        let control = Arc::new(TcpConnectionControl::new(64, 64));
+        assert!(control.take_touched(), "a new connection starts flagged");
+        assert!(!control.take_touched(), "and taking the flag clears it");
+        assert!(!control.owed_work(), "an idle connection is owed nothing");
+
+        let notifier = StackNotifier::new(Arc::new(|| {}));
+        let mut conn = TcpConnection::new(control.clone(), notifier.clone());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Pin::new(&mut conn).poll_write(&mut cx, b"abc"),
+            Poll::Ready(Ok(3))
+        ));
+        assert!(control.take_touched(), "a write flags the connection");
+        assert!(
+            control.owed_work(),
+            "bytes wait for the socket to take them"
+        );
+        assert!(!notifier.take_parked_touch(), "it is not parked");
+        let mut sink = [0u8; 8];
+        assert_eq!(control.dequeue_send_data(&mut sink), 3);
+        assert!(!control.owed_work());
+
+        control.set_parked(true);
+        control.enqueue_recv_data(b"xyz");
+        let mut storage = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(Pin::new(&mut conn).poll_read(&mut cx, &mut buf).is_ready());
+        assert!(control.is_touched(), "a read frees room, and flags it");
+        assert!(
+            notifier.take_parked_touch(),
+            "a parked connection that acts tells the stack"
+        );
+        control.set_parked(false);
+        assert!(control.take_touched());
+
+        let _ = Pin::new(&mut conn).poll_shutdown(&mut cx);
+        assert!(control.take_touched(), "a shutdown flags the connection");
+        assert!(control.owed_work(), "a close in progress is owed work");
+
+        drop(conn);
+        assert!(control.take_touched(), "a drop flags the connection");
+    }
 
     #[test]
     fn test_control_basic() {
