@@ -747,30 +747,6 @@ mod tests {
         }
     }
 
-    /// Send one datagram through a session and read the reply back.
-    async fn udp_exchange(
-        stream: &mut Box<dyn AsyncMessageStream>,
-        payload: &[u8],
-    ) -> std::io::Result<Vec<u8>> {
-        use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
-
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_write_message(cx, payload))
-            .await?;
-
-        let mut buf = vec![0u8; 65535];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            std::future::poll_fn(|cx| {
-                std::pin::Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
-            }),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply arrived"))??;
-
-        Ok(read_buf.filled().to_vec())
-    }
-
     #[tokio::test]
     async fn test_udp_round_trip() {
         let (server, _cert) = spawn_server(None).await;
@@ -783,7 +759,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = udp_exchange(&mut stream, b"udp hello").await.unwrap();
+        let reply = udp_echo_exchange(&mut stream, b"udp hello").await.unwrap();
         assert_eq!(reply, b"udp hello");
     }
 
@@ -817,46 +793,57 @@ mod tests {
             .unwrap();
 
         // Interleaved, so a stealing reader has every chance to win the race.
-        for round in 0..8u8 {
+        // Whatever has not come back is sent again: a datagram lost on
+        // loopback is not coming, and waiting for it is what made this kind
+        // of test flaky (see `udp_echo_exchange`). Resending cannot hide a
+        // steal, which shows up as the wrong label on a reply.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut received: [std::collections::BTreeSet<u8>; 2] = Default::default();
+        while received.iter().any(|r| r.len() < 8) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sessions received only {} and {} of their 8 datagrams",
+                received[0].len(),
+                received[1].len()
+            );
+            for round in 0..8u8 {
+                for (label, session) in [(1u8, &mut first), (2u8, &mut second)] {
+                    if received[usize::from(label - 1)].contains(&round) {
+                        continue;
+                    }
+                    std::future::poll_fn(|cx| {
+                        std::pin::Pin::new(&mut *session).poll_write_message(cx, &[label, round])
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+
             for (label, session) in [(1u8, &mut first), (2u8, &mut second)] {
-                std::future::poll_fn(|cx| {
-                    std::pin::Pin::new(&mut *session).poll_write_message(cx, &[label, round])
-                })
-                .await
-                .unwrap();
+                loop {
+                    let mut buf = [0u8; 64];
+                    let mut read = tokio::io::ReadBuf::new(&mut buf);
+                    let next = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        std::future::poll_fn(|cx| {
+                            std::pin::Pin::new(&mut *session).poll_read_message(cx, &mut read)
+                        }),
+                    )
+                    .await;
+                    let Ok(result) = next else { break };
+                    result.unwrap();
+                    assert_eq!(
+                        read.filled()[0],
+                        label,
+                        "session {label} was handed another session's datagram"
+                    );
+                    received[usize::from(label - 1)].insert(read.filled()[1]);
+                }
             }
         }
-
-        for (label, session) in [(1u8, &mut first), (2u8, &mut second)] {
-            let mut received = Vec::new();
-            for _ in 0..8u8 {
-                let mut buf = [0u8; 64];
-                let mut read = tokio::io::ReadBuf::new(&mut buf);
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    std::future::poll_fn(|cx| {
-                        std::pin::Pin::new(&mut *session).poll_read_message(cx, &mut read)
-                    }),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "session {label} received only {} of its 8 datagrams",
-                        received.len()
-                    )
-                })
-                .unwrap();
-
-                assert_eq!(
-                    read.filled()[0],
-                    label,
-                    "session {label} was handed another session's datagram"
-                );
-                received.push(read.filled()[1]);
-            }
-            received.sort_unstable();
+        for (label, rounds) in [(1u8, &received[0]), (2u8, &received[1])] {
             assert_eq!(
-                received,
+                rounds.iter().copied().collect::<Vec<_>>(),
                 (0..8u8).collect::<Vec<_>>(),
                 "session {label} did not get its own eight back"
             );
@@ -877,7 +864,7 @@ mod tests {
 
         for i in 0..4u8 {
             let payload = vec![i; 32];
-            let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+            let reply = udp_echo_exchange(&mut stream, &payload).await.unwrap();
             assert_eq!(reply, payload, "packet {i}");
         }
     }
@@ -897,7 +884,7 @@ mod tests {
             .unwrap();
 
         let payload: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
-        let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+        let reply = udp_echo_exchange(&mut stream, &payload).await.unwrap();
         assert_eq!(reply, payload);
     }
 
@@ -914,7 +901,9 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = udp_exchange(&mut stream, b"obfuscated udp").await.unwrap();
+        let reply = udp_echo_exchange(&mut stream, b"obfuscated udp")
+            .await
+            .unwrap();
         assert_eq!(reply, b"obfuscated udp");
     }
 
