@@ -561,7 +561,7 @@ what it does to a host and what is still unverified:
 **Windows is the third**, on the same trait, sequencer and protocol. The
 socket is AF_UNIX there too, not a named pipe -- the first consumer is a JVM
 client and grpc-java has no pipe transport -- at
-`%ProgramFiles%shoesdshoesd.sock`, where no standard user can create
+`%ProgramFiles%\shoesd\shoesd.sock`, where no standard user can create
 anything first. The peer check reads the client's token through
 `SIO_AF_UNIX_GETPEERPID` and admits SYSTEM or a member of Administrators in
 any state, because an administrator's unelevated token carries that group as
