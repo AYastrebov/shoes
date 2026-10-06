@@ -18,8 +18,72 @@ use windows_sys::Win32::Security::{
     PSECURITY_DESCRIPTOR,
 };
 
+/// A directory of the daemon's that clients reach the socket through: SYSTEM
+/// and Administrators fully, authenticated users may traverse and read -- the
+/// counterpart of 0750 root:group, with group membership checked per call by
+/// `auth` rather than by the file system. Protected, so what it would inherit
+/// cannot widen it. One definition for the install directory and for a
+/// directory `socket::bind` creates, so the two cannot drift.
+pub const SERVICE_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;AU)";
+
+/// SYSTEM, Administrators and the object's owner, nothing inherited: the
+/// revert record and the log directory -- what the daemon undoes as SYSTEM,
+/// and what it says about the host. The owner (`OW`, Owner Rights) is whoever
+/// created it: SYSTEM for the service, so it adds no one there; the account
+/// running the tests, so they can read back what they wrote.
+pub const PRIVATE_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;OW)";
+
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
     text.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Read a NUL-terminated UTF-16 string the OS handed back.
+///
+/// # Safety
+/// `p` must point to a NUL-terminated UTF-16 string that stays valid for the
+/// call.
+pub unsafe fn wide_cstr(p: *const u16) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    // SAFETY: the caller guarantees a NUL-terminated string at `p`.
+    unsafe {
+        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+        std::ffi::OsString::from_wide(std::slice::from_raw_parts(p, len))
+    }
+}
+
+/// The real `Program Files` directory, from the shell's known-folder store
+/// -- never from `%ProgramFiles%`.
+///
+/// The environment is the caller's to set, and an elevated `install`
+/// inherits the user's: a per-user `ProgramFiles` would otherwise move a
+/// LocalSystem service's binary into a directory the user can write, which
+/// is the privilege escalation this whole layout exists to prevent.
+/// `FOLDERID_ProgramFiles` is machine configuration only an administrator
+/// can change. `None` only if the shell cannot answer at all.
+pub fn program_files() -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+
+    let mut path: *mut u16 = std::ptr::null_mut();
+    // SAFETY: a valid folder id; `path` is CoTaskMemAlloc'd on success and
+    // freed below in every case, as documented.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramFiles,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut path,
+        )
+    };
+    let result = (hr >= 0 && !path.is_null())
+        // SAFETY: a NUL-terminated string from the call above.
+        .then(|| std::path::PathBuf::from(unsafe { wide_cstr(path) }));
+    // SAFETY: allocated by SHGetKnownFolderPath (freeing null is allowed).
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
 }
 
 /// A LocalAlloc'd security descriptor, freed on drop.
@@ -137,11 +201,9 @@ pub fn file_dacl_sddl(path: &Path) -> std::io::Result<String> {
     }
     let text = Descriptor(text.cast());
     // SAFETY: NUL-terminated UTF-16 from the call above.
-    let sddl = unsafe {
-        let p = text.0.cast::<u16>();
-        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
-    };
+    let sddl = unsafe { wide_cstr(text.0.cast::<u16>()) }
+        .to_string_lossy()
+        .into_owned();
     Ok(sddl)
 }
 
@@ -181,4 +243,28 @@ pub fn is_elevated() -> std::io::Result<bool> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(elevation.TokenIsElevated != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// From the known-folder store, not the environment: setting
+    /// `ProgramFiles` in this process must not move the answer.
+    #[test]
+    fn program_files_ignores_the_environment() {
+        let real = program_files().expect("the shell knows Program Files");
+        assert!(real.is_absolute(), "{}", real.display());
+
+        // SAFETY: tests in this binary do not read ProgramFiles concurrently;
+        // the variable is restored before returning.
+        let saved = std::env::var_os("ProgramFiles");
+        unsafe { std::env::set_var("ProgramFiles", std::env::temp_dir()) };
+        let after = program_files();
+        match saved {
+            Some(value) => unsafe { std::env::set_var("ProgramFiles", value) },
+            None => unsafe { std::env::remove_var("ProgramFiles") },
+        }
+        assert_eq!(after.as_deref(), Some(real.as_path()));
+    }
 }

@@ -15,20 +15,20 @@ use std::time::Duration;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::{define_windows_service, service_dispatcher};
 
 /// The service's name. KVN tells users to run `sc.exe query shoesd` when the
 /// daemon does not come up, so this is part of the contract with it.
 pub const SERVICE_NAME: &str = "shoesd";
 
-/// The service's own log directory: SYSTEM and Administrators only. The log
-/// carries what the daemon does to the host, and the Unix arms keep theirs
-/// from other local users (`/var/log/shoesd` is 0750 on macOS), so the
-/// install directory's users-may-read ACL is not good enough for it.
-const LOG_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
-
 /// Where the service logs, since under the SCM nothing captures stderr --
+/// in a directory with `win_security::PRIVATE_SDDL`: the log carries what the
+/// daemon does to the host, and the Unix arms keep theirs from other local
+/// users (`/var/log/shoesd` is 0750 on macOS), so the install directory's
+/// users-may-read ACL is not good enough for it --
 /// the file `install` points at when the service does not come up.
 ///
 /// `None` when the directory cannot be made or secured: the daemon then runs
@@ -36,7 +36,7 @@ const LOG_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
 fn log_file() -> Option<std::path::PathBuf> {
     let dir = crate::install::log_dir();
     let made = std::fs::create_dir_all(&dir)
-        .and_then(|()| crate::win_security::set_file_dacl(&dir, LOG_DIR_SDDL));
+        .and_then(|()| crate::win_security::set_file_dacl(&dir, crate::win_security::PRIVATE_SDDL));
     match made {
         Ok(()) => Some(dir.join("shoesd.log")),
         Err(e) => {
@@ -48,6 +48,10 @@ fn log_file() -> Option<std::path::PathBuf> {
 
 /// How long the SCM is told startup may take before the socket is bound.
 const START_HINT: Duration = Duration::from_secs(30);
+
+/// How long the SCM is told a stop may take: the engine's own stop timeout
+/// (`control::STOP_TIMEOUT`, 5 s) plus the revert, with room to spare.
+const STOP_HINT: Duration = Duration::from_secs(20);
 
 /// Woken by the SCM's Stop or Shutdown. `notify_one` stores a permit, so a
 /// stop that arrives before anything is waiting is not lost.
@@ -83,9 +87,45 @@ pub fn run(args: crate::RunArgs) -> ExitCode {
     }
 }
 
+/// The handle `service_main` registered, for the control handler -- which is
+/// created before the handle exists and so cannot capture it.
+static STATUS: OnceLock<ServiceStatusHandle> = OnceLock::new();
+
+fn report(
+    status: ServiceStatusHandle,
+    state: ServiceState,
+    accepted: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    wait_hint: Duration,
+) {
+    let _ = status.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: accepted,
+        exit_code,
+        checkpoint: 0,
+        wait_hint,
+        process_id: None,
+    });
+}
+
 fn service_main(_arguments: Vec<OsString>) {
     let handler = |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
+            // STOP_PENDING at once, with time for the revert: stopping the
+            // engine (up to `control::STOP_TIMEOUT`) and removing the NRPT
+            // rule. A service that went on reporting RUNNING through that is
+            // one the SCM may give up on at system shutdown -- and the NRPT
+            // rule, unlike the routes, outlives a reboot.
+            if let Some(&status) = STATUS.get() {
+                report(
+                    status,
+                    ServiceState::StopPending,
+                    ServiceControlAccept::empty(),
+                    ServiceExitCode::Win32(0),
+                    STOP_HINT,
+                );
+            }
             STOP.notify_one();
             ServiceControlHandlerResult::NoError
         }
@@ -99,17 +139,10 @@ fn service_main(_arguments: Vec<OsString>) {
             return;
         }
     };
+    let _ = STATUS.set(status);
 
     let report = |state, accepted, exit_code, wait_hint| {
-        let _ = status.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accepted,
-            exit_code,
-            checkpoint: 0,
-            wait_hint,
-            process_id: None,
-        });
+        report(status, state, accepted, exit_code, wait_hint);
     };
 
     // START_PENDING until the socket is bound, RUNNING only then: `install`

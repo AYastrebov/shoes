@@ -267,14 +267,13 @@ mod platform {
     /// user enough to connect. Protected (`P`), so nothing inherited widens it.
     pub(super) const SOCKET_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
 
-    /// A directory this created: SYSTEM and Administrators fully, users may
-    /// traverse and read -- the counterpart of 0750 root:group, with the
-    /// group's membership checked per call instead of by the file system.
-    const DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;AU)";
-
     /// How many accepted connections may wait for the server before accept
     /// parks.
     const ACCEPT_BACKLOG: usize = 16;
+
+    /// The pause after a failed accept, so a persistent failure costs a few
+    /// wake-ups a second rather than a core.
+    const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
     pub fn bind(path: &Path) -> std::io::Result<Listener> {
         uds_windows::UnixListener::bind(path)
@@ -321,7 +320,7 @@ mod platform {
     }
 
     pub fn restrict_dir(path: &Path, _: Access) -> std::io::Result<()> {
-        crate::win_security::set_file_dacl(path, DIR_SDDL)
+        crate::win_security::set_file_dacl(path, crate::win_security::SERVICE_DIR_SDDL)
     }
 
     /// Who the peer on a connection is, or why that could not be learned.
@@ -394,13 +393,27 @@ mod platform {
             .name("shoesd-accept".into())
             .spawn(move || {
                 loop {
-                    let accepted = listener.accept().and_then(|(stream, _)| {
-                        // Taken as soon as accept returns: the peer existed
-                        // before this moment, which is what lets the identity
-                        // lookup refuse a process that took its PID later.
-                        let accepted_at = crate::auth::now();
-                        connection(stream.into_raw_socket(), accepted_at, &runtime)
+                    // The time a connection became pending, not the time it
+                    // was accepted: the peer existed before this moment, so a
+                    // process created after it cannot be the peer -- which is
+                    // what lets the identity lookup refuse one that took the
+                    // peer's PID. Taken at `poll`'s wake rather than after
+                    // `accept`, so a connection left waiting in the backlog
+                    // does not stretch the window in which a recycled PID
+                    // would pass. What remains is the wake-up latency between
+                    // the client's connect and this thread running.
+                    let accepted = wait_for_pending(&listener).and_then(|()| {
+                        let pending_at = crate::auth::now();
+                        listener.accept().and_then(|(stream, _)| {
+                            connection(stream.into_raw_socket(), pending_at, &runtime)
+                        })
                     });
+                    // An error here is usually persistent -- out of handles or
+                    // buffers -- and an immediate retry would spin a core
+                    // against it while tonic logs each one and carries on.
+                    if accepted.is_err() {
+                        std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    }
                     if tx.blocking_send(accepted).is_err() {
                         return;
                     }
@@ -408,6 +421,28 @@ mod platform {
             })
             .expect("spawning the accept thread");
         tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
+
+    /// Block until the listener has a connection waiting.
+    fn wait_for_pending(listener: &Listener) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLRDNORM, WSAGetLastError, WSAPOLLFD, WSAPoll,
+        };
+
+        let mut fd = WSAPOLLFD {
+            fd: listener.as_raw_socket() as usize,
+            events: POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: one valid WSAPOLLFD, an infinite timeout.
+        if unsafe { WSAPoll(&mut fd, 1, -1) } < 0 {
+            // SAFETY: plain FFI call.
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+        Ok(())
     }
 
     fn connection(

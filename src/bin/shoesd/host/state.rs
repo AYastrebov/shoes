@@ -73,8 +73,15 @@ impl AppliedState {
     /// truncated record is worse than none: it parses as fewer routes than
     /// were applied, and the revert silently skips the rest.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
             std::fs::create_dir_all(parent)?;
+            // Windows has no umask to lean on: a directory this created takes
+            // whatever its parent grants, so it is closed explicitly -- the
+            // counterpart of the record's own 0600 below.
+            #[cfg(windows)]
+            crate::win_security::set_file_dacl(parent, crate::win_security::PRIVATE_SDDL)?;
         }
 
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
@@ -99,6 +106,11 @@ impl AppliedState {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
+        // The same on Windows: SYSTEM and Administrators only, whatever the
+        // directory would have let it inherit -- which matters for a `--state`
+        // outside the protected install directory.
+        #[cfg(windows)]
+        crate::win_security::set_file_dacl(path, crate::win_security::PRIVATE_SDDL)?;
 
         Ok(())
     }
@@ -213,6 +225,27 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
+    }
+
+    /// The Windows twin: a protected DACL naming SYSTEM, Administrators and
+    /// the owner, so a `--state` in a directory others can write still gets
+    /// a record they cannot rewrite -- and it still reads back.
+    #[test]
+    #[cfg(windows)]
+    fn a_record_is_closed_to_other_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("applied.json");
+        populated().save(&path).unwrap();
+
+        for target in [path.as_path(), path.parent().unwrap()] {
+            let sddl = crate::win_security::file_dacl_sddl(target).unwrap();
+            assert!(sddl.starts_with("D:P"), "protected: {sddl}");
+            assert!(
+                !sddl.contains(";;;AU)") && !sddl.contains(";;;BU)"),
+                "{sddl}"
+            );
+        }
+        assert_eq!(AppliedState::load(&path).unwrap(), Some(populated()));
     }
 
     /// Saving twice must leave one readable record, not a directory full of

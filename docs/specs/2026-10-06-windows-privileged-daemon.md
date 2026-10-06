@@ -120,6 +120,15 @@ The socket is the only thing a client touches; what access an AF_UNIX
 and the socket file gets exactly that for Authenticated Users and no more.
 The directory is never loosened to admit clients.
 
+`%ProgramFiles%` here means the known folder (`SHGetKnownFolderPath
+(FOLDERID_ProgramFiles)`), never the environment variable: an elevated
+`install` inherits the user's environment, and a per-user `ProgramFiles`
+would otherwise move a LocalSystem service's binary into a directory that
+user can write. The revert record and the service's log directory carry a
+protected DACL of SYSTEM, Administrators and their owner -- the counterpart
+of the record's 0600 on Unix -- so a `--state` outside the install directory
+is closed too.
+
 ## Authorization
 
 The Unix rule is "root, or a member of the admin group" — the set of users who
@@ -143,11 +152,18 @@ Mechanics, per accepted connection:
    Administrators SID (`EqualSid` against `CreateWellKnownSid`).
 
 The PID is only a number, so the lookup is bound to the connection: the
-accept time is taken as soon as `accept` returns, and the process opened for
-that PID must have been created before it (`GetProcessTimes`), its handle
-held while the token is read. A client that exits in between is refused --
-either there is no process to open, or the PID's new owner was born after the
-accept and so cannot be the peer.
+accept thread waits with `WSAPoll` for a connection to become pending and
+takes the time at that wake, before `accept`; the process opened for the PID
+must have been created before it (`GetProcessTimes`), its handle held while
+the token is read. A client that exits and loses its PID to a newer process
+is refused -- the new owner was born after the connection appeared. Taking
+the time at the poll rather than after `accept` keeps a connection waiting
+in the backlog from stretching that window; what remains is the wake-up
+latency between the client's connect and the accept thread running, and
+closing it would need a credential from the connection itself, which
+Windows AF_UNIX does not offer. The time is the later of the wall clock and
+a monotonic reading anchored at first use, so an administrator stepping the
+clock back does not make an older client look newer.
 The result rides into each request as a `Connected::ConnectInfo`, and
 `check_peer` reads it instead of `UdsConnectInfo`. Refusal stays a gRPC
 `PERMISSION_DENIED` per call, never a dropped socket. The pure decision —

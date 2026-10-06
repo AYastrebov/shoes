@@ -12,7 +12,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::windows::ffi::OsStrExt;
 
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+use windows_sys::Win32::Foundation::{
+    ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERROR,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceAliasToLuid, CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
     GetBestRoute2, GetIfTable2, GetIpForwardTable2, GetIpInterfaceEntry, IF_TYPE_SOFTWARE_LOOPBACK,
@@ -84,6 +86,14 @@ pub fn add(route: &Route) -> std::io::Result<()> {
 
     // SAFETY: a fully initialised row.
     let rc = unsafe { CreateIpForwardEntry2(&row) };
+    // Said as `AlreadyExists`, which the plan reads as "someone else's route"
+    // and keeps out of the record -- so the revert never deletes it.
+    if rc == ERROR_OBJECT_ALREADY_EXISTS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("a route to {destination}/{prefix_length} already exists"),
+        ));
+    }
     check(rc, || {
         format!("could not add a route to {destination}/{prefix_length}")
     })

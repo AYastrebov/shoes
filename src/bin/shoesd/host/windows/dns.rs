@@ -48,16 +48,21 @@ pub fn flush() -> std::io::Result<()> {
 
 /// The PowerShell that does it. Pure, for the tests.
 ///
-/// Always removes this daemon's rule first, so a re-apply replaces it rather
-/// than stacking a second, and a revert is the same script with no servers.
+/// A revert removes every rule of this daemon's. An apply never leaves a
+/// moment without one: it runs on every network change -- twice, settled and
+/// on the second look -- including the changes this daemon's own routes
+/// trigger, and a remove-then-add would open a window each time in which
+/// multi-homed resolution leaks lookups to every interface. So a rule that
+/// already names these servers is kept as it is, and a changed one is
+/// replaced by adding the new rule *before* removing the old.
 fn script(adapter: &str, servers: &[IpAddr]) -> String {
     let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
     script.push_str(&format!(
-        "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{RULE_COMMENT}' }} | \
-         Remove-DnsClientNrptRule -Force\n"
+        "$ours = @(Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{RULE_COMMENT}' }})\n"
     ));
     let adapter = quote(adapter);
     if servers.is_empty() {
+        script.push_str("$ours | Remove-DnsClientNrptRule -Force\n");
         // The adapter is normally gone by now; when it is not, put it back to
         // DHCP-or-nothing. A missing adapter is not an error.
         script.push_str(&format!(
@@ -70,11 +75,22 @@ fn script(adapter: &str, servers: &[IpAddr]) -> String {
             .map(|ip| format!("'{ip}'"))
             .collect::<Vec<_>>()
             .join(",");
+        script.push_str(&format!("$want = @({list})\n"));
         script.push_str(&format!(
-            "Set-DnsClientServerAddress -InterfaceAlias {adapter} -ServerAddresses {list}\n"
+            "Set-DnsClientServerAddress -InterfaceAlias {adapter} -ServerAddresses $want\n"
         ));
+        // A rule of ours for `.` naming exactly these servers, if there is one.
+        script.push_str(
+            "$keep = @($ours | Where-Object { $_.Namespace -contains '.' -and \
+             -not (Compare-Object @($_.NameServers) $want) })\n",
+        );
         script.push_str(&format!(
-            "Add-DnsClientNrptRule -Namespace '.' -NameServers {list} -Comment '{RULE_COMMENT}'\n"
+            "if ($keep.Count -eq 0) {{\n\
+             \x20   Add-DnsClientNrptRule -Namespace '.' -NameServers $want -Comment '{RULE_COMMENT}'\n\
+             \x20   $ours | Remove-DnsClientNrptRule -Force\n\
+             }} else {{\n\
+             \x20   $ours | Where-Object {{ $_.Name -ne $keep[0].Name }} | Remove-DnsClientNrptRule -Force\n\
+             }}\n"
         ));
     }
     script
@@ -127,28 +143,72 @@ mod tests {
         let script = script("shoesd", &ips(&["1.1.1.1", "1.0.0.1"]));
 
         assert!(
+            script.contains("$want = @('1.1.1.1','1.0.0.1')"),
+            "{script}"
+        );
+        assert!(
             script.contains(
-                "Set-DnsClientServerAddress -InterfaceAlias 'shoesd' -ServerAddresses '1.1.1.1','1.0.0.1'"
+                "Set-DnsClientServerAddress -InterfaceAlias 'shoesd' -ServerAddresses $want"
             ),
             "{script}"
         );
         assert!(
             script.contains(
-                "Add-DnsClientNrptRule -Namespace '.' -NameServers '1.1.1.1','1.0.0.1' -Comment 'shoesd'"
+                "Add-DnsClientNrptRule -Namespace '.' -NameServers $want -Comment 'shoesd'"
             ),
             "{script}"
         );
     }
 
-    /// A re-apply on a network change must replace the rule, not add a
-    /// second; so the old one goes first, every time.
+    /// A re-apply never leaves a moment with no rule: when the rule changes,
+    /// the new one is added before the old one is removed.
     #[test]
-    fn apply_removes_its_previous_rule_first() {
+    fn apply_adds_the_new_rule_before_removing_the_old() {
         let script = script("shoesd", &ips(&["9.9.9.9"]));
 
-        let remove = script.find("Remove-DnsClientNrptRule").expect("removes");
         let add = script.find("Add-DnsClientNrptRule").expect("adds");
-        assert!(remove < add, "{script}");
+        let remove = script
+            .find("$ours | Remove-DnsClientNrptRule")
+            .expect("removes");
+        assert!(add < remove, "{script}");
+    }
+
+    /// And when the rule already names these servers it is kept as it is --
+    /// the common re-apply, which then touches NRPT not at all.
+    #[test]
+    fn apply_keeps_a_rule_that_already_names_these_servers() {
+        let script = script("shoesd", &ips(&["9.9.9.9"]));
+
+        assert!(
+            script.contains("Compare-Object @($_.NameServers) $want"),
+            "{script}"
+        );
+        assert!(script.contains("if ($keep.Count -eq 0)"), "{script}");
+    }
+
+    /// The script PowerShell's own parser accepts, for both shapes -- the
+    /// string tests above cannot catch a brace out of place.
+    #[test]
+    fn both_scripts_parse() {
+        for servers in [ips(&["1.1.1.1"]), Vec::new()] {
+            let text = script("shoesd", &servers);
+            let check = format!(
+                "$e = $null; [System.Management.Automation.Language.Parser]::ParseInput({}, \
+                 [ref]$null, [ref]$e) | Out-Null; if ($e.Count) {{ $e | ForEach-Object Message; exit 1 }}",
+                quote(&text)
+            );
+            let output = std::process::Command::new(
+                system32().join("WindowsPowerShell\\v1.0\\powershell.exe"),
+            )
+            .args(["-NoProfile", "-NonInteractive", "-Command", &check])
+            .output()
+            .expect("powershell runs");
+            assert!(
+                output.status.success(),
+                "{text}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 
     /// Revert removes only this daemon's rule and adds nothing.

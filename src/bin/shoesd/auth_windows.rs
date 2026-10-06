@@ -51,7 +51,8 @@ pub struct PeerIdentity {
 
 impl PeerIdentity {
     /// Read the identity of the process that connected as `pid`, given the
-    /// moment the connection was accepted (a FILETIME, from [`now`]).
+    /// moment the connection was seen pending (a FILETIME, from [`now`]; see
+    /// `socket::incoming` for why pending and not accepted).
     ///
     /// The socket names its peer only by PID, and a PID is not an identity:
     /// if the client exits between connecting and this lookup, Windows may
@@ -87,8 +88,28 @@ impl PeerIdentity {
     }
 }
 
-/// The current time as a FILETIME, the unit process creation times are in.
+/// "Now" for the creation-time comparison, as a FILETIME -- the unit process
+/// creation times are in.
+///
+/// The later of the wall clock and a monotonic reading anchored to the wall
+/// clock at first use. Process creation times are wall-clock stamps, so a
+/// clock stepped backwards (an NTP correction, an administrator) would make
+/// a client started before the step look newer than any later "now", and
+/// refuse it as a recycled PID until the clock caught up. The anchored
+/// reading cannot step backwards; the wall clock covers a step forwards. The
+/// cost is that after a backwards step of D, a process created within D of
+/// the bound is still taken as older -- and stepping the clock takes an
+/// administrator.
 pub fn now() -> u64 {
+    static ANCHOR: std::sync::OnceLock<(u64, std::time::Instant)> = std::sync::OnceLock::new();
+    let wall = wall_clock();
+    let (anchor_wall, anchor_instant) = *ANCHOR.get_or_init(|| (wall, std::time::Instant::now()));
+    // FILETIME counts 100 ns intervals.
+    let elapsed = u64::try_from(anchor_instant.elapsed().as_nanos() / 100).unwrap_or(u64::MAX);
+    wall.max(anchor_wall.saturating_add(elapsed))
+}
+
+fn wall_clock() -> u64 {
     use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 
     // SAFETY: writes the struct it is given.
@@ -329,10 +350,9 @@ fn sid_string(sid: PSID) -> std::io::Result<String> {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: a NUL-terminated UTF-16 string from the call above.
-    let text = unsafe {
-        let len = (0..).take_while(|&i| *wide.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(wide, len))
-    };
+    let text = unsafe { crate::win_security::wide_cstr(wide) }
+        .to_string_lossy()
+        .into_owned();
     // SAFETY: allocated by ConvertSidToStringSidW with LocalAlloc.
     unsafe { LocalFree(wide.cast()) };
     Ok(text)

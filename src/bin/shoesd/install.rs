@@ -800,12 +800,6 @@ pub const INSTALLED_BINARY: &str = "%ProgramFiles%\\shoesd\\shoesd.exe";
 #[cfg(windows)]
 pub const LABEL: &str = crate::win_service::SERVICE_NAME;
 
-/// SYSTEM and Administrators fully; users may read and traverse -- so the
-/// socket inside is reachable and nothing inside is writable. Protected, so
-/// the `%ProgramFiles%` ACL it would otherwise inherit cannot widen it.
-#[cfg(windows)]
-const INSTALL_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;BU)";
-
 /// How long to wait for the service to report RUNNING, or STOPPED.
 #[cfg(windows)]
 const SERVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -814,16 +808,15 @@ const SERVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 ///
 /// `%ProgramFiles%` because no standard user can create anything there; see
 /// the spec's "Paths, and who can create them" for what `%ProgramData%` would
-/// allow. Read from the environment because Windows need not be on `C:`; a
-/// value that is not an absolute path falls back to the default rather than
-/// rooting a SYSTEM service's files somewhere relative.
+/// allow. Resolved through the known-folder store, **not** the environment:
+/// an elevated `install` inherits the user's environment, and a per-user
+/// `ProgramFiles` would otherwise put a LocalSystem service's binary in a
+/// directory the user can write. See `win_security::program_files`.
 #[cfg(windows)]
 pub fn install_dir() -> std::path::PathBuf {
-    let program_files = std::env::var_os("ProgramFiles")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Program Files"));
-    program_files.join("shoesd")
+    crate::win_security::program_files()
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Program Files"))
+        .join("shoesd")
 }
 
 /// Where the service's log lives: a subdirectory only SYSTEM and
@@ -925,7 +918,9 @@ fn install_steps(
 
     let dir = install_dir();
     std::fs::create_dir_all(&dir)
-        .and_then(|()| crate::win_security::set_file_dacl(&dir, INSTALL_DIR_SDDL))
+        .and_then(|()| {
+            crate::win_security::set_file_dacl(&dir, crate::win_security::SERVICE_DIR_SDDL)
+        })
         .map_err(at(Step::Directory))?;
 
     let source = std::env::current_exe().map_err(at(Step::Binary))?;
@@ -1097,7 +1092,7 @@ fn state_argument(arguments: &[std::ffi::OsString]) -> Option<std::path::PathBuf
 /// the service.
 #[cfg(windows)]
 fn split_command_line(line: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
@@ -1112,11 +1107,7 @@ fn split_command_line(line: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>>
     let arguments = (0..count as usize)
         .map(|i| {
             // SAFETY: `argv` holds `count` NUL-terminated wide strings.
-            unsafe {
-                let p = *argv.add(i);
-                let len = (0..).take_while(|&j| *p.add(j) != 0).count();
-                std::ffi::OsString::from_wide(std::slice::from_raw_parts(p, len))
-            }
+            unsafe { crate::win_security::wide_cstr(*argv.add(i)) }
         })
         .collect();
     // SAFETY: allocated by CommandLineToArgvW.
