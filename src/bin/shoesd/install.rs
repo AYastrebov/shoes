@@ -946,7 +946,7 @@ fn install_steps(
         | ServiceAccess::START
         | ServiceAccess::STOP
         | ServiceAccess::CHANGE_CONFIG;
-    let existing = manager.open_service(LABEL, access).ok();
+    let existing = open_existing(&manager, access).map_err(at(Step::Service))?;
     if let Some(service) = &existing {
         stop_and_wait(service).map_err(at(Step::Service))?;
     }
@@ -1006,16 +1006,20 @@ pub fn uninstall() -> std::io::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
     let mut state_path = crate::default_state_path();
-    if let Ok(service) = manager.open_service(
-        LABEL,
+    let service = open_existing(
+        &manager,
         ServiceAccess::QUERY_STATUS
             | ServiceAccess::QUERY_CONFIG
             | ServiceAccess::STOP
             | ServiceAccess::DELETE,
-    ) {
+    )?;
+    if let Some(service) = service {
         // The record is wherever this service was told to keep it, which
-        // `install --state` may have moved.
-        if let Some(configured) = configured_state_path(&service) {
+        // `install --state` may have moved. A configuration that cannot be
+        // read stops the uninstall: guessing the default could replay the
+        // wrong record and delete the directory while the real one -- and the
+        // routes and NRPT rule it describes -- survive.
+        if let Some(configured) = configured_state_path(&service)? {
             state_path = configured;
         }
         // Stopped first: the service reverts its session on the way out, and
@@ -1067,15 +1071,59 @@ fn recover_record(state_path: &Path) -> std::io::Result<()> {
         })
 }
 
+/// The installed service, or `None` when there is none.
+///
+/// Only `ERROR_SERVICE_DOES_NOT_EXIST` means "none". Any other failure --
+/// access denied, the SCM itself -- may be hiding a service that is running,
+/// and treating it as absent would let `uninstall` recover and delete files
+/// out from under that service, or `install` overwrite a binary it holds
+/// open. So it is an error.
+#[cfg(windows)]
+fn open_existing(
+    manager: &windows_service::service_manager::ServiceManager,
+    access: windows_service::service::ServiceAccess,
+) -> std::io::Result<Option<windows_service::service::Service>> {
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+
+    match manager.open_service(LABEL, access) {
+        Ok(service) => Ok(Some(service)),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            Ok(None)
+        }
+        Err(e) => {
+            let e = service_error(e);
+            Err(std::io::Error::new(
+                e.kind(),
+                format!("could not open the {LABEL} service: {e}"),
+            ))
+        }
+    }
+}
+
 /// The `--state` the installed service was registered with, read back from
-/// its command line. `None` when the configuration cannot be read or names
-/// none, which leaves the default.
+/// its command line. `Ok(None)` only when the command line was read and
+/// names none, which leaves the default; failing to read or split it is an
+/// error, never a silent default.
 #[cfg(windows)]
 fn configured_state_path(
     service: &windows_service::service::Service,
-) -> Option<std::path::PathBuf> {
-    let config = service.query_config().ok()?;
-    state_argument(&split_command_line(config.executable_path.as_os_str())?)
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let config = service.query_config().map_err(|e| {
+        let e = service_error(e);
+        std::io::Error::new(
+            e.kind(),
+            format!("could not read the {LABEL} service's configuration: {e}"),
+        )
+    })?;
+    let arguments = split_command_line(config.executable_path.as_os_str()).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "could not parse the {LABEL} service's command line: {}",
+            config.executable_path.display()
+        ))
+    })?;
+    Ok(state_argument(&arguments))
 }
 
 /// The value after `--state`, if any. Pure, for the tests.
