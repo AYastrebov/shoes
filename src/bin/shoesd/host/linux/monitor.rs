@@ -10,34 +10,11 @@
 //! This is the mechanism `ip monitor route link` is built on, and the same pair
 //! of multicast groups it subscribes to.
 //!
-//! The macOS twin of this file is `host/macos/monitor.rs`; the shape is
-//! deliberately identical, because the difference between `PF_ROUTE` and
-//! `AF_NETLINK` here is one `bind` and nothing else.
+//! The macOS twin of this file is `host/macos/monitor.rs`, and the Windows one
+//! `host/windows/monitor.rs`. All three differ only in their source of events;
+//! the loop around it -- settle, report, look again -- is `host/monitor.rs`.
 
 use std::os::unix::io::RawFd;
-
-/// How long to wait after a burst before reporting it.
-///
-/// A single network change produces a flurry of messages -- the link going
-/// down, addresses being removed, the new default arriving -- and re-applying
-/// on each would mean re-reading the table a dozen times while it is still
-/// settling.
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// And again, a moment later.
-///
-/// The macOS rationale for this -- the system restoring its own resolvers
-/// asynchronously, a little after the change -- does not apply to the
-/// systemd-resolved backend, whose per-link configuration nothing else touches.
-/// It applies squarely to the direct `/etc/resolv.conf` backend, which contends
-/// with whatever else on the host writes that file: NetworkManager and
-/// `netconfig` both rewrite it on their own schedule rather than ours, so a DNS
-/// re-apply that runs only once can be undone immediately afterwards with
-/// nothing left to notice it.
-///
-/// Keeping one code path costs two extra `resolvectl` calls per network change
-/// on hosts that do not need them. That is cheaper than two monitors.
-const SECOND_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Watch the routing table, calling `on_change` when it moves.
 ///
@@ -57,56 +34,43 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
         .name("shoesd-route-monitor".to_owned())
         .spawn(move || {
             let _guard = guard;
-            // Nothing here parses a message, so a netlink message longer than
-            // this is truncated and that costs nothing -- the signal is that
-            // one arrived at all.
+            // Nothing here parses a message, so one longer than the buffer is
+            // truncated and that costs nothing -- the signal is that one
+            // arrived at all. Two buffers because the wait and the drain are
+            // separate closures that would otherwise both borrow one.
             let mut buffer = [0u8; 4096];
+            let mut spare = [0u8; 4096];
 
-            loop {
-                // SAFETY: `buffer` is valid for `len` bytes for the duration of
-                // the call, and `fd` is open until `_guard` drops.
-                let read = unsafe {
-                    libc::read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len())
-                };
-
-                if read < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if recoverable(&error) {
-                        // Notably ENOBUFS. This thread sleeps for over two
-                        // seconds per event without reading, so a burst on a
-                        // busy network overflows the socket buffer -- and
-                        // treating that as fatal would end the monitor after
-                        // the first Wi-Fi-to-Ethernet move, which is the exact
-                        // event it exists for. The messages are lost either
-                        // way and it does not matter: nothing here parses
-                        // them, and the re-apply that follows re-reads the
-                        // table.
-                        continue;
+            crate::host::monitor::run(
+                || {
+                    // SAFETY: `buffer` is valid for `len` bytes for the
+                    // duration of the call, and `fd` is open until `_guard`
+                    // drops.
+                    let read = unsafe {
+                        libc::read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len())
+                    };
+                    if read < 0 {
+                        let error = std::io::Error::last_os_error();
+                        // Notably ENOBUFS. The loop sleeps for over two seconds
+                        // per event without reading, so a burst on a busy
+                        // network overflows the socket buffer -- and treating
+                        // that as fatal would end the monitor after the first
+                        // Wi-Fi-to-Ethernet move, which is the exact event it
+                        // exists for.
+                        if recoverable(&error) {
+                            crate::host::monitor::Event::Spurious
+                        } else {
+                            crate::host::monitor::Event::Ended(error.to_string())
+                        }
+                    } else if read == 0 {
+                        crate::host::monitor::Event::Ended("its socket closed".to_owned())
+                    } else {
+                        crate::host::monitor::Event::Changed
                     }
-                    // The socket is gone and reopening it is the job of the
-                    // next process. Losing the monitor costs re-application on
-                    // a network change, not the session.
-                    log::error!("the route monitor stopped: {error}");
-                    return;
-                }
-                if read == 0 {
-                    log::error!("the route monitor's socket closed");
-                    return;
-                }
-
-                // Drain whatever else the kernel has queued for this change
-                // before reporting, so a burst becomes one re-apply.
-                std::thread::sleep(SETTLE);
-                drain(fd, &mut buffer);
-
-                on_change();
-
-                // The second look, for the resolvers something else on the host
-                // puts back on its own schedule rather than ours.
-                std::thread::sleep(SECOND_LOOK);
-                drain(fd, &mut buffer);
-                on_change();
-            }
+                },
+                || drain(fd, &mut spare),
+                on_change,
+            );
         })?;
 
     Ok(())

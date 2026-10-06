@@ -124,12 +124,15 @@ pub fn device_name() -> Option<String> {
     DEVICE_NAME.lock().clone()
 }
 
-/// Publish the interface name. Called once, immediately after creation.
+/// Publish the interface name. Called once, immediately after creation, on
+/// every platform that creates a device: the Unix path reads it back from the
+/// kernel, the wintun path knows it because the config named it.
 ///
-/// `test` as well as `unix` so that the control tests can stage a name
-/// without a device; on a Windows test build that leaves it with no caller,
-/// hence the allow.
-#[cfg(any(unix, test))]
+/// Windows was missing until the daemon needed it: `shoesd`'s supervisor
+/// waits for this name before it installs routes, so a Windows session that
+/// never published one would time out every start. The allow stays for the
+/// `shoes` binary, which creates devices but reads no names -- see
+/// [`device_name`].
 #[allow(dead_code)]
 pub(crate) fn set_device_name(name: String) {
     *DEVICE_NAME.lock() = Some(name);
@@ -235,7 +238,10 @@ pub async fn run_tun_server(
                  the wintun configuration path cannot express IPv6",
             ));
         };
-        wintun_device::open_wintun(name, address, netmask, config.mtu)?
+        let opened = wintun_device::open_wintun(name, address, netmask, config.mtu)?;
+        info!("Created wintun adapter {}", name);
+        set_device_name(name.to_string());
+        opened
     };
 
     let mtu = config.mtu as usize;

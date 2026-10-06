@@ -32,6 +32,9 @@ pub struct Recorder {
     existing_dns: Vec<IpAddr>,
     /// Fail `add_route` once this many have succeeded.
     fail_add_after: Option<usize>,
+    /// What that failure says it was. `AlreadyExists` stands for a route the
+    /// host had before the session -- someone else's.
+    fail_add_kind: std::io::ErrorKind,
     fail_delete: bool,
     fail_write_dns: bool,
     /// The live version of `fail_write_dns`, shared so a test can flip it
@@ -47,6 +50,7 @@ impl Recorder {
             gateway_now: std::sync::Mutex::new(None),
             existing_dns: Vec::new(),
             fail_add_after: None,
+            fail_add_kind: std::io::ErrorKind::Other,
             fail_delete: false,
             fail_write_dns: false,
             fail_write_dns_now: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -78,6 +82,12 @@ impl Recorder {
 
     pub fn failing_add_route_after(mut self, successes: usize) -> Self {
         self.fail_add_after = Some(successes);
+        self
+    }
+
+    /// Make that failure "the route is already there".
+    pub fn because_it_already_exists(mut self) -> Self {
+        self.fail_add_kind = std::io::ErrorKind::AlreadyExists;
         self
     }
 
@@ -145,7 +155,10 @@ impl HostNetwork for Recorder {
             // have this route. `apply` will still ask for it to be deleted,
             // since it wrote the route down before attempting it, and a real
             // host answers that with "not in table" and success.
-            return Err(std::io::Error::other("add_route refused by the test"));
+            return Err(std::io::Error::new(
+                self.fail_add_kind,
+                "add_route refused by the test",
+            ));
         }
         self.record(Step::AddRoute(route.clone()));
         Ok(())

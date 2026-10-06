@@ -63,7 +63,7 @@ pub struct DaemonService {
 /// Linux DNS problem needs answered. `capabilities` is a repeated string and
 /// unknown values are ignored, so adding one costs no protocol change.
 fn capabilities(extra: Vec<String>) -> Vec<String> {
-    let mut capabilities = if cfg!(any(target_os = "macos", target_os = "linux")) {
+    let mut capabilities = if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         vec!["routes".to_string(), "dns".to_string()]
     } else {
         Vec::new()
@@ -301,38 +301,22 @@ impl DaemonService {
     /// and then used for as long as the client likes, so putting the check at
     /// accept time makes the answer older with every request; and the cost
     /// here is reading two integers out of the request extensions.
+    ///
+    /// Who the peer is comes from the socket -- kernel credentials on Unix, the
+    /// peer process's token on Windows, both read by `auth::peer_of` -- and a
+    /// connection that carries none is refused, never read as "no
+    /// credentials, therefore allow".
     fn check_peer<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let Some(info) = request
-            .extensions()
-            .get::<tonic::transport::server::UdsConnectInfo>()
-        else {
-            // No connect info means this did not arrive over the Unix socket
-            // this daemon serves. There is no other transport, so this is a
-            // programming error rather than an attack -- but it must not be
-            // read as "no credentials, therefore allow".
-            return Err(Status::permission_denied(
-                "no peer credentials on this connection",
-            ));
-        };
-
-        let Some(cred) = info.peer_cred else {
-            return Err(Status::permission_denied(
-                "the peer supplied no credentials",
-            ));
-        };
-
-        let (uid, gid) = (cred.uid(), cred.gid());
-        if self.authorizer.allows(uid, gid) {
+        let peer = crate::auth::peer_of(request).map_err(Status::permission_denied)?;
+        if self.authorizer.allows_peer(&peer) {
             return Ok(());
         }
 
-        // The uid is logged and not returned: the caller already knows who it
-        // is, and the message stays the same for every refusal so it cannot
-        // be used to probe which groups exist.
-        log::warn!("refused a call from uid {uid} (gid {gid})");
-        Err(Status::permission_denied(
-            "not permitted; this daemon serves root and one configured group",
-        ))
+        // Who it was is logged and not returned: the caller already knows who
+        // it is, and the message stays the same for every refusal so it
+        // cannot be used to probe which groups exist.
+        log::warn!("refused a call from {peer}");
+        Err(Status::permission_denied(crate::auth::REFUSAL))
     }
 }
 
@@ -456,16 +440,20 @@ pub async fn serve(
     supervisor: Supervisor,
     logs: Arc<BroadcastLogWriter>,
     host_capabilities: Vec<String>,
+    on_listening: impl FnOnce(),
 ) -> std::io::Result<()> {
     let authorizer = Authorizer::for_group(group)?;
-    let listener = crate::socket::bind(socket_path, authorizer.group_gid())?;
+    let listener = crate::socket::bind(socket_path, authorizer.socket_access())?;
 
     log::info!(
-        "shoesd listening on {} for root and group {} (gid {})",
+        "shoesd listening on {} for {} (group {group})",
         socket_path.display(),
-        group,
-        authorizer.group_gid()
+        authorizer.describe(),
     );
+    // The moment a client can connect, and not before: under the Windows SCM
+    // this is what reports RUNNING, which `install` waits for -- so a daemon
+    // that fails to bind never lets an install report success.
+    on_listening();
 
     let service = DaemonService {
         authorizer,
@@ -473,7 +461,7 @@ pub async fn serve(
         logs,
         capabilities: capabilities(host_capabilities),
     };
-    let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+    let incoming = crate::socket::incoming(listener);
 
     let result = tonic::transport::Server::builder()
         .add_service(DaemonServer::new(service))
@@ -493,6 +481,7 @@ pub async fn serve(
 }
 
 /// `SIGTERM` from launchd, or `SIGINT` from a terminal.
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -516,6 +505,25 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => log::info!("SIGTERM; shutting down"),
         _ = interrupt.recv() => log::info!("SIGINT; shutting down"),
+    }
+}
+
+/// The Service Control Manager's Stop or Shutdown, or Ctrl-C under `shoesd
+/// run` -- the Windows counterparts of `SIGTERM` and `SIGINT`, ending in the
+/// same graceful exit, where the supervisor reverts the session.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => match result {
+            Ok(()) => log::info!("Ctrl-C; shutting down"),
+            Err(e) => {
+                log::error!("could not listen for Ctrl-C ({e}); serving until the service is stopped");
+                crate::win_service::stop_requested().await;
+            }
+        },
+        () = crate::win_service::stop_requested() => {
+            log::info!("the Service Control Manager asked to stop; shutting down");
+        }
     }
 }
 
@@ -561,11 +569,11 @@ mod tests {
     ///
     /// The list is keyed on which platforms have a `HostNetwork`
     /// implementation, so it moves when one is added. It said macOS alone
-    /// until the Linux arm landed.
+    /// until the Linux arm landed, and macOS and Linux until the Windows one.
     #[test]
     fn a_build_reports_the_host_capabilities_it_implements() {
         let caps = capabilities(Vec::new());
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             assert!(caps.contains(&"routes".to_string()), "{caps:?}");
             assert!(caps.contains(&"dns".to_string()), "{caps:?}");
         } else {
@@ -787,7 +795,7 @@ mod tests {
     /// group `--group` named.
     async fn serve_for_test(
         authorizer: Authorizer,
-        bind_gid: u32,
+        access: crate::socket::Access,
     ) -> (
         proto::daemon_client::DaemonClient<tonic::transport::Channel>,
         tokio::sync::oneshot::Sender<()>,
@@ -800,19 +808,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let listener =
-            crate::socket::bind(&path, bind_gid).expect("bind in the temp dir should succeed");
+            crate::socket::bind(&path, access).expect("bind in the temp dir should succeed");
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         let service = service_with(authorizer);
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(DaemonServer::new(service))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::UnixListenerStream::new(listener),
-                    async {
-                        let _ = rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(crate::socket::incoming(listener), async {
+                    let _ = rx.await;
+                })
                 .await;
         });
 
@@ -824,7 +829,7 @@ mod tests {
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let connect_path = connect_path.clone();
                 async move {
-                    let stream = tokio::net::UnixStream::connect(connect_path).await?;
+                    let stream = connect(connect_path).await?;
                     Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
                 }
             }))
@@ -834,14 +839,85 @@ mod tests {
         (proto::daemon_client::DaemonClient::new(channel), tx)
     }
 
+    /// Serve with a rule that admits the account running the tests -- the one
+    /// account a test can be sure of on any machine or CI runner.
+    async fn serve_admitting_me() -> (
+        proto::daemon_client::DaemonClient<tonic::transport::Channel>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (authorizer, access) = admitting_me();
+        serve_for_test(authorizer, access).await
+    }
+
+    /// The caller's own primary gid, for the rule and for the socket's group.
+    #[cfg(unix)]
+    fn admitting_me() -> (Authorizer, crate::socket::Access) {
+        // SAFETY: plain FFI call.
+        let gid = unsafe { libc::getgid() } as u32;
+        (Authorizer::for_gid(gid), gid)
+    }
+
+    /// The caller's own SID, on top of the real rule: a developer's account
+    /// may or may not be an administrator.
+    #[cfg(windows)]
+    fn admitting_me() -> (Authorizer, crate::socket::Access) {
+        let me = crate::auth::PeerIdentity::of_process(std::process::id())
+            .expect("the test process can read its own token");
+        (Authorizer::also_allowing(me.user), Default::default())
+    }
+
+    #[cfg(unix)]
+    async fn connect(path: std::path::PathBuf) -> std::io::Result<tokio::net::UnixStream> {
+        tokio::net::UnixStream::connect(path).await
+    }
+
+    /// The client half of what `socket` does on accept: connect through
+    /// `uds_windows`, then hand the socket to tokio.
+    #[cfg(windows)]
+    async fn connect(path: std::path::PathBuf) -> std::io::Result<tokio::net::TcpStream> {
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+
+        let stream = tokio::task::spawn_blocking(move || uds_windows::UnixStream::connect(path))
+            .await
+            .map_err(std::io::Error::other)??;
+        // SAFETY: the raw socket was just released by the stream that owned it.
+        let stream = unsafe { std::net::TcpStream::from_raw_socket(stream.into_raw_socket()) };
+        stream.set_nonblocking(true)?;
+        tokio::net::TcpStream::from_std(stream)
+    }
+
+    /// A rule this account is not in, bound so the account can still reach
+    /// the socket. `None` for root, which is allowed by design.
+    #[cfg(unix)]
+    fn refusing_me() -> Option<(Authorizer, crate::socket::Access)> {
+        // SAFETY: plain FFI calls.
+        let (uid, own_gid) = unsafe { (libc::getuid() as u32, libc::getgid() as u32) };
+        if uid == 0 {
+            return None;
+        }
+        let outsider = (1..64u32)
+            .find(|gid| !Authorizer::for_gid(*gid).allows(uid, own_gid))
+            .expect("some low gid must not contain this user");
+        Some((Authorizer::for_gid(outsider), own_gid))
+    }
+
+    /// A rule admitting one SID that is nobody's -- so, unlike the real rule,
+    /// not this account even when it is an administrator.
+    #[cfg(windows)]
+    fn refusing_me() -> Option<(Authorizer, crate::socket::Access)> {
+        Some((
+            Authorizer::allowing_only("S-1-5-21-0-0-0-4242".into()),
+            Default::default(),
+        ))
+    }
+
     /// The transport, the generated code and the allow path, end to end.
     ///
     /// The group is the caller's own primary gid, which is the one group the
     /// test can be sure it is in on any machine.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_member_of_the_group_gets_a_hello() {
-        let gid = unsafe { libc::getgid() } as u32;
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+        let (mut client, shutdown) = serve_admitting_me().await;
 
         let reply = client
             .hello(proto::HelloRequest {
@@ -865,17 +941,11 @@ mod tests {
     /// cannot tell them apart offers to install one that is already there.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_non_member_is_refused_with_a_status() {
-        if unsafe { libc::getuid() } == 0 {
+        let Some((authorizer, access)) = refusing_me() else {
             // Root is allowed by design, so there is nothing to refuse.
             return;
-        }
-        let uid = unsafe { libc::getuid() } as u32;
-        let own_gid = unsafe { libc::getgid() } as u32;
-        let outsider = (1..64u32)
-            .find(|gid| !Authorizer::for_gid(*gid).allows(uid, own_gid))
-            .expect("some low gid must not contain this user");
-
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(outsider), own_gid).await;
+        };
+        let (mut client, shutdown) = serve_for_test(authorizer, access).await;
 
         let status = client
             .hello(proto::HelloRequest {
@@ -894,8 +964,7 @@ mod tests {
     /// says stopped.
     #[tokio::test(flavor = "multi_thread")]
     async fn stopping_an_idle_daemon_is_released_not_an_error() {
-        let gid = unsafe { libc::getgid() } as u32;
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+        let (mut client, shutdown) = serve_admitting_me().await;
 
         let reply = client
             .stop(proto::StopRequest {})
@@ -919,8 +988,7 @@ mod tests {
     /// STARTING.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bad_config_is_invalid_argument_over_the_wire() {
-        let gid = unsafe { libc::getgid() } as u32;
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+        let (mut client, shutdown) = serve_admitting_me().await;
 
         let status = client
             .start(proto::StartRequest {
@@ -953,8 +1021,7 @@ mod tests {
     /// left them all green. This drives the request a client would send.
     #[tokio::test(flavor = "multi_thread")]
     async fn start_refuses_ipv6_in_either_field() {
-        let gid = unsafe { libc::getgid() } as u32;
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+        let (mut client, shutdown) = serve_admitting_me().await;
 
         for (field, request) in [
             (
@@ -997,8 +1064,7 @@ mod tests {
     async fn watch_status_leads_with_the_current_state() {
         use tokio_stream::StreamExt;
 
-        let gid = unsafe { libc::getgid() } as u32;
-        let (mut client, shutdown) = serve_for_test(Authorizer::for_gid(gid), gid).await;
+        let (mut client, shutdown) = serve_admitting_me().await;
 
         let mut stream = client
             .watch_status(proto::StatusRequest {})

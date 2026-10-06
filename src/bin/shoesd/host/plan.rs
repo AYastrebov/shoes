@@ -205,10 +205,23 @@ impl<'a, N: HostNetwork> Session<'a, N> {
     /// leaves a route described but not applied, and reverting it is a no-op.
     /// The other order leaves a route applied and undescribed, which is a Mac
     /// with no network.
+    ///
+    /// One failure is different: `AlreadyExists` means the host had this exact
+    /// route before the session -- a static route of the user's, say. It is
+    /// not ours, so it comes back out of the record before the error goes up;
+    /// otherwise the revert that follows, or a later recovery, would delete a
+    /// route this daemon never created.
     fn add_recorded(&self, route: Route, state: &mut AppliedState) -> std::io::Result<()> {
         state.routes.push(route.clone());
         state.save(&self.state_path)?;
-        self.net.add_route(&route)
+        if let Err(e) = self.net.add_route(&route) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                state.routes.pop();
+                state.save(&self.state_path)?;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn apply_dns(
@@ -483,6 +496,29 @@ mod tests {
     /// required to be a no-op -- see `HostNetwork::delete_route` -- so the
     /// cost of the safe order is one harmless call, and the cost of the other
     /// order is a route nothing knows about.
+    /// A route the host already had is someone else's: the failed apply
+    /// reverts the two it added and leaves that one alone.
+    #[test]
+    fn a_route_that_already_existed_is_not_deleted_by_the_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new()
+            .with_gateway(Some(ip("192.168.1.1")))
+            .failing_add_route_after(2)
+            .because_it_already_exists();
+        let session = Session::new(&net, session_path(&dir));
+
+        session
+            .apply(&plan())
+            .expect_err("the third route already exists");
+
+        assert_eq!(net.count_added(), 2);
+        assert_eq!(
+            net.count_deleted(),
+            2,
+            "only the two this session added -- not the one that was already there"
+        );
+    }
+
     #[test]
     fn a_route_failure_undoes_what_it_recorded_and_stops() {
         let dir = tempfile::tempdir().unwrap();

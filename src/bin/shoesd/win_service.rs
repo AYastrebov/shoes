@@ -1,0 +1,184 @@
+//! Running under the Windows Service Control Manager.
+//!
+//! The daemon itself is unchanged: `shoesd service` runs exactly what
+//! `shoesd run` runs, inside the handshake the SCM requires -- register a
+//! control handler, report RUNNING, and report STOPPED with an exit code when
+//! the daemon returns. A Stop or Shutdown from the SCM wakes the same
+//! shutdown future `SIGTERM` drives on Unix, so the supervisor reverts the
+//! session on the way out exactly as it does there.
+
+use std::ffi::OsString;
+use std::process::ExitCode;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use windows_service::service::{
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
+use windows_service::{define_windows_service, service_dispatcher};
+
+/// The service's name. KVN tells users to run `sc.exe query shoesd` when the
+/// daemon does not come up, so this is part of the contract with it.
+pub const SERVICE_NAME: &str = "shoesd";
+
+/// Where the service logs, since under the SCM nothing captures stderr --
+/// in a directory with `win_security::PRIVATE_SDDL`: the log carries what the
+/// daemon does to the host, and the Unix arms keep theirs from other local
+/// users (`/var/log/shoesd` is 0750 on macOS), so the install directory's
+/// users-may-read ACL is not good enough for it --
+/// the file `install` points at when the service does not come up.
+///
+/// `None` when the directory cannot be made or secured: the daemon then runs
+/// with stderr alone rather than writing a log others could read.
+fn log_file() -> Option<std::path::PathBuf> {
+    let dir = crate::install::log_dir();
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| crate::win_security::set_file_dacl(&dir, crate::win_security::PRIVATE_SDDL));
+    match made {
+        Ok(()) => Some(dir.join("shoesd.log")),
+        Err(e) => {
+            eprintln!("shoesd: could not prepare {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
+/// How long the SCM is told startup may take before the socket is bound.
+const START_HINT: Duration = Duration::from_secs(30);
+
+/// How long the SCM is told a stop may take: the engine's own stop timeout
+/// (`control::STOP_TIMEOUT`, 5 s) plus the revert, with room to spare.
+const STOP_HINT: Duration = Duration::from_secs(20);
+
+/// Woken by the SCM's Stop or Shutdown. `notify_one` stores a permit, so a
+/// stop that arrives before anything is waiting is not lost.
+static STOP: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// What `shoesd service` was asked to run. Set once, before the dispatcher
+/// starts: `define_windows_service!` takes a plain function, so the arguments
+/// cannot be captured.
+static RUN: OnceLock<crate::RunArgs> = OnceLock::new();
+
+/// Resolves when the SCM asks the service to stop.
+pub async fn stop_requested() {
+    STOP.notified().await;
+}
+
+define_windows_service!(ffi_service_main, service_main);
+
+/// Hand the process to the SCM. Returns once the service has stopped.
+///
+/// Fails at once when the process was not started by the SCM, which is what
+/// running `shoesd service` from a console does -- `run` is the console mode.
+pub fn run(args: crate::RunArgs) -> ExitCode {
+    let _ = RUN.set(args);
+    match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "shoesd: could not connect to the Service Control Manager ({e}); \
+                 `service` is what the SCM runs -- use `run` from a console"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The handle `service_main` registered, for the control handler -- which is
+/// created before the handle exists and so cannot capture it.
+static STATUS: OnceLock<ServiceStatusHandle> = OnceLock::new();
+
+fn report(
+    status: ServiceStatusHandle,
+    state: ServiceState,
+    accepted: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    wait_hint: Duration,
+) {
+    let _ = status.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: accepted,
+        exit_code,
+        checkpoint: 0,
+        wait_hint,
+        process_id: None,
+    });
+}
+
+fn service_main(_arguments: Vec<OsString>) {
+    let handler = |control| match control {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            // STOP_PENDING at once, with time for the revert: stopping the
+            // engine (up to `control::STOP_TIMEOUT`) and removing the NRPT
+            // rule. A service that went on reporting RUNNING through that is
+            // one the SCM may give up on at system shutdown -- and the NRPT
+            // rule, unlike the routes, outlives a reboot.
+            if let Some(&status) = STATUS.get() {
+                report(
+                    status,
+                    ServiceState::StopPending,
+                    ServiceControlAccept::empty(),
+                    ServiceExitCode::Win32(0),
+                    STOP_HINT,
+                );
+            }
+            STOP.notify_one();
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
+    };
+    let status = match service_control_handler::register(SERVICE_NAME, handler) {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("shoesd: could not register with the Service Control Manager: {e}");
+            return;
+        }
+    };
+    let _ = STATUS.set(status);
+
+    let report = |state, accepted, exit_code, wait_hint| {
+        report(status, state, accepted, exit_code, wait_hint);
+    };
+
+    // START_PENDING until the socket is bound, RUNNING only then: `install`
+    // waits for RUNNING, so reporting it any earlier would let an install
+    // succeed over a daemon that then failed to bind. The hint covers startup
+    // -- probing the host and reverting a previous crash's record -- which
+    // normally takes well under a second.
+    report(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        START_HINT,
+    );
+    let listening = || {
+        report(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceExitCode::Win32(0),
+            Duration::default(),
+        );
+    };
+
+    let log_file = log_file();
+    let exit = match RUN.get() {
+        Some(args) => crate::run_daemon(args.clone(), log_file.as_deref(), listening),
+        None => ExitCode::FAILURE,
+    };
+    let exit_code = if exit == ExitCode::SUCCESS {
+        ServiceExitCode::Win32(0)
+    } else {
+        ServiceExitCode::ServiceSpecific(1)
+    };
+    report(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        exit_code,
+        Duration::default(),
+    );
+}

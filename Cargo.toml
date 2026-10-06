@@ -106,6 +106,8 @@ daemon = [
     "dep:serde_json",
     "dep:system-configuration",
     "dep:core-foundation",
+    "dep:uds_windows",
+    "dep:windows-service",
 ]
 
 [[bin]]
@@ -233,7 +235,7 @@ tun = { version = "*", features = ["async"] }
 # 0.14 (the codec split into `tonic-prost`, and `UdsConnectInfo::peer_addr`
 # gained an Arc), and a silent jump would land in the peer-credential check,
 # which is the daemon's whole authentication.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 tonic = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
@@ -250,7 +252,7 @@ core-foundation = { version = "0.10", optional = true }
 # socket. tonic's client takes a URI, so reaching a socket path means handing
 # it a connector, and `service_fn` is how that is expressed. Already in the
 # graph via tonic; this makes it nameable.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -263,7 +265,26 @@ wintun-bindings = { version = "0.7", features = ["verify_binary_signature"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # The rest are the daemon's: the peer check (WinSock ioctl, process
+    # tokens, SIDs), routes and DNS (IP Helper), the install directory's DACL
+    # (Authorization), and the elevation check (Security).
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
 ] }
+# The daemon's Windows half, behind `daemon`. AF_UNIX on Windows: tokio's
+# `UnixListener` is `cfg(unix)`, so binding and accepting go through this and
+# each accepted socket is handed to tokio. See
+# docs/specs/2026-10-06-windows-privileged-daemon.md.
+uds_windows = { version = "1.2", optional = true }
+# Running under the Service Control Manager, and creating the service.
+windows-service = { version = "0.8", optional = true }
 
 # 64-bit atomics for targets without them (Keenetic mipsel); see util::AtomicU64.
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]

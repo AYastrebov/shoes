@@ -32,6 +32,7 @@ use crate::host::{AppliedState, HostNetwork, Plan, Session};
 ///
 /// The MTU is deliberately not overridden: it is a property of the path rather
 /// than of the host, and the client is the one that knows what it wants.
+#[cfg(unix)]
 fn device_policy() -> DeviceOverride {
     DeviceOverride {
         // Left to the kernel: choosing a `utun` unit races every other utun
@@ -44,6 +45,31 @@ fn device_policy() -> DeviceOverride {
         mtu: None,
     }
 }
+
+/// The Windows shape of the same policy, which wintun dictates rather than
+/// chooses: a wintun adapter has no identity but its name, so one is required,
+/// and `destination` is refused because the adapter path would turn it into a
+/// system default route (`src/tun/mod.rs`). The address and netmask are the
+/// Unix ones, so a config behaves the same everywhere.
+///
+/// The name is fixed rather than chosen per session: the adapter's GUID is
+/// derived from it (`wintun_device::adapter_guid`), so a stable name is one
+/// adapter Windows keeps recognising rather than a new "network" every start.
+#[cfg(windows)]
+fn device_policy() -> DeviceOverride {
+    DeviceOverride {
+        device_name: Some(WINDOWS_ADAPTER_NAME.to_string()),
+        address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+        destination: None,
+        mtu: None,
+    }
+}
+
+/// The wintun adapter's name, which is also its interface alias -- what the
+/// Windows host resolves to a LUID for every route and DNS call.
+#[cfg(windows)]
+const WINDOWS_ADAPTER_NAME: &str = "shoesd";
 
 /// How long to wait for the engine to create its device.
 ///

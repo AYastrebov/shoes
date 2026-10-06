@@ -111,16 +111,17 @@ jobs:
       - name: Guard the mobile builds against the controller
         run: scripts/check-mobile-features.sh
 
-      # The privileged daemon, which exists on macOS and Linux: its
-      # dependencies sit under a target section naming both, and Windows has no
-      # host-network arm. Without this its tests -- the revert sequencing, the
-      # peer check, the unit and plist rendering -- run nowhere.
+      # The privileged daemon, which exists on macOS, Linux and Windows: its
+      # dependencies sit under a target section naming all three. Without this
+      # its tests -- the revert sequencing, the peer check, the unit and plist
+      # rendering, the service tests over a real socket -- run nowhere.
       #
       # protoc is an install step rather than a crate: prost-build stopped
       # vendoring one.
-      # The daemon builds on macOS and Linux, and both arms need running: the
-      # `HostNetwork` implementations share a trait and a sequencer but no
-      # code, so a change to one compiles perfectly while breaking the other.
+      # The daemon builds on macOS, Linux and Windows, and every arm needs
+      # running: the `HostNetwork` implementations share a trait and a
+      # sequencer but no code, so a change to one compiles perfectly while
+      # breaking another.
       # Gating this to macOS meant the Linux arm -- five thousand lines of it --
       # compiled in no CI job at all.
       - name: Install protoc (macOS)
@@ -131,6 +132,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
+
+      # Every runner. On Windows the service tests run over a real AF_UNIX
+      # socket with the real token-based peer check, unprivileged.
       - name: Run tests with the privileged daemon enabled
-        if: runner.os == 'macOS' || runner.os == 'Linux'
         run: cargo test --locked --features daemon

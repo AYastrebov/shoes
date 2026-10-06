@@ -6,12 +6,13 @@
 //! escalation, not a convenience. `install` copies the executable to a
 //! root-owned location and points the service manager at the copy.
 //!
-//! One arm per service manager -- launchd on macOS, systemd on Linux -- and
-//! everything below them shared: staging the copy, the ownership discipline
+//! One arm per service manager -- launchd on macOS, systemd on Linux, the
+//! Service Control Manager on Windows -- and everything below them shared: staging the copy, the ownership discipline
 //! and the root check are where a mistake is a privilege escalation rather
 //! than a broken install, so they are written once.
 
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 
 /// Where the daemon's own output goes.
@@ -61,6 +62,7 @@ const PLIST_MODE: u32 = 0o644;
 /// The installed binary's mode, on both platforms. Root writes it, everyone
 /// executes it, and nobody else writes it -- the last clause is the one that
 /// makes the copy worth making.
+#[cfg(unix)]
 const BINARY_MODE: u32 = 0o755;
 
 /// The plist, with the arguments this daemon was asked to run with.
@@ -778,6 +780,568 @@ pub fn uninstall() -> std::io::Result<()> {
     )))
 }
 
+// --- Windows -----------------------------------------------------------------
+//
+// The same install as the other two, under the Service Control Manager: copy
+// the running executable somewhere only an administrator can write, register
+// the service on *that* path, start it. What Windows adds is that its client
+// raises UAC with `Start-Process -Verb RunAs`, which cannot capture the
+// elevated child's output -- so a failure is reported by exit code (see
+// [`failure_code`]) and written to `install.log`, not just printed.
+//
+// Design: docs/specs/2026-10-06-windows-privileged-daemon.md, "Install".
+
+/// Shown in `install`/`uninstall`'s own messages. The real path depends on
+/// `%ProgramFiles%`; see [`install_dir`].
+#[cfg(windows)]
+pub const INSTALLED_BINARY: &str = "%ProgramFiles%\\shoesd\\shoesd.exe";
+
+/// The service's name, which is what the SCM, `sc.exe` and KVN all call it.
+#[cfg(windows)]
+pub const LABEL: &str = crate::win_service::SERVICE_NAME;
+
+/// How long to wait for the service to report RUNNING, or STOPPED.
+#[cfg(windows)]
+const SERVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `%ProgramFiles%\shoesd` -- everything the daemon installs or writes.
+///
+/// `%ProgramFiles%` because no standard user can create anything there; see
+/// the spec's "Paths, and who can create them" for what `%ProgramData%` would
+/// allow. Resolved through the known-folder store, **not** the environment:
+/// an elevated `install` inherits the user's environment, and a per-user
+/// `ProgramFiles` would otherwise put a LocalSystem service's binary in a
+/// directory the user can write. See `win_security::program_files`.
+#[cfg(windows)]
+pub fn install_dir() -> std::path::PathBuf {
+    crate::win_security::program_files()
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Program Files"))
+        .join("shoesd")
+}
+
+/// Where the service's log lives: a subdirectory only SYSTEM and
+/// Administrators can read (see `win_service::log_file`).
+#[cfg(windows)]
+pub fn log_dir() -> std::path::PathBuf {
+    install_dir().join("logs")
+}
+
+/// What `install` failed at, as the exit code its client reads.
+///
+/// Distinct per step, because the client cannot see the output -- and never
+/// 1223, `ERROR_CANCELLED`, which the client reads as "the UAC prompt was
+/// dismissed".
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Step {
+    NotElevated = 2,
+    Directory = 3,
+    Binary = 4,
+    Wintun = 5,
+    Service = 6,
+    NotRunning = 7,
+}
+
+/// An install failure that knows its exit code.
+#[cfg(windows)]
+#[derive(Debug)]
+struct Failure {
+    step: Step,
+    message: String,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for Failure {}
+
+#[cfg(windows)]
+fn at(step: Step) -> impl FnOnce(std::io::Error) -> std::io::Error {
+    move |e| {
+        std::io::Error::new(
+            e.kind(),
+            Failure {
+                step,
+                message: e.to_string(),
+            },
+        )
+    }
+}
+
+/// The exit code for a failed `install` or `uninstall`.
+#[cfg(windows)]
+pub fn failure_code(error: &std::io::Error) -> u8 {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Failure>())
+        .map_or(1, |failure| failure.step as u8)
+}
+
+/// One code for every failure on Unix: `sudo` shows the output, so the
+/// message carries what the code would.
+#[cfg(unix)]
+pub fn failure_code(_error: &std::io::Error) -> u8 {
+    1
+}
+
+#[cfg(windows)]
+pub fn install(socket_path: &Path, state_path: &Path, group: Option<&str>) -> std::io::Result<()> {
+    let result = install_steps(socket_path, state_path, group);
+    log_install(&result);
+    result
+}
+
+#[cfg(windows)]
+fn install_steps(
+    socket_path: &Path,
+    state_path: &Path,
+    group: Option<&str>,
+) -> std::io::Result<()> {
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    require_root("install").map_err(at(Step::NotElevated))?;
+    // Validated here, not at first start: `--group` cannot change who is let
+    // in on Windows, and a service that refuses to start is a worse place to
+    // learn that than the install.
+    if let Some(group) = group {
+        crate::auth::Authorizer::for_group(group).map_err(at(Step::Service))?;
+    }
+
+    let dir = install_dir();
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| {
+            crate::win_security::set_file_dacl(&dir, crate::win_security::SERVICE_DIR_SDDL)
+        })
+        .map_err(at(Step::Directory))?;
+
+    let source = std::env::current_exe().map_err(at(Step::Binary))?;
+    let binary = dir.join("shoesd.exe");
+    if same_file(&source, &binary) {
+        return Err(at(Step::Binary)(std::io::Error::other(format!(
+            "already running from {}; run install from the copy you want installed",
+            binary.display()
+        ))));
+    }
+
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .map_err(service_error)
+    .map_err(at(Step::Service))?;
+
+    // An installed service holds its executable open, so it is stopped before
+    // the copy -- as `launchctl bootout` and `systemctl restart` stop the old
+    // job. Stopping it reverts any session, which is what an upgrade wants.
+    let access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::CHANGE_CONFIG;
+    let existing = open_existing(&manager, access).map_err(at(Step::Service))?;
+    if let Some(service) = &existing {
+        stop_and_wait(service).map_err(at(Step::Service))?;
+    }
+
+    replace_with(&binary, |staged| stage(&source, staged)).map_err(at(Step::Binary))?;
+    install_wintun(&source, &dir.join("wintun.dll")).map_err(at(Step::Wintun))?;
+
+    let info = ServiceInfo {
+        name: LABEL.into(),
+        display_name: "shoes privileged daemon".into(),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: binary.clone(),
+        launch_arguments: vec![
+            "service".into(),
+            "--socket".into(),
+            socket_path.into(),
+            "--state".into(),
+            state_path.into(),
+        ],
+        dependencies: Vec::new(),
+        // LocalSystem.
+        account_name: None,
+        account_password: None,
+    };
+    let service = match existing {
+        Some(service) => {
+            service
+                .change_config(&info)
+                .map_err(service_error)
+                .map_err(at(Step::Service))?;
+            service
+        }
+        None => manager
+            .create_service(&info, access)
+            .map_err(service_error)
+            .map_err(at(Step::Service))?,
+    };
+    restart_on_failure(&service).map_err(at(Step::Service))?;
+
+    service
+        .start::<&str>(&[])
+        .map_err(service_error)
+        .map_err(at(Step::NotRunning))?;
+    wait_for(&service, windows_service::service::ServiceState::Running)
+        .map_err(at(Step::NotRunning))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn uninstall() -> std::io::Result<()> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    require_root("uninstall").map_err(at(Step::NotElevated))?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(service_error)?;
+    let mut state_path = crate::default_state_path();
+    let service = open_existing(
+        &manager,
+        ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::STOP
+            | ServiceAccess::DELETE,
+    )?;
+    if let Some(service) = service {
+        // The record is wherever this service was told to keep it, which
+        // `install --state` may have moved. A configuration that cannot be
+        // read stops the uninstall: guessing the default could replay the
+        // wrong record and delete the directory while the real one -- and the
+        // routes and NRPT rule it describes -- survive.
+        if let Some(configured) = configured_state_path(&service)? {
+            state_path = configured;
+        }
+        // Stopped first: the service reverts its session on the way out, and
+        // the files below are held open while it runs.
+        stop_and_wait(&service)?;
+        service.delete().map_err(service_error)?;
+    }
+
+    // A stop reverts a running session and clears its record -- but a service
+    // that had already crashed did neither, and stopping a stopped service is
+    // a no-op. Its routes and NRPT rule are then still on the host, and the
+    // record is the only thing that says what to undo; deleting the directory
+    // first would make them unrecoverable. So the record is replayed here,
+    // through the same `Session::recover` the daemon runs at startup, and a
+    // failure stops the uninstall with the record still in place.
+    recover_record(&state_path)?;
+
+    let dir = install_dir();
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("could not remove {}: {e}", dir.display()),
+        )),
+    }
+}
+
+/// Undo whatever a revert record at `state_path` describes, then remove it.
+/// Nothing to do when there is no record -- the normal case, after a clean
+/// stop.
+#[cfg(windows)]
+fn recover_record(state_path: &Path) -> std::io::Result<()> {
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let host = crate::host::windows::WindowsHost::new()?;
+    crate::host::Session::new(&host, state_path)
+        .recover()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "could not undo what {} records ({e}); uninstall stopped so the \
+                     record is kept -- run uninstall again once the cause is fixed",
+                    state_path.display()
+                ),
+            )
+        })
+}
+
+/// The installed service, or `None` when there is none.
+///
+/// Only `ERROR_SERVICE_DOES_NOT_EXIST` means "none". Any other failure --
+/// access denied, the SCM itself -- may be hiding a service that is running,
+/// and treating it as absent would let `uninstall` recover and delete files
+/// out from under that service, or `install` overwrite a binary it holds
+/// open. So it is an error.
+#[cfg(windows)]
+fn open_existing(
+    manager: &windows_service::service_manager::ServiceManager,
+    access: windows_service::service::ServiceAccess,
+) -> std::io::Result<Option<windows_service::service::Service>> {
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+
+    match manager.open_service(LABEL, access) {
+        Ok(service) => Ok(Some(service)),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            Ok(None)
+        }
+        Err(e) => {
+            let e = service_error(e);
+            Err(std::io::Error::new(
+                e.kind(),
+                format!("could not open the {LABEL} service: {e}"),
+            ))
+        }
+    }
+}
+
+/// The `--state` the installed service was registered with, read back from
+/// its command line. `Ok(None)` only when the command line was read and
+/// names none, which leaves the default; failing to read or split it is an
+/// error, never a silent default.
+#[cfg(windows)]
+fn configured_state_path(
+    service: &windows_service::service::Service,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let config = service.query_config().map_err(|e| {
+        let e = service_error(e);
+        std::io::Error::new(
+            e.kind(),
+            format!("could not read the {LABEL} service's configuration: {e}"),
+        )
+    })?;
+    let arguments = split_command_line(config.executable_path.as_os_str()).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "could not parse the {LABEL} service's command line: {}",
+            config.executable_path.display()
+        ))
+    })?;
+    Ok(state_argument(&arguments))
+}
+
+/// The value after `--state`, if any. Pure, for the tests.
+#[cfg(windows)]
+fn state_argument(arguments: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--state")
+        .map(|pair| std::path::PathBuf::from(&pair[1]))
+}
+
+/// Split a command line the way Windows does, quoting included -- the inverse
+/// of how `windows-service` joined the launch arguments when it registered
+/// the service.
+#[cfg(windows)]
+fn split_command_line(line: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    let wide: Vec<u16> = line.encode_wide().chain(std::iter::once(0)).collect();
+    let mut count = 0;
+    // SAFETY: a NUL-terminated string; the returned array is LocalAlloc'd and
+    // freed below, and read only within `count`.
+    let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+    if argv.is_null() {
+        return None;
+    }
+    let arguments = (0..count as usize)
+        .map(|i| {
+            // SAFETY: `argv` holds `count` NUL-terminated wide strings.
+            unsafe { crate::win_security::wide_cstr(*argv.add(i)) }
+        })
+        .collect();
+    // SAFETY: allocated by CommandLineToArgvW.
+    unsafe { LocalFree(argv.cast()) };
+    Some(arguments)
+}
+
+/// `install` is elevated, or refuses with a sentence -- the Windows twin of
+/// the root check: `TokenElevation` on this process's own token.
+#[cfg(windows)]
+fn require_root(action: &str) -> std::io::Result<()> {
+    if crate::win_security::is_elevated()? {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("shoesd {action} must run elevated (Run as administrator)"),
+    ))
+}
+
+/// Write `target` by staging beside it and renaming over it, so a reader --
+/// the SCM starting the service -- never sees half a file.
+#[cfg(windows)]
+fn replace_with(
+    target: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let staged = target.with_extension("new");
+    write(&staged)?;
+    std::fs::rename(&staged, target).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not move {} into place: {e}", target.display()),
+        )
+    })
+}
+
+/// Put `wintun.dll` beside the installed daemon, copied from beside the
+/// executable being installed.
+///
+/// shoes does not ship the DLL -- it is WireGuard's signed binary under its own
+/// license (see the Windows entries in `build.yml`) -- so whoever packages
+/// `shoesd` puts one next to it; KVN's installer does. shoes verifies the
+/// DLL's Authenticode signer when it loads it, so the copy is checked where it
+/// matters wherever it came from.
+#[cfg(windows)]
+fn install_wintun(source_binary: &Path, target: &Path) -> std::io::Result<()> {
+    let beside = source_binary.with_file_name("wintun.dll");
+    if !beside.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no wintun.dll at {}: shoes does not ship it; place WireGuard's signed \
+                 wintun.dll (https://www.wintun.net) beside shoesd.exe and install again",
+                beside.display()
+            ),
+        ));
+    }
+    replace_with(target, |staged| stage(&beside, staged))
+}
+
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The counterpart of systemd's `Restart=always`: restart after any failure,
+/// with a pause, and forget past failures after a day.
+#[cfg(windows)]
+fn restart_on_failure(service: &windows_service::service::Service) -> std::io::Result<()> {
+    use windows_service::service::{
+        ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+    };
+
+    let restart = ServiceAction {
+        action_type: ServiceActionType::Restart,
+        delay: std::time::Duration::from_secs(5),
+    };
+    service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart.clone(), restart.clone(), restart]),
+        })
+        .map_err(service_error)?;
+    // Without this the actions above cover only crashes. The daemon's own
+    // failures end in a clean SERVICE_STOPPED with a non-zero exit code --
+    // `win_service` reports one -- and those are the ones that most need a
+    // restart; `Restart=always` makes no such distinction either.
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .map_err(service_error)
+}
+
+#[cfg(windows)]
+fn stop_and_wait(service: &windows_service::service::Service) -> std::io::Result<()> {
+    use windows_service::service::ServiceState;
+
+    let status = service.query_status().map_err(service_error)?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    // A stop that races the service stopping on its own is not a failure; the
+    // wait below is the answer either way.
+    let _ = service.stop();
+    wait_for(service, ServiceState::Stopped)
+}
+
+#[cfg(windows)]
+fn wait_for(
+    service: &windows_service::service::Service,
+    state: windows_service::service::ServiceState,
+) -> std::io::Result<()> {
+    use windows_service::service::ServiceState;
+
+    let deadline = std::time::Instant::now() + SERVICE_WAIT;
+    loop {
+        let status = service.query_status().map_err(service_error)?;
+        if status.current_state == state {
+            return Ok(());
+        }
+        // Waiting for RUNNING and finding STOPPED is a failed start, not a slow
+        // one: the service reports RUNNING only once its socket is bound, so
+        // this is a daemon that exited first. Said now, with its exit code,
+        // rather than after the whole wait.
+        if state == ServiceState::Running && status.current_state == ServiceState::Stopped {
+            return Err(std::io::Error::other(format!(
+                "the {LABEL} service stopped before it was listening ({:?}); its log, \
+                 {}, says why",
+                status.exit_code,
+                log_dir().join("shoesd.log").display()
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the {LABEL} service is {:?}, not {state:?}, after {}s",
+                    status.current_state,
+                    SERVICE_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(windows)]
+fn service_error(e: windows_service::Error) -> std::io::Error {
+    match e {
+        windows_service::Error::Winapi(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
+/// What happened, written beside the daemon: the elevated client cannot see
+/// this process's output, so this is where a failed install explains itself.
+/// Best effort -- a log that cannot be written must not turn a successful
+/// install into a failed one.
+#[cfg(windows)]
+fn log_install(result: &std::io::Result<()>) {
+    use std::io::Write;
+
+    let line = match result {
+        Ok(()) => format!("shoesd {}: installed\n", env!("CARGO_PKG_VERSION")),
+        Err(e) => format!(
+            "shoesd {}: install failed (exit {}): {e}\n",
+            env!("CARGO_PKG_VERSION"),
+            failure_code(e)
+        ),
+    };
+    let dir = install_dir();
+    if dir.is_dir()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("install.log"))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Write a root-owned configuration file with its mode decided in advance.
 ///
 /// `std::fs::write` is `create`, and `create` on an existing file keeps
@@ -794,6 +1358,7 @@ pub fn uninstall() -> std::io::Result<()> {
 /// for every privileged write is easier to keep than a rule with an exception
 /// whose justification has to be re-derived. Both platforms, so neither is the
 /// odd one out.
+#[cfg(unix)]
 fn write_root_owned(path: &Path, contents: &str, mode: u32) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -821,7 +1386,12 @@ fn write_root_owned(path: &Path, contents: &str, mode: u32) -> std::io::Result<(
 }
 
 /// Copy `source` to `staged`, created writable by nobody else.
+///
+/// On Windows there is no mode to pass: `staged` is inside the install
+/// directory, whose protected DACL every file in it inherits, so "nobody else"
+/// is already true of anything created there.
 fn stage(source: &Path, staged: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     // Removed first, because `create` on an existing file keeps the mode it
@@ -832,17 +1402,16 @@ fn stage(source: &Path, staged: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
 
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(staged)
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("could not create {}: {e}", staged.display()),
-            )
-        })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options.open(staged).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not create {}: {e}", staged.display()),
+        )
+    })?;
     let mut input = std::fs::File::open(source).map_err(|e| {
         std::io::Error::new(
             e.kind(),
@@ -875,6 +1444,7 @@ const ROOT_OWNER: &str = "root:wheel";
 const ROOT_OWNER: &str = "root:root";
 
 /// Owned by root, and the given mode.
+#[cfg(unix)]
 fn set_root_owned(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -901,6 +1471,7 @@ fn set_root_owned(path: &Path, mode: u32) -> std::io::Result<()> {
 
 /// Refuse early, with a sentence rather than a permission error from
 /// whichever step happened to be first.
+#[cfg(unix)]
 fn require_root(action: &str) -> std::io::Result<()> {
     // SAFETY: no arguments, no pointers; `geteuid` cannot fail.
     if unsafe { libc::geteuid() } == 0 {
@@ -912,6 +1483,7 @@ fn require_root(action: &str) -> std::io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 fn run(program: &str, args: &[String]) -> std::io::Result<()> {
     let output = Command::new(program).args(args).output().map_err(|e| {
         std::io::Error::new(e.kind(), format!("could not run {program} {args:?}: {e}"))
@@ -926,10 +1498,11 @@ fn run(program: &str, args: &[String]) -> std::io::Result<()> {
     )))
 }
 
-/// What both arms share: the staging discipline and the root check, which are
-/// the parts a mistake in is a privilege escalation rather than a broken
-/// install.
-#[cfg(test)]
+/// What both Unix arms share: the staging discipline and the root check, which
+/// are the parts a mistake in is a privilege escalation rather than a broken
+/// install. Unix-only because what they pin is file modes; the Windows twin of
+/// each is below.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1053,6 +1626,105 @@ mod tests {
 
         let err = uninstall().expect_err("a non-root uninstall must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The shared staging, on Windows: a leftover from an interrupted install
+    /// is replaced, not appended to or refused.
+    #[test]
+    fn staging_replaces_a_leftover_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shoesd-source.exe");
+        std::fs::write(&source, b"new").unwrap();
+        let staged = dir.path().join("shoesd.new");
+        std::fs::write(&staged, b"old and longer").unwrap();
+
+        stage(&source, &staged).expect("a leftover must not block an install");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+    }
+
+    /// Refused before touching anything, with a sentence -- and with the exit
+    /// code the client reads, since it cannot read the sentence.
+    #[test]
+    fn installing_unelevated_is_refused_early_with_its_code() {
+        if crate::win_security::is_elevated().unwrap() {
+            return;
+        }
+        let err = install(
+            Path::new("C:\\nowhere\\shoesd.sock"),
+            Path::new("C:\\nowhere\\applied.json"),
+            None,
+        )
+        .expect_err("an unelevated install must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("Run as administrator"),
+            "got {err}"
+        );
+        assert_eq!(failure_code(&err), Step::NotElevated as u8);
+    }
+
+    /// Every step has its own code; none is 1 (the generic failure) or 1223
+    /// (which the client reads as a dismissed UAC prompt).
+    #[test]
+    fn every_step_has_a_distinct_code_the_client_cannot_misread() {
+        let steps = [
+            Step::NotElevated,
+            Step::Directory,
+            Step::Binary,
+            Step::Wintun,
+            Step::Service,
+            Step::NotRunning,
+        ];
+        let codes: std::collections::BTreeSet<u8> = steps.iter().map(|s| *s as u8).collect();
+        assert_eq!(codes.len(), steps.len());
+        assert!(!codes.contains(&0) && !codes.contains(&1));
+
+        let wrapped = at(Step::Wintun)(std::io::Error::other("x"));
+        assert_eq!(failure_code(&wrapped), Step::Wintun as u8);
+        assert_eq!(failure_code(&std::io::Error::other("unclassified")), 1);
+    }
+
+    /// The command line `windows-service` registers, read back: quoted
+    /// paths with spaces must come out whole, or uninstall would recover
+    /// the wrong record.
+    #[test]
+    fn the_registered_state_path_is_read_back_from_the_command_line() {
+        let line = std::ffi::OsStr::new(
+            r#""C:\Program Files\shoesd\shoesd.exe" service --socket "C:\Program Files\shoesd\shoesd.sock" --state "D:\custom dir\applied.json""#,
+        );
+        let arguments = split_command_line(line).expect("a well-formed line splits");
+
+        assert_eq!(arguments[1], "service");
+        assert_eq!(
+            state_argument(&arguments),
+            Some(std::path::PathBuf::from(r"D:\custom dir\applied.json"))
+        );
+    }
+
+    #[test]
+    fn a_command_line_without_state_leaves_the_default() {
+        let arguments = split_command_line(std::ffi::OsStr::new("shoesd.exe service")).unwrap();
+        assert_eq!(state_argument(&arguments), None);
+    }
+
+    /// The ordinary uninstall: a clean stop already removed the record, so
+    /// there is nothing to replay -- and nothing privileged is attempted.
+    #[test]
+    fn recovering_with_no_record_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        recover_record(&dir.path().join("applied.json")).expect("no record, nothing to undo");
+    }
+
+    #[test]
+    fn everything_lives_under_program_files() {
+        let dir = install_dir();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(dir.ends_with("shoesd"), "{}", dir.display());
     }
 }
 
