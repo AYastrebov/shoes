@@ -826,6 +826,13 @@ pub fn install_dir() -> std::path::PathBuf {
     program_files.join("shoesd")
 }
 
+/// Where the service's log lives: a subdirectory only SYSTEM and
+/// Administrators can read (see `win_service::log_file`).
+#[cfg(windows)]
+pub fn log_dir() -> std::path::PathBuf {
+    install_dir().join("logs")
+}
+
 /// What `install` failed at, as the exit code its client reads.
 ///
 /// Distinct per step, because the client cannot see the output -- and never
@@ -1003,15 +1010,33 @@ pub fn uninstall() -> std::io::Result<()> {
     require_root("uninstall").map_err(at(Step::NotElevated))?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(service_error)?;
+    let mut state_path = crate::default_state_path();
     if let Ok(service) = manager.open_service(
         LABEL,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::STOP
+            | ServiceAccess::DELETE,
     ) {
+        // The record is wherever this service was told to keep it, which
+        // `install --state` may have moved.
+        if let Some(configured) = configured_state_path(&service) {
+            state_path = configured;
+        }
         // Stopped first: the service reverts its session on the way out, and
         // the files below are held open while it runs.
         stop_and_wait(&service)?;
         service.delete().map_err(service_error)?;
     }
+
+    // A stop reverts a running session and clears its record -- but a service
+    // that had already crashed did neither, and stopping a stopped service is
+    // a no-op. Its routes and NRPT rule are then still on the host, and the
+    // record is the only thing that says what to undo; deleting the directory
+    // first would make them unrecoverable. So the record is replayed here,
+    // through the same `Session::recover` the daemon runs at startup, and a
+    // failure stops the uninstall with the record still in place.
+    recover_record(&state_path)?;
 
     let dir = install_dir();
     match std::fs::remove_dir_all(&dir) {
@@ -1022,6 +1047,81 @@ pub fn uninstall() -> std::io::Result<()> {
             format!("could not remove {}: {e}", dir.display()),
         )),
     }
+}
+
+/// Undo whatever a revert record at `state_path` describes, then remove it.
+/// Nothing to do when there is no record -- the normal case, after a clean
+/// stop.
+#[cfg(windows)]
+fn recover_record(state_path: &Path) -> std::io::Result<()> {
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let host = crate::host::windows::WindowsHost::new()?;
+    crate::host::Session::new(&host, state_path)
+        .recover()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "could not undo what {} records ({e}); uninstall stopped so the \
+                     record is kept -- run uninstall again once the cause is fixed",
+                    state_path.display()
+                ),
+            )
+        })
+}
+
+/// The `--state` the installed service was registered with, read back from
+/// its command line. `None` when the configuration cannot be read or names
+/// none, which leaves the default.
+#[cfg(windows)]
+fn configured_state_path(
+    service: &windows_service::service::Service,
+) -> Option<std::path::PathBuf> {
+    let config = service.query_config().ok()?;
+    state_argument(&split_command_line(config.executable_path.as_os_str())?)
+}
+
+/// The value after `--state`, if any. Pure, for the tests.
+#[cfg(windows)]
+fn state_argument(arguments: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--state")
+        .map(|pair| std::path::PathBuf::from(&pair[1]))
+}
+
+/// Split a command line the way Windows does, quoting included -- the inverse
+/// of how `windows-service` joined the launch arguments when it registered
+/// the service.
+#[cfg(windows)]
+fn split_command_line(line: &std::ffi::OsStr) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    let wide: Vec<u16> = line.encode_wide().chain(std::iter::once(0)).collect();
+    let mut count = 0;
+    // SAFETY: a NUL-terminated string; the returned array is LocalAlloc'd and
+    // freed below, and read only within `count`.
+    let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+    if argv.is_null() {
+        return None;
+    }
+    let arguments = (0..count as usize)
+        .map(|i| {
+            // SAFETY: `argv` holds `count` NUL-terminated wide strings.
+            unsafe {
+                let p = *argv.add(i);
+                let len = (0..).take_while(|&j| *p.add(j) != 0).count();
+                std::ffi::OsString::from_wide(std::slice::from_raw_parts(p, len))
+            }
+        })
+        .collect();
+    // SAFETY: allocated by CommandLineToArgvW.
+    unsafe { LocalFree(argv.cast()) };
+    Some(arguments)
 }
 
 /// `install` is elevated, or refuses with a sentence -- the Windows twin of
@@ -1148,9 +1248,10 @@ fn wait_for(
         // rather than after the whole wait.
         if state == ServiceState::Running && status.current_state == ServiceState::Stopped {
             return Err(std::io::Error::other(format!(
-                "the {LABEL} service stopped before it was listening ({:?}); see the \
-                 Application event log",
-                status.exit_code
+                "the {LABEL} service stopped before it was listening ({:?}); its log, \
+                 {}, says why",
+                status.exit_code,
+                log_dir().join("shoesd.log").display()
             )));
         }
         if std::time::Instant::now() >= deadline {
@@ -1547,6 +1648,37 @@ mod windows_tests {
         let wrapped = at(Step::Wintun)(std::io::Error::other("x"));
         assert_eq!(failure_code(&wrapped), Step::Wintun as u8);
         assert_eq!(failure_code(&std::io::Error::other("unclassified")), 1);
+    }
+
+    /// The command line `windows-service` registers, read back: quoted
+    /// paths with spaces must come out whole, or uninstall would recover
+    /// the wrong record.
+    #[test]
+    fn the_registered_state_path_is_read_back_from_the_command_line() {
+        let line = std::ffi::OsStr::new(
+            r#""C:\Program Files\shoesd\shoesd.exe" service --socket "C:\Program Files\shoesd\shoesd.sock" --state "D:\custom dir\applied.json""#,
+        );
+        let arguments = split_command_line(line).expect("a well-formed line splits");
+
+        assert_eq!(arguments[1], "service");
+        assert_eq!(
+            state_argument(&arguments),
+            Some(std::path::PathBuf::from(r"D:\custom dir\applied.json"))
+        );
+    }
+
+    #[test]
+    fn a_command_line_without_state_leaves_the_default() {
+        let arguments = split_command_line(std::ffi::OsStr::new("shoesd.exe service")).unwrap();
+        assert_eq!(state_argument(&arguments), None);
+    }
+
+    /// The ordinary uninstall: a clean stop already removed the record, so
+    /// there is nothing to replay -- and nothing privileged is attempted.
+    #[test]
+    fn recovering_with_no_record_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        recover_record(&dir.path().join("applied.json")).expect("no record, nothing to undo");
     }
 
     #[test]

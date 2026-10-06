@@ -186,7 +186,7 @@ fn main() -> ExitCode {
 
     match args.first().map(String::as_str) {
         Some("run") => match parse_run_args(&args[1..]) {
-            Ok(run) => run_daemon(run, || {}),
+            Ok(run) => run_daemon(run, None, || {}),
             Err(e) => {
                 eprintln!("shoesd: {e}\n\n{}", usage());
                 ExitCode::FAILURE
@@ -263,7 +263,15 @@ fn report(what: &str, result: std::io::Result<()>) -> ExitCode {
 /// `on_listening` runs once the control socket is bound -- see
 /// `service::serve`. A no-op for `run`; the Windows SCM wrapper reports
 /// RUNNING from it.
-fn run_daemon(args: RunArgs, on_listening: impl FnOnce()) -> ExitCode {
+///
+/// `log_file` is where the log also goes, when stderr reaches nobody: `None`
+/// for `run` and under launchd or systemd, which keep stderr; the Windows
+/// service's log file otherwise.
+fn run_daemon(
+    args: RunArgs,
+    log_file: Option<&std::path::Path>,
+    on_listening: impl FnOnce(),
+) -> ExitCode {
     // The daemon's own runtime. It never owns a `ServiceHandle`: stopping one
     // sleeps its caller for up to STOP_TIMEOUT and may drop a runtime inline,
     // which is the last thing that may happen on a gRPC worker. The engine
@@ -280,11 +288,21 @@ fn run_daemon(args: RunArgs, on_listening: impl FnOnce()) -> ExitCode {
     // still sees why a start failed. The ring is bounded, which is what makes
     // its memory a number chosen here rather than a leak.
     let logs = std::sync::Arc::new(shoes::control::logs::BroadcastLogWriter::new(LOG_BACKLOG));
+    let mut writers: Vec<Box<dyn shoes::logging::LogWriter>> = vec![
+        Box::new(shoes::logging::StderrWriter),
+        Box::new(SharedLogWriter(logs.clone())),
+    ];
+    // A file only where nothing captures stderr -- the Windows service; launchd
+    // and systemd already keep it. Not fatal if it cannot be opened: the
+    // daemon still runs, and stderr still gets the reason.
+    if let Some(path) = log_file {
+        match shoes::logging::FileLogWriter::new(&path.to_string_lossy()) {
+            Ok(writer) => writers.push(Box::new(writer)),
+            Err(e) => eprintln!("shoesd: could not open {}: {e}", path.display()),
+        }
+    }
     shoes::logging::init_multi_logger(
-        vec![
-            Box::new(shoes::logging::StderrWriter),
-            Box::new(SharedLogWriter(logs.clone())),
-        ],
+        writers,
         vec![shoes::logging::Directive {
             name: None,
             level: log::LevelFilter::Info,
@@ -300,8 +318,11 @@ fn run_daemon(args: RunArgs, on_listening: impl FnOnce()) -> ExitCode {
     let (supervisor, supervisor_thread) =
         match supervisor::Supervisor::spawn(setup.into_factory(), args.state_path.clone()) {
             Ok(pair) => pair,
+            // Logged rather than printed: the logger is up by now, and under
+            // the Windows SCM stderr reaches nobody -- the log file is where
+            // a failed start has to explain itself. Stderr still gets it.
             Err(e) => {
-                eprintln!("shoesd: could not start the supervisor: {e}");
+                log::error!("could not start the supervisor: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -376,8 +397,9 @@ fn run_daemon(args: RunArgs, on_listening: impl FnOnce()) -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // A bind failure lands here: logged for the reason given above.
         Err(e) => {
-            eprintln!("shoesd: {e}");
+            log::error!("{e}");
             ExitCode::FAILURE
         }
     }

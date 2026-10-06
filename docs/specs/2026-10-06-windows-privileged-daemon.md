@@ -266,8 +266,19 @@ writes `install.log`:
 | 7 | service did not reach RUNNING |
 
 Never 1223: that is `ERROR_CANCELLED`, which KVN reads as "the UAC prompt was
-dismissed". `uninstall` stops the service (which reverts any session), deletes
-it, and removes the directory.
+dismissed". When the service starts but stops before listening, `install`
+says so at once and points at the service's log, `%ProgramFiles%\shoesd\logs\
+shoesd.log` -- under the SCM nothing captures stderr, so the service also
+logs to that file, in a directory only SYSTEM and Administrators can read
+(the Unix arms keep their logs from other users the same way).
+
+`uninstall` stops the service (which reverts a running session), deletes it,
+then replays any revert record still on disk through `Session::recover`
+before removing the directory. The replay is for a service that had already
+crashed: stopping a stopped service reverts nothing, and the record --
+found at the `--state` the service was registered with -- is the only thing
+that knows which routes and NRPT rule to remove. A failed replay stops the
+uninstall with the record kept, so it can be run again.
 
 ## Testing
 

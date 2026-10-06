@@ -22,6 +22,30 @@ use windows_service::{define_windows_service, service_dispatcher};
 /// daemon does not come up, so this is part of the contract with it.
 pub const SERVICE_NAME: &str = "shoesd";
 
+/// The service's own log directory: SYSTEM and Administrators only. The log
+/// carries what the daemon does to the host, and the Unix arms keep theirs
+/// from other local users (`/var/log/shoesd` is 0750 on macOS), so the
+/// install directory's users-may-read ACL is not good enough for it.
+const LOG_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+
+/// Where the service logs, since under the SCM nothing captures stderr --
+/// the file `install` points at when the service does not come up.
+///
+/// `None` when the directory cannot be made or secured: the daemon then runs
+/// with stderr alone rather than writing a log others could read.
+fn log_file() -> Option<std::path::PathBuf> {
+    let dir = crate::install::log_dir();
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| crate::win_security::set_file_dacl(&dir, LOG_DIR_SDDL));
+    match made {
+        Ok(()) => Some(dir.join("shoesd.log")),
+        Err(e) => {
+            eprintln!("shoesd: could not prepare {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
 /// How long the SCM is told startup may take before the socket is bound.
 const START_HINT: Duration = Duration::from_secs(30);
 
@@ -108,8 +132,9 @@ fn service_main(_arguments: Vec<OsString>) {
         );
     };
 
+    let log_file = log_file();
     let exit = match RUN.get() {
-        Some(args) => crate::run_daemon(args.clone(), listening),
+        Some(args) => crate::run_daemon(args.clone(), log_file.as_deref(), listening),
         None => ExitCode::FAILURE,
     };
     let exit_code = if exit == ExitCode::SUCCESS {
