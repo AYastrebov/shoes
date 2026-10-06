@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ClientQuicConfig, RuleConfig};
 use crate::option_util::{NoneOrOne, NoneOrSome};
@@ -133,6 +134,63 @@ pub async fn spawn_tcp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+/// How long [`udp_echo_exchange`] keeps trying in all, and how long it waits
+/// for a reply before sending the payload again.
+const ECHO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const ECHO_RESEND: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Send `payload` through a UDP relay to [`spawn_udp_echo`] and return the
+/// reply that matches it, sending it again whenever none has come back for a
+/// while.
+///
+/// UDP may drop a datagram, and nothing on these paths sends one again: not
+/// the echo, not the plain UDP hop between the relay server and the echo, and
+/// for Hysteria2 not QUIC either, whose datagrams are unreliable by design.
+/// Sending once and waiting failed on macOS runners, whose loopback drops
+/// under the suite's parallel load, even with a whole minute to wait (TUIC's
+/// `quic` mode, run 36267194840): a lost datagram does not arrive late, it
+/// does not arrive. Sending again is what a real UDP client does.
+///
+/// A reply that is not the payload -- a late duplicate of an earlier send --
+/// is skipped and counted, and the count is reported if nothing matching ever
+/// arrives, so an echo that comes back altered still fails the test.
+pub async fn udp_echo_exchange(
+    stream: &mut Box<dyn AsyncMessageStream>,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+    use std::pin::Pin;
+    use tokio::time::{Instant, timeout_at};
+
+    let deadline = Instant::now() + ECHO_DEADLINE;
+    let mut other_replies = 0usize;
+    let mut buf = vec![0u8; 65535];
+    loop {
+        std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, payload)).await?;
+        let resend_at = (Instant::now() + ECHO_RESEND).min(deadline);
+        loop {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+            let read = std::future::poll_fn(|cx| {
+                Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
+            });
+            match timeout_at(resend_at, read).await {
+                Ok(Ok(())) if read_buf.filled() == payload => {
+                    return Ok(read_buf.filled().to_vec());
+                }
+                Ok(Ok(())) => other_replies += 1,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no matching reply arrived; {other_replies} other replies did"),
+            ));
+        }
+    }
 }
 
 /// An echo server on a fresh UDP port. Returns its address.
