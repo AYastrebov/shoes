@@ -49,11 +49,6 @@ impl Authorizer {
         Ok(Self { group_gid })
     }
 
-    /// The resolved gid, for logging what the daemon actually granted.
-    pub fn group_gid(&self) -> u32 {
-        self.group_gid
-    }
-
     /// An authorizer for a gid directly, skipping the name lookup.
     ///
     /// For the service tests, which need a group the user running them is
@@ -77,7 +72,8 @@ impl Authorizer {
         self.allows(peer.uid, peer.gid)
     }
 
-    /// What `socket::bind` restricts the socket to: this group.
+    /// What `socket::bind` restricts the socket to: the resolved gid. Also how
+    /// a test reads back what a name resolved to.
     pub fn socket_access(&self) -> u32 {
         self.group_gid
     }
@@ -415,6 +411,6 @@ mod tests {
         let resolved = Authorizer::for_group(&name)
             .unwrap_or_else(|e| panic!("the process's own group {name:?} must resolve: {e}"));
 
-        assert_eq!(resolved.group_gid(), gid);
+        assert_eq!(resolved.socket_access(), gid);
     }
 }
