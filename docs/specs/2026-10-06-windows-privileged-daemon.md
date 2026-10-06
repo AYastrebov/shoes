@@ -142,8 +142,12 @@ Mechanics, per accepted connection:
 3. Allowed iff the user SID is `S-1-5-18`, or any group equals the
    Administrators SID (`EqualSid` against `CreateWellKnownSid`).
 
-The PID is read at accept and the token immediately after; a client that
-exits in between is refused (no process to open), not mistaken for another.
+The PID is only a number, so the lookup is bound to the connection: the
+accept time is taken as soon as `accept` returns, and the process opened for
+that PID must have been created before it (`GetProcessTimes`), its handle
+held while the token is read. A client that exits in between is refused --
+either there is no process to open, or the PID's new owner was born after the
+accept and so cannot be the peer.
 The result rides into each request as a `Connected::ConnectInfo`, and
 `check_peer` reads it instead of `UdsConnectInfo`. Refusal stays a gRPC
 `PERMISSION_DENIED` per call, never a dropped socket. The pure decision —

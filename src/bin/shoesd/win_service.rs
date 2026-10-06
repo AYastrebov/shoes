@@ -22,6 +22,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 /// daemon does not come up, so this is part of the contract with it.
 pub const SERVICE_NAME: &str = "shoesd";
 
+/// How long the SCM is told startup may take before the socket is bound.
+const START_HINT: Duration = Duration::from_secs(30);
+
 /// Woken by the SCM's Stop or Shutdown. `notify_one` stores a permit, so a
 /// stop that arrives before anything is waiting is not lost.
 static STOP: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -73,30 +76,40 @@ fn service_main(_arguments: Vec<OsString>) {
         }
     };
 
-    let report = |state, accepted, exit_code| {
+    let report = |state, accepted, exit_code, wait_hint| {
         let _ = status.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accepted,
             exit_code,
             checkpoint: 0,
-            wait_hint: Duration::default(),
+            wait_hint,
             process_id: None,
         });
     };
 
-    // RUNNING before the socket is bound: the SCM wants an answer within its
-    // start timeout, and binding cannot take long. Clients poll for the
-    // socket rather than trusting the service state, so nothing reads this as
-    // "listening".
+    // START_PENDING until the socket is bound, RUNNING only then: `install`
+    // waits for RUNNING, so reporting it any earlier would let an install
+    // succeed over a daemon that then failed to bind. The hint covers startup
+    // -- probing the host and reverting a previous crash's record -- which
+    // normally takes well under a second.
     report(
-        ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
         ServiceExitCode::Win32(0),
+        START_HINT,
     );
+    let listening = || {
+        report(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceExitCode::Win32(0),
+            Duration::default(),
+        );
+    };
 
     let exit = match RUN.get() {
-        Some(args) => crate::run_daemon(args.clone()),
+        Some(args) => crate::run_daemon(args.clone(), listening),
         None => ExitCode::FAILURE,
     };
     let exit_code = if exit == ExitCode::SUCCESS {
@@ -108,5 +121,6 @@ fn service_main(_arguments: Vec<OsString>) {
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
         exit_code,
+        Duration::default(),
     );
 }

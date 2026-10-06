@@ -51,7 +51,19 @@ pub enum Event {
 ///
 /// `next` blocks for the next event. `drain` discards whatever else is queued
 /// without blocking, so a burst becomes one re-apply.
-pub fn run(mut next: impl FnMut() -> Event, mut drain: impl FnMut(), on_change: impl Fn()) {
+pub fn run(next: impl FnMut() -> Event, drain: impl FnMut(), on_change: impl Fn()) {
+    run_paced(next, drain, on_change, SETTLE, SECOND_LOOK);
+}
+
+/// [`run`] with its two delays as parameters, so the transitions can be tested
+/// without sleeping for real.
+fn run_paced(
+    mut next: impl FnMut() -> Event,
+    mut drain: impl FnMut(),
+    on_change: impl Fn(),
+    settle: std::time::Duration,
+    second_look: std::time::Duration,
+) {
     loop {
         match next() {
             Event::Changed => {}
@@ -62,11 +74,11 @@ pub fn run(mut next: impl FnMut() -> Event, mut drain: impl FnMut(), on_change: 
             }
         }
 
-        std::thread::sleep(SETTLE);
+        std::thread::sleep(settle);
         drain();
         on_change();
 
-        std::thread::sleep(SECOND_LOOK);
+        std::thread::sleep(second_look);
         drain();
         on_change();
     }
@@ -86,7 +98,7 @@ mod tests {
         let reports = AtomicUsize::new(0);
         let drains = Cell::new(0);
 
-        run(
+        run_paced(
             || {
                 script.set(script.get() + 1);
                 match script.get() {
@@ -99,6 +111,8 @@ mod tests {
             || {
                 reports.fetch_add(1, Ordering::SeqCst);
             },
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
         );
 
         assert_eq!(reports.load(Ordering::SeqCst), 2);

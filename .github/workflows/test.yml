@@ -1,7 +1,3 @@
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc --no-progress -y
-
 name: Test
 
 on:

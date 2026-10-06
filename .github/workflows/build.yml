@@ -1,4 +1,4 @@
-name: Build Binaries || runner.os == 'Windows'
+name: Build Binaries
 
 # Tags only, plus pull requests and manual runs. A branch push runs Test and
 # Lint; it does not spend five macOS-runner minutes producing artifacts that

@@ -1105,6 +1105,13 @@ fn restart_on_failure(service: &windows_service::service::Service) -> std::io::R
             command: None,
             actions: Some(vec![restart.clone(), restart.clone(), restart]),
         })
+        .map_err(service_error)?;
+    // Without this the actions above cover only crashes. The daemon's own
+    // failures end in a clean SERVICE_STOPPED with a non-zero exit code --
+    // `win_service` reports one -- and those are the ones that most need a
+    // restart; `Restart=always` makes no such distinction either.
+    service
+        .set_failure_actions_on_non_crash_failures(true)
         .map_err(service_error)
 }
 
@@ -1127,11 +1134,24 @@ fn wait_for(
     service: &windows_service::service::Service,
     state: windows_service::service::ServiceState,
 ) -> std::io::Result<()> {
+    use windows_service::service::ServiceState;
+
     let deadline = std::time::Instant::now() + SERVICE_WAIT;
     loop {
         let status = service.query_status().map_err(service_error)?;
         if status.current_state == state {
             return Ok(());
+        }
+        // Waiting for RUNNING and finding STOPPED is a failed start, not a slow
+        // one: the service reports RUNNING only once its socket is bound, so
+        // this is a daemon that exited first. Said now, with its exit code,
+        // rather than after the whole wait.
+        if state == ServiceState::Running && status.current_state == ServiceState::Stopped {
+            return Err(std::io::Error::other(format!(
+                "the {LABEL} service stopped before it was listening ({:?}); see the \
+                 Application event log",
+                status.exit_code
+            )));
         }
         if std::time::Instant::now() >= deadline {
             return Err(std::io::Error::new(

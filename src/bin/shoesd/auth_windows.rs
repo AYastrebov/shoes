@@ -50,13 +50,27 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
-    /// Read the identity of process `pid`.
+    /// Read the identity of the process that connected as `pid`, given the
+    /// moment the connection was accepted (a FILETIME, from [`now`]).
     ///
-    /// An error when the process cannot be opened -- most often because it
-    /// has already exited, between connecting and being looked up. That is a
-    /// refusal, never a guess: the PID may by now belong to someone else.
-    pub fn of_process(pid: u32) -> std::io::Result<Self> {
+    /// The socket names its peer only by PID, and a PID is not an identity:
+    /// if the client exits between connecting and this lookup, Windows may
+    /// hand the number to a new process, and reading *that* token would
+    /// authenticate the wrong program. So the process found must have been
+    /// created before `accepted_at` -- the peer existed when it connected,
+    /// and anything born afterwards cannot be it. The handle is held while
+    /// the token is read, so the process checked is the process read.
+    ///
+    /// An error, and so a refusal, when the process is gone or too new.
+    pub fn of_connected_process(pid: u32, accepted_at: u64) -> std::io::Result<Self> {
         let process = Handle::open_process(pid)?;
+        let created = process.creation_time()?;
+        if created > accepted_at {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("pid {pid} was reused after the connection was accepted"),
+            ));
+        }
         let token = process.token()?;
         Ok(Self {
             pid,
@@ -64,6 +78,27 @@ impl PeerIdentity {
             groups: token_groups(&token)?,
         })
     }
+
+    /// The identity of a process known to be alive and to be the one meant --
+    /// this process itself, in the tests.
+    #[cfg(test)]
+    pub fn of_process(pid: u32) -> std::io::Result<Self> {
+        Self::of_connected_process(pid, now())
+    }
+}
+
+/// The current time as a FILETIME, the unit process creation times are in.
+pub fn now() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
+
+    // SAFETY: writes the struct it is given.
+    let mut time = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemTimePreciseAsFileTime(&mut time) };
+    filetime(time)
+}
+
+fn filetime(time: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
 /// Same name as the Unix type, so `service` has one body on every platform.
@@ -192,6 +227,29 @@ impl Handle {
             ));
         }
         Ok(Self(handle))
+    }
+
+    /// When the process was created, as a FILETIME.
+    fn creation_time(&self) -> std::io::Result<u64> {
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+        // SAFETY: four out-parameters the call fills; `self.0` is a live
+        // process handle opened with PROCESS_QUERY_LIMITED_INFORMATION,
+        // which GetProcessTimes accepts.
+        let (mut created, mut exited, mut kernel, mut user) = unsafe {
+            (
+                std::mem::zeroed(),
+                std::mem::zeroed(),
+                std::mem::zeroed(),
+                std::mem::zeroed(),
+            )
+        };
+        if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(filetime(created))
     }
 
     fn token(&self) -> std::io::Result<Self> {
@@ -328,6 +386,16 @@ mod tests {
         let me = PeerIdentity::of_process(std::process::id()).expect("own token is readable");
         assert!(me.user.starts_with("S-1-5-"), "{}", me.user);
         assert!(me.groups.iter().any(|g| g == "S-1-1-0"), "{:?}", me.groups);
+    }
+
+    /// A PID now held by a process born after the accept is not the peer --
+    /// the recycled-PID case. Staged with this process and an accept time
+    /// before it existed.
+    #[test]
+    fn a_process_newer_than_the_connection_is_refused() {
+        let err = PeerIdentity::of_connected_process(std::process::id(), 0)
+            .expect_err("a process created after the accept cannot be the peer");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

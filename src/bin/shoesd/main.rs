@@ -186,7 +186,7 @@ fn main() -> ExitCode {
 
     match args.first().map(String::as_str) {
         Some("run") => match parse_run_args(&args[1..]) {
-            Ok(run) => run_daemon(run),
+            Ok(run) => run_daemon(run, || {}),
             Err(e) => {
                 eprintln!("shoesd: {e}\n\n{}", usage());
                 ExitCode::FAILURE
@@ -260,7 +260,10 @@ fn report(what: &str, result: std::io::Result<()>) -> ExitCode {
     }
 }
 
-fn run_daemon(args: RunArgs) -> ExitCode {
+/// `on_listening` runs once the control socket is bound -- see
+/// `service::serve`. A no-op for `run`; the Windows SCM wrapper reports
+/// RUNNING from it.
+fn run_daemon(args: RunArgs, on_listening: impl FnOnce()) -> ExitCode {
     // The daemon's own runtime. It never owns a `ServiceHandle`: stopping one
     // sleeps its caller for up to STOP_TIMEOUT and may drop a runtime inline,
     // which is the last thing that may happen on a gRPC worker. The engine
@@ -355,6 +358,7 @@ fn run_daemon(args: RunArgs) -> ExitCode {
         supervisor.clone(),
         logs,
         host_capabilities,
+        on_listening,
     ));
 
     // Unconditionally, and before the join: `serve` can fail during setup --

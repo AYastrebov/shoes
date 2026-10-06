@@ -110,7 +110,7 @@ fn remove_stale(path: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
 
-    if !platform::is_socket(&metadata) {
+    if !platform::is_socket(path, &metadata) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -148,7 +148,9 @@ mod platform {
         tokio_stream::wrappers::UnixListenerStream::new(listener)
     }
 
-    pub fn is_socket(metadata: &std::fs::Metadata) -> bool {
+    /// The file type says so outright on Unix; the path is for Windows' sake,
+    /// where the type does not.
+    pub fn is_socket(_path: &Path, metadata: &std::fs::Metadata) -> bool {
         metadata.file_type().is_socket()
     }
 
@@ -253,9 +255,13 @@ mod platform {
     const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
 
     /// `FILE_ATTRIBUTE_REPARSE_POINT`. An AF_UNIX socket on Windows is a
-    /// reparse point, which is how a stale one is told from a file someone
-    /// left there.
+    /// reparse point -- but so are symlinks, junctions and several other
+    /// kinds of file, so this alone does not make something a socket.
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    /// `IO_REPARSE_TAG_AF_UNIX`, from `ntifs.h`: the tag that makes a reparse
+    /// point a socket, and the only one `remove_stale` may delete.
+    const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
 
     /// The socket file: SYSTEM and Administrators fully, every authenticated
     /// user enough to connect. Protected (`P`), so nothing inherited widens it.
@@ -274,8 +280,40 @@ mod platform {
         uds_windows::UnixListener::bind(path)
     }
 
-    pub fn is_socket(metadata: &std::fs::Metadata) -> bool {
+    /// A reparse point whose tag says AF_UNIX socket. The attribute is checked
+    /// first because it is free; the tag is what decides, since a symlink or
+    /// junction carries the same attribute and deleting one with SYSTEM's
+    /// rights is exactly what `remove_stale` exists to refuse.
+    pub fn is_socket(path: &Path, metadata: &std::fs::Metadata) -> bool {
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            && reparse_tag(path) == Some(IO_REPARSE_TAG_AF_UNIX)
+    }
+
+    /// The reparse tag of `path`, which `FindFirstFileW` reports in
+    /// `dwReserved0` for a reparse point. `None` when it cannot be read --
+    /// which `is_socket` then treats as "not a socket", the safe answer.
+    fn reparse_tag(path: &Path) -> Option<u32> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindClose, FindFirstFileW, WIN32_FIND_DATAW,
+        };
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a NUL-terminated path; `data` is written on success and the
+        // handle is closed below.
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: a find handle from the call above, closed once.
+        unsafe { FindClose(handle) };
+        Some(data.dwReserved0)
     }
 
     pub fn restrict_socket(path: &Path, _: Access) -> std::io::Result<()> {
@@ -356,9 +394,13 @@ mod platform {
             .name("shoesd-accept".into())
             .spawn(move || {
                 loop {
-                    let accepted = listener
-                        .accept()
-                        .and_then(|(stream, _)| connection(stream.into_raw_socket(), &runtime));
+                    let accepted = listener.accept().and_then(|(stream, _)| {
+                        // Taken as soon as accept returns: the peer existed
+                        // before this moment, which is what lets the identity
+                        // lookup refuse a process that took its PID later.
+                        let accepted_at = crate::auth::now();
+                        connection(stream.into_raw_socket(), accepted_at, &runtime)
+                    });
                     if tx.blocking_send(accepted).is_err() {
                         return;
                     }
@@ -370,14 +412,16 @@ mod platform {
 
     fn connection(
         socket: RawSocket,
+        accepted_at: u64,
         runtime: &tokio::runtime::Handle,
     ) -> std::io::Result<Connection> {
         // Identify first, before the socket changes hands: the PID is the
         // kernel's answer for this connection, read as close to accept as
-        // possible.
+        // possible, and the process found must predate the accept -- see
+        // `PeerIdentity::of_connected_process`.
         let peer = PeerInfo(
             peer_pid(socket)
-                .and_then(PeerIdentity::of_process)
+                .and_then(|pid| PeerIdentity::of_connected_process(pid, accepted_at))
                 .map_err(|e| e.to_string()),
         );
 
@@ -459,6 +503,7 @@ mod tests {
         // this the ordinary case rather than an exotic one.
         drop(first);
         assert!(platform::is_socket(
+            &path,
             &std::fs::symlink_metadata(&path).unwrap()
         ));
 
@@ -553,6 +598,31 @@ mod tests {
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A junction carries the same reparse attribute a socket does. Deleting
+    /// one with SYSTEM's rights is what the tag check exists to prevent; a
+    /// junction rather than a symlink because creating one needs no privilege.
+    #[cfg(windows)]
+    #[test]
+    fn bind_refuses_to_delete_a_junction() {
+        let path = scratch("junction");
+        let target = path.with_file_name("target-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&path)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+
+        let err = bind(&path, own_access()).expect_err("a junction is not ours to delete");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "the junction must still be there");
+
+        let _ = std::fs::remove_dir(&path);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     /// The socket's DACL is the one asked for, protected from inheritance.

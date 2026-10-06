@@ -440,6 +440,7 @@ pub async fn serve(
     supervisor: Supervisor,
     logs: Arc<BroadcastLogWriter>,
     host_capabilities: Vec<String>,
+    on_listening: impl FnOnce(),
 ) -> std::io::Result<()> {
     let authorizer = Authorizer::for_group(group)?;
     let listener = crate::socket::bind(socket_path, authorizer.socket_access())?;
@@ -449,6 +450,10 @@ pub async fn serve(
         socket_path.display(),
         authorizer.describe(),
     );
+    // The moment a client can connect, and not before: under the Windows SCM
+    // this is what reports RUNNING, which `install` waits for -- so a daemon
+    // that fails to bind never lets an install report success.
+    on_listening();
 
     let service = DaemonService {
         authorizer,

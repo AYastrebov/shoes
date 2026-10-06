@@ -274,6 +274,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
 ] }
 # The daemon's Windows half, behind `daemon`. AF_UNIX on Windows: tokio's
 # `UnixListener` is `cfg(unix)`, so binding and accepting go through this and
