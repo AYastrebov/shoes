@@ -792,12 +792,58 @@ mod tests {
             .await
             .unwrap();
 
-        // Interleaved, so a stealing reader has every chance to win the race.
-        // Whatever has not come back is sent again: a datagram lost on
-        // loopback is not coming, and waiting for it is what made this kind
-        // of test flaky (see `udp_echo_exchange`). Resending cannot hide a
-        // steal, which shows up as the wrong label on a reply.
+        // The check that cannot be passed by luck: while `first` is the only
+        // session reading, a reply for `second` must still reach `second`.
+        // Before the demultiplexer, `first`'s reader popped it off the one
+        // queue, saw a session id not its own, and dropped it -- so `second`
+        // never got it, however often it was sent. A datagram lost on
+        // loopback is sent again; a stolen one never arrives no matter how
+        // many times, and the deadline reports it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *second).poll_write_message(cx, &[2u8, 0xff])
+            })
+            .await
+            .unwrap();
+            let mut buf = [0u8; 64];
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            let on_first = tokio::time::timeout(
+                Duration::from_millis(250),
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *first).poll_read_message(cx, &mut read)
+                }),
+            )
+            .await;
+            assert!(
+                on_first.is_err(),
+                "session 1 was handed a datagram while only session 2 had sent: {:?}",
+                read.filled()
+            );
+            let mut buf = [0u8; 64];
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            let on_second = tokio::time::timeout(
+                Duration::from_millis(250),
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *second).poll_read_message(cx, &mut read)
+                }),
+            )
+            .await;
+            if on_second.is_ok() {
+                assert_eq!(read.filled(), [2u8, 0xff]);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "session 2 never received its reply while session 1 was reading: \
+                 the reply is being taken by whichever session reads first"
+            );
+        }
+
+        // Then both at once, interleaved, so a reader that only steals under
+        // contention has every chance to. Whatever has not come back is sent
+        // again, for the same reason as above; a steal of the returning kind
+        // shows up as the wrong label on a reply.
         let mut received: [std::collections::BTreeSet<u8>; 2] = Default::default();
         while received.iter().any(|r| r.len() < 8) {
             assert!(

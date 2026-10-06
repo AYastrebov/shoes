@@ -136,7 +136,6 @@ pub async fn spawn_tcp_echo() -> SocketAddr {
     addr
 }
 
-/// An echo server on a fresh UDP port. Returns its address.
 /// How long [`udp_echo_exchange`] keeps trying in all, and how long it waits
 /// for a reply before sending the payload again.
 const ECHO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -194,6 +193,7 @@ pub async fn udp_echo_exchange(
     }
 }
 
+/// An echo server on a fresh UDP port. Returns its address.
 pub async fn spawn_udp_echo() -> SocketAddr {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();

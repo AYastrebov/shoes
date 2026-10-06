@@ -417,9 +417,6 @@ mod tests {
         }
     }
 
-    /// How long a single loopback exchange may take before the test calls it a
-    /// hang.
-    ///
     #[tokio::test]
     async fn test_udp_round_trip_in_native_mode() {
         let server = spawn_server().await;
