@@ -411,6 +411,7 @@ mod tests {
                 obfs: None,
                 port_hopping: None,
                 default_alpn: "h3",
+                congestion: crate::quic_transport::CongestionControl::Cubic,
             },
             Arc::new(CountingAuthenticator::default()),
             None,
@@ -479,6 +480,7 @@ mod tests {
                 obfs: None,
                 port_hopping: None,
                 default_alpn: "h3",
+                congestion: crate::quic_transport::CongestionControl::Cubic,
             },
             Arc::new(crate::hysteria2::auth::Hysteria2Authenticator::new(
                 PASSWORD.to_string(),
@@ -514,6 +516,7 @@ mod tests {
                 obfs: None,
                 port_hopping: None,
                 default_alpn: "h3",
+                congestion: crate::quic_transport::CongestionControl::Cubic,
             },
             Arc::new(CountingAuthenticator::default()),
             None,
