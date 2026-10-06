@@ -15,11 +15,18 @@
 mod plan;
 mod state;
 
+/// The route monitors' shared loop; each platform supplies only its source of
+/// events.
+pub mod monitor;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(windows)]
+pub mod windows;
 
 #[cfg(test)]
 pub mod double;

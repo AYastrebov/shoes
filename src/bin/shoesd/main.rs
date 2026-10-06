@@ -14,22 +14,29 @@
 // The daemon's dependencies live under target sections, so building it on a
 // platform with no arm fails with a pile of unresolved crates. Say why instead.
 //
-// Not a placeholder for a port: the protocol and the daemon's structure leave
-// room for Windows -- `capabilities` is reported rather than inferred precisely
-// so a client can ask -- but routes and DNS there are their own design.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+// `capabilities` is reported rather than inferred precisely so a client can
+// ask what a build does, and every platform here has its own design for
+// routes and DNS. Anything else is not a port waiting to happen.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 compile_error!(
-    "the `daemon` feature builds shoesd, which is macOS and Linux only: its \
-     host network configuration (routes, DNS) has no arm for this platform \
-     yet. Build without `--features daemon`."
+    "the `daemon` feature builds shoesd, which is macOS, Linux and Windows \
+     only: its host network configuration (routes, DNS) has no arm for this \
+     platform. Build without `--features daemon`."
 );
 
+// One interface, two mechanisms: kernel credentials on Unix, the peer
+// process's token on Windows. `service` calls the same names on both.
+#[cfg_attr(windows, path = "auth_windows.rs")]
 mod auth;
 mod host;
 mod install;
 mod service;
 mod socket;
 mod supervisor;
+#[cfg(windows)]
+mod win_security;
+#[cfg(windows)]
+mod win_service;
 
 use std::process::ExitCode;
 
@@ -38,10 +45,40 @@ use std::process::ExitCode;
 /// In its own directory, which `bind` creates `0750` root:group. That is what
 /// closes the instant between the socket being created and its mode being set
 /// -- reaching a socket needs search permission on every directory above it.
+#[cfg(unix)]
 const DEFAULT_SOCKET_PATH: &str = "/var/run/shoesd/shoesd.sock";
 
 /// Where the revert record lives. Root-only; see `host::AppliedState`.
+#[cfg(unix)]
 const DEFAULT_STATE_PATH: &str = "/var/db/shoesd/applied.json";
+
+#[cfg(unix)]
+fn default_socket_path() -> std::path::PathBuf {
+    DEFAULT_SOCKET_PATH.into()
+}
+
+#[cfg(unix)]
+fn default_state_path() -> std::path::PathBuf {
+    DEFAULT_STATE_PATH.into()
+}
+
+/// `%ProgramFiles%\shoesd\shoesd.sock`, which KVN dials.
+///
+/// Under `%ProgramFiles%` for the reason `/var/run` is root's: a standard user
+/// cannot create anything there, so nothing can be listening at this path
+/// before the daemon is. `%ProgramData%` would let one pre-create `shoesd\`
+/// and receive every config a client sends. See the Windows spec, "Paths".
+#[cfg(windows)]
+fn default_socket_path() -> std::path::PathBuf {
+    install::install_dir().join("shoesd.sock")
+}
+
+/// The revert record, in the same protected directory: a record a standard
+/// user could seed would have a SYSTEM process delete routes of their choosing.
+#[cfg(windows)]
+fn default_state_path() -> std::path::PathBuf {
+    install::install_dir().join("state").join("applied.json")
+}
 
 /// Log lines retained for a client that attaches after the interesting part.
 /// A GUI started after a failed tunnel still needs to see why it failed.
@@ -61,8 +98,12 @@ const LOG_BACKLOG: usize = 512;
 /// nothing".
 #[cfg(target_os = "macos")]
 const DEFAULT_GROUP: &str = "admin";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 const DEFAULT_GROUP: &str = "wheel";
+/// Fixed, not a default: on Windows the group is not configurable. See
+/// `auth_windows::Authorizer::for_group`.
+#[cfg(windows)]
+const DEFAULT_GROUP: &str = auth::ADMINISTRATORS_GROUP;
 
 fn usage() -> String {
     format!(
@@ -74,18 +115,20 @@ fn usage() -> String {
              shoesd uninstall\n\
          \n\
          OPTIONS:\n    \
-             --socket <path>  Control socket path (default: {DEFAULT_SOCKET_PATH})\n    \
-             --state <path>   Revert record (default: {DEFAULT_STATE_PATH})\n    \
+             --socket <path>  Control socket path (default: {})\n    \
+             --state <path>   Revert record (default: {})\n    \
              --group <name>   Group allowed to connect\n                     \
                               (run: default {DEFAULT_GROUP}; install: detected\n                     \
                               from wheel/sudo/adm unless given)\n    \
              -V, --version    Print version and exit\n",
         env!("CARGO_PKG_VERSION"),
+        default_socket_path().display(),
+        default_state_path().display(),
     )
 }
 
 /// What `run` was asked for.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RunArgs {
     socket_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
@@ -101,8 +144,8 @@ struct RunArgs {
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
-    let mut socket_path = std::path::PathBuf::from(DEFAULT_SOCKET_PATH);
-    let mut state_path = std::path::PathBuf::from(DEFAULT_STATE_PATH);
+    let mut socket_path = default_socket_path();
+    let mut state_path = default_state_path();
     let mut group: Option<String> = None;
 
     let mut rest = args.iter();
@@ -170,6 +213,22 @@ fn main() -> ExitCode {
             &format!("removed {} and its job", install::INSTALLED_BINARY),
             install::uninstall(),
         ),
+        // What the Service Control Manager runs: the same daemon as `run`,
+        // inside the SCM's handshake. Windows only; on Unix the service
+        // manager runs `run` itself.
+        #[cfg(windows)]
+        Some("service") => match parse_run_args(&args[1..]) {
+            Ok(run) => win_service::run(run),
+            Err(e) => {
+                eprintln!(
+                    "shoesd: {e}
+
+{}",
+                    usage()
+                );
+                ExitCode::FAILURE
+            }
+        },
         Some("-V" | "--version") => {
             println!("shoesd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -192,9 +251,11 @@ fn report(what: &str, result: std::io::Result<()>) -> ExitCode {
             println!("shoesd: {what}");
             ExitCode::SUCCESS
         }
+        // A code per step on Windows, where the elevated client cannot see
+        // this output; 1 everywhere else. See `install::failure_code`.
         Err(e) => {
             eprintln!("shoesd: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(install::failure_code(&e))
         }
     }
 }
@@ -397,6 +458,40 @@ impl HostSetup {
     }
 }
 
+#[cfg(windows)]
+struct HostSetup;
+
+#[cfg(windows)]
+impl HostSetup {
+    fn probe() -> Self {
+        Self
+    }
+
+    /// The `dns-backend:` line, as on Linux: NRPT is the one Windows mechanism
+    /// that stops the multi-homed resolver leaking around the tunnel, and the
+    /// first thing a Windows DNS report needs to confirm.
+    fn capabilities(&self) -> Vec<String> {
+        vec!["dns-backend:nrpt".to_string()]
+    }
+
+    /// NRPT is not a file, and nothing else on the host writes the tunnel
+    /// adapter's own DNS settings.
+    fn watched_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn into_factory(
+        self,
+    ) -> impl FnOnce() -> std::io::Result<crate::host::windows::WindowsHost> + Send + 'static {
+        crate::host::windows::WindowsHost::new
+    }
+}
+
+#[cfg(windows)]
+fn monitor_spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
+    crate::host::windows::monitor::spawn(on_change)
+}
+
 #[cfg(target_os = "macos")]
 fn monitor_spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
     crate::host::macos::monitor::spawn(on_change)
@@ -418,10 +513,11 @@ fn watch_dns_file(
 /// Unreachable, and an error rather than a silent `Ok`.
 ///
 /// `HostSetup::watched_file` answers `None` on macOS -- DNS there lives in the
-/// `SCDynamicStore`, which is not a file -- so nothing calls this. It exists so
+/// `SCDynamicStore`, which is not a file -- and on Windows, where it lives in
+/// NRPT and the adapter's own settings; so nothing calls this. It exists so
 /// the call site needs no `cfg` of its own, and it says so out loud rather than
 /// reporting a watch that was never installed.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn watch_dns_file(
     path: &std::path::Path,
     _on_change: impl Fn() + Send + 'static,
@@ -455,8 +551,8 @@ mod tests {
     #[test]
     fn run_takes_the_documented_defaults() {
         let args = parse_run_args(&[]).expect("no arguments is the launchd shape");
-        assert_eq!(args.socket_path, std::path::Path::new(DEFAULT_SOCKET_PATH));
-        assert_eq!(args.state_path, std::path::Path::new(DEFAULT_STATE_PATH));
+        assert_eq!(args.socket_path, default_socket_path());
+        assert_eq!(args.state_path, default_state_path());
         // Not the default: *absent*. `install` needs to tell the two apart,
         // and substituting here is exactly what would stop it.
         assert_eq!(args.group, None);

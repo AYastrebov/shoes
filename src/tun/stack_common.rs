@@ -1637,6 +1637,11 @@ pub mod test_util {
 
     /// One IPv6 SYN, checksummed, from [2001:db8::2]:`src_port` to
     /// [2001:db8::1]:443, with initial sequence number 0.
+    ///
+    /// Dead on Windows, where its one caller -- the utun-framing test in
+    /// `tcp_stack_direct`, the descriptor-based stack -- is not built. An
+    /// allow rather than a `cfg`, so its imports stay used on every platform.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn syn6_packet(src_port: u16) -> Vec<u8> {
         let tcp = TcpRepr {
             src_port,

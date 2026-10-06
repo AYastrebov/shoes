@@ -521,7 +521,7 @@ executable per product for the simulator and asserts with `nm` that the
 host has no engine symbol and the extension does. Design:
 [docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md](./docs/superpowers/specs/2026-08-28-spm-host-extension-split-design.md).
 
-### 4. Privileged helper and IPC contract — macOS and Linux done, pending their live runs
+### 4. Privileged helper and IPC contract — macOS, Linux and Windows done, pending their live runs
 
 `shoesd` (`src/bin/shoesd/`, `--features daemon`) is a root daemon -- launchd
 on macOS, systemd on Linux -- serving gRPC over a Unix domain socket, with the `.proto` owned here in
@@ -558,19 +558,39 @@ bug report needs answered. Design:
 what it does to a host and what is still unverified:
 [docs/LINUX.md](./docs/LINUX.md).
 
+**Windows is the third**, on the same trait, sequencer and protocol. The
+socket is AF_UNIX there too, not a named pipe -- the first consumer is a JVM
+client and grpc-java has no pipe transport -- at
+`%ProgramFiles%shoesdshoesd.sock`, where no standard user can create
+anything first. The peer check reads the client's token through
+`SIO_AF_UNIX_GETPEERPID` and admits SYSTEM or a member of Administrators in
+any state, because an administrator's unelevated token carries that group as
+deny-only. Routes go through the IP Helper API rather than localised
+`route.exe` output; DNS is the tunnel adapter's plus an NRPT rule for `.`,
+without which multi-homed name resolution leaks every lookup to the local
+resolver. It runs under the Service Control Manager, and `install` reports
+failures by exit code, since a UAC-elevated child's output cannot be
+captured. wintun.dll is still not shipped by shoes; `install` copies it from
+beside `shoesd.exe`, so the packager supplies it. The route monitors' settle
+and second-look loop moved to `host/monitor.rs`, shared by all three. Design:
+[docs/specs/2026-10-06-windows-privileged-daemon.md](./docs/specs/2026-10-06-windows-privileged-daemon.md).
+
 **What is left.** Both live runs — on Apple Silicon (step 8 of
 [the macOS plan](./docs/plans/2026-09-04-macos-privileged-daemon.md)) and on
 Linux (step 8 of
 [its own](./docs/plans/2026-09-04-linux-privileged-daemon.md), nine items,
-against a Fedora host with systemd-resolved and Tailscale up) — and Windows.
+against a Fedora host with systemd-resolved and Tailscale up) -- and on
+Windows 11, whose five open measurements are listed in its spec: what a
+Windows AF_UNIX `connect` checks on the socket file, whether a loopback route
+makes IPv6 fail fast, that NRPT stops port-53 traffic on the physical
+adapter, the deny-only peer case, and an end-to-end start/stop/crash run.
 
 Linux was expected to be the awkward one, and the four mechanisms are real:
 the answer is two backends chosen by a probe at startup, not four arms. What
 made it awkward was not the count but that "systemd-resolved, where it is
 running" is not a sufficient test — in resolved's `uplink` and `foreign` modes
 every glibc client bypasses it, so per-link configuration succeeds and DNS
-leaks with nothing saying so. Windows remains an `unimplemented` arm behind the
-same protocol, with `capabilities` there so a client asks rather than infers.
+leaks with nothing saying so.
 
 ### 5. The Tauri GUI
 

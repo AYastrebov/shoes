@@ -70,6 +70,58 @@ impl Authorizer {
             groups_of(uid, primary_gid)
         })
     }
+
+    /// [`Authorizer::allows`] for a [`Peer`] -- the shape `service` calls on
+    /// every platform, so its check has one body.
+    pub fn allows_peer(&self, peer: &Peer) -> bool {
+        self.allows(peer.uid, peer.gid)
+    }
+
+    /// What `socket::bind` restricts the socket to: this group.
+    pub fn socket_access(&self) -> u32 {
+        self.group_gid
+    }
+
+    /// Who this admits, for the log line `serve` writes at startup.
+    pub fn describe(&self) -> String {
+        format!("root and gid {}", self.group_gid)
+    }
+}
+
+/// The message every refused call gets. One string for every refusal, so it
+/// cannot be used to probe which groups exist.
+pub const REFUSAL: &str = "not permitted; this daemon serves root and one configured group";
+
+/// A caller, as the kernel reported it on the socket.
+#[derive(Debug, Clone, Copy)]
+pub struct Peer {
+    uid: u32,
+    gid: u32,
+}
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "uid {} (gid {})", self.uid, self.gid)
+    }
+}
+
+/// The peer of a request: the credentials tonic's Unix-socket transport
+/// attached to it.
+///
+/// An error when there are none. That means this did not arrive over the Unix
+/// socket this daemon serves; there is no other transport, so it is a
+/// programming error rather than an attack -- but it must not be read as "no
+/// credentials, therefore allow".
+pub fn peer_of<T>(request: &tonic::Request<T>) -> Result<Peer, &'static str> {
+    let info = request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .ok_or("no peer credentials on this connection")?;
+    let cred = info.peer_cred.ok_or("the peer supplied no credentials")?;
+    Ok(Peer {
+        uid: cred.uid(),
+        gid: cred.gid(),
+    })
 }
 
 /// The decision, with the group lookup injected so it can be tested without

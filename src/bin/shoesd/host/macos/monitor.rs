@@ -12,23 +12,6 @@
 
 use std::os::unix::io::RawFd;
 
-/// How long to wait after a burst before reporting it.
-///
-/// A single network change produces a flurry of messages -- the interface
-/// going down, addresses being removed, the new default arriving -- and
-/// re-applying on each would mean re-reading the table a dozen times while it
-/// is still settling.
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// And again, a moment later.
-///
-/// macOS restores the host's own resolvers asynchronously a little after a
-/// network change, so a DNS re-apply that runs only once can be undone
-/// immediately afterwards with nothing left to notice it. wg-quick works
-/// around the same behaviour by kicking itself with `SIGALRM` two seconds
-/// later; this is that, without the signal.
-const SECOND_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Watch the routing table, calling `on_change` when it moves.
 ///
 /// The thread runs for the life of the process. It is detached deliberately:
@@ -42,53 +25,43 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> std::io::Result<()> {
         .name("shoesd-route-monitor".to_owned())
         .spawn(move || {
             let _guard = FdGuard(fd);
+            // Nothing here parses a message, so one longer than the buffer is
+            // truncated and that costs nothing -- the signal is that one
+            // arrived at all. Two buffers because the wait and the drain are
+            // separate closures that would otherwise both borrow one.
             let mut buffer = [0u8; 4096];
+            let mut spare = [0u8; 4096];
 
-            loop {
-                // SAFETY: `buffer` is valid for `len` bytes for the duration of
-                // the call, and `fd` is open until `_guard` drops.
-                let read = unsafe {
-                    libc::read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len())
-                };
-
-                if read < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if recoverable(&error) {
-                        // Notably ENOBUFS. This thread sleeps for over two
-                        // seconds per event without reading, so a burst on a
-                        // busy network overflows the socket buffer -- and
-                        // treating that as fatal would end the monitor after
-                        // the first Wi-Fi-to-Ethernet move, which is the exact
-                        // event it exists for. The messages are lost either
-                        // way and it does not matter: nothing here parses
-                        // them, and the re-apply that follows re-reads the
-                        // table.
-                        continue;
+            crate::host::monitor::run(
+                || {
+                    // SAFETY: `buffer` is valid for `len` bytes for the
+                    // duration of the call, and `fd` is open until `_guard`
+                    // drops.
+                    let read = unsafe {
+                        libc::read(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len())
+                    };
+                    if read < 0 {
+                        let error = std::io::Error::last_os_error();
+                        // Notably ENOBUFS. The loop sleeps for over two seconds
+                        // per event without reading, so a burst on a busy
+                        // network overflows the socket buffer -- and treating
+                        // that as fatal would end the monitor after the first
+                        // Wi-Fi-to-Ethernet move, which is the exact event it
+                        // exists for.
+                        if recoverable(&error) {
+                            crate::host::monitor::Event::Spurious
+                        } else {
+                            crate::host::monitor::Event::Ended(error.to_string())
+                        }
+                    } else if read == 0 {
+                        crate::host::monitor::Event::Ended("its socket closed".to_owned())
+                    } else {
+                        crate::host::monitor::Event::Changed
                     }
-                    // The socket is gone and reopening it is the job of the
-                    // next process. Losing the monitor costs re-application on
-                    // a network change, not the session.
-                    log::error!("the route monitor stopped: {error}");
-                    return;
-                }
-                if read == 0 {
-                    log::error!("the route monitor's socket closed");
-                    return;
-                }
-
-                // Drain whatever else the kernel has queued for this change
-                // before reporting, so a burst becomes one re-apply.
-                std::thread::sleep(SETTLE);
-                drain(fd, &mut buffer);
-
-                on_change();
-
-                // The second look, for the resolvers macOS puts back on its
-                // own schedule rather than ours.
-                std::thread::sleep(SECOND_LOOK);
-                drain(fd, &mut buffer);
-                on_change();
-            }
+                },
+                || drain(fd, &mut spare),
+                on_change,
+            );
         })?;
 
     Ok(())
