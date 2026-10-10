@@ -654,18 +654,19 @@ inside a packet tunnel provider talks to the app that owns it.
 
 ### Open
 
-- **Log growth.** `shoes_set_log_file` appends forever
-  (`src/ffi/common.rs:66`), and on iOS an App Group log outlives the
-  process, so it grows across sessions. Truncating on set is the wrong fix —
-  it is called once per start and would discard the log of the previous
-  crash, which is the one worth reading. Size-capped rotation in Rust, one
-  `.1` kept, is small.
-- **The compiled log ceiling.** Release builds carry
-  `release_max_level_info` (`Cargo.toml`), so `debug` and `trace` behave as
-  `info` and a support session asks for logs the build cannot produce. A
-  `shoes_max_log_level()` returning the ceiling, surfaced as
-  `ShoesEngine.effectiveLogLevel`, ends that conversation. Ship it with the
-  rotation.
+- **Log growth — done.** `shoes_set_log_file` appended forever, and on iOS
+  an App Group log outlives the process, so it grew across sessions. It now
+  rotates at 4 MiB to `<path>.1`, keeping one previous file; it still appends
+  when set, and a previous session's log past the cap is rotated before the
+  first write, so the log of a crash is kept whole. Spec:
+  [docs/specs/2026-10-10-mobile-log-rotation-and-ceiling.md](./docs/specs/2026-10-10-mobile-log-rotation-and-ceiling.md).
+- **The compiled log ceiling — done.** Release builds carry
+  `release_max_level_info`, so `debug` and `trace` behave as `info`.
+  `shoes_max_log_level()` and `ShoesNative.maxLogLevel()` return the ceiling,
+  `ShoesEngine.maxLogLevel` surfaces it in Swift, and the host app can ask the
+  extension with `ShoesAppMessage.maxLogLevel`. It is `maxLogLevel`, not the
+  `effectiveLogLevel` this entry proposed, because it is the build's ceiling
+  rather than the level in effect.
 - **Path changes.** The provider wakes on every `.satisfied` path after the
   first (`ShoesPacketTunnelProvider.swift`, `startPathObservation`). A wake
   costs one `shoes_network_changed` call and a full rebind only when the
