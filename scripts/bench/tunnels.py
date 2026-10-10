@@ -19,8 +19,9 @@ Environment:
   LOGS    print the last N lines of each shoes process's output at the end
   PERF    record and print a perf profile of each shoes process (Linux);
           PERF_SORT picks the key (symbol, tid, ...), PERF_TOP the rows
-  TUIC_CC sing-box's TUIC `congestion_control` at both ends, e.g. bbr
-          (default: unset, which sing-box takes as cubic)
+  TUIC_CC TUIC's `congestion_control`, e.g. bbr, for every TUIC client and
+          server, shoes and sing-box alike (default: unset, which both
+          take as cubic)
   NETEM   a path between client and server, as `tc netem` arguments, e.g.
           "delay 25ms loss 0.5%" (Linux, root). Applied to each direction of
           the tunnel leg only, so "delay 25ms" is a 50 ms round trip, and
@@ -104,15 +105,15 @@ def write_configs():
             - "0.0.0.0/0"
           mtu: 1408
 '''
-    # TUIC with each implementation's default congestion controller, which
-    # is Cubic in both: sing-box's `congestion_control` defaults to it, and
-    # ours is fixed to it.
+    # TUIC with each implementation's default congestion controller, Cubic
+    # in both, unless TUIC_CC chooses another for every end.
+    cc = f"\n            congestion_control: {os.environ['TUIC_CC']}" if os.environ.get("TUIC_CC") else ""
     tuic = lambda port: f'''      client_chain:
         - address: "127.0.0.1:{port}"
           protocol:
             type: tuic
             uuid: "{TUIC_UUID}"
-            password: "pw"
+            password: "pw"{cc}
           quic_settings:
             verify: false
             sni_hostname: "localhost"
@@ -143,7 +144,7 @@ def write_configs():
     type: tuic
     uuid: "{TUIC_UUID}"
     password: pw
-''')
+{"    congestion_control: " + os.environ["TUIC_CC"] + chr(10) if os.environ.get("TUIC_CC") else ""}''')
     tls_s = {"enabled": True, "alpn": ["h3"], "certificate_path": f"{B}/cert.pem", "key_path": f"{B}/key.pem"}
     tls_c = {"enabled": True, "insecure": True, "server_name": "localhost", "alpn": ["h3"]}
     json.dump({"log": {"level": "warn"},

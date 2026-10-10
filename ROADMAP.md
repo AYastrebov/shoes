@@ -222,6 +222,14 @@ association and write bare packet bodies onto it, without the version and
 command bytes that make a `Packet` a command, so what it sent was something its
 own receiving side would have rejected.
 
+The two differ in congestion control, as their references do. Hysteria2 runs
+BBR at both ends with no option, upstream's fallback when Brutal is not
+negotiated. TUIC takes `congestion_control` (`cubic`, `new_reno`, `bbr`) on
+the client and the server, Cubic by default as in the reference and sing-box;
+on Cubic it carries single-digit Mbit/s at 0.5% loss, in sing-box too, and on
+`bbr` about 500. See
+[docs/specs/2026-10-10-tuic-congestion-control.md](./docs/specs/2026-10-10-tuic-congestion-control.md).
+
 One option is refused at config load rather than silently ignored, because a
 user who asks for it and does not get it should be told: TUIC's
 `zero_rtt_handshake`. What else is missing is in

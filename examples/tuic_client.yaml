@@ -18,5 +18,9 @@
             # unidirectional streams, which survives a path that mangles
             # datagrams and does not fragment a large packet.
             udp_relay_mode: native
+            # Controls what this client sends, so upload. Cubic is the
+            # default and collapses on a lossy path; bbr does not. The server
+            # chooses for download with its own congestion_control.
+            congestion_control: bbr
           quic_settings:
             sni_hostname: "example.com"

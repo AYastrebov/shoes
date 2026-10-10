@@ -2813,6 +2813,7 @@ mod tests {
                     udp_relay_mode: TuicUdpRelayMode::Native,
                     zero_rtt_handshake: false,
                     heartbeat_ms,
+                    congestion_control: Default::default(),
                 })),
                 ..Default::default()
             }

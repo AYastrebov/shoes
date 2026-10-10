@@ -347,7 +347,12 @@ protocol:
   uuid: string                 # UUID
   password: string
   zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
+  congestion_control: cubic    # Default: cubic. One of 'cubic', 'new_reno', 'bbr'
 ```
+
+`congestion_control` governs what the server sends, so it is the one that
+decides download speed for its clients. See the TUIC client below for when to
+choose `bbr`.
 
 ### AnyTLS
 ```yaml
@@ -856,7 +861,17 @@ protocol:
   udp_enabled: true            # Default: true
   udp_relay_mode: native       # Default: native. Either 'native' or 'quic'.
   heartbeat_ms: 10000          # Default: 10000
+  congestion_control: cubic    # Default: cubic. One of 'cubic', 'new_reno', 'bbr'
 ```
+
+`congestion_control` is the controller for what this end sends, so on a client
+it governs upload, and the server's own setting governs download. The two ends
+do not negotiate it and need not match. `cubic` is the default, as in the TUIC
+reference and sing-box, and it collapses on a lossy path: at 50 ms with 0.5%
+loss a single stream carried 5 to 11 Mbit/s on Cubic and about 500 on `bbr`.
+Choose `bbr` at both ends for a lossy or long-distance path. On a clean path
+between different implementations it can be somewhat slower than Cubic.
+`newreno` is accepted as another spelling of `new_reno`.
 
 `udp_relay_mode: native` carries UDP over QUIC datagrams, and `quic` carries
 them over unidirectional streams. Datagrams are cheaper; streams are the way

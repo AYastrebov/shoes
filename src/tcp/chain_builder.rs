@@ -192,6 +192,7 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
                 std::time::Duration::from_millis(tuic.heartbeat_ms),
                 config.quic_settings.unwrap_or_default(),
                 config.bind_interface.into_option(),
+                tuic.congestion_control.into(),
             )
             .expect("the uuid was validated during config load"),
         ),
@@ -471,6 +472,37 @@ mod tests {
         );
         assert_eq!(chain.num_hops(), 1);
         assert!(chain.supports_udp());
+    }
+
+    /// The TUIC outbound built from a config dials with the congestion
+    /// controller that config chose, Cubic when it chose none.
+    #[test]
+    fn test_tuic_outbound_takes_its_congestion_control_from_config() {
+        use crate::config::{TuicClientConfig, TuicCongestionControl};
+        let build = |congestion_control| {
+            format!(
+                "{:?}",
+                build_terminal_connector(ClientConfig {
+                    address: NetLocation::from_str("127.0.0.1:443", None).unwrap(),
+                    protocol: ClientProxyConfig::Tuic(Box::new(TuicClientConfig {
+                        uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4".to_string(),
+                        password: "secret".into(),
+                        udp_enabled: true,
+                        udp_relay_mode: Default::default(),
+                        zero_rtt_handshake: false,
+                        heartbeat_ms: 10_000,
+                        congestion_control,
+                    })),
+                    ..Default::default()
+                })
+            )
+        };
+        let built = build(TuicCongestionControl::default());
+        assert!(built.contains("congestion: Cubic"), "{built}");
+        let built = build(TuicCongestionControl::Bbr);
+        assert!(built.contains("congestion: Bbr"), "{built}");
+        let built = build(TuicCongestionControl::NewReno);
+        assert!(built.contains("congestion: NewReno"), "{built}");
     }
 
     /// A built chain picks up the counters the running config installed, and

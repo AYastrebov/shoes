@@ -11,5 +11,8 @@
     # Enable 0-RTT handshake for lower latency (default: false)
     # Note: 0-RTT is vulnerable to replay attacks, only enable if acceptable
     zero_rtt_handshake: false
+    # Controls what the server sends, so its clients' download. One of cubic
+    # (default), new_reno or bbr; bbr for a lossy or long-distance path.
+    congestion_control: cubic
   rules:
     - allow-all-direct

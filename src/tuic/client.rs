@@ -70,6 +70,7 @@ impl std::fmt::Debug for TuicConnector {
         f.debug_struct("TuicConnector")
             .field("server", &self.connection.settings().server)
             .field("udp_relay_mode", &self.udp_relay_mode)
+            .field("congestion", &self.connection.settings().congestion)
             .finish()
     }
 }
@@ -85,6 +86,7 @@ impl TuicConnector {
         heartbeat_interval: Duration,
         quic: ClientQuicConfig,
         bind_interface: Option<String>,
+        congestion: CongestionControl,
     ) -> std::io::Result<Self> {
         // parse_uuid hands back a Vec; the protocol field is exactly 16 bytes,
         // and pinning that in the type means the encoder cannot be handed
@@ -119,8 +121,8 @@ impl TuicConnector {
             // setting would offer something no real server understands.
             port_hopping: None,
             default_alpn: "h3",
-            // TUIC's default, unlike Hysteria2's.
-            congestion: CongestionControl::Cubic,
+            // The operator's choice, Cubic unless they made one.
+            congestion,
         };
 
         Ok(Self {
@@ -273,6 +275,7 @@ mod tests {
             direct_selector(resolver.clone()),
             resolver,
             false,
+            CongestionControl::Cubic,
         )
         .await
         .unwrap();
@@ -280,14 +283,28 @@ mod tests {
         bind_address
     }
 
-    /// TUIC's client keeps Cubic, its reference's default.
+    /// The connector dials with the controller its config chose.
     #[test]
-    fn test_the_connector_asks_for_cubic() {
-        let connector = connector(reserve_udp_port(), TEST_UUID, "pw");
-        assert_eq!(
-            connector.connection.settings().congestion,
-            CongestionControl::Cubic
-        );
+    fn test_the_connector_asks_for_the_configured_controller() {
+        for congestion in [
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+            CongestionControl::Bbr,
+        ] {
+            let connector = TuicConnector::new(
+                NetLocation::from_str("127.0.0.1:1", None).unwrap(),
+                TEST_UUID,
+                "pw".to_string(),
+                true,
+                TuicUdpRelayMode::Native,
+                Duration::from_millis(10_000),
+                client_quic_config(),
+                None,
+                congestion,
+            )
+            .unwrap();
+            assert_eq!(connector.connection.settings().congestion, congestion);
+        }
     }
 
     fn connector(server: SocketAddr, uuid: &str, password: &str) -> TuicConnector {
@@ -309,6 +326,7 @@ mod tests {
             Duration::from_millis(10_000),
             client_quic_config(),
             None,
+            CongestionControl::Cubic,
         )
         .unwrap()
     }
@@ -330,6 +348,7 @@ mod tests {
             Duration::from_millis(10_000),
             client_quic_config(),
             None,
+            CongestionControl::Cubic,
         )
         .expect_err("a malformed uuid must be refused at construction")
         .to_string();
@@ -347,6 +366,7 @@ mod tests {
             Duration::from_millis(3000),
             client_quic_config(),
             None,
+            CongestionControl::Cubic,
         )
         .unwrap();
         assert_eq!(connector.udp_relay_mode(), TuicUdpRelayMode::Quic);
@@ -554,6 +574,7 @@ mod tests {
             Duration::from_millis(10_000),
             client_quic_config(),
             None,
+            CongestionControl::Cubic,
         )
         .unwrap();
 

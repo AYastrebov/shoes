@@ -36,7 +36,8 @@ pub use clash_api::ClashApiConfig;
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
     HttpUpgradeClientConfig, Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig,
-    TuicClientConfig, TuicUdpRelayMode, WebsocketClientConfig, WireGuardClientConfig,
+    TuicClientConfig, TuicCongestionControl, TuicUdpRelayMode, WebsocketClientConfig,
+    WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
