@@ -1716,7 +1716,14 @@ mod tests {
     /// drops without answering, which is a tunnel that never comes up and
     /// never says why. After it, the same client speaks 3.0 framing and the
     /// peer answers.
-    #[tokio::test]
+    ///
+    /// On a paused clock: the claim is that the test lands between the first
+    /// probe and the second. The probe's first deadline starts when its task
+    /// is first polled, after the test's own sleep is registered, so on a
+    /// wall clock a stall of half an interval in between put the probe after
+    /// the test -- which then found trailers still on, intermittently, on
+    /// macOS runners.
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_31_tunnel_probes_its_way_back_to_30_framing() {
         let client_config = convert_amnezia_config(&awg31_params(), 1420).unwrap();
         let server_config = convert_amnezia_config(&real_world_params(), 1420).unwrap();

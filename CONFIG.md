@@ -1364,7 +1364,7 @@ client_chain:
 
 ### Hot Reloading
 
-Configuration changes are automatically detected and applied without restarting, after a three-second debounce. Disable with `--no-reload` flag. Sending `SIGHUP` reloads immediately, with or without the watcher.
+Configuration changes are automatically detected and applied without restarting, after a three-second debounce. A file saved with the same bytes it already had restarts nothing, since a restart drops live connections. Disable with `--no-reload` flag. Sending `SIGHUP` reloads immediately, with or without the watcher, and always reloads, even when no file changed.
 
 ### mTLS (Mutual TLS)
 

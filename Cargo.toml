@@ -222,6 +222,9 @@ tonic-prost-build = { version = "0.14", optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde_json = "1"
 tempfile = "3"
+# test-util: a paused clock, for tests whose claim is about which side of a
+# timer they land on. On a wall clock a loaded runner moves the line.
+tokio = { version = "1", features = ["test-util"] }
 tokio-rustls = "0.26"
 
 # Unix only: on Windows the TUN backend drives wintun directly

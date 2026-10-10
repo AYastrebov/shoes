@@ -362,7 +362,14 @@ async fn a_write_then_a_sighup_is_one_reload_not_two() {
     let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
     let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
-    wait_until(first_addr, true).await;
+    // The child's own word that it bound the first port, not a connect to
+    // it: the ports are free only when allocated, and a sibling test's
+    // process can hold one by now. A connect answered by that process lets
+    // the write below land before this child reads its config; it then
+    // starts on the second port and sees no change. That is the only way
+    // found to produce this test's one Linux failure, a child that started
+    // and never printed "Configs changed".
+    stdout.wait_for(&format!("server at 127.0.0.1:{first}"));
 
     std::fs::write(&config, socks_config(second)).unwrap();
     stdout.wait_for("Configs changed");
@@ -388,6 +395,45 @@ async fn a_write_then_a_sighup_is_one_reload_not_two() {
         restarts,
         1,
         "one edit, one reload; stdout was:\n{}",
+        lines.join("\n")
+    );
+    drop(child);
+}
+
+/// A watcher event for a file whose bytes did not change restarts nothing.
+///
+/// FSEvents on macOS can deliver a second event for one write after the
+/// reload that write caused has drained the first, and a restart drops every
+/// live connection. This test made that visible as two restarts for one
+/// edit, intermittently, on macOS runners. Rewriting the same bytes produces
+/// the same late event on demand on every platform.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_watcher_event_for_unchanged_bytes_restarts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    let [port] = free_ports::<1>();
+    std::fs::write(&config, socks_config(port)).unwrap();
+    let mut child = Child(
+        std::process::Command::new(shoes_bin())
+            .arg(&config)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = Stdout::tap(&mut child);
+    stdout.wait_for(&format!("server at 127.0.0.1:{port}"));
+
+    std::fs::write(&config, socks_config(port)).unwrap();
+    stdout.wait_for("Configs changed");
+    stdout.wait_for("Configs unchanged");
+
+    let _ = child.0.kill();
+    let lines = stdout.rest();
+    assert!(
+        !lines.iter().any(|l| l.contains("Restarting servers..")),
+        "the same bytes are not an edit; stdout was:\n{}",
         lines.join("\n")
     );
     drop(child);
