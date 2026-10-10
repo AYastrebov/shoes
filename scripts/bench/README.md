@@ -1,8 +1,8 @@
 # Benchmarks
 
 Throughput and latency of the data paths that carry most traffic: the TUN
-stack, the UDP tunnels (WireGuard and AmneziaWG, Hysteria2) and the plain
-relay. sing-box is the peer for the protocols shoes only speaks as a client,
+stack, the UDP tunnels (WireGuard and AmneziaWG, Hysteria2, TUIC) and the
+plain relay. sing-box is the peer for the protocols shoes only speaks as a client,
 and the yardstick for the rest.
 
 ## Running
@@ -17,6 +17,7 @@ scripts/bench/run-linux.sh tunnels            # tunnels.py: U and D, one stream
 scripts/bench/run-linux.sh tunnels MODES=P    # round-trip latency
 scripts/bench/run-linux.sh tunnels MODES=S ONLY="-> shoes"   # slow destination
 scripts/bench/run-linux.sh tunnels NETEM="delay 25ms loss 0.5%" # a lossy 50 ms path
+scripts/bench/run-linux.sh tunnels ONLY=tuic TUIC_CC=bbr       # TUIC on BBR at every end
 scripts/bench/run-linux.sh tun                # tun_linux.py: a real TUN device
 scripts/bench/run-linux.sh tun CASES=idle PERF=1             # with a profile
 scripts/bench/run-linux.sh tun SINGBOX=system                 # sing-box's TUN instead

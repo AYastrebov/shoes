@@ -433,6 +433,7 @@ pub async fn start_quic_servers(
             uuid,
             password,
             zero_rtt_handshake,
+            congestion_control,
         } => {
             let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
             let password: &'static str = Box::leak(password.into_inner().into_boxed_str());
@@ -450,6 +451,7 @@ pub async fn start_quic_servers(
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     zero_rtt_handshake,
+                    congestion_control.into(),
                 )
                 .await?;
                 handles.extend(tuic_handles);

@@ -1489,7 +1489,10 @@ async fn run_datagram_loop(
 }
 
 /// The transport parameters of a TUIC listener.
-fn transport_params(obfs: Option<&Arc<dyn Obfuscator>>) -> QuicTransportParams {
+fn transport_params(
+    obfs: Option<&Arc<dyn Obfuscator>>,
+    congestion: CongestionControl,
+) -> QuicTransportParams {
     QuicTransportParams {
         max_concurrent_bidi_streams: 4096,
         // The `quic` UDP relay mode carries every packet fragment on its own
@@ -1501,8 +1504,8 @@ fn transport_params(obfs: Option<&Arc<dyn Obfuscator>>) -> QuicTransportParams {
         // takes out of every datagram.
         mtu: effective_mtu(obfs.map(|o| o.overhead())),
         enable_segmentation_offload: obfs.is_none(),
-        // TUIC's default, unlike Hysteria2's.
-        congestion: CongestionControl::Cubic,
+        // The operator's choice, Cubic unless they made one.
+        congestion,
     }
 }
 
@@ -1513,8 +1516,9 @@ pub async fn start_tuic_server(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     zero_rtt_handshake: bool,
+    congestion: CongestionControl,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let params = transport_params(listener.obfs.as_ref());
+    let params = transport_params(listener.obfs.as_ref(), congestion);
 
     let inbound = crate::connection_registry::intern(format!("tuic@{}", listener.bind_address));
     start_quic_listeners(listener, params, move |conn| {
@@ -1539,17 +1543,23 @@ pub async fn start_tuic_server(
 mod transport_tests {
     use super::*;
 
-    /// TUIC keeps Cubic, its reference's default, where Hysteria2 runs BBR.
+    /// The listener runs the controller its config chose, obfuscated or not.
     #[test]
-    fn test_the_listener_runs_cubic() {
-        assert_eq!(transport_params(None).congestion, CongestionControl::Cubic);
+    fn test_the_listener_runs_the_configured_controller() {
         let salamander: Arc<dyn Obfuscator> = Arc::new(
             crate::quic_transport::obfs::Salamander::new(b"obfuscation password").unwrap(),
         );
-        assert_eq!(
-            transport_params(Some(&salamander)).congestion,
-            CongestionControl::Cubic
-        );
+        for congestion in [
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+            CongestionControl::Bbr,
+        ] {
+            assert_eq!(transport_params(None, congestion).congestion, congestion);
+            assert_eq!(
+                transport_params(Some(&salamander), congestion).congestion,
+                congestion
+            );
+        }
     }
 }
 

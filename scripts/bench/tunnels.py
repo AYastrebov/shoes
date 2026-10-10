@@ -19,6 +19,9 @@ Environment:
   LOGS    print the last N lines of each shoes process's output at the end
   PERF    record and print a perf profile of each shoes process (Linux);
           PERF_SORT picks the key (symbol, tid, ...), PERF_TOP the rows
+  TUIC_CC TUIC's `congestion_control`, e.g. bbr, for every TUIC client and
+          server, shoes and sing-box alike (default: unset, which both
+          take as cubic)
   NETEM   a path between client and server, as `tc netem` arguments, e.g.
           "delay 25ms loss 0.5%" (Linux, root). Applied to each direction of
           the tunnel leg only, so "delay 25ms" is a 50 ms round trip, and
@@ -60,6 +63,10 @@ def keypair():
     return d["PrivateKey"], d["PublicKey"]
 
 
+TUIC_UUID = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
+TUIC_CC = {"congestion_control": os.environ["TUIC_CC"]} if os.environ.get("TUIC_CC") else {}
+
+
 def write_configs():
     srv, shoes, sb = keypair(), keypair(), keypair()
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
@@ -98,8 +105,23 @@ def write_configs():
             - "0.0.0.0/0"
           mtu: 1408
 '''
+    # TUIC with each implementation's default congestion controller, Cubic
+    # in both, unless TUIC_CC chooses another for every end.
+    cc = f"\n            congestion_control: {os.environ['TUIC_CC']}" if os.environ.get("TUIC_CC") else ""
+    tuic = lambda port: f'''      client_chain:
+        - address: "127.0.0.1:{port}"
+          protocol:
+            type: tuic
+            uuid: "{TUIC_UUID}"
+            password: "pw"{cc}
+          quic_settings:
+            verify: false
+            sni_hostname: "localhost"
+            alpn_protocols:
+              - h3'''
     w("shoes-client.yaml",
-      socks(21080, "") + socks(21081, hy2(24431)) + socks(21082, hy2(24432)) + socks(21087, hy2(24433, OB)) + socks(21089, hy2(24434, OB)) + socks(21084, wg("wireguard")))
+      socks(21080, "") + socks(21081, hy2(24431)) + socks(21082, hy2(24432)) + socks(21087, hy2(24433, OB)) + socks(21089, hy2(24434, OB)) + socks(21084, wg("wireguard"))
+      + socks(21091, tuic(24435)) + socks(21092, tuic(24436)))
     srvblk = lambda port, obfs="": f'''- address: "127.0.0.1:{port}"
   transport: quic
   quic_settings:
@@ -111,27 +133,42 @@ def write_configs():
     type: hysteria2
     password: pw
 {obfs}'''
-    w("shoes-server.yaml", srvblk(24431) + srvblk(24433, "    obfs:\n      type: salamander\n      password: obfspw\n"))
+    w("shoes-server.yaml", srvblk(24431) + srvblk(24433, "    obfs:\n      type: salamander\n      password: obfspw\n") + f'''- address: "127.0.0.1:24435"
+  transport: quic
+  quic_settings:
+    cert: {B}/cert.pem
+    key: {B}/key.pem
+    alpn_protocols:
+      - h3
+  protocol:
+    type: tuic
+    uuid: "{TUIC_UUID}"
+    password: pw
+{"    congestion_control: " + os.environ["TUIC_CC"] + chr(10) if os.environ.get("TUIC_CC") else ""}''')
     tls_s = {"enabled": True, "alpn": ["h3"], "certificate_path": f"{B}/cert.pem", "key_path": f"{B}/key.pem"}
     tls_c = {"enabled": True, "insecure": True, "server_name": "localhost", "alpn": ["h3"]}
     json.dump({"log": {"level": "warn"},
                "inbounds": [{"type": "hysteria2", "tag": "hy2-in", "listen": "127.0.0.1", "listen_port": 24432, "users": [{"password": "pw"}], "tls": tls_s},
                             {"type": "hysteria2", "tag": "hy2-obfs-in", "listen": "127.0.0.1", "listen_port": 24434, "users": [{"password": "pw"}], "tls": tls_s,
-                             "obfs": {"type": "salamander", "password": "obfspw"}}],
+                             "obfs": {"type": "salamander", "password": "obfspw"}},
+                            {"type": "tuic", "tag": "tuic-in", "listen": "127.0.0.1", "listen_port": 24436, "users": [{"uuid": TUIC_UUID, "password": "pw"}], "tls": tls_s, **TUIC_CC}],
                "endpoints": [{"type": "wireguard", "tag": "wg-srv", "system": False, "mtu": 1408, "address": ["10.9.0.1/24"], "private_key": srv[0], "listen_port": 25182,
                               "peers": [{"public_key": shoes[1], "allowed_ips": ["10.9.0.2/32"]}, {"public_key": sb[1], "allowed_ips": ["10.9.0.3/32"]}]}],
                "outbounds": [{"type": "direct", "tag": "direct"}], "route": {"final": "direct"}}, open(f"{B}/sb-server.json", "w"), indent=1)
     json.dump({"log": {"level": "warn"},
                "inbounds": [{"type": "socks", "tag": t, "listen": "127.0.0.1", "listen_port": p} for t, p in
-                            (("s-direct", 21086), ("s-hy2", 21083), ("s-hy2-shoes", 21088), ("s-hy2-obfs-shoes", 21090), ("s-wg", 21085))],
+                            (("s-direct", 21086), ("s-hy2", 21083), ("s-hy2-shoes", 21088), ("s-hy2-obfs-shoes", 21090), ("s-wg", 21085),
+                             ("s-tuic-shoes", 21093), ("s-tuic", 21094))],
                "endpoints": [{"type": "wireguard", "tag": "wg-cli", "system": False, "mtu": 1408, "address": ["10.9.0.3/32"], "private_key": sb[0],
                               "peers": [{"address": "127.0.0.1", "port": 25182, "public_key": srv[1], "allowed_ips": ["0.0.0.0/0"]}]}],
                "outbounds": [{"type": "direct", "tag": "direct"},
                              {"type": "hysteria2", "tag": "hy2", "server": "127.0.0.1", "server_port": 24432, "password": "pw", "tls": tls_c},
                              {"type": "hysteria2", "tag": "hy2-shoes", "server": "127.0.0.1", "server_port": 24431, "password": "pw", "tls": tls_c},
                              {"type": "hysteria2", "tag": "hy2-obfs-shoes", "server": "127.0.0.1", "server_port": 24433, "password": "pw", "tls": tls_c,
-                              "obfs": {"type": "salamander", "password": "obfspw"}}],
-               "route": {"rules": [{"inbound": "s-hy2", "outbound": "hy2"}, {"inbound": "s-hy2-shoes", "outbound": "hy2-shoes"}, {"inbound": "s-hy2-obfs-shoes", "outbound": "hy2-obfs-shoes"}, {"inbound": "s-wg", "outbound": "wg-cli"}], "final": "direct"}},
+                              "obfs": {"type": "salamander", "password": "obfspw"}},
+                             {"type": "tuic", "tag": "tuic-shoes", "server": "127.0.0.1", "server_port": 24435, "uuid": TUIC_UUID, "password": "pw", "tls": tls_c, **TUIC_CC},
+                             {"type": "tuic", "tag": "tuic", "server": "127.0.0.1", "server_port": 24436, "uuid": TUIC_UUID, "password": "pw", "tls": tls_c, **TUIC_CC}],
+               "route": {"rules": [{"inbound": "s-tuic-shoes", "outbound": "tuic-shoes"}, {"inbound": "s-tuic", "outbound": "tuic"}, {"inbound": "s-hy2", "outbound": "hy2"}, {"inbound": "s-hy2-shoes", "outbound": "hy2-shoes"}, {"inbound": "s-hy2-obfs-shoes", "outbound": "hy2-obfs-shoes"}, {"inbound": "s-wg", "outbound": "wg-cli"}], "final": "direct"}},
               open(f"{B}/sb-client.json", "w"), indent=1)
 
 
@@ -157,7 +194,7 @@ def wait_port(p, t=10):
     return False
 # The ports the tunnel servers listen on; the netem path is between these
 # and their clients.
-TUNNEL_PORTS = (24431, 24432, 24433, 24434, 25182)
+TUNNEL_PORTS = (24431, 24432, 24433, 24434, 24435, 24436, 25182)
 
 
 def netem():
@@ -239,6 +276,10 @@ cases = [
  ("singbox hy2 -> singbox hy2", 21083, ["sb_cli", "sb_srv"]),
  ("shoes wg -> singbox wg", 21084, ["shoes_cli", "sb_srv"]),
  ("singbox wg -> singbox wg", 21085, ["sb_cli", "sb_srv"]),
+ ("shoes tuic -> shoes tuic", 21091, ["shoes_cli", "shoes_srv"]),
+ ("shoes tuic -> singbox tuic", 21092, ["shoes_cli", "sb_srv"]),
+ ("singbox tuic -> shoes tuic", 21093, ["sb_cli", "shoes_srv"]),
+ ("singbox tuic -> singbox tuic", 21094, ["sb_cli", "sb_srv"]),
 ]
 only = os.environ.get("ONLY")
 conns_list = [int(x) for x in os.environ.get("CONNS", "1").split(",")]

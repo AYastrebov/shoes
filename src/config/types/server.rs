@@ -9,6 +9,7 @@ use super::redacted::Redacted;
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
+use super::client::TuicCongestionControl;
 use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
 use super::dns::DnsConfig;
 use super::obfs::ObfsConfig;
@@ -804,6 +805,10 @@ pub enum ServerProxyConfig {
         /// See: https://blog.cloudflare.com/even-faster-connection-establishment-with-quic-0-rtt-resumption/
         #[serde(default)]
         zero_rtt_handshake: bool,
+        /// The controller for what this server sends. Cubic unless set, as
+        /// in the TUIC reference; `bbr` for a lossy path.
+        #[serde(default, skip_serializing_if = "TuicCongestionControl::is_default")]
+        congestion_control: TuicCongestionControl,
     },
     /// Mixed HTTP+SOCKS5 server (auto-detects protocol from first byte)
     /// Similar to mihomo's mixed-port feature.
@@ -1147,6 +1152,7 @@ mod tests {
                 uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 password: "tuic_password".into(),
                 zero_rtt_handshake: false,
+                congestion_control: TuicCongestionControl::Bbr,
             },
             transport: Transport::Quic,
             tcp_settings: None,
@@ -1358,8 +1364,40 @@ protocol:
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
         assert!(matches!(
             deserialized.protocol,
-            ServerProxyConfig::TuicV5 { .. }
+            ServerProxyConfig::TuicV5 {
+                congestion_control: TuicCongestionControl::Bbr,
+                ..
+            }
         ));
+    }
+
+    /// The server takes the same option as the client, defaulting to Cubic
+    /// as the TUIC reference's server does.
+    #[test]
+    fn test_server_config_tuic_congestion_control() {
+        let parse = |extra: &str| {
+            let yaml = format!(
+                "address: \"127.0.0.1:8443\"\ntransport: quic\nquic_settings:\n  cert: tuic.crt\n  key: tuic.key\nprotocol:\n  type: tuic\n  uuid: \"550e8400-e29b-41d4-a716-446655440000\"\n  password: pw\n{extra}"
+            );
+            match serde_yaml::from_str::<ServerConfig>(&yaml)
+                .unwrap()
+                .protocol
+            {
+                ServerProxyConfig::TuicV5 {
+                    congestion_control, ..
+                } => congestion_control,
+                other => panic!("expected TuicV5, got {other:?}"),
+            }
+        };
+        assert_eq!(parse(""), TuicCongestionControl::Cubic);
+        assert_eq!(
+            parse("  congestion_control: bbr\n"),
+            TuicCongestionControl::Bbr
+        );
+        assert_eq!(
+            parse("  congestion_control: new_reno\n"),
+            TuicCongestionControl::NewReno
+        );
     }
 
     #[test]

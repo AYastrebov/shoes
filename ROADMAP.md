@@ -52,7 +52,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 - [Open risk: AmneziaWG upload throughput is unmeasured](#open-risk-amneziawg-upload-throughput-is-unmeasured)
-- [Open risk: the receive window is only measured on a clean path](#open-risk-the-receive-window-is-only-measured-on-a-clean-path)
+- [Open risk: Android's receive window is extrapolated from macOS](#open-risk-androids-receive-window-is-extrapolated-from-macos)
 
 ## Where we already compete
 
@@ -221,6 +221,14 @@ does and what our server now does — it used to hold a single stream open for t
 association and write bare packet bodies onto it, without the version and
 command bytes that make a `Packet` a command, so what it sent was something its
 own receiving side would have rejected.
+
+The two differ in congestion control, as their references do. Hysteria2 runs
+BBR at both ends with no option, upstream's fallback when Brutal is not
+negotiated. TUIC takes `congestion_control` (`cubic`, `new_reno`, `bbr`) on
+the client and the server, Cubic by default as in the reference and sing-box;
+on Cubic it carries single-digit Mbit/s at 0.5% loss, in sing-box too, and on
+`bbr` about 500. See
+[docs/specs/2026-10-10-tuic-congestion-control.md](./docs/specs/2026-10-10-tuic-congestion-control.md).
 
 One option is refused at config load rather than silently ignored, because a
 user who asks for it and does not get it should be told: TUIC's
@@ -1033,27 +1041,33 @@ BDP**, a per-cycle send-refill stall that raising the window does not remove. It
 caps the ceiling below the raw path and is the next thing to chase, on a
 controlled path rather than the WAN.
 
-## Open risk: the receive window is only measured on a clean path
+## Open risk: Android's receive window is extrapolated from macOS
 
-Every measurement behind `default_remote_rx_window_size` ran on a 26 ms path
-with no meaningful loss, which is where a large window is unambiguously good.
-Two things that window interacts with have not been measured, and both would
-show up only on a worse path.
+The other half of this entry is settled. It asked whether the 4 MiB desktop
+receive window is *slower* than 256 KiB on a lossy path, because smoltcp's
+reassembler tracks at most 32 holes (`assembler-max-segment-count-32`, its
+largest setting) and drops a segment past that without even a duplicate ACK.
+Measured 2026-10-10 with `NETEM` in `scripts/bench/tunnels.py`: a WireGuard
+download from a sing-box server into a shoes client, 50 ms round trip,
+1 Gbit/s, the window changed in code and everything else equal, two rounds
+each, Mbit/s:
 
-**Reassembly holes scale with the window; the assembler does not.** `Cargo.toml`
-pins smoltcp to `assembler-max-segment-count-32`, and that is smoltcp's largest
-setting — there is no feature above it, so this is a ceiling to design around
-rather than raise. A 4 MiB window holds roughly 3000 segments in flight against
-256 KiB's 180, so the number of simultaneous holes a lossy or reordering path
-opens scales with the window while the assembler stays at 32. Past that,
-`Assembler::add_then_remove_front` returns `Err` and smoltcp's `process` drops
-the arriving segment and returns without a reply — not even a duplicate ACK —
-so the sender waits out an RTO instead of taking a fast retransmit. The
-plausible outcome is that on a path with around 1% loss the 4 MiB window is
-*slower* than 256 KiB. What settles it is a download benchmark against the same
-peer with loss and reordering injected (`dummynet` or `netem`), sweeping the
-window across 256 KiB, 1 MiB and 4 MiB. If the crossover is real, the answer is
-a smaller desktop window or a fork of the assembler, not a feature bump.
+| loss | 4 MiB | 1 MiB | 256 KiB |
+| --- | --- | --- | --- |
+| none | 541, 547 | 161, 161 | 40, 40 |
+| 0.5% | 5, 6 | 5, 5 | 5, 5 |
+| 1% | 3, 3 | 3, 3 | 3, 4 |
+| 2% | 2, 2 | 2, 2 | 2, 2 |
+
+On a clean path the window is the whole story, `window / RTT` to within a few
+percent. On a lossy one every size collapses to the same few Mbit/s, which is
+the loss-based sender inside the tunnel (gVisor's TCP in sing-box) running at
+about MSS / RTT × 1.22 / √p. The reassembler is not involved: sing-box's own
+client, whose receiver has no such ceiling, carried 4 Mbit/s on the same
+0.5% path. So there is no crossover and no reason to shrink the window. What
+decides a lossy download is the sender's controller, which is never ours: in
+the benchmark it is sing-box's netstack, and through a kernel WireGuard server
+it is the destination host's TCP.
 
 **Android's window is extrapolated from macOS RSS.** The per-connection RSS
 table in MOBILE.md was sampled on macOS, and Android's 1 MiB was chosen from

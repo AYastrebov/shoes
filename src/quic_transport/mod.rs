@@ -72,14 +72,17 @@ pub fn build_obfuscator(
 ///
 /// Per protocol, because the references differ. Hysteria2 falls back to BBR
 /// whenever Brutal is not negotiated (`core/internal/congestion/utils.go` in
-/// `apernet/hysteria`), which for us is always; TUIC defaults to Cubic. A
-/// loss-based controller on Hysteria2 carried single-digit Mbit/s over a
+/// `apernet/hysteria`), which for us is always; TUIC defaults to Cubic and lets
+/// the operator choose any of these three, as its reference does. A
+/// loss-based controller on either protocol carried single-digit Mbit/s over a
 /// 50 ms path with 0.5% loss, where BBR carried 500. See
-/// `docs/specs/2026-10-01-hysteria2-bbr.md`.
+/// `docs/specs/2026-10-01-hysteria2-bbr.md` and
+/// `docs/specs/2026-10-10-tuic-congestion-control.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CongestionControl {
     Bbr,
     Cubic,
+    NewReno,
 }
 
 /// The transport parameters that differ between protocols.
@@ -140,6 +143,7 @@ impl QuicTransportParams {
             match self.congestion {
                 CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
                 CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+                CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
             };
         transport.congestion_controller_factory(controller);
         transport
@@ -356,21 +360,34 @@ mod tests {
         }
     }
 
-    /// Whether a live connection runs BBR, asked of quinn rather than of our
-    /// own configuration.
-    fn runs_bbr(conn: &quinn::Connection) -> bool {
-        conn.congestion_state()
-            .into_any()
-            .downcast::<quinn::congestion::Bbr>()
-            .is_ok()
+    /// The controller a live connection runs, asked of quinn rather than of
+    /// our own configuration.
+    fn running(conn: &quinn::Connection) -> Option<CongestionControl> {
+        let any = conn.congestion_state().into_any();
+        let any = match any.downcast::<quinn::congestion::Bbr>() {
+            Ok(_) => return Some(CongestionControl::Bbr),
+            Err(any) => any,
+        };
+        let any = match any.downcast::<quinn::congestion::Cubic>() {
+            Ok(_) => return Some(CongestionControl::Cubic),
+            Err(any) => any,
+        };
+        any.downcast::<quinn::congestion::NewReno>()
+            .ok()
+            .map(|_| CongestionControl::NewReno)
     }
 
     /// The controller `build` is asked for is the one both ends of a real
     /// connection run, through the production listener and dialer. Hysteria2
-    /// needs BBR to carry anything over a lossy path; TUIC keeps Cubic.
+    /// needs BBR to carry anything over a lossy path; TUIC lets the operator
+    /// choose any of the three.
     #[tokio::test]
     async fn test_both_ends_run_the_congestion_controller_asked_for() {
-        for congestion in [CongestionControl::Bbr, CongestionControl::Cubic] {
+        for congestion in [
+            CongestionControl::Bbr,
+            CongestionControl::Cubic,
+            CongestionControl::NewReno,
+        ] {
             let bind = reserve_udp_port();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
@@ -385,7 +402,7 @@ mod tests {
                     async move {
                         let conn = incoming.await.map_err(std::io::Error::other)?;
                         if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(runs_bbr(&conn));
+                            let _ = tx.send(running(&conn));
                         }
                         conn.closed().await;
                         Ok(())
@@ -413,12 +430,8 @@ mod tests {
             .expect("the handshake never finished")
             .unwrap();
 
-            let expected = congestion == CongestionControl::Bbr;
-            assert_eq!(
-                runs_bbr(&conn),
-                expected,
-                "client, asked for {congestion:?}"
-            );
+            let expected = Some(congestion);
+            assert_eq!(running(&conn), expected, "client, asked for {congestion:?}");
             let server = tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
                 .expect("the server never saw the connection")

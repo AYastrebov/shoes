@@ -272,6 +272,39 @@ impl TuicUdpRelayMode {
     }
 }
 
+/// The congestion controller a TUIC endpoint runs for what it sends.
+///
+/// The names and the default are the TUIC reference's (`tuic-server/src/utils.rs`
+/// at tag `tuic-server-1.0.0`) and sing-box's. Each end chooses for itself;
+/// nothing is negotiated. Cubic collapses on a lossy path, where BBR does not:
+/// see docs/specs/2026-10-10-tuic-congestion-control.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuicCongestionControl {
+    #[default]
+    Cubic,
+    /// `newreno` is the reference's other spelling.
+    #[serde(alias = "newreno")]
+    NewReno,
+    Bbr,
+}
+
+impl TuicCongestionControl {
+    pub(super) fn is_default(&self) -> bool {
+        *self == Self::Cubic
+    }
+}
+
+impl From<TuicCongestionControl> for crate::quic_transport::CongestionControl {
+    fn from(choice: TuicCongestionControl) -> Self {
+        match choice {
+            TuicCongestionControl::Cubic => Self::Cubic,
+            TuicCongestionControl::NewReno => Self::NewReno,
+            TuicCongestionControl::Bbr => Self::Bbr,
+        }
+    }
+}
+
 fn default_heartbeat_ms() -> u64 {
     10_000
 }
@@ -313,6 +346,8 @@ pub struct TuicClientConfig {
         skip_serializing_if = "is_default_heartbeat"
     )]
     pub heartbeat_ms: u64,
+    #[serde(default, skip_serializing_if = "TuicCongestionControl::is_default")]
+    pub congestion_control: TuicCongestionControl,
 }
 
 /// Custom deserializer for ClientProxyConfig::Shadowsocks
@@ -1072,11 +1107,65 @@ password: secret
                 assert_eq!(t.udp_relay_mode, TuicUdpRelayMode::Native);
                 assert!(!t.zero_rtt_handshake);
                 assert_eq!(t.heartbeat_ms, 10_000);
+                assert_eq!(t.congestion_control, TuicCongestionControl::Cubic);
             }
             ref other => panic!("expected Tuic, got {other:?}"),
         }
         assert!(config.owns_transport());
         assert_eq!(config.protocol_name(), "TUIC");
+    }
+
+    /// The names are the TUIC reference's and sing-box's, including the
+    /// reference's `newreno` spelling.
+    #[test]
+    fn test_tuic_congestion_control_names() {
+        for (name, expected) in [
+            ("cubic", TuicCongestionControl::Cubic),
+            ("new_reno", TuicCongestionControl::NewReno),
+            ("newreno", TuicCongestionControl::NewReno),
+            ("bbr", TuicCongestionControl::Bbr),
+        ] {
+            let yaml = format!(
+                "type: tuic\nuuid: \"00000000-0000-0000-0000-000000000000\"\npassword: secret\ncongestion_control: {name}\n"
+            );
+            match serde_yaml::from_str::<ClientProxyConfig>(&yaml).unwrap() {
+                ClientProxyConfig::Tuic(t) => assert_eq!(t.congestion_control, expected, "{name}"),
+                other => panic!("expected Tuic, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_tuic_rejects_unknown_congestion_control() {
+        let yaml = r#"
+type: tuic
+uuid: "00000000-0000-0000-0000-000000000000"
+password: secret
+congestion_control: vegas
+"#;
+        let err = serde_yaml::from_str::<ClientProxyConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("new_reno"), "{err}");
+    }
+
+    /// The default is left out when a config is written back, as the relay
+    /// mode's is; a chosen controller is kept.
+    #[test]
+    fn test_tuic_congestion_control_serialises_only_when_chosen() {
+        let yaml = r#"
+type: tuic
+uuid: "00000000-0000-0000-0000-000000000000"
+password: secret
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let written = serde_yaml::to_string(&config).unwrap();
+        assert!(!written.contains("congestion_control"), "{written}");
+
+        let config: ClientProxyConfig =
+            serde_yaml::from_str(&format!("{yaml}congestion_control: bbr\n")).unwrap();
+        let written = serde_yaml::to_string(&config).unwrap();
+        assert!(written.contains("congestion_control: bbr"), "{written}");
     }
 
     #[test]
