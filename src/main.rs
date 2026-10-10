@@ -498,8 +498,14 @@ fn main() {
             let (api_wanted, api_ports) =
                 (prepared.clash_api.clone(), prepared.server_configs.clone());
 
+            let loaded = std::mem::take(&mut prepared.sources);
+            let mut running = None;
+
             let join_handles = match launch_servers(prepared).await {
-                Ok(handles) => handles,
+                Ok(handles) => {
+                    running = Some(loaded);
+                    handles
+                }
                 Err(e) if first_launch => {
                     eprintln!("{e}\n");
                     std::process::exit(1);
@@ -568,11 +574,26 @@ fn main() {
                             // full debounce would be the delay it exists to
                             // skip. It is consumed here, and so cannot fire a
                             // second reload after this one.
-                            tokio::select! {
-                                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                            let signalled = tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => false,
                                 () = reload.recv() => {
                                     println!("Received SIGHUP, reloading now..");
+                                    true
                                 }
+                            };
+                            // Only the watcher's word for it, so check it:
+                            // the same bytes are not an edit. A SIGHUP always
+                            // reloads -- the operator may mean a file nobody
+                            // watches, a certificate say. With no servers
+                            // running, the next event retries regardless.
+                            if !signalled
+                                && let Some(running) = &running
+                                && running.reread().await == *running
+                            {
+                                if let Some((_, rx)) = reload_state.as_mut() {
+                                    while rx.try_recv().is_ok() {}
+                                }
+                                return None;
                             }
                         } else {
                             println!("Received SIGHUP, reloading..");
@@ -585,22 +606,24 @@ fn main() {
                         //
                         // What this does not cover: an event still in flight
                         // in the watcher's callback, or a write that lands
-                        // during the prepare. Those cause one extra reload
-                        // later, which is the pre-existing trade -- the
-                        // watcher path drained only before its prepare too --
-                        // and the right direction: an edit is never lost.
+                        // during the prepare. Those start another debounce
+                        // later, which then finds the bytes unchanged and
+                        // restarts nothing (see `Sources`) -- unless the write
+                        // really changed them, when the reload is wanted: an
+                        // edit is never lost.
                         if let Some((_, rx)) = reload_state.as_mut() {
                             while rx.try_recv().is_ok() {}
                         }
                         reload.drain();
-                        prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
+                        Some(prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await)
                     } => outcome,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 };
 
                 match outcome {
-                    Ok(p) => break p,
-                    Err(e) => {
+                    None => println!("Configs unchanged, keeping the running servers."),
+                    Some(Ok(p)) => break p,
+                    Some(Err(e)) => {
                         eprintln!(
                             "{e}\nKeeping the previous configuration; fix the file to retry."
                         );
@@ -891,6 +914,42 @@ struct PreparedServers {
     /// validated, so a config means one thing in every build.
     #[allow(dead_code)]
     clash_api: Option<config::ClashApiConfig>,
+    /// The watched files as they were read for this configuration.
+    sources: Sources,
+}
+
+/// Each watched file -- the configs and the rule-sets they name -- with a
+/// hash of its bytes, or `None` where it could not be read.
+///
+/// The watcher reports that a file was touched, not that it changed, and
+/// FSEvents on macOS can report one write twice, the second time after the
+/// reload the first caused. A restart drops every live connection, so a
+/// watcher event whose files hash the same as the running configuration's is
+/// not a reload. Taken before the files are parsed: a write that lands in
+/// between leaves the old hash recorded, which costs one extra reload later
+/// rather than a lost edit.
+#[derive(Default, PartialEq)]
+struct Sources(Vec<(String, Option<u64>)>);
+
+impl Sources {
+    async fn read(paths: impl IntoIterator<Item = String>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut sources = Vec::new();
+        for path in paths {
+            let hash = tokio::fs::read(&path).await.ok().map(|bytes| {
+                let mut hasher = std::hash::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            });
+            sources.push((path, hash));
+        }
+        Self(sources)
+    }
+
+    /// The same files, read again now.
+    async fn reread(&self) -> Self {
+        Self::read(self.0.iter().map(|(path, _)| path.clone())).await
+    }
 }
 
 /// What an operator should hear about the `clash_api` block, on stdout and
@@ -930,6 +989,7 @@ async fn prepare_servers(
     args: &Vec<String>,
     watcher: Option<&mut RecommendedWatcher>,
 ) -> Result<PreparedServers, String> {
+    let config_sources = Sources::read(args.iter().cloned()).await;
     let configs = config::load_configs(args)
         .await
         .map_err(|e| format!("Failed to load server configs: {e}"))?;
@@ -955,6 +1015,13 @@ async fn prepare_servers(
     if let Some(watcher) = watcher {
         watch_rule_set_paths(watcher, &configs);
     }
+    let rule_set_sources = Sources::read(configs.iter().filter_map(|config| match config {
+        config::Config::RuleSet(rule_set) => Some(rule_set.path.clone()),
+        _ => None,
+    }))
+    .await;
+    let mut sources = config_sources;
+    sources.0.extend(rule_set_sources.0);
 
     let config::ValidatedConfigs {
         configs: server_configs,
@@ -978,6 +1045,7 @@ async fn prepare_servers(
         outbounds,
         groups,
         clash_api,
+        sources,
     })
 }
 
@@ -997,6 +1065,8 @@ async fn launch_servers(
         // The serve loop reconciles the controller; launching servers does
         // not touch it, so that a reload's listener survives the restart.
         clash_api: _,
+        // The serve loop keeps these to judge the next watcher event.
+        sources: _,
     } = prepared;
 
     // Replace, not add: a reload must not carry the previous config's
