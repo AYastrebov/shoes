@@ -260,3 +260,110 @@ mod rule_set_path_tests {
         assert_eq!(path_of(&configs[0]), "geo.srs");
     }
 }
+
+/// What a mistake deep inside a config file reports.
+///
+/// `NoneOrSome`, `OneOrSome` and `NoneOrOne` sit between almost every
+/// nested option and the file. Derived as `#[serde(untagged)]`, each failed
+/// variant's error was thrown away and the file reported only "data did not
+/// match any variant of untagged enum NoneOrSome", for a misspelled value
+/// three levels down as much as for a malformed top level.
+#[cfg(test)]
+mod nested_error_tests {
+    use super::load_config_str;
+
+    fn server_with_hop(hop: &str) -> String {
+        format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "example.com:443"
+          protocol:
+{hop}
+"#
+        )
+    }
+
+    fn tuic_hop(extra: &str) -> String {
+        format!(
+            "            type: tuic\n            uuid: \"b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4\"\n            password: secret\n{extra}"
+        )
+    }
+
+    fn error_of(yaml: &str) -> String {
+        load_config_str(yaml)
+            .expect_err("the config must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn an_unknown_value_in_a_rules_outbound_is_named() {
+        let err = error_of(&server_with_hop(&tuic_hop(
+            "            congestion_control: vegas\n",
+        )));
+        assert!(err.contains("vegas"), "{err}");
+        assert!(err.contains("new_reno"), "{err}");
+        assert!(!err.contains("did not match any variant"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_relay_mode_in_a_rules_outbound_is_named() {
+        let err = error_of(&server_with_hop(&tuic_hop(
+            "            udp_relay_mode: sideways\n",
+        )));
+        assert!(err.contains("sideways"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_field_in_a_rules_outbound_is_named() {
+        let err = error_of(&server_with_hop(&tuic_hop("            heartbeat: 5\n")));
+        assert!(err.contains("heartbeat"), "{err}");
+        assert!(!err.contains("did not match any variant"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_mask_list_says_it_is_empty() {
+        let err = error_of(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: []
+      action: allow
+"#,
+        );
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_field_in_a_dns_server_is_named() {
+        let err = error_of(
+            r#"
+- dns_group: proxied
+  dns_servers:
+    - url: "udp://8.8.8.8"
+      client_chian: direct
+"#,
+        );
+        assert!(err.contains("client_chian"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_field_in_a_server_is_still_named() {
+        let err = error_of(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rulez: []
+"#,
+        );
+        assert!(err.contains("rulez"), "{err}");
+    }
+}

@@ -113,17 +113,14 @@ Every number above argues for BBR, and the default stays Cubic anyway:
 ## Error handling
 
 An unknown value is a configuration error, raised by serde when the config is
-loaded. Parsed as a client protocol on its own, the error names the accepted
-values; inside a whole config file it does not, because the outbound sits
-under the untagged `NoneOrSome` that holds a server's rules, and serde
-replaces the inner error with "data did not match any variant of untagged
-enum NoneOrSome". Every option at that depth reports that way today,
-`udp_relay_mode: sideways` included; the config is refused either way, but
-the message does not say which field. Fixing that is a change to how the
-config loader reports errors, not to this option. The reference also rejects
-unknown values; it is case-insensitive where we are not, so `BBR` is refused
-here. The factories are infallible, and the choice is fixed when the
-connection is made.
+loaded, and the message names the value and the accepted ones. When this was
+written it did not inside a whole config file: the untagged `NoneOrSome`
+around a server's rules replaced every inner error with "data did not match
+any variant of untagged enum NoneOrSome". That was fixed separately, for every
+option at that depth, by deserialising `NoneOrSome` and its siblings by hand
+(`src/option_util.rs`). The reference also rejects unknown values; it is
+case-insensitive where we are not, so `BBR` is refused here. The factories are
+infallible, and the choice is fixed when the connection is made.
 
 ## Testing
 
@@ -158,6 +155,5 @@ connection is made.
 - **A `congestion_control` option for Hysteria2.** Upstream's `congestion.type`
   exists to choose `reno` over BBR; the Hysteria2 spec deferred it until
   someone needs it, and nothing here changes that.
-- **Naming the bad field in a config file's error.** See error handling.
 - **Case-insensitive parsing.** The reference lowercases; serde does not, and
   no config seen in the wild writes the names in another case.

@@ -24,7 +24,9 @@ fn default_attempts() -> usize {
 }
 
 /// A DNS server specification in config.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// Serialised untagged; deserialised by hand, see the `Deserialize` impl.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum DnsServerSpec {
@@ -60,6 +62,81 @@ pub enum DnsServerSpec {
         #[serde(default = "default_attempts")]
         attempts: usize,
     },
+}
+
+impl<'de> Deserialize<'de> for DnsServerSpec {
+    /// A string is `Simple`; a map is `WithOptions`, and refuses a key it does
+    /// not know.
+    ///
+    /// Derived as `#[serde(untagged)]`, a map accepted any key -- a misspelled
+    /// `client_chian` loaded, and the server quietly ran without its chain --
+    /// and any error inside one was reported as "did not match any variant".
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The fields of `WithOptions`, with its defaults. Building the variant
+        // from this names every field on both sides, so the two cannot drift
+        // apart without failing to compile.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Options {
+            url: String,
+            #[serde(default)]
+            client_chain: NoneOrSome<ConfigSelection<ClientChain>>,
+            #[serde(default)]
+            bootstrap_url: Option<String>,
+            #[serde(default)]
+            server_name: Option<String>,
+            #[serde(default)]
+            ip_strategy: IpStrategy,
+            #[serde(default = "default_timeout_secs")]
+            timeout_secs: u32,
+            #[serde(default = "default_connect_timeout_secs")]
+            connect_timeout_secs: u32,
+            #[serde(default = "default_attempts")]
+            attempts: usize,
+        }
+
+        struct SpecVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SpecVisitor {
+            type Value = DnsServerSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a DNS server URL, a dns_group name, or a map with a `url`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<DnsServerSpec, E> {
+                Ok(DnsServerSpec::Simple(value.to_string()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<DnsServerSpec, A::Error> {
+                let Options {
+                    url,
+                    client_chain,
+                    bootstrap_url,
+                    server_name,
+                    ip_strategy,
+                    timeout_secs,
+                    connect_timeout_secs,
+                    attempts,
+                } = Options::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(DnsServerSpec::WithOptions {
+                    url,
+                    client_chain,
+                    bootstrap_url,
+                    server_name,
+                    ip_strategy,
+                    timeout_secs,
+                    connect_timeout_secs,
+                    attempts,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
+    }
 }
 
 impl DnsServerSpec {
