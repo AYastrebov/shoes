@@ -303,7 +303,16 @@ impl RotatingFile {
             self.written = 0;
             return true;
         }
-        if self.file.set_len(0).is_ok() {
+        // Through a second handle opened for writing, not `self.file.set_len`:
+        // on Windows an append-mode handle lacks the write access truncation
+        // needs, so that call fails there. The append handle carries on and
+        // writes at the new end.
+        if OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .is_ok()
+        {
             self.written = 0;
             return true;
         }
