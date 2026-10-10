@@ -195,9 +195,11 @@ pub const fn default_tun_relay_buffer_size() -> usize {
 /// held 180, so the holes a lossy or reordering path opens scale with the
 /// window while the assembler does not. Past 32 holes smoltcp drops the
 /// arriving segment and returns without a reply — not even a duplicate ACK —
-/// so recovery waits out the RTO rather than a fast retransmit. Every
-/// measurement above ran on a clean path, which is where that does not show.
-/// ROADMAP.md records the lossy-path measurement that would bound it.
+/// so recovery waits out the RTO rather than a fast retransmit. Measured on a
+/// 50 ms path with 0.5–2% loss, that does not decide anything: 4 MiB, 1 MiB
+/// and 256 KiB all carried the same 2–5 Mbit/s, the ceiling of the remote's
+/// loss-based sender, and a sing-box receiver without the limit did no
+/// better. ROADMAP.md has the table.
 pub const fn default_remote_rx_window_size() -> usize {
     if in_network_extension() {
         256 * 1024
