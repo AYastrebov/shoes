@@ -869,6 +869,26 @@ client_chain:
         }
     }
 
+    /// A plain list under `client_chain` is one chain of several hops, not
+    /// several one-hop chains. `NoneOrSome` decides that by trying the single
+    /// item before the list, and its hand-written deserialiser has to keep
+    /// that order.
+    #[test]
+    fn test_rule_client_chain_list_is_one_chain_of_hops() {
+        let yaml = r#"
+masks: 0.0.0.0/0
+action: allow
+client_chain: [proxy1, proxy2]
+"#;
+        let rule: RuleConfig = serde_yaml::from_str(yaml).unwrap();
+        if let RuleActionConfig::Allow { client_chains, .. } = rule.action {
+            assert_eq!(client_chains.len(), 1);
+            assert_eq!(client_chains.iter().next().unwrap().hops.len(), 2);
+        } else {
+            panic!("Expected Allow action");
+        }
+    }
+
     #[test]
     fn test_rule_config_with_multiple_chains_object_syntax() {
         // Multiple chains using object syntax { chain: [...] }

@@ -1,13 +1,37 @@
+use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
 
-#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+// The three wrappers below serialise untagged but deserialise by hand.
+//
+// Derived as `#[serde(untagged)]`, each tried its variants in order and, when
+// none matched, discarded every variant's error for "data did not match any
+// variant of untagged enum NoneOrSome". Almost every nested option sits under
+// one of them, so a misspelled value three levels into a config file was
+// reported as that and nothing else. These keep the derived order and the
+// derived set of accepted inputs exactly, and differ only in what a refusal
+// says: the error of the variant the input's shape was meant for -- the
+// single item's for a lone value, the list's for a list. The input is
+// buffered as a YAML `Value`, as the untagged derive buffered it, and as the
+// chain-hop deserialisers in `config::types::rules` already do.
+
+#[derive(Default, Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum NoneOrOne<T> {
-    #[serde(skip_deserializing)]
     #[default]
     Unspecified,
     None,
     One(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NoneOrOne<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // null is `None`; anything else is the item, with the item's own error.
+        match Option::<T>::deserialize(deserializer)? {
+            None => Ok(NoneOrOne::None),
+            Some(item) => Ok(NoneOrOne::One(item)),
+        }
+    }
 }
 
 impl<T> NoneOrOne<T> {
@@ -29,15 +53,51 @@ impl<T> NoneOrOne<T> {
     }
 }
 
-#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum NoneOrSome<T> {
-    #[serde(skip_deserializing)]
     #[default]
     Unspecified,
     None,
     One(T),
     Some(Vec<T>),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NoneOrSome<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if value.is_null() {
+            return Ok(NoneOrSome::None);
+        }
+        one_then_list(value)
+            .map(|parsed| match parsed {
+                Parsed::One(item) => NoneOrSome::One(item),
+                Parsed::List(items) => NoneOrSome::Some(items),
+            })
+            .map_err(D::Error::custom)
+    }
+}
+
+enum Parsed<T> {
+    One(T),
+    List(Vec<T>),
+}
+
+/// The item first, as the untagged derive tried it, then a list of items.
+///
+/// The order matters and is kept: some items, a `ClientChain` among them,
+/// accept a list themselves, and for those a list is one item rather than
+/// several. When both fail, a list reports the list's error and anything
+/// else the item's.
+fn one_then_list<'de, T: Deserialize<'de>>(value: Value) -> Result<Parsed<T>, serde_yaml::Error> {
+    let one = match T::deserialize(value.clone()) {
+        Ok(item) => return Ok(Parsed::One(item)),
+        Err(e) => e,
+    };
+    if value.is_sequence() {
+        return Vec::<T>::deserialize(value).map(Parsed::List);
+    }
+    Err(one)
 }
 
 impl<T> NoneOrSome<T> {
@@ -142,27 +202,25 @@ impl<T> NoneOrSome<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum OneOrSome<T> {
     One(T),
-    #[serde(deserialize_with = "validate_non_empty")]
     Some(Vec<T>),
 }
 
-fn validate_non_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
-where
-    D: serde::de::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    let value = Vec::deserialize(d)?;
-    if value.is_empty() {
-        return Err(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Other("empty"),
-            &"need at least one element",
-        ));
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OneOrSome<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match one_then_list(value).map_err(D::Error::custom)? {
+            Parsed::One(item) => Ok(OneOrSome::One(item)),
+            Parsed::List(items) if items.is_empty() => Err(D::Error::invalid_value(
+                serde::de::Unexpected::Other("empty"),
+                &"need at least one element",
+            )),
+            Parsed::List(items) => Ok(OneOrSome::Some(items)),
+        }
     }
-    Ok(value)
 }
 
 impl<T> OneOrSome<T> {

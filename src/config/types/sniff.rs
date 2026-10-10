@@ -30,9 +30,11 @@ impl From<SniffProtocolConfig> for SniffedProtocol {
 
 /// Accepts either one protocol name or a list of them.
 ///
-/// Hand-written rather than reusing `NoneOrSome`, which is `#[serde(untagged)]`
-/// and therefore reports "data did not match any variant" instead of naming
-/// the protocol that was misspelled. For a config file the name matters.
+/// Hand-written rather than reusing `NoneOrSome`, which was derived
+/// `#[serde(untagged)]` at the time and reported "data did not match any
+/// variant" instead of naming the protocol that was misspelled. `NoneOrSome`
+/// now passes the inner error through as well; this predates that change and
+/// was left as it is.
 fn deserialize_protocols<'de, D>(
     deserializer: D,
 ) -> Result<Option<Vec<SniffProtocolConfig>>, D::Error>
