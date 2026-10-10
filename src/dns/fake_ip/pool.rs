@@ -46,8 +46,8 @@ impl FakeIpNetwork {
     /// Parse a CIDR such as `198.18.0.0/16`.
     ///
     /// Returns an error rather than panicking on a bad prefix: this runs on the
-    /// config path of a library whose callers are Kotlin and Swift, where an
-    /// unwinding panic is undefined behaviour rather than a stack trace.
+    /// config path of a library whose callers are Kotlin and Swift, where a
+    /// panic aborts the host app rather than reaching it as an error.
     pub fn parse(s: &str) -> io::Result<Self> {
         let (addr_str, prefix_str) = s.split_once('/').ok_or_else(|| {
             invalid(format!(

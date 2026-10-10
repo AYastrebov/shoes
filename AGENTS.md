@@ -338,12 +338,6 @@ costs to leave.
 
 Open findings from the 2026-08-20 audit, none of them fixed yet:
 
-- **No `catch_unwind` at the FFI boundary.** The 10 JNI and 11 C entry points
-  are plain `extern` functions. On the mobile profile `panic = "abort"` makes
-  a panic a defined abort, but a desktop `--features ffi` build unwinds, and a
-  panic crossing an `extern "C"` frame is undefined behaviour. Either wrap the
-  entry points in `catch_unwind` or build desktop FFI artifacts with
-  `panic = "abort"` too.
 - **Every crates.io dependency is `"*"`** (58 of them). `--locked` in CI and
   the committed lockfile mean builds are reproducible, but any plain
   `cargo update` may jump majors untested, and nothing pins what a fresh
