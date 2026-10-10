@@ -508,7 +508,26 @@ pub extern "C" fn shoes_get_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
+/// The most verbose level this build can log at: "off", "error", "warn",
+/// "info", "debug" or "trace", spelled as `shoes_set_log_level` takes it.
+///
+/// Release builds compile with `release_max_level_info`, so this is "info"
+/// in every published artifact, and asking `shoes_set_log_level` for more
+/// changes nothing. Ask this before offering a debug logging switch.
+///
+/// # Returns
+/// A static string. Do not free this pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn shoes_max_log_level() -> *const c_char {
+    common::max_log_level_name().as_ptr()
+}
+
 /// Set the log file path for file-based logging.
+///
+/// The file is appended to, never truncated when set, and rotates at 4 MiB:
+/// it is renamed to `<path>.1`, replacing any earlier one, and a new file is
+/// started. A previous session's log past that size is rotated before the
+/// first write, so it is kept whole.
 ///
 /// # Arguments
 /// * `path` - Absolute path to the log file

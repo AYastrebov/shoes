@@ -45,6 +45,13 @@ import Testing
         #expect(stats.activeConnections == 0)
     }
 
+    /// The tests link the release-mobile XCFramework, which compiles with
+    /// `release_max_level_info`.
+    @Test func maxLogLevelIsTheReleaseCeiling() throws {
+        try engine.initialize(logLevel: .error)
+        #expect(engine.maxLogLevel == .info)
+    }
+
     @Test func networkChangedIsSafeWhenIdle() throws {
         try engine.initialize(logLevel: .error)
         #expect(engine.networkChanged() == 0)

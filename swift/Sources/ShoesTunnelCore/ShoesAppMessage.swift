@@ -13,6 +13,9 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
     /// The last error the provider reported; see `ShoesAppReply.lastError`.
     case lastError
     case setLogLevel(ShoesLogLevel)
+    /// The most verbose level the engine's build can log at; see
+    /// `ShoesAppReply.maxLogLevel`.
+    case maxLogLevel
 
     private enum CodingKeys: String, CodingKey { case kind, level }
 
@@ -26,6 +29,7 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
         case .setLogLevel(let level):
             try c.encode("setLogLevel", forKey: .kind)
             try c.encode(level.rawValue, forKey: .level)
+        case .maxLogLevel: try c.encode("maxLogLevel", forKey: .kind)
         }
     }
 
@@ -42,6 +46,7 @@ public enum ShoesAppMessage: Codable, Sendable, Equatable {
                 throw DecodingError.dataCorruptedError(forKey: .level, in: c, debugDescription: "unknown level \(raw)")
             }
             self = .setLogLevel(level)
+        case "maxLogLevel": self = .maxLogLevel
         case let other:
             throw DecodingError.dataCorruptedError(forKey: .kind, in: c, debugDescription: "unknown message \(other)")
         }
@@ -75,10 +80,14 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
     /// the app then sees `.disconnected` and nobody is left to answer, so a
     /// host persists fatal reasons from `report(error:)` instead.
     case lastError(ShoesError?)
+    /// The most verbose level the engine's build can log at. Release builds
+    /// compile with `release_max_level_info`, so this is `.info` in every
+    /// published artifact and a `setLogLevel` past it changes nothing.
+    case maxLogLevel(ShoesLogLevel)
     case ok
     case error(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, version, running, stats, error, message }
+    private enum CodingKeys: String, CodingKey { case kind, version, running, stats, error, level, message }
 
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -95,6 +104,9 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
         case .lastError(let error):
             try c.encode("lastError", forKey: .kind)
             try c.encodeIfPresent(error, forKey: .error)
+        case .maxLogLevel(let level):
+            try c.encode("maxLogLevel", forKey: .kind)
+            try c.encode(level.rawValue, forKey: .level)
         case .ok: try c.encode("ok", forKey: .kind)
         case .error(let message):
             try c.encode("error", forKey: .kind)
@@ -109,6 +121,12 @@ public enum ShoesAppReply: Codable, Sendable, Equatable {
         case "status": self = .status(running: try c.decode(Bool.self, forKey: .running))
         case "stats": self = .stats(try c.decodeIfPresent(ShoesStats.self, forKey: .stats))
         case "lastError": self = .lastError(try c.decodeIfPresent(ShoesError.self, forKey: .error))
+        case "maxLogLevel":
+            let raw = try c.decode(String.self, forKey: .level)
+            guard let level = ShoesLogLevel(rawValue: raw) else {
+                throw DecodingError.dataCorruptedError(forKey: .level, in: c, debugDescription: "unknown level \(raw)")
+            }
+            self = .maxLogLevel(level)
         case "ok": self = .ok
         case "error": self = .error(try c.decode(String.self, forKey: .message))
         case let other:

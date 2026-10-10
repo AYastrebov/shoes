@@ -5,7 +5,7 @@ import Testing
 
 @Suite struct ShoesAppMessageTests {
     @Test func messagesRoundTrip() throws {
-        for message in [ShoesAppMessage.version, .status, .stats, .lastError, .setLogLevel(.debug)] {
+        for message in [ShoesAppMessage.version, .status, .stats, .lastError, .setLogLevel(.debug), .maxLogLevel] {
             let data = try message.encoded()
             #expect(try ShoesAppMessage.decode(data) == message)
         }
@@ -15,7 +15,7 @@ import Testing
         let stats = ShoesStats(uploadBytes: 1, downloadBytes: 2, activeConnections: 0, outbounds: [])
         for reply in [
             ShoesAppReply.version("0.2.15"), .status(running: true), .stats(stats), .stats(nil),
-            .lastError(.engineStopped("x")), .lastError(nil), .ok, .error("x"),
+            .lastError(.engineStopped("x")), .lastError(nil), .maxLogLevel(.info), .ok, .error("x"),
         ] {
             let data = try reply.encoded()
             #expect(try ShoesAppReply.decode(data) == reply)

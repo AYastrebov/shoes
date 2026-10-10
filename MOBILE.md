@@ -17,12 +17,13 @@ open and are ordered at the end. Line references were last checked against
 |---|---|---|
 | Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64` clean | `cargo build --target aarch64-apple-ios` clean |
 | Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-apple.sh` |
-| Entry points | 10 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 11 `shoes_*` C symbols |
+| Entry points | 11 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 13 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
 | Traffic stats | `TrafficListener.onTrafficUpdate`, `getStats()` | `ShoesTrafficCallback`, `shoes_get_stats()` |
 | Error reporting | `getLastError()`, and `start` returns -1 on a bad config | same, via `shoes_get_last_error()` |
 | Network change | `networkChanged()` | `shoes_network_changed()` |
-| Live log level | `setLogLevel()` | `shoes_set_log_level()` |
+| Live log level | `setLogLevel()`, ceiling from `maxLogLevel()` | `shoes_set_log_level()`, ceiling from `shoes_max_log_level()` |
+| Log file | `setLogFile()`, rotates at 4 MiB to `.1` | `shoes_set_log_file()`, the same |
 | AmneziaWG 2.0/3.0/3.1 | yes | yes |
 | Fake IP / DNS leak | yes, via TUN interception | written, not yet shown on a device (section 8, utun) |
 
@@ -118,7 +119,7 @@ for exactly that and fails rather than publishing it.
 
 ## FFI surface
 
-Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
+Android — 11 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 `ShoesNative.kt`:
 
 | Kotlin | Rust | Returns |
@@ -127,6 +128,7 @@ Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `getVersion()` | `android.rs:119` | version string |
 | `setLogFile(logPath: String)` | `android.rs:145` | 0 ok, -1 error |
 | `setLogLevel(logLevel: String)` | `android.rs` | 0 ok, -1 unrecognised |
+| `maxLogLevel()` | `android.rs` | the build's ceiling, e.g. `"info"` |
 | `networkChanged()` | `android.rs` | tunnels notified |
 | `start(configYaml, protectCallback, trafficCallback)` | `android.rs:177` | `1` on success, -1 on error |
 | `stop(handle: Long)` | `android.rs:317` | — |
@@ -134,7 +136,7 @@ Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `getLastError()` | `android.rs:348` | string or null |
 | `getStats()` | `android.rs` | JSON string, or null (see below) |
 
-iOS and macOS — 12 symbols, declared in `include/shoes.h`:
+iOS and macOS — 13 symbols, declared in `include/shoes.h`:
 
 ```c
 int   shoes_init(const char *log_level);
@@ -143,6 +145,7 @@ long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb 
 int   shoes_stop(long _handle); /* 1: descriptor released; 0: timed out */
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);
+const char *shoes_max_log_level(void);  // static; do not free
 int   shoes_set_log_file(const char *path);
 int   shoes_set_log_level(const char *log_level);
 int   shoes_network_changed(void);

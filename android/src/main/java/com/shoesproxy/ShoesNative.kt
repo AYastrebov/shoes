@@ -119,9 +119,21 @@ object ShoesNative {
     external fun getVersion(): String
 
     /**
+     * The most verbose level this build can log at: "off", "error", "warn",
+     * "info", "debug" or "trace", spelled as [setLogLevel] takes it.
+     *
+     * Release builds are compiled with `release_max_level_info`, so this is
+     * "info" in every published artifact and [setLogLevel] cannot go past it.
+     * Ask this before offering a debug logging switch.
+     */
+    external fun maxLogLevel(): String
+
+    /**
      * Redirect log output to a file.
      *
-     * Call after [init] to persist logs to disk.
+     * Call after [init] to persist logs to disk. The file is appended to,
+     * never truncated when set, and rotates at 4 MiB: it is renamed to
+     * `<logPath>.1`, replacing any earlier one, and a new file is started.
      *
      * @param logPath Absolute path to the log file.
      * @return 0 on success, -1 on error.

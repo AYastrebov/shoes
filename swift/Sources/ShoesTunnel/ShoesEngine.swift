@@ -37,6 +37,14 @@ public final class ShoesEngine: Sendable {
         shoes_is_running()
     }
 
+    /// The most verbose level this build can log at. Release builds compile
+    /// with `release_max_level_info`, so this is `.info` in every published
+    /// artifact and `setLogLevel` cannot go past it: ask before offering a
+    /// debug logging switch.
+    public var maxLogLevel: ShoesLogLevel {
+        ShoesLogLevel(rawValue: String(cString: shoes_max_log_level())) ?? .info
+    }
+
     /// `shoes_init`. Safe to call repeatedly; only the first call's level is
     /// used, and `setLogLevel` changes it afterwards.
     public func initialize(logLevel: ShoesLogLevel) throws {
@@ -118,6 +126,8 @@ public final class ShoesEngine: Sendable {
         return message.isEmpty ? nil : message
     }
 
+    /// `shoes_set_log_file`. Appends, and rotates at 4 MiB to `<path>.1`,
+    /// keeping one previous file.
     public func setLogFile(_ path: String) throws {
         let rc = shoes_set_log_file(path)
         guard rc == 0 else { throw ShoesError.engine("shoes_set_log_file returned \(rc)") }

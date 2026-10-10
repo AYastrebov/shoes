@@ -182,13 +182,15 @@ impl LogWriter for FileLogWriter {
 // Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
 #[allow(dead_code)]
 pub struct DynamicFileLogWriter {
-    file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>,
+    file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<RotatingFile>>>,
 }
 
 // Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
 #[allow(dead_code)]
 impl DynamicFileLogWriter {
-    pub fn new(file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>) -> Self {
+    pub fn new(
+        file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<RotatingFile>>>,
+    ) -> Self {
         Self { file }
     }
 }
@@ -200,7 +202,11 @@ impl LogWriter for DynamicFileLogWriter {
             if let Some(ref mut file) = *guard {
                 let mut line = formatted.to_string();
                 line.push('\n');
-                let _ = file.write_all(line.as_bytes());
+                if !file.write_line(line.as_bytes()) {
+                    // Neither rotated nor truncated, so it can no longer be
+                    // kept under its cap; the platform log carries on.
+                    *guard = None;
+                }
             }
         }
     }
@@ -209,9 +215,108 @@ impl LogWriter for DynamicFileLogWriter {
         if let Some(mutex) = self.file.get() {
             let mut guard = mutex.lock();
             if let Some(ref mut file) = *guard {
-                let _ = file.flush();
+                file.flush();
             }
         }
+    }
+}
+
+/// The most a mobile log file holds before it is rotated to `<path>.1`.
+///
+/// On iOS the file is in the App Group container and outlives the extension,
+/// so without a cap it grew across every session for the life of the install.
+/// One `.1` is kept, so the pair is at most about twice this. See
+/// docs/specs/2026-10-10-mobile-log-rotation-and-ceiling.md.
+// Used by the mobile FFI, which the desktop binary does not compile.
+#[allow(dead_code)]
+pub const LOG_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// An append-only log file that keeps itself under a cap by rotating to
+/// `<path>.1`, replacing the previous one.
+///
+/// Appends on open rather than truncating: the host sets the file once per
+/// start, and the previous session's log, the one that ended in a crash, is
+/// the one worth reading. A file already past the cap is rotated before the
+/// first write, so that log is kept whole.
+pub struct RotatingFile {
+    path: std::path::PathBuf,
+    file: File,
+    written: u64,
+    cap: u64,
+}
+
+// Used by the mobile FFI, which the desktop binary does not compile.
+#[allow(dead_code)]
+impl RotatingFile {
+    pub fn open(path: &std::path::Path, cap: u64) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let written = file.metadata()?.len();
+        let mut this = Self {
+            path: path.to_path_buf(),
+            file,
+            written,
+            cap,
+        };
+        if this.written >= this.cap && !this.rotate() {
+            return Err(std::io::Error::other(
+                "the log file is past its cap and could be neither rotated nor truncated",
+            ));
+        }
+        Ok(this)
+    }
+
+    /// Write one line, rotating first if it would take the file past the cap.
+    ///
+    /// Returns false when the file could be neither rotated nor truncated, so
+    /// it can no longer be kept under its cap and the caller should stop
+    /// writing to it. A failed write itself is ignored, as there is nowhere
+    /// to report a failure to log.
+    pub fn write_line(&mut self, line: &[u8]) -> bool {
+        let len = line.len() as u64;
+        if self.written > 0 && self.written + len > self.cap && !self.rotate() {
+            return false;
+        }
+        if self.file.write_all(line).is_ok() {
+            self.written += len;
+        }
+        true
+    }
+
+    pub fn flush(&mut self) {
+        let _ = self.file.flush();
+    }
+
+    /// Move the current file to `<path>.1` and start a new one. If the rename
+    /// fails, empty the current file instead, which keeps the cap and the
+    /// newest lines. False only when both fail.
+    fn rotate(&mut self) -> bool {
+        let _ = self.file.flush();
+        let mut old = self.path.as_os_str().to_owned();
+        old.push(".1");
+        if std::fs::rename(&self.path, &old).is_ok()
+            && let Ok(file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+        {
+            self.file = file;
+            self.written = 0;
+            return true;
+        }
+        // Through a second handle opened for writing, not `self.file.set_len`:
+        // on Windows an append-mode handle lacks the write access truncation
+        // needs, so that call fails there. The append handle carries on and
+        // writes at the new end.
+        if OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .is_ok()
+        {
+            self.written = 0;
+            return true;
+        }
+        false
     }
 }
 
@@ -843,5 +948,116 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() >= 170);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::RotatingFile;
+    use std::path::{Path, PathBuf};
+
+    const CAP: u64 = 100;
+
+    fn rotated(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".1");
+        PathBuf::from(name)
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// A line of `n` bytes including its newline.
+    fn line(tag: char, n: usize) -> String {
+        let mut s: String = std::iter::repeat_n(tag, n - 1).collect();
+        s.push('\n');
+        s
+    }
+
+    /// Setting the file again keeps what an earlier session wrote: that log,
+    /// the one ending in a crash, is the one worth reading.
+    #[test]
+    fn a_file_under_the_cap_is_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoes.log");
+        std::fs::write(&path, line('a', 30)).unwrap();
+
+        let mut file = RotatingFile::open(&path, CAP).unwrap();
+        assert!(file.write_line(line('b', 30).as_bytes()));
+        file.flush();
+
+        assert_eq!(read(&path), line('a', 30) + &line('b', 30));
+        assert!(!rotated(&path).exists());
+    }
+
+    #[test]
+    fn writing_past_the_cap_moves_the_file_to_dot_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoes.log");
+
+        let mut file = RotatingFile::open(&path, CAP).unwrap();
+        for tag in ['a', 'b', 'c'] {
+            assert!(file.write_line(line(tag, 40).as_bytes()));
+        }
+        file.flush();
+
+        assert_eq!(read(&rotated(&path)), line('a', 40) + &line('b', 40));
+        assert_eq!(read(&path), line('c', 40));
+    }
+
+    /// Only one old file is kept, so the pair stays under twice the cap.
+    #[test]
+    fn a_second_rotation_replaces_dot_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoes.log");
+
+        let mut file = RotatingFile::open(&path, CAP).unwrap();
+        for tag in ['a', 'b', 'c', 'd', 'e'] {
+            assert!(file.write_line(line(tag, 40).as_bytes()));
+        }
+        file.flush();
+
+        assert_eq!(read(&rotated(&path)), line('c', 40) + &line('d', 40));
+        assert_eq!(read(&path), line('e', 40));
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(files, 2, "the current file and one .1, nothing more");
+    }
+
+    /// A file a previous session filled is rotated before the first write, so
+    /// it is kept whole rather than cut mid-line by the next rotation.
+    #[test]
+    fn opening_a_file_past_the_cap_rotates_it_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoes.log");
+        let previous = line('p', 60) + &line('q', 60);
+        std::fs::write(&path, &previous).unwrap();
+
+        let mut file = RotatingFile::open(&path, CAP).unwrap();
+        assert!(file.write_line(line('n', 10).as_bytes()));
+        file.flush();
+
+        assert_eq!(read(&rotated(&path)), previous);
+        assert_eq!(read(&path), line('n', 10));
+    }
+
+    /// When `.1` cannot be replaced the cap still holds: the current file is
+    /// emptied and the newest line kept.
+    #[test]
+    fn a_failed_rename_truncates_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shoes.log");
+        let blocker = rotated(&path);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("occupied"), "x").unwrap();
+
+        let mut file = RotatingFile::open(&path, CAP).unwrap();
+        for tag in ['a', 'b', 'c'] {
+            assert!(file.write_line(line(tag, 40).as_bytes()));
+        }
+        file.flush();
+
+        assert_eq!(read(&path), line('c', 40));
+        assert!(blocker.is_dir(), "the directory in the way is left alone");
     }
 }

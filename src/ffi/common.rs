@@ -7,8 +7,6 @@
 //! because a caller on the far side addresses its service by an integer rather
 //! than by holding a value, and the log-file plumbing those callers configure.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
@@ -41,8 +39,10 @@ pub async fn prepare_from_config(
     }
 }
 
-/// Global log file handle for file-based logging.
-pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();
+/// Global log file handle for file-based logging. Rotates at
+/// [`crate::logging::LOG_FILE_MAX_BYTES`].
+pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<crate::logging::RotatingFile>>> =
+    OnceLock::new();
 
 /// Global flag to track if logger has been initialized.
 pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -100,7 +100,10 @@ pub fn transition_guard() -> parking_lot::MutexGuard<'static, ()> {
 pub fn setup_log_file(path_str: &str) -> i32 {
     let file_mutex = LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
-    match OpenOptions::new().create(true).append(true).open(path_str) {
+    match crate::logging::RotatingFile::open(
+        std::path::Path::new(path_str),
+        crate::logging::LOG_FILE_MAX_BYTES,
+    ) {
         Ok(file) => {
             *file_mutex.lock() = Some(file);
             info!("Log file set to: {}", path_str);
@@ -110,12 +113,32 @@ pub fn setup_log_file(path_str: &str) -> i32 {
     }
 }
 
+/// The most verbose level this build can log at, spelled the way
+/// `shoes_set_log_level` takes it.
+///
+/// Every artifact is built with `release_max_level_info`, so `debug!` and
+/// `trace!` are compiled out and asking for them changes nothing. A host asks
+/// this before offering a "debug logging" switch that would do nothing.
+pub fn max_log_level_name() -> &'static std::ffi::CStr {
+    match log::STATIC_MAX_LEVEL {
+        log::LevelFilter::Off => c"off",
+        log::LevelFilter::Error => c"error",
+        log::LevelFilter::Warn => c"warn",
+        log::LevelFilter::Info => c"info",
+        log::LevelFilter::Debug => c"debug",
+        log::LevelFilter::Trace => c"trace",
+    }
+}
+
 /// Write a log message to the log file if configured.
 pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
     if let Some(file_mutex) = LOG_FILE.get() {
         let mut guard = file_mutex.lock();
         if let Some(ref mut writer) = *guard {
-            let _ = writeln!(writer, "{} [{}] {}", level, target, message);
+            let line = format!("{} [{}] {}\n", level, target, message);
+            if !writer.write_line(line.as_bytes()) {
+                *guard = None;
+            }
         }
     }
 }
@@ -125,7 +148,7 @@ pub fn flush_log_file() {
     if let Some(file_mutex) = LOG_FILE.get() {
         let mut guard = file_mutex.lock();
         if let Some(ref mut writer) = *guard {
-            let _ = writer.flush();
+            writer.flush();
         }
     }
 }
@@ -275,6 +298,23 @@ pub(crate) static LAST_ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling is reported in the spelling `shoes_set_log_level` takes,
+    /// and names the level this build actually compiles in.
+    #[test]
+    fn the_log_ceiling_names_the_compiled_maximum() {
+        let name = max_log_level_name().to_str().unwrap();
+        assert_eq!(
+            crate::logging::parse_log_level(name),
+            Some(log::STATIC_MAX_LEVEL),
+            "{name}"
+        );
+        assert_eq!(
+            name,
+            name.to_lowercase(),
+            "spelled as set_log_level takes it"
+        );
+    }
 
     #[test]
     fn test_set_and_get_last_error() {

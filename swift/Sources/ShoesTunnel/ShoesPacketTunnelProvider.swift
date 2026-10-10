@@ -305,6 +305,7 @@ open class ShoesPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             case .status: return .status(running: engine.isRunning)
             case .stats: return .stats(engine.stats())
             case .lastError: return .lastError(lastError)
+            case .maxLogLevel: return .maxLogLevel(engine.maxLogLevel)
             case .setLogLevel(let level):
                 do {
                     try engine.setLogLevel(level)

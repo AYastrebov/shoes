@@ -132,7 +132,33 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_getVersion<'local>(
     }
 }
 
+/// The most verbose level this build can log at: "off", "error", "warn",
+/// "info", "debug" or "trace", spelled as `setLogLevel` takes it.
+///
+/// Release builds compile with `release_max_level_info`, so this is "info"
+/// in every published artifact, and asking `setLogLevel` for more changes
+/// nothing. Ask this before offering a debug logging switch.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_maxLogLevel<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let name = common::max_log_level_name()
+        .to_str()
+        .expect("the level names are ASCII");
+    match unowned.with_env(|env| env.new_string(name)).into_outcome() {
+        Outcome::Ok(s) => s,
+        // Can fail under JVM OOM; return null to avoid panicking across FFI.
+        _ => JString::null(),
+    }
+}
+
 /// Set the log file path for file-based logging.
+///
+/// The file is appended to, never truncated when set, and rotates at 4 MiB:
+/// it is renamed to `<path>.1`, replacing any earlier one, and a new file is
+/// started. A previous session's log past that size is rotated before the
+/// first write, so it is kept whole.
 ///
 /// # Arguments
 /// * `unowned` - JNI environment
