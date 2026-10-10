@@ -338,11 +338,6 @@ costs to leave.
 
 Open findings from the 2026-08-20 audit, none of them fixed yet:
 
-- **Every crates.io dependency is `"*"`** (58 of them). `--locked` in CI and
-  the committed lockfile mean builds are reproducible, but any plain
-  `cargo update` may jump majors untested, and nothing pins what a fresh
-  clone without the lockfile would get. Pinning majors (`"1"`, `"0.12"`) keeps
-  the flexibility and removes the cliff.
 - **Dependabot alerts are still off.** The other half of this entry is done:
   `cargo audit --deny warnings` now also runs on a daily `schedule:` trigger
   in `lint.yml` (the non-audit jobs skip scheduled ticks), added after the
