@@ -41,7 +41,8 @@
 // The whole surface is written against panic = "abort": ExitGuard's Drop
 // never runs on a panic (a claim control/mod.rs states outright), the
 // callback contract promises a panicking engine cannot report a clean
-// stop, and a panic must never unwind across extern "C" (UB). Only the
+// stop, and a panic that reaches an extern "C" or "system" entry point aborts
+// anyway (Rust 1.81 made those ABIs non-unwinding). Only the
 // release-mobile profile sets abort, so an artifact cut with plain
 // --release silently got the unwinding behavior: a panicking engine
 // delivered on_exit as a reasonless clean stop. Refuse the build

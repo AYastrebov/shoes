@@ -116,83 +116,88 @@ path = "src/bin/shoesd/main.rs"
 required-features = ["daemon"]
 
 [dependencies]
-async-trait = "*"
+# Every requirement names the major the lockfile resolved (the minor below
+# 1.0), never "*". The lockfile already fixes what CI builds; this bounds
+# what a `cargo update` or a clone without the lockfile may pick, so a new
+# major arrives as a deliberate edit here rather than as a surprise -- digest
+# broke a release build that way (see its note below).
+async-trait = "0.1"
 # Optional, and enabled by two features that do not overlap in platform:
 # `daemon` writes the revert state file and parses `ip -j route show default`
 # (macOS and Linux), `clash-api` renders JSON bodies (every platform the CLI
 # builds for). Declared here rather than in a target section for the second:
 # a target-gated optional is a no-op off that target, which would leave the
 # controller without a serializer on Windows.
-serde_json = { version = "*", optional = true }
+serde_json = { version = "1", optional = true }
 # Optional, and enabled by two features on different platforms, for the same
 # reason as serde_json above: `net` carries the UnixListenerStream the daemon
 # hands to tonic, and `ReceiverStream` carries the controller's chunked
 # bodies.
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
 awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "b6b4bcb4372858fdf77c1184c86170d1732b3de1", default-features = false }
-aws-lc-rs = { version = "*", default-features = false }
-base64 = "*"
-blake2 = "*"
-blake3 = "*"
-bytes = "*"
+aws-lc-rs = { version = "1", default-features = false }
+base64 = "0.22"
+blake2 = "0.10"
+blake3 = "1"
+bytes = "1"
 chacha20poly1305 = "0.10"
-chrono = "*"
-dashmap = "*"
+chrono = "0.4"
+dashmap = "6"
 # Pinned to the major: shake 0.1 implements digest 0.11's XofReader, and a
 # wildcard let a re-resolution flip this to 0.10, where the trait does not
 # match and vmess_stream stops compiling. Found during the 0.2.10 release.
 digest = "0.11"
-etherparse = "*"
+etherparse = "0.21"
 # rust_backend rather than the default: the C zlib would add a C toolchain
 # requirement to the Android and iOS cross-builds.
-flate2 = { version = "*", default-features = false, features = ["rust_backend"] }
-futures = "*"
-pin-project-lite = "*"
-h2 = "*"
-h3 = "*"
-h3-quinn = "*"
-hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
-http = "*"
-http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
-indexmap = "*"
-libc = "*"
-log = { version = "*", features = ["std", "release_max_level_info"] }
-lru = "*"
-md-5 = "*"
-memchr = "*"
-mime_guess = "*"
-notify = "*"
-parking_lot = "*"
-percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures = "0.3"
+pin-project-lite = "0.2"
+h2 = "0.4"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+indexmap = "2"
+libc = "0.2"
+log = { version = "0.4", features = ["std", "release_max_level_info"] }
+lru = "0.18"
+md-5 = "0.11"
+memchr = "2"
+mime_guess = "2"
+notify = "8"
+parking_lot = "0.12"
+percent-encoding = "2"
+quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 # Not used directly; this is a floor under quinn's own dependency. Through
 # 0.11.17 a stream whose reader fell about 2.4 MB behind -- an upload to a slow
 # destination does it -- ended the whole connection with "too many gaps in
 # stream buffer": full-size chunks were counted against a limit of 1024 and
 # never merged. 0.11.18 merges them.
 quinn-proto = { version = "0.11.18", default-features = false }
-rand = "*"
-rand_core = "*"
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+rand = "0.10"
+rand_core = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # regex-lite, not regex: a few hundred rule-set patterns behind an LRU do not
 # justify ~1.5MB of binary on mobile, and its linear-time engine has no ReDoS.
-regex-lite = "*"
-rust-argon2 = "*"
-rustc-hash = "*"
-rustls = "*"
-serde = { version = "*", features = ["derive", "std"] }
-serde_yaml = "*"
-shake = "*"
+regex-lite = "0.1"
+rust-argon2 = "3"
+rustc-hash = "2"
+rustls = "0.23"
+serde = { version = "1", features = ["derive", "std"] }
+serde_yaml = "0.9"
+shake = "0.1"
 # auto-icmp-echo-reply: without it smoltcp silently ignores echo requests
 # (src/iface/interface/ipv4.rs gates the reply arm on it), so `icmp_enabled`
 # promised ping support the stack never delivered — found by pinging through
 # the Windows TUN and confirmed to be platform-independent.
-smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "auto-icmp-echo-reply"] }
-socket2 = "*"
-subtle = "*"
-tokio = { version = "*", features = [
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "auto-icmp-echo-reply"] }
+socket2 = "0.6"
+subtle = "2"
+tokio = { version = "1", features = [
     "fs",
     "io-util",
     "macros",
@@ -202,10 +207,10 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "*", features = ["time"] }
-url = "*"
-webpki-roots = { version = "*" }
-x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+tokio-util = { version = "0.7", features = ["time"] }
+url = "2"
+webpki-roots = { version = "1" }
+x509-parser = { version = "0.18", default-features = false, features = ["verify-aws"] }
 
 # Optional so that only a `--features daemon` build compiles it: a build
 # dependency costs build time on every target otherwise, including the mobile
@@ -214,26 +219,26 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 tonic-prost-build = { version = "0.14", optional = true }
 
 [dev-dependencies]
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-serde_json = "*"
-tempfile = "*"
-tokio-rustls = "*"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+serde_json = "1"
+tempfile = "3"
+tokio-rustls = "0.26"
 
 # Unix only: on Windows the TUN backend drives wintun directly
 # (src/tun/wintun_device.rs), and the tun crate's Windows half — wintun
 # behind a blocking Read on an internal thread — is exactly the
 # double-buffered shape that backend exists to avoid.
 [target.'cfg(unix)'.dependencies]
-tun = { version = "*", features = ["async"] }
+tun = { version = "0.8", features = ["async"] }
 
 # The daemon's gRPC stack. Optional, and gated to the platforms that have a
 # `HostNetwork` arm rather than to macOS -- these five are portable, and the
 # only reason they sat under a macOS section was that macOS was the only host.
 # Nothing else resolves them; see the `daemon` feature.
 #
-# Pinned to a major rather than "*": tonic's server API moved across 0.13 and
-# 0.14 (the codec split into `tonic-prost`, and `UdsConnectInfo::peer_addr`
-# gained an Arc), and a silent jump would land in the peer-credential check,
+# Pinned like everything else, and here it matters most: tonic's server API
+# moved across 0.13 and 0.14 (the codec split into `tonic-prost`, and
+# `UdsConnectInfo::peer_addr` gained an Arc), and a silent jump would land in the peer-credential check,
 # which is the daemon's whole authentication.
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 tonic = { version = "0.14", optional = true }
@@ -296,12 +301,12 @@ portable-atomic = "1.15.0"
 # save, its build has no background-thread support for the target, and the
 # musl cross GCCs crash compiling it.
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android", target_arch = "mips")))'.dependencies]
-tikv-jemallocator = "*"
+tikv-jemallocator = "0.7"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "*"
+android_logger = "0.15"
 jni = "0.22"
-ndk-sys = "*"
+ndk-sys = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -320,8 +325,9 @@ strip = true
 # panic = "abort" rather than unwind: this deletes .eh_frame and
 # .gcc_except_table, which are ~2 MiB of the baseline on their own. It is also
 # the honest setting for this crate. A panic that reaches the JNI or extern "C"
-# boundary is undefined behaviour, not a caught error, so the unwind tables buy
-# containment we are not entitled to rely on. See install_panic_hook() in
+# boundary aborts whatever the profile says -- since Rust 1.81 those ABIs
+# cannot unwind, and the panic becomes "panic in a function that cannot
+# unwind" -- so the unwind tables buy no containment there. See install_panic_hook() in
 # src/logging.rs — with abort, a panic is the last thing the process does, so it
 # has to be logged before it happens or it is lost.
 [profile.release-mobile]
