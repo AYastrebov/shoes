@@ -224,10 +224,26 @@ pub fn new_transparent_udp_listener(bind: SocketAddr) -> std::io::Result<socket2
 /// which is not where `tproxy` compiles.
 #[cfg(target_os = "linux")]
 pub fn new_transparent_reply_socket(spoof: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket = new_socket2_udp_socket(spoof.is_ipv6(), None, None, true)?;
+    let socket = new_unbound_reply_socket(spoof.is_ipv6())?;
     crate::tproxy::sys::make_transparent(socket.as_raw_fd(), spoof.is_ipv6())?;
     socket.bind(&SockAddr::from(spoof))?;
     into_tokio_udp_socket(socket)
+}
+
+/// A reply socket's sharing options, apart from the transparency only root
+/// can grant, so a test can bind one.
+///
+/// `SO_REUSEADDR` as well as `SO_REUSEPORT`: a service on the router holding
+/// the wildcard of the remote's port (dnsmasq on `0.0.0.0:53`) overlaps the
+/// spoofed address, and Linux lets two sockets share an overlapping bind only
+/// when both set the same one of the two. Services set `SO_REUSEADDR`, so
+/// replies need it. A holder that set neither still refuses the bind, and
+/// replies spoofed from its port are dropped.
+#[cfg(target_os = "linux")]
+fn new_unbound_reply_socket(ipv6: bool) -> std::io::Result<socket2::Socket> {
+    let socket = new_socket2_udp_socket(ipv6, None, None, true)?;
+    socket.set_reuse_address(true)?;
+    Ok(socket)
 }
 
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
@@ -495,5 +511,31 @@ mod protection_tests {
         // Whatever ran before, prove the unset path is harmless.
         assert!(protect_socket(-1).is_ok());
         assert!(new_tcp_socket(None, false).is_ok());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transparent_tests {
+    use super::*;
+
+    /// A reply spoofed from `8.8.8.8:53` binds that address and port, and a
+    /// service on the router holding the wildcard of that port (dnsmasq on
+    /// `0.0.0.0:53`) overlaps it. Linux lets the two share only when both
+    /// set `SO_REUSEADDR`; `SO_REUSEPORT` alone does not help against a
+    /// holder that never set it. Without it every DNS reply through the
+    /// listener fails to bind and is dropped.
+    #[test]
+    fn a_reply_socket_binds_beside_a_wildcard_service_on_its_port() {
+        let service = new_socket2_udp_socket(false, None, None, false).unwrap();
+        service.set_reuse_address(true).unwrap();
+        service
+            .bind(&SockAddr::from(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .unwrap();
+        let port = service.local_addr().unwrap().as_socket().unwrap().port();
+
+        let reply = new_unbound_reply_socket(false).unwrap();
+        reply
+            .bind(&SockAddr::from(SocketAddr::from(([127, 0, 0, 1], port))))
+            .expect("a reply socket must share a port a wildcard service holds");
     }
 }

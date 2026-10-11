@@ -376,18 +376,29 @@ inbound's.
   a UDP `-m socket --transparent` rule ahead of `TPROXY`: it matches shoes'
   reply sockets, which never read, and the client's next datagrams vanish.
 - **`udp_nat_max` bounds file descriptors**: the sessions of every client
-  together, and as many sockets again for replies. At startup the listener
-  raises the soft open-file limit to the hard one, prints the limit, and warns
-  if `2 × udp_nat_max` does not fit. Past the limit new sessions are dropped,
-  not refused at startup: some routers ship a soft limit of 1024, below the
-  default.
+  together, and as many sockets again for replies. Each listener address has
+  its own, so a listener on two addresses can hold twice as many. At startup
+  shoes raises the soft open-file limit to the hard one, prints the limit, and
+  warns if the listeners at their full `udp_nat_max` would not fit. Past the
+  limit new sessions are dropped, not refused at startup: some routers ship a
+  soft limit of 1024, below the default.
 - **A client is a source socket**, not a LAN host: each DNS query from a
   random port and each QUIC connection is one, and lives until it has been
-  idle for `udp_timeout`. Each holds its own UDP router, about 40 KB measured
-  on x86_64, so `udp_nat_max` is a memory setting as much as a descriptor one:
+  idle for `udp_timeout`. At `udp_nat_max` clients a new one evicts the client
+  heard from least recently, as sing-box does, and one warning says the cap
+  was reached. Each client holds its own UDP router, about 40 KB measured on
+  x86_64, so `udp_nat_max` is a memory setting as much as a descriptor one:
   the default 4096 can reach about 160 MB. On a router with 256 MB or less,
   set it to what the memory allows, 1024 for example. A client is one entry
   in `/connections`; its sessions are routed one destination at a time.
+- **A reply is sent from the remote's own address and port**, so it shares
+  that port with any service on the router holding its wildcard: `dnsmasq` on
+  `0.0.0.0:53`, say, when a client asks `8.8.8.8`. That works with services
+  that set `SO_REUSEADDR`, as most do. A service that set neither it nor
+  `SO_REUSEPORT` refuses the share, and replies from a remote on that port are
+  dropped.
+- **`sniff` is refused.** Sniffing reads a TCP stream's first bytes, and this
+  listener carries datagrams.
 - **`udp_timeout` is between 1 and 86400 seconds.** A client idle for that
   long in both directions is forgotten.
 

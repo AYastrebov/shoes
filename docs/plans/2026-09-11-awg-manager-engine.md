@@ -820,9 +820,12 @@ the build departed from the listing below:
 
 1. **The receive buffer.** `buf.resize(MAX_DATAGRAM)` after `split_to(n)`
    would make `BytesMut` reallocate and copy about 64 KiB per datagram, since
-   the frozen half keeps the old block alive. `recvmsg` reads into the spare
-   capacity of a 1 MiB block instead (`&mut [MaybeUninit<u8>]`), and a new
-   block is reserved only when fewer than 64 KiB remain.
+   the frozen half keeps the old block alive. `recvmsg` reads into one
+   reusable 64 KiB buffer (`&mut [MaybeUninit<u8>]`) and the datagram is
+   copied out at its own size. (A first build carved datagrams out of 1 MiB
+   blocks to save that allocation; the code review found each queued
+   datagram then pinned its whole block, up to 256 MiB for one stalled
+   client.)
 2. **A refused reply is dropped, not an error.** `UdpRouter` takes a server
    write error as the end of the whole client, so the listing's `Err` on an
    exhausted reply budget would have silenced every flow of that client.
@@ -858,6 +861,26 @@ except the third:
     the whole reply budget; they now close after `udp_timeout` unused.
 12. **The documented `TPROXY` rule took broadcast and multicast**, DHCP
     among them; it now excludes `addrtype LOCAL,BROADCAST,MULTICAST`.
+
+The code review on PR #49 (2026-10-11) found more, all fixed in a second
+commit:
+
+13. **Reply sockets set `SO_REUSEPORT` but not `SO_REUSEADDR`**, so a reply
+    spoofed from `8.8.8.8:53` failed to bind beside `dnsmasq` on
+    `0.0.0.0:53`, and every such reply was dropped.
+14. **A full client table refused newcomers**; it now evicts the least
+    recently heard-from client, as sing-box does, and warns once per
+    stretch at the cap rather than once per datagram.
+15. **A client whose router had ended** was reported as a full queue until
+    the sweep; the next datagram now starts it afresh.
+16. **`sniff:` on a `tproxy` listener** was accepted and ignored; refused.
+17. **Several bind addresses**: the open-file warning counted one listener's
+    budgets, and an error on a later address left earlier demuxes running.
+    Every address is now resolved and bound before any demux starts.
+18. **A reply socket that could not open** cost the client a working one
+    when the budget was spent; the new socket now opens first. The
+    address-family mapping of the reply source, unreachable because the
+    router reports the destination as the demux read it, is gone.
 
 **Files:**
 - Modify: `src/tproxy/mod.rs`

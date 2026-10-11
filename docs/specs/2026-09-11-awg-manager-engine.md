@@ -334,7 +334,15 @@ is bound with `IP_TRANSPARENT` to the remote's address and port and sends
 to the client. Each client keeps a small LRU of them keyed by remote, and
 the listener bounds their total at `udp_nat_max` with a second shared
 budget, so the descriptor cost of a listener is at most twice that figure
-whatever the number of clients.
+whatever the number of clients. A reply socket sets `SO_REUSEADDR` as well as
+`SO_REUSEPORT`: its bind overlaps any wildcard service on the remote's port
+(`dnsmasq` on `0.0.0.0:53`), and Linux shares an overlapping bind only when
+both sockets set the same option.
+
+At `udp_nat_max` clients a new one evicts the least recently heard-from
+client, as sing-box's UDP NAT does, rather than being refused: each DNS query
+from a fresh port is a client, so refusal would fail every new lookup until
+the idle sweep ran. (Revised 2026-10-11, from review.)
 
 The kernel side is awg-manager's: the `fwmark 0x1` policy route into table
 `100` with a `local` default is what makes a transparent socket receive the

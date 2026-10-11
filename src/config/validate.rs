@@ -1057,6 +1057,20 @@ fn validate_tproxy_listener(
         ));
     }
 
+    // Sniffing reads a TCP stream's first bytes. Refused rather than accepted
+    // and ignored: a datagram inbound has no stream to read.
+    if server_config
+        .sniff
+        .as_ref()
+        .is_some_and(|sniff| sniff.enabled)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the tproxy inbound cannot sniff: sniffing reads a TCP stream, and tproxy carries \
+             UDP datagrams; drop the sniff block",
+        ));
+    }
+
     let super::types::BindLocation::Address(addresses) = &server_config.bind_location else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -5386,6 +5400,20 @@ mod tproxy_validation_tests {
             let err = refusal(&tproxy("127.0.0.1:51271", fields));
             assert!(err.contains(name), "{fields}: {err}");
         }
+    }
+
+    /// Sniffing reads a TCP stream's first bytes; a datagram inbound has no
+    /// stream, so the block would be accepted and do nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_with_sniff_is_refused() {
+        let err = refusal(&format!("{}  sniff: true\n", tproxy("127.0.0.1:51271", "")));
+        assert!(err.contains("sniff"), "{err}");
+        validate(&format!(
+            "{}  sniff: {{enabled: false}}\n",
+            tproxy("127.0.0.1:51271", "")
+        ))
+        .expect("a disabled sniff block asks for nothing");
     }
 
     #[test]

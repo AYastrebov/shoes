@@ -382,11 +382,13 @@ Network Extension can decline it.
   kernel. `tproxy` for UDP shipped in `src/tproxy/` as this entry described
   it: `IP_RECVORIGDSTADDR` and a hand-walked `recvmsg`, one socket seeing
   every client and so a source-keyed table with idle sweeping, and replies
-  from `IP_TRANSPARENT` sockets bound to the original destination. Two
+  from `IP_TRANSPARENT` sockets bound to the original destination. Three
   details it did not foresee: the reply sockets must stay unconnected, or
-  TPROXY hands the client's next datagrams to them instead of the listener,
-  and the listener must be loopback-only, because on the wildcard it relays
-  ordinary traffic to itself. One prediction was wrong in a useful way: the
+  TPROXY hands the client's next datagrams to them instead of the listener;
+  they need `SO_REUSEADDR`, or they cannot bind beside a router service on
+  the remote's port, `dnsmasq` on 53 above all; and the listener must be
+  loopback-only, because on the wildcard it relays ordinary traffic to
+  itself. One prediction was wrong in a useful way: the
   interesting paths *can* run in CI. GitHub's Linux runners have passwordless
   `sudo`, and both inbounds' tests under real netfilter rules run there on
   every push.

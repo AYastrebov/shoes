@@ -325,6 +325,14 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
         echo.send_to(&buf[..n], from).await.unwrap();
     });
     let remote: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+    // A router service on the remote's port, bound the way dnsmasq binds 53:
+    // the wildcard, with SO_REUSEADDR. The reply socket's bind overlaps it,
+    // and fails unless the reply socket sets SO_REUSEADDR too.
+    let service = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+    service.set_reuse_address(true).unwrap();
+    service
+        .bind(&SocketAddr::from(([0, 0, 0, 0], remote.port())).into())
+        .unwrap();
 
     let listener_port = free_port();
     let dir = tempfile::tempdir().unwrap();

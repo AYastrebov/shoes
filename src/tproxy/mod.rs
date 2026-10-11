@@ -14,7 +14,7 @@ pub mod sys;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
+    use std::mem::MaybeUninit;
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
     use std::os::fd::AsRawFd;
@@ -24,7 +24,7 @@ mod linux {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
     use log::{debug, error, warn};
     use lru::LruCache;
     use tokio::io::ReadBuf;
@@ -50,10 +50,6 @@ mod linux {
     /// Datagrams queued for one client's router. Full means drop.
     const CLIENT_QUEUE: usize = 256;
     const MAX_DATAGRAM: usize = 65535;
-    /// The receive buffer is carved into one `Bytes` per datagram, and a new
-    /// block is allocated only when the last one cannot hold a full datagram:
-    /// one allocation per many datagrams rather than one per datagram.
-    const RECV_BLOCK: usize = 1 << 20;
     const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
     /// A datagram's original destination and its payload.
@@ -129,65 +125,68 @@ mod linux {
 
         /// The cached socket speaking as `spoof`, opened on first use.
         fn reply_socket(&mut self, spoof: SocketAddr) -> std::io::Result<&tokio::net::UdpSocket> {
-            if !self.replies.contains(&spoof) {
-                // Out of budget: free this client's own oldest socket and try
-                // once more, so a busy client recycles rather than starves.
-                // If the listener is still full the caller drops the reply.
-                let permit = match self.reply_budget.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        self.replies.pop_lru();
-                        match self.reply_budget.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                if !self.budget_refusal_reported {
-                                    self.budget_refusal_reported = true;
-                                    warn!(
-                                        "tproxy: udp_nat_max reply sockets all in use; replies \
-                                         to {} are dropped until some go idle",
-                                        self.client
-                                    );
-                                }
-                                return Err(std::io::Error::other(
-                                    "the listener's reply sockets are all in use",
-                                ));
-                            }
-                        }
-                    }
-                };
-                self.budget_refusal_reported = false;
-                let socket = (self.open_reply_socket)(spoof)?;
-                // At the per-client cap this evicts the oldest socket, and
-                // its permit with it.
-                self.replies.put(
-                    spoof,
-                    ReplySocket {
-                        socket,
-                        last_used: Instant::now(),
-                        _permit: permit,
-                    },
-                );
+            let now = Instant::now();
+            if self.reply_budget.available_permits() == 0 && !self.replies.contains(&spoof) {
+                self.recycle_oldest_reply_socket(spoof, now)?;
             }
-            let entry = self.replies.get_mut(&spoof).unwrap();
-            entry.last_used = Instant::now();
+            let budget = &self.reply_budget;
+            let open = self.open_reply_socket;
+            // One lookup on a hit. On a miss the per-client cap evicts the
+            // oldest socket, and its permit with it.
+            let entry = self.replies.try_get_or_insert_mut(spoof, || {
+                let permit = budget.clone().try_acquire_owned().map_err(|_| {
+                    std::io::Error::other("the listener's reply sockets are all in use")
+                })?;
+                Ok::<_, std::io::Error>(ReplySocket {
+                    socket: open(spoof)?,
+                    last_used: now,
+                    _permit: permit,
+                })
+            })?;
+            entry.last_used = now;
+            self.budget_refusal_reported = false;
             Ok(&entry.socket)
         }
-    }
 
-    /// The address a reply to `client` must come from: `remote`, in the
-    /// client's address family. The router reports the remote as it resolved
-    /// it, and an IPv4 remote seen through a dual-stack socket arrives
-    /// IPv4-mapped; a socket of the wrong family cannot send to the client.
-    fn reply_source(remote: SocketAddr, client: SocketAddr) -> SocketAddr {
-        match (remote, client) {
-            (SocketAddr::V6(v6), SocketAddr::V4(_)) => match v6.ip().to_ipv4_mapped() {
-                Some(v4) => SocketAddr::new(v4.into(), v6.port()),
-                None => remote,
-            },
-            (SocketAddr::V4(v4), SocketAddr::V6(_)) => {
-                SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
+        /// The listener's budget is spent: give up this client's own oldest
+        /// socket for one speaking as `spoof`, so a busy client recycles
+        /// rather than starves. The new socket is opened first, so a remote
+        /// that cannot be spoofed costs no socket that works, and a client
+        /// with nothing to give up opens nothing.
+        fn recycle_oldest_reply_socket(
+            &mut self,
+            spoof: SocketAddr,
+            now: Instant,
+        ) -> std::io::Result<()> {
+            if self.replies.is_empty() {
+                if !self.budget_refusal_reported {
+                    self.budget_refusal_reported = true;
+                    warn!(
+                        "tproxy: udp_nat_max reply sockets all in use; replies to {} are \
+                         dropped until some go idle",
+                        self.client
+                    );
+                }
+                return Err(std::io::Error::other(
+                    "the listener's reply sockets are all in use",
+                ));
             }
-            _ => remote,
+            let socket = (self.open_reply_socket)(spoof)?;
+            self.replies.pop_lru();
+            // Another client may take the freed permit first; then this
+            // reply is dropped like any other over the budget.
+            let permit = self.reply_budget.clone().try_acquire_owned().map_err(|_| {
+                std::io::Error::other("the listener's reply sockets are all in use")
+            })?;
+            self.replies.put(
+                spoof,
+                ReplySocket {
+                    socket,
+                    last_used: now,
+                    _permit: permit,
+                },
+            );
+            Ok(())
         }
     }
 
@@ -235,7 +234,10 @@ mod linux {
             this.replied.store(true, Ordering::Relaxed);
             this.close_idle_reply_sockets(Instant::now());
             let client = this.client;
-            let spoof = reply_source(*source, client);
+            // The remote as the client addressed it: the router resolves the
+            // destination the demux read, an address literal, so it reports
+            // it back in the client's own family.
+            let spoof = *source;
             let socket = match this.reply_socket(spoof) {
                 Ok(socket) => socket,
                 Err(e) => {
@@ -307,21 +309,25 @@ mod linux {
         Delivered,
         /// A datagram no router may see; see `worth_routing`.
         Ignored,
-        /// A new client, with the listener already at `udp_nat_max` clients.
-        Refused,
         /// The client's queue is full.
         Dropped,
     }
 
-    /// The listener's clients, keyed by source address.
+    /// The listener's clients, keyed by source address, least recently heard
+    /// from first in line for eviction.
     struct Clients<S> {
         /// The listener's own address, which no datagram may be routed to.
         listener: SocketAddr,
-        clients: HashMap<SocketAddr, Client>,
+        /// Unbounded as a cache: `deliver` enforces `max_clients` itself, so
+        /// it can say so when it evicts.
+        clients: LruCache<SocketAddr, Client>,
         /// Every client holds at least one session, so more clients than
         /// `udp_nat_max` could never all be served.
         max_clients: usize,
         idle: Duration,
+        /// Whether eviction at the cap has been reported since the listener
+        /// was last below it: one warning per stretch, not one per client.
+        eviction_reported: bool,
         /// Starts a client's router over its stream.
         spawn: S,
     }
@@ -333,9 +339,10 @@ mod linux {
         fn new(listener: SocketAddr, max_clients: usize, idle: Duration, spawn: S) -> Self {
             Self {
                 listener,
-                clients: HashMap::new(),
+                clients: LruCache::unbounded(),
                 max_clients,
                 idle,
+                eviction_reported: false,
                 spawn,
             }
         }
@@ -350,49 +357,89 @@ mod linux {
             if payload.is_empty() || !worth_routing(destination, self.listener) {
                 return Delivery::Ignored;
             }
-            if !self.clients.contains_key(&source) {
-                if self.clients.len() >= self.max_clients {
-                    return Delivery::Refused;
+            let datagram = match self.clients.get_mut(&source) {
+                Some(client) => {
+                    client.last_seen = now;
+                    // Bounded, and full means drop: what a full socket buffer
+                    // does, and the only answer that cannot stall the
+                    // listener for every other client.
+                    match client.tx.try_send((destination, payload)) {
+                        Ok(()) => return Delivery::Delivered,
+                        Err(mpsc::error::TrySendError::Full(_)) => return Delivery::Dropped,
+                        // The router has ended: start the client afresh
+                        // rather than drop its traffic until the sweep.
+                        Err(mpsc::error::TrySendError::Closed(datagram)) => {
+                            self.clients.pop(&source);
+                            datagram
+                        }
+                    }
                 }
-                let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
-                let replied = Arc::new(AtomicBool::new(false));
-                let task = (self.spawn)(source, rx, replied.clone());
-                self.clients.insert(
-                    source,
-                    Client {
-                        tx,
-                        last_seen: now,
-                        replied,
-                        task,
-                    },
-                );
+                None => (destination, payload),
+            };
+            self.admit(source, datagram, now)
+        }
+
+        /// Start a client for `source` with `datagram` queued, evicting the
+        /// least recently heard-from client at the cap: as sing-box's UDP NAT
+        /// does, and unlike refusal, which fails every new flow (each DNS
+        /// query from a fresh port is one) until the idle sweep runs.
+        fn admit(&mut self, source: SocketAddr, datagram: Datagram, now: Instant) -> Delivery {
+            if self.clients.len() >= self.max_clients {
+                if !self.eviction_reported {
+                    self.eviction_reported = true;
+                    warn!(
+                        "tproxy: udp_nat_max {} clients reached; the least recently heard \
+                         from are evicted for new ones",
+                        self.max_clients
+                    );
+                }
+                if let Some((evicted, _)) = self.clients.pop_lru() {
+                    debug!("tproxy: client {evicted} evicted for {source}");
+                }
             }
-            let client = self.clients.get_mut(&source).unwrap();
-            client.last_seen = now;
-            // Bounded, and full means drop: what a full socket buffer does,
-            // and the only answer that cannot stall the listener for every
-            // other client.
-            match client.tx.try_send((destination, payload)) {
-                Ok(()) => Delivery::Delivered,
-                Err(_) => Delivery::Dropped,
-            }
+            let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
+            let replied = Arc::new(AtomicBool::new(false));
+            // A fresh queue cannot be full.
+            let _ = tx.try_send(datagram);
+            let task = (self.spawn)(source, rx, replied.clone());
+            self.clients.put(
+                source,
+                Client {
+                    tx,
+                    last_seen: now,
+                    replied,
+                    task,
+                },
+            );
+            Delivery::Delivered
         }
 
         /// Forget clients idle in both directions for `idle`, and clients
-        /// whose router has ended.
+        /// whose router has ended. A client that only receives counts as
+        /// heard from, for eviction as for expiry.
         fn sweep(&mut self, now: Instant) {
             let idle = self.idle;
-            self.clients.retain(|source, client| {
+            let mut expired = Vec::new();
+            let mut replied = Vec::new();
+            for (source, client) in self.clients.iter_mut() {
                 if client.replied.swap(false, Ordering::Relaxed) {
                     client.last_seen = now;
+                    replied.push(*source);
                 }
-                let keep =
-                    now.duration_since(client.last_seen) < idle && !client.task.is_finished();
-                if !keep {
-                    debug!("tproxy: client {source} expired");
+                if now.duration_since(client.last_seen) >= idle || client.task.is_finished() {
+                    expired.push(*source);
                 }
-                keep
-            });
+            }
+            for source in replied {
+                self.clients.promote(&source);
+            }
+            for source in expired {
+                debug!("tproxy: client {source} expired");
+                self.clients.pop(&source);
+            }
+            if self.clients.len() < self.max_clients {
+                self.eviction_reported = false;
+            }
         }
     }
 
@@ -437,7 +484,23 @@ mod linux {
         let BindLocation::Address(addresses) = config.bind_location else {
             unreachable!("validated: tproxy binds an address");
         };
-        let open_files = raise_open_file_limit(udp_nat_max);
+        // Every address resolved and bound before any demux starts, so a
+        // failure part-way leaves nothing running behind the error.
+        let mut binds = Vec::new();
+        for address in addresses.into_vec() {
+            binds.extend(address.to_socket_addrs()?);
+        }
+        let open_files = raise_open_file_limit(udp_nat_max, binds.len());
+        let mut listeners = Vec::with_capacity(binds.len());
+        for bind in binds {
+            let listener = crate::socket_util::new_transparent_udp_listener(bind)
+                .and_then(AsyncFd::new)
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("tproxy listener at {bind}: {e}"))
+                })?;
+            listeners.push((bind, listener));
+        }
+
         let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
         let selector = Arc::new(
             crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
@@ -445,47 +508,31 @@ mod linux {
                 resolver.clone(),
             ),
         );
-
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
-        for address in addresses.into_vec() {
-            for bind in address.to_socket_addrs()? {
-                println!(
-                    "Starting TPROXY UDP server at {bind} (udp_nat_max {udp_nat_max}, \
-                     open-file limit {open_files})"
-                );
-                let listener = match crate::socket_util::new_transparent_udp_listener(bind) {
-                    Ok(listener) => AsyncFd::new(listener)?,
-                    Err(e) => {
-                        for handle in &handles {
-                            handle.abort();
-                        }
-                        return Err(std::io::Error::new(
-                            e.kind(),
-                            format!("tproxy listener at {bind}: {e}"),
-                        ));
-                    }
-                };
-                // One budget of each kind per listener, shared by every
-                // client's router and reply cache: `udp_nat_max` is a
-                // promise about the listener's descriptors, not each client's.
-                let limits = RouterLimits {
-                    session_timeout: Duration::from_secs(udp_timeout),
-                    max_sessions: udp_nat_max,
-                    shared_budget: Some(Arc::new(Semaphore::new(udp_nat_max))),
-                };
-                let reply_budget = Arc::new(Semaphore::new(udp_nat_max));
-                let label =
-                    crate::tcp::tcp_server::inbound_label(&config.protocol, &bind.to_string());
-                handles.push(tokio::spawn(demux(
-                    listener,
-                    bind,
-                    selector.clone(),
-                    resolver.clone(),
-                    limits,
-                    reply_budget,
-                    label,
-                )));
-            }
+        let mut handles = Vec::with_capacity(listeners.len());
+        for (bind, listener) in listeners {
+            println!(
+                "Starting TPROXY UDP server at {bind} (udp_nat_max {udp_nat_max}, \
+                 open-file limit {open_files})"
+            );
+            // One budget of each kind per listener, shared by every client's
+            // router and reply cache: `udp_nat_max` is a promise about the
+            // listener's descriptors, not each client's.
+            let limits = RouterLimits {
+                session_timeout: Duration::from_secs(udp_timeout),
+                max_sessions: udp_nat_max,
+                shared_budget: Some(Arc::new(Semaphore::new(udp_nat_max))),
+            };
+            let reply_budget = Arc::new(Semaphore::new(udp_nat_max));
+            let label = crate::tcp::tcp_server::inbound_label(&config.protocol, &bind.to_string());
+            handles.push(tokio::spawn(demux(
+                listener,
+                bind,
+                selector.clone(),
+                resolver.clone(),
+                limits,
+                reply_budget,
+                label,
+            )));
         }
         Ok(handles)
     }
@@ -532,7 +579,7 @@ mod linux {
             }
         };
         let mut clients = Clients::new(bind, limits.max_sessions, limits.session_timeout, spawn);
-        let mut buf = BytesMut::new();
+        let mut receiver = Receiver::new();
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
 
         loop {
@@ -545,14 +592,9 @@ mod linux {
                             return;
                         }
                     };
-                    if buf.capacity() - buf.len() < MAX_DATAGRAM {
-                        buf.reserve(RECV_BLOCK);
-                    }
-                    let spare = &mut buf.spare_capacity_mut()[..MAX_DATAGRAM];
-                    let received = guard.try_io(|inner| {
-                        sys::recv_with_original_destination(inner.get_ref().as_raw_fd(), spare)
-                    });
-                    let (n, source, destination) = match received {
+                    let received =
+                        guard.try_io(|inner| receiver.recv(inner.get_ref().as_raw_fd()));
+                    let (payload, source, destination) = match received {
                         Ok(Ok(datagram)) => datagram,
                         Ok(Err(e)) => {
                             debug!("tproxy recvmsg: {e}");
@@ -560,10 +602,6 @@ mod linux {
                         }
                         Err(_would_block) => continue,
                     };
-                    // SAFETY: the kernel initialised the first `n` bytes of
-                    // the spare capacity it was handed.
-                    unsafe { buf.set_len(n) };
-                    let payload = buf.split().freeze();
                     let Some(destination) = destination else {
                         debug!("tproxy: datagram from {source} without an original destination; dropped");
                         continue;
@@ -573,10 +611,6 @@ mod linux {
                         Delivery::Ignored => {
                             debug!("tproxy: datagram from {source} for {destination} ignored")
                         }
-                        Delivery::Refused => warn!(
-                            "tproxy: udp_nat_max {} clients reached; datagram from {source} dropped",
-                            clients.max_clients
-                        ),
                         Delivery::Dropped => {
                             debug!("tproxy: client {source} queue full; datagram dropped")
                         }
@@ -587,13 +621,44 @@ mod linux {
         }
     }
 
+    /// Reads the listener's datagrams, each with its original destination.
+    ///
+    /// Into one reusable buffer, then copied out at its own size: one
+    /// allocation per datagram, which the hand-off to a client's task needs
+    /// anyway. Carving datagrams out of a large shared block saved that
+    /// allocation but let each queued datagram keep its whole block alive,
+    /// and a client whose router stalls holds a full queue of them.
+    struct Receiver {
+        scratch: Box<[MaybeUninit<u8>]>,
+    }
+
+    impl Receiver {
+        fn new() -> Self {
+            Self {
+                scratch: vec![MaybeUninit::uninit(); MAX_DATAGRAM].into_boxed_slice(),
+            }
+        }
+
+        fn recv(
+            &mut self,
+            fd: std::os::fd::RawFd,
+        ) -> std::io::Result<(Bytes, SocketAddr, Option<SocketAddr>)> {
+            let (n, source, destination) =
+                sys::recv_with_original_destination(fd, &mut self.scratch)?;
+            // SAFETY: the kernel initialised the first `n` bytes of the buffer
+            // it was handed, and `n` is within it.
+            let payload =
+                unsafe { std::slice::from_raw_parts(self.scratch.as_ptr().cast::<u8>(), n) };
+            Ok((Bytes::copy_from_slice(payload), source, destination))
+        }
+    }
+
     /// Raise the soft open-file limit to the hard one and return it, warning
-    /// when a full listener could exceed it: `udp_nat_max` sessions plus as
-    /// many reply sockets, and room for everything else the process holds.
-    /// A warning, not a refusal: the limit is the host's to change, and a
-    /// listener over it degrades by dropping, not by failing. Entware's soft
-    /// limit is 1024 on some routers, below the default `udp_nat_max`.
-    fn raise_open_file_limit(udp_nat_max: usize) -> u64 {
+    /// when full listeners could exceed it. A warning, not a refusal: the
+    /// limit is the host's to change, and a listener over it degrades by
+    /// dropping, not by failing. Entware's soft limit is 1024 on some
+    /// routers, below the default `udp_nat_max`.
+    fn raise_open_file_limit(udp_nat_max: usize, listeners: usize) -> u64 {
         // SAFETY: plain data the kernel fills in or reads.
         let limit = unsafe {
             let mut limit: libc::rlimit = std::mem::zeroed();
@@ -611,15 +676,22 @@ mod linux {
             }
             limit.rlim_cur as u64
         };
-        let needed = 2 * udp_nat_max as u64 + 64;
+        let needed = open_files_needed(udp_nat_max, listeners);
         if limit < needed {
             println!(
-                "WARNING: tproxy udp_nat_max {udp_nat_max} needs up to {needed} open files and \
-                 the limit is {limit}; past it new UDP sessions are dropped. Raise the limit \
-                 (ulimit -n) or lower udp_nat_max"
+                "WARNING: {listeners} tproxy listener(s) with udp_nat_max {udp_nat_max} need up \
+                 to {needed} open files and the limit is {limit}; past it new UDP sessions are \
+                 dropped. Raise the limit (ulimit -n) or lower udp_nat_max"
             );
         }
         limit
+    }
+
+    /// Each listener has budgets of its own: `udp_nat_max` sessions and as
+    /// many reply sockets, plus the listener itself. Then room for everything
+    /// else the process holds.
+    fn open_files_needed(udp_nat_max: usize, listeners: usize) -> u64 {
+        (listeners as u64) * (2 * udp_nat_max as u64 + 1) + 64
     }
 
     #[cfg(test)]
@@ -752,17 +824,58 @@ mod linux {
             assert_eq!(stream.reply_budget.available_permits(), 10);
         }
 
+        fn refused_on_port_2(spoof: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+            if spoof.port() == 2 {
+                return refused_socket(spoof);
+            }
+            plain_socket(spoof)
+        }
+
+        /// With the budget spent, a remote that cannot be spoofed must not
+        /// cost the client a socket that works: the old one is given up only
+        /// once the new one is open.
+        #[tokio::test]
+        async fn a_reply_socket_that_cannot_open_costs_no_working_one() {
+            let (_tx, mut stream) = stream("127.0.0.1:9".parse().unwrap(), 1, refused_on_port_2);
+            let working = SocketAddr::from(([1, 1, 1, 1], 1));
+            reply(&mut stream, working).await.unwrap();
+            reply(&mut stream, SocketAddr::from(([1, 1, 1, 1], 2)))
+                .await
+                .unwrap();
+            assert!(stream.replies.contains(&working));
+            assert_eq!(stream.reply_budget.available_permits(), 0);
+        }
+
+        /// A queued datagram holds its own bytes and nothing more. A share
+        /// of a larger receive block would keep the whole block alive for as
+        /// long as it waits, and a client whose router stalls holds a full
+        /// queue of them: 256 blocks of 1 MiB for a few bytes each.
         #[test]
-        fn a_reply_speaks_in_the_clients_address_family() {
-            let v4_client: SocketAddr = "192.168.1.5:4000".parse().unwrap();
-            let v6_client: SocketAddr = "[fd00::5]:4000".parse().unwrap();
-            let mapped: SocketAddr = "[::ffff:1.1.1.1]:53".parse().unwrap();
-            let v4: SocketAddr = "1.1.1.1:53".parse().unwrap();
-            let v6: SocketAddr = "[2606:4700::1111]:53".parse().unwrap();
-            assert_eq!(reply_source(mapped, v4_client), v4);
-            assert_eq!(reply_source(v4, v4_client), v4);
-            assert_eq!(reply_source(v4, v6_client), mapped);
-            assert_eq!(reply_source(v6, v6_client), v6);
+        fn a_received_datagram_holds_only_its_own_bytes() {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            sys::receive_original_destination(socket.as_raw_fd(), false).unwrap();
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender.send_to(b"first", addr).unwrap();
+            sender.send_to(b"second", addr).unwrap();
+
+            let mut receiver = Receiver::new();
+            let (first, source, destination) = receiver.recv(socket.as_raw_fd()).unwrap();
+            let (second, _, _) = receiver.recv(socket.as_raw_fd()).unwrap();
+            assert_eq!((&first[..], &second[..]), (&b"first"[..], &b"second"[..]));
+            assert_eq!(source, sender.local_addr().unwrap());
+            assert_eq!(destination, Some(addr));
+            assert!(
+                first.is_unique(),
+                "the first datagram shares its allocation"
+            );
+        }
+
+        /// Budgets are per listener, so two addresses need twice the room.
+        #[test]
+        fn open_files_are_budgeted_for_every_listener() {
+            assert_eq!(open_files_needed(4096, 1), 8193 + 64);
+            assert_eq!(open_files_needed(4096, 2), 2 * 8193 + 64);
         }
 
         /// What the demux handed a client's router: its address, its
@@ -879,25 +992,69 @@ mod linux {
             assert_eq!(stream.reply_budget.available_permits(), 4);
         }
 
+        /// At `udp_nat_max` clients a newcomer evicts the client heard from
+        /// least recently, as sing-box's UDP NAT does, rather than being
+        /// refused: every DNS query from a fresh source port is a client, and
+        /// refusal would fail every new lookup until the idle sweep ran.
         #[tokio::test]
-        async fn a_client_past_the_cap_is_refused_and_an_existing_one_is_not() {
-            let (mut clients, _spawned) = clients(1, Duration::from_secs(60));
+        async fn a_client_past_the_cap_evicts_the_least_recently_seen() {
+            let (mut clients, spawned) = clients(2, Duration::from_secs(60));
             let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
             let now = Instant::now();
             let a: SocketAddr = "10.0.0.5:4000".parse().unwrap();
             let b: SocketAddr = "10.0.0.6:4000".parse().unwrap();
+            let c: SocketAddr = "10.0.0.7:4000".parse().unwrap();
+            for source in [a, b, a, c] {
+                assert_eq!(
+                    clients.deliver(source, dns, Bytes::from_static(b"x"), now),
+                    Delivery::Delivered,
+                    "{source}"
+                );
+            }
+            let spawned = spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 3);
+            assert!(spawned[1].1.is_closed(), "b, least recently seen, went");
+            assert!(!spawned[0].1.is_closed(), "a was heard from after b");
+            assert_eq!(clients.clients.len(), 2);
+        }
+
+        /// A client that only receives is in use: replies seen by the sweep
+        /// keep it from being the one evicted.
+        #[tokio::test]
+        async fn a_client_receiving_replies_is_not_the_one_evicted() {
+            let (mut clients, spawned) = clients(2, Duration::from_secs(60));
+            let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let now = Instant::now();
+            let a: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+            let b: SocketAddr = "10.0.0.6:4000".parse().unwrap();
+            let c: SocketAddr = "10.0.0.7:4000".parse().unwrap();
+            clients.deliver(a, dns, Bytes::from_static(b"x"), now);
+            clients.deliver(b, dns, Bytes::from_static(b"x"), now);
+            spawned.lock().unwrap()[0].2.store(true, Ordering::Relaxed);
+            clients.sweep(now + Duration::from_secs(1));
+            clients.deliver(c, dns, Bytes::from_static(b"x"), now);
+            let spawned = spawned.lock().unwrap();
+            assert!(!spawned[0].1.is_closed(), "a is receiving replies");
+            assert!(spawned[1].1.is_closed(), "b went instead");
+        }
+
+        /// A client whose router has ended is replaced by the next datagram
+        /// from it, not reported as a full queue until the sweep finds it.
+        #[tokio::test]
+        async fn a_client_whose_router_ended_is_started_afresh() {
+            let (mut clients, spawned) = clients(8, Duration::from_secs(60));
+            let a: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+            let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let now = Instant::now();
+            clients.deliver(a, dns, Bytes::from_static(b"1"), now);
+            spawned.lock().unwrap()[0].1.close();
             assert_eq!(
-                clients.deliver(a, dns, Bytes::from_static(b"x"), now),
+                clients.deliver(a, dns, Bytes::from_static(b"2"), now),
                 Delivery::Delivered
             );
-            assert_eq!(
-                clients.deliver(b, dns, Bytes::from_static(b"x"), now),
-                Delivery::Refused
-            );
-            assert_eq!(
-                clients.deliver(a, dns, Bytes::from_static(b"x"), now),
-                Delivery::Delivered
-            );
+            let mut spawned = spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 2, "a second router for the same client");
+            assert_eq!(spawned[1].1.try_recv().unwrap(), (dns, Bytes::from("2")));
         }
 
         #[tokio::test]
