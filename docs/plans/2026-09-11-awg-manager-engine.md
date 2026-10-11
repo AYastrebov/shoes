@@ -814,6 +814,51 @@ git -c user.email=ayastrebov@gmail.com commit -m "udp router: per-listener sessi
 
 Spec: "Slice 2" → "`tproxy`".
 
+**Status, 2026-10-11: done**, with Task 5's documentation share in the same
+commit (AGENTS.md: an option is documented in the commit that adds it). Where
+the build departed from the listing below:
+
+1. **The receive buffer.** `buf.resize(MAX_DATAGRAM)` after `split_to(n)`
+   would make `BytesMut` reallocate and copy about 64 KiB per datagram, since
+   the frozen half keeps the old block alive. `recvmsg` reads into the spare
+   capacity of a 1 MiB block instead (`&mut [MaybeUninit<u8>]`), and a new
+   block is reserved only when fewer than 64 KiB remain.
+2. **A refused reply is dropped, not an error.** `UdpRouter` takes a server
+   write error as the end of the whole client, so the listing's `Err` on an
+   exhausted reply budget would have silenced every flow of that client.
+3. **Replies count as activity.** The listing expired a client on client-side
+   silence alone, which ends a one-way download after `udp_timeout`.
+4. **`make_transparent` lost its third argument.** `receive_original_destination`
+   is separate, because it needs no capability and so lets the `recvmsg` walk
+   be tested without root.
+5. **The root test sends to a remote that is not on the host** (198.51.100.7)
+   and reaches the echo through a rule's `override_address`. The listing's
+   echo on `127.0.0.2` would have held the very address the reply socket
+   binds. The client binds the wildcard, because the kernel refuses a loopback
+   source on a route to a remote, and no owner match is needed, because shoes
+   dials the echo, not the remote. Verified by hand in an unprivileged
+   user-and-network namespace; `tests/transparent.rs` says how.
+6. **A non-root test** checks that a listener without `CAP_NET_ADMIN` fails
+   saying so.
+7. **The re-exports are Linux-only**, because their only caller is.
+
+The final review (2026-10-11) found five more, fixed in the same commit
+except the third:
+
+8. **An empty datagram ended its client's reads**, because the router reads
+   zero bytes as end of stream; the demux drops it.
+9. **A datagram addressed to the listener itself** (a local process sending
+   to it directly) was relayed to the listener, starting a client per relay
+   until `udp_nat_max` ran out. The demux drops it, with broadcast,
+   multicast, unspecified and port-zero destinations.
+10. **A client is a source socket, and each costs about 40 KB** (measured),
+    about 160 MB at the default cap. Documented, and the router-side fix is
+    recorded in ROADMAP; not fixed here because the cost is in `UdpRouter`.
+11. **Reply sockets outlived their sessions**, so a few clients could hold
+    the whole reply budget; they now close after `udp_timeout` unused.
+12. **The documented `TPROXY` rule took broadcast and multicast**, DHCP
+    among them; it now excludes `addrtype LOCAL,BROADCAST,MULTICAST`.
+
 **Files:**
 - Modify: `src/tproxy/mod.rs`
 - Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")

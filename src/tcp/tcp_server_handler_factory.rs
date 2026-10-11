@@ -256,6 +256,9 @@ pub fn create_tcp_server_handler(
                 client_proxy_selector.clone(),
             ))
         }
+        ServerProxyConfig::Tproxy { .. } => {
+            unreachable!("tproxy runs on the UDP transport, not through the TCP handler factory")
+        }
         ServerProxyConfig::Redirect {} => Box::new(
             crate::redirect_handler::RedirectServerHandler::new(client_proxy_selector.clone()),
         ),

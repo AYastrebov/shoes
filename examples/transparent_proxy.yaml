@@ -1,4 +1,5 @@
-# Transparent proxy for TCP (Linux only): the target of NAT REDIRECT.
+# Transparent proxy (Linux only): TCP as the target of NAT REDIRECT, UDP as
+# the target of TPROXY.
 #
 # shoes installs no firewall rules; the host, or a manager such as
 # awg-manager, does. For a router's LAN that is, for example:
@@ -22,6 +23,37 @@
   # The original destination is an IP address. Sniffing recovers the hostname
   # so that domain rules can match.
   sniff: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:1080"
+        protocol:
+          type: socks
+
+# UDP: the target of TPROXY. TPROXY marks the datagram and a policy route for
+# the mark delivers it to this socket; the host installs both, as for TCP:
+#
+#   ip rule add fwmark 0x1 lookup 100
+#   ip route add local 0.0.0.0/0 dev lo table 100
+#   iptables -t mangle -A PREROUTING -i br0 -p udp ! -d 192.168.1.0/24 \
+#       -m addrtype ! --dst-type LOCAL,BROADCAST,MULTICAST \
+#       -j TPROXY --on-ip 127.0.0.1 --on-port 51271 --tproxy-mark 0x1/0x1
+#
+# Replies leave from the address each datagram was going to, so the client
+# sees the remote and not shoes. Making a socket that can do that needs
+# CAP_NET_ADMIN: run as root, or `setcap cap_net_admin+ep` the binary.
+#
+# Loopback, unlike the TCP listener above, and refused anywhere else: TPROXY
+# delivers to the address --on-ip names whatever the interface, and a
+# transparent socket on the wildcard would also receive ordinary traffic and
+# relay it to itself.
+- address: "127.0.0.1:51271"
+  transport: udp
+  protocol:
+    type: tproxy
+    udp_timeout: 300
+    udp_nat_max: 4096
   rules:
     - masks: "0.0.0.0/0"
       action: allow

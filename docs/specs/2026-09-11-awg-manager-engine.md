@@ -517,13 +517,31 @@ else in slices 1 to 4 is per configured item. The measurement that matters
 is the one this document opens with, repeated on the router after each
 slice.
 
+**Revised 2026-10-11, measured.** The paragraph above priced a flow and missed
+the larger cost: a `tproxy` client is a source *socket*, not a LAN host, and
+each one runs its own `UdpRouter`, which keeps two 64 KiB pool buffers for as
+long as it lives. A LAN host's DNS stub or each QUIC connection is a new
+client, alive for `udp_timeout`. Measured in a network namespace with the
+x86_64 release binary and jemalloc, one 1200-byte exchange per client socket:
+1000 clients took shoes from 11.8 to 51.6 MB, 3000 from 12.5 to 129.2 MB, so
+about 40 KB each and about 160 MB at the default `udp_nat_max` of 4096. Most
+of it is pages of those buffers the reads touched. Until the router stops
+holding a buffer pair per idle client, `udp_nat_max` on a router is a memory
+setting as much as a descriptor one; the router run should measure the
+mipsel figure, where the system allocator may touch every page it zeroes.
+
 ## Security notes
 
 - **`redirect` and `tproxy` listeners trust the kernel.** They forward
   whatever arrives to wherever the kernel says it was going. For `tproxy` a
   non-loopback bind is refused at validation: `TPROXY --on-ip 127.0.0.1`
   delivers to a loopback socket, and awg-manager found a wildcard bind there
-  to be a self-sustaining flow loop (its issue #689). For `redirect` the
+  to be a self-sustaining flow loop (its issue #689). Loopback keeps the LAN
+  out but not the host: a local process sending to the listener directly
+  gets the listener's own address as the original destination, and relaying
+  that starts a client per relay until `udp_nat_max` is spent. The demux
+  drops it, as `redirect` refuses its own address (found in review,
+  2026-10-11). For `redirect` the
   bind cannot be restricted, because `REDIRECT` delivers to the LAN
   interface's address. What stands in for the rule is that the client never
   chooses the destination: the kernel records it, and a connection that
@@ -594,7 +612,7 @@ Slice 1 and 2 tests, at the level where a missing call is visible:
 | tproxy UDP model | `AsyncTargetedMessageStream` into the existing `UdpRouter` | The router already does per-destination sessions, routing and expiry |
 | Reply spoofing | `IP_TRANSPARENT` sockets in a per-client LRU keyed by remote, total bounded by `udp_nat_max` | The only portable way; a cache rather than one per session because the router owns sessions and the stream owns sockets |
 | `udp_nat_max` enforcement | One budget per listener, shared by its per-client routers | A per-router cap multiplies by the number of clients |
-| `tproxy` in `/connections` | One row per LAN client, destination unset | A row per destination is a registry write on the session-create path |
+| `tproxy` in `/connections` | One row per client source socket, destination unset | A row per destination is a registry write on the session-create path |
 | Logical rules syntax | `all_of` / `any_of` | Reads as what it is; `masks` stays `any_of` |
 | `.srs` encoder | In shoes, behind sing-box's subcommand names | awg-manager shells out with those arguments today |
 | Chrome ClientHello | Gated on a live DPI test | The cost is large and the need is unmeasured |

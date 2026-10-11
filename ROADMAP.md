@@ -359,7 +359,7 @@ Network Extension can decline it.
   (`src/h2mux/mod.rs:60`), but they are identifiers only: no framing behind
   them. H2MUX covers our own deployments; this is purely about talking to other
   implementations.
-- **Transparent inbounds on Linux: `redirect` done, `tproxy` open.** This
+- **Transparent inbounds on Linux: `redirect` and `tproxy` done.** This
   entry used to open "we have neither", and argued for both from a Linux
   router proxying *other* devices, where sing-box, mihomo and v2ray all ship
   them and where routing every byte through the userspace netstack in
@@ -379,15 +379,17 @@ Network Extension can decline it.
 
   `tproxy` for TCP is not planned: awg-manager uses NAT `REDIRECT` for TCP
   precisely because `-m socket --transparent` does not match on Keenetic's 4.9
-  kernel. `tproxy` for UDP is the open half, specified in
-  `docs/specs/2026-09-11-awg-manager-engine.md` and planned as tasks 4 and 5.
-  What this entry said about it still holds: `IP_RECVORIGDSTADDR` and a
-  hand-walked `recvmsg`, one socket seeing every client and so a source-keyed
-  table with idle sweeping, and replies from a second `IP_TRANSPARENT` socket
-  bound to the original destination. One prediction is already wrong in a
-  useful way: the interesting paths *can* run in CI. GitHub's Linux runners
-  have passwordless `sudo`, and `redirect`'s test under a real NAT rule runs
-  there on every push.
+  kernel. `tproxy` for UDP shipped in `src/tproxy/` as this entry described
+  it: `IP_RECVORIGDSTADDR` and a hand-walked `recvmsg`, one socket seeing
+  every client and so a source-keyed table with idle sweeping, and replies
+  from `IP_TRANSPARENT` sockets bound to the original destination. Two
+  details it did not foresee: the reply sockets must stay unconnected, or
+  TPROXY hands the client's next datagrams to them instead of the listener,
+  and the listener must be loopback-only, because on the wildcard it relays
+  ordinary traffic to itself. One prediction was wrong in a useful way: the
+  interesting paths *can* run in CI. GitHub's Linux runners have passwordless
+  `sudo`, and both inbounds' tests under real netfilter rules run there on
+  every push.
 
 ## Desktop clients
 
@@ -694,20 +696,30 @@ tasks in `docs/plans/2026-09-11-awg-manager-engine.md`.
 
 Done: the process contract (`check`, `version`, `SIGHUP`), the Clash API
 slice awg-manager's health probe and log tail need, aarch64 and mipsel builds
-(`scripts/build-keenetic.sh`), and the `redirect` inbound for transparent TCP.
-That is enough for awg-manager's legacy-tunnel mode, which has not been run on
-a router yet: it waits on awg-manager's emitter, not on anything here.
+(`scripts/build-keenetic.sh`), the `redirect` inbound for transparent TCP, and
+the `tproxy` inbound for transparent UDP. That is enough for awg-manager's
+legacy-tunnel mode and, with both inbounds, its tproxy router mode. Neither has
+been run on a router yet: they wait on awg-manager's emitter, not on anything
+here.
 
 Open, with what each costs while it stays open:
 
-- **No `tproxy` UDP inbound.** awg-manager's tproxy router mode is `redirect`
-  for TCP plus `tproxy` for UDP; with only the first, a router's LAN gets TCP
-  through shoes and UDP (QUIC, DNS, games, VoIP) not at all, so the mode cannot
-  be switched over. Plan tasks 3 and 4.
-- **The `redirect` inbound has never met a router's kernel.** It is tested
-  under a real NAT rule in CI, from the `OUTPUT` chain of one host. The
-  `PREROUTING` path from a LAN client on Keenetic's 4.9 kernel is the one that
-  matters and is untried.
+- **Neither transparent inbound has met a router's kernel.** Both are tested
+  under real netfilter rules in CI, from the `OUTPUT` chain of one host
+  looped back through `lo`. The `PREROUTING` path from a LAN client on
+  Keenetic's 4.9 kernel is the one that matters and is untried. Plan task 5's
+  router run.
+- **A `tproxy` client costs about 40 KB.** A client is a source socket, and
+  each runs its own `UdpRouter`, which keeps two 64 KiB pool buffers for its
+  whole life; measured on x86_64, that is about 160 MB at the default
+  `udp_nat_max` of 4096, which a busy LAN can reach in `udp_timeout`. The fix
+  is in the router, shared by every UDP inbound: give its pool buffers back
+  when it goes idle, or run one router per listener keyed by client socket
+  and destination. Until then CONFIG.md advises a router-sized `udp_nat_max`.
+  Spec, "RSS budget".
+- **`tproxy` on MIPS reads its control messages unaligned**, which is correct
+  and untested there: no datagram has crossed it on mipsel, under QEMU or on
+  a router.
 - **No logical or source-address rules, no per-rule UDP timeout, no `.srs`
   encoder.** awg-manager's rule editor emits all four; until they exist its
   emitter has to refuse those rules for shoes. Spec slice 3.

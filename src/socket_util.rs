@@ -193,6 +193,43 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     Ok(socket)
 }
 
+/// A UDP listener for the `tproxy` inbound: `IP_TRANSPARENT`, so it receives
+/// datagrams the policy route delivered for other addresses, and
+/// `IP_RECVORIGDSTADDR`, so each read says where the datagram was going.
+#[cfg(target_os = "linux")]
+pub fn new_transparent_udp_listener(bind: SocketAddr) -> std::io::Result<socket2::Socket> {
+    // Unbound until both options are set: transparency is checked at bind.
+    let socket =
+        new_socket2_udp_socket_with_buffer_size(bind.is_ipv6(), None, None, false, Some(1 << 20))?;
+    crate::tproxy::sys::make_transparent(socket.as_raw_fd(), bind.is_ipv6())?;
+    crate::tproxy::sys::receive_original_destination(socket.as_raw_fd(), bind.is_ipv6())?;
+    socket.bind(&SockAddr::from(bind))?;
+    Ok(socket)
+}
+
+/// A socket that sends as `spoof`, an address that is not this host's: bound
+/// to it with `IP_TRANSPARENT`, so a `tproxy` client sees its reply come from
+/// the remote it spoke to.
+///
+/// `SO_REUSEPORT`, because two clients talking to one remote need two sockets
+/// bound to the same address. Never connected: TPROXY hands a datagram to a
+/// *connected* socket matching its addresses before it considers the
+/// listener (`nf_tproxy_get_sock_v4`'s established lookup, in
+/// `net/ipv4/netfilter/nf_tproxy_ipv4.c`), so a reply socket connected to its
+/// client would swallow that client's next datagrams, which nothing reads.
+///
+/// No `protect_outbound`, deliberately rather than by the omission AGENTS.md
+/// warns about: this socket's peer is a LAN client, not an upstream, and the
+/// protector exists only where a VPN service owns the routes (Android, iOS),
+/// which is not where `tproxy` compiles.
+#[cfg(target_os = "linux")]
+pub fn new_transparent_reply_socket(spoof: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = new_socket2_udp_socket(spoof.is_ipv6(), None, None, true)?;
+    crate::tproxy::sys::make_transparent(socket.as_raw_fd(), spoof.is_ipv6())?;
+    socket.bind(&SockAddr::from(spoof))?;
+    into_tokio_udp_socket(socket)
+}
+
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
     #[cfg(unix)]
     {

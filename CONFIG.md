@@ -76,7 +76,7 @@ path: "/tmp/shoes.sock"
 protocol: ServerProxyConfig
 
 # Transport layer (default: tcp)
-transport: tcp | quic
+transport: tcp | quic | udp     # udp: the tproxy inbound only
 
 # TCP settings (only when transport: tcp)
 tcp_settings:
@@ -323,6 +323,73 @@ a hostname, since the original destination is always an IP address.
 - **Exclude shoes' own traffic from the rule** (`-m owner ! --uid-owner`, a
   mark, or the outbound interface). shoes dials the same address the client
   did, and a rule that matches that dial sends it straight back.
+
+### Tproxy (transparent UDP, Linux)
+```yaml
+- address: "127.0.0.1:51271"
+  transport: udp               # Required, and for this inbound only
+  protocol:
+    type: tproxy
+    udp_timeout: 300           # Seconds a UDP session may sit idle. Default: 300
+    udp_nat_max: 4096          # UDP sessions, and separately reply sockets,
+                               # across all clients. Default: 4096
+```
+
+The target of the kernel's `TPROXY`, for UDP: QUIC, DNS, games and calls from
+the clients behind a router. Each datagram arrives as the client sent it; shoes
+reads where it was going from the socket (`IP_RECVORIGDSTADDR`), routes it
+through the listener's `rules` like any other UDP, and sends the replies from
+that same address, so the client sees the remote it spoke to and not shoes.
+The two fields are sing-box's, with its defaults, so a config that awg-manager
+writes for sing-box means the same here. TCP is the [redirect](#redirect-transparent-tcp-linux)
+inbound's.
+
+- **Linux only**, `transport: udp` only, and only as a listener's own
+  protocol. `transport: udp` with any other protocol is refused when the
+  config is loaded.
+- **It needs `CAP_NET_ADMIN`**, for `IP_TRANSPARENT`. Root has it; otherwise
+  give it to the binary (`setcap cap_net_admin+ep shoes`) rather than running
+  as root. Without it the listener fails to start and says so. A filesystem
+  mounted `nosuid` ignores file capabilities.
+- **Bind loopback; anything else is refused.** A transparent socket on another
+  address also receives datagrams delivered to the host the ordinary way, and
+  relays them to the address they were already at, which is shoes talking to
+  itself without end. `TPROXY`'s `--on-ip` names the listener, so loopback
+  costs nothing.
+- **shoes installs no firewall rules or routes.** `TPROXY` marks a datagram,
+  and a policy route for that mark is what delivers it to a local socket;
+  without both, the listener starts and nothing ever arrives:
+  ```sh
+  ip rule add fwmark 0x1 lookup 100
+  ip route add local 0.0.0.0/0 dev lo table 100
+  iptables -t mangle -A PREROUTING -i br0 -p udp ! -d 192.168.1.0/24 \
+      -m addrtype ! --dst-type LOCAL,BROADCAST,MULTICAST \
+      -j TPROXY --on-ip 127.0.0.1 --on-port 51271 --tproxy-mark 0x1/0x1
+  ```
+  The `! -d` matters as it does for `redirect`: shoes sends from this host, so
+  a datagram for the router itself would arrive as a local one. The `addrtype`
+  exclusion keeps out what is not a remote's flow: the router's own addresses,
+  and broadcast and multicast, where DHCP, mDNS and SSDP live. TPROXY takes a
+  datagram before any local service sees it, so without it `dnsmasq` stops
+  hearing DHCP. shoes also drops broadcast, multicast and its own address
+  itself, but subnet-directed broadcast only the rule can recognise. Do not put
+  a UDP `-m socket --transparent` rule ahead of `TPROXY`: it matches shoes'
+  reply sockets, which never read, and the client's next datagrams vanish.
+- **`udp_nat_max` bounds file descriptors**: the sessions of every client
+  together, and as many sockets again for replies. At startup the listener
+  raises the soft open-file limit to the hard one, prints the limit, and warns
+  if `2 × udp_nat_max` does not fit. Past the limit new sessions are dropped,
+  not refused at startup: some routers ship a soft limit of 1024, below the
+  default.
+- **A client is a source socket**, not a LAN host: each DNS query from a
+  random port and each QUIC connection is one, and lives until it has been
+  idle for `udp_timeout`. Each holds its own UDP router, about 40 KB measured
+  on x86_64, so `udp_nat_max` is a memory setting as much as a descriptor one:
+  the default 4096 can reach about 160 MB. On a router with 256 MB or less,
+  set it to what the memory allows, 1024 for example. A client is one entry
+  in `/connections`; its sessions are routed one destination at a time.
+- **`udp_timeout` is between 1 and 86400 seconds.** A client idle for that
+  long in both directions is forgotten.
 
 ### Hysteria2
 ```yaml

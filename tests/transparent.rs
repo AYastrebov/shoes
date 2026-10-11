@@ -9,6 +9,20 @@
 //! Building first and running the test binary under `sudo`, rather than
 //! `sudo cargo test`, keeps root-owned files out of `target/`.
 //!
+//! Without `sudo`, a user and network namespace grants the same powers over
+//! a private network stack, where your `/etc/subuid` range maps the `nobody`
+//! the tests run shoes as. It needs a default route, which the namespace
+//! lacks, and a `TMPDIR` not mounted `nosuid`, which would void the file
+//! capability the `tproxy` test sets:
+//!
+//! ```text
+//! unshare --map-root-user --map-auto -n sh -c '
+//!   ip link set lo up
+//!   ip link add d0 type dummy && ip link set d0 up
+//!   ip addr add 10.9.0.1/24 dev d0 && ip route add default via 10.9.0.2
+//!   TMPDIR=/var/tmp target/debug/deps/transparent-<hash> --ignored'
+//! ```
+//!
 //! See docs/specs/2026-09-11-awg-manager-engine.md, "Slice 2".
 #![cfg(target_os = "linux")]
 
@@ -98,8 +112,9 @@ fn spawn_shoes(config: &Path) -> Child {
 }
 
 /// shoes as `nobody`, from a copy in `dir`: `target/` usually sits under a
-/// home directory `nobody` cannot traverse.
-fn spawn_shoes_as_nobody(dir: &Path, config: &Path) -> Child {
+/// home directory `nobody` cannot traverse. With `net_admin` the copy gets
+/// the one capability `tproxy` needs, which also proves it needs no more.
+fn spawn_shoes_as_nobody(dir: &Path, config: &Path, net_admin: bool) -> Child {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
@@ -107,6 +122,9 @@ fn spawn_shoes_as_nobody(dir: &Path, config: &Path) -> Child {
     std::fs::copy(env!("CARGO_BIN_EXE_shoes"), &bin).unwrap();
     for (path, mode) in [(dir, 0o755), (bin.as_path(), 0o755), (config, 0o644)] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    if net_admin {
+        run(&format!("setcap cap_net_admin+ep {}", bin.display()));
     }
     Child(
         Command::new(&bin)
@@ -178,7 +196,7 @@ async fn redirect_forwards_to_the_original_destination() {
     let listener: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let config = write_redirect_config(dir.path(), listener_port);
-    let mut shoes = spawn_shoes_as_nobody(dir.path(), &config);
+    let mut shoes = spawn_shoes_as_nobody(dir.path(), &config, false);
     wait_for(&mut shoes, listener).await;
 
     // The target answers with a prefix, so a reply proves the bytes went
@@ -213,4 +231,162 @@ async fn redirect_forwards_to_the_original_destination() {
     tokio::time::timeout(Duration::from_secs(5), through_shoes)
         .await
         .expect("the redirected connection reached the target through shoes");
+}
+
+/// Commands undone when the test ends, pass or panic, in reverse order: a
+/// policy route left behind on a developer's machine silently swallows
+/// marked traffic.
+struct Setup(Vec<String>);
+
+impl Setup {
+    fn run(&mut self, cmd: &str, undo: &str) {
+        run(cmd);
+        self.0.push(undo.to_string());
+    }
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        for undo in self.0.iter().rev() {
+            let _ = Command::new("sh").arg("-c").arg(undo).status();
+        }
+    }
+}
+
+fn write_tproxy_config(dir: &Path, listener_port: u16, rules: &str) -> std::path::PathBuf {
+    let config = dir.join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "- address: 127.0.0.1:{listener_port}\n  transport: udp\n  protocol:\n    \
+             type: tproxy\n{rules}"
+        ),
+    )
+    .unwrap();
+    config
+}
+
+/// Wait until `shoes` has bound UDP `port`, by `/proc/net/udp`: the probe
+/// awg-manager itself uses, and the only one for a socket that answers
+/// nothing. Fails if shoes has exited, for the reason `wait_for` gives.
+async fn wait_for_udp_bound(shoes: &mut Child, port: u16) {
+    let needle = format!(":{port:04X} ");
+    for _ in 0..300 {
+        if let Some(status) = shoes.0.try_wait().unwrap() {
+            panic!("shoes exited with {status} before binding UDP {port}; its stderr is above");
+        }
+        let table = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
+        if table.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|local| format!("{local} ").ends_with(&needle))
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nothing bound UDP port {port}");
+}
+
+/// Without `CAP_NET_ADMIN` the listener cannot be made transparent, and the
+/// process must say which capability it lacks rather than fail with a bare
+/// EPERM. Needs no root, which is the point.
+#[test]
+fn a_tproxy_listener_without_cap_net_admin_says_so() {
+    if is_root() {
+        return; // root has the capability; the ignored test covers that side
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_tproxy_config(dir.path(), free_port(), "");
+    let out = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .arg("--no-reload")
+        .arg(&config)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("CAP_NET_ADMIN"), "stderr: {stderr}");
+}
+
+#[tokio::test]
+#[ignore = "needs root: installs a policy route and an iptables TPROXY rule"]
+async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
+    assert!(is_root(), "needs root for iptables and setcap");
+
+    // The echo stands in for the remote. The client addresses a remote that
+    // is not on this host, as a LAN client does; shoes is told by a rule to
+    // dial the echo instead, and its reply must still come from the address
+    // the client spoke to.
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+        echo.send_to(&buf[..n], from).await.unwrap();
+    });
+    let remote: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+
+    let listener_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_tproxy_config(
+        dir.path(),
+        listener_port,
+        &format!(
+            "  rules:\n    - masks: 0.0.0.0/0\n      action: allow\n      \
+             override_address: {echo_addr}\n"
+        ),
+    );
+    let mut shoes = spawn_shoes_as_nobody(dir.path(), &config, true);
+    wait_for_udp_bound(&mut shoes, listener_port).await;
+
+    // The local-client shape of what awg-manager installs for the LAN. A
+    // locally sent datagram traverses OUTPUT, not PREROUTING: mark it there,
+    // and the policy route loops it through `lo` into PREROUTING, where
+    // TPROXY can act. Nothing of shoes' needs excluding, as the redirect
+    // test's owner match does: shoes dials the echo, never the remote.
+    let mut setup = Setup(Vec::new());
+    setup.run(
+        "ip rule add fwmark 0x1 lookup 100 priority 30000",
+        "ip rule del fwmark 0x1 lookup 100 priority 30000",
+    );
+    setup.run(
+        "ip route add local 0.0.0.0/0 dev lo table 100",
+        "ip route del local 0.0.0.0/0 dev lo table 100",
+    );
+    let mark = format!(
+        "OUTPUT -t mangle -p udp -d {} --dport {} -j MARK --set-mark 0x1",
+        remote.ip(),
+        remote.port()
+    );
+    setup.run(
+        &format!("iptables -A {mark}"),
+        &format!("iptables -D {mark}"),
+    );
+    let tproxy = format!(
+        "PREROUTING -t mangle -p udp -d {} --dport {} -j TPROXY --on-ip 127.0.0.1 \
+         --on-port {listener_port} --tproxy-mark 0x1/0x1",
+        remote.ip(),
+        remote.port()
+    );
+    setup.run(
+        &format!("iptables -A {tproxy}"),
+        &format!("iptables -D {tproxy}"),
+    );
+
+    let through_shoes = async {
+        // The wildcard, so the source is the host's own address: the kernel
+        // refuses a loopback source on a route to a remote, with EINVAL.
+        let client = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        client.send_to(b"ping", remote).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(
+            from, remote,
+            "the reply must appear to come from the remote, not from shoes"
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(5), through_shoes)
+        .await
+        .expect("the datagram went through shoes and came back spoofed");
 }

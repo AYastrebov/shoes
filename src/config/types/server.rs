@@ -672,6 +672,14 @@ pub struct HttpUpgradeServerConfig {
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
 }
 
+fn default_tproxy_udp_timeout() -> u64 {
+    300
+}
+
+fn default_tproxy_udp_nat_max() -> usize {
+    4096
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
@@ -787,6 +795,20 @@ pub enum ServerProxyConfig {
     /// `AsyncStream::original_destination` for `TcpStream`. See
     /// `validate_redirect_listener`.
     Redirect {},
+    /// Transparent UDP: the target of the kernel's `TPROXY`, on
+    /// `transport: udp`. Each datagram's destination is read from the socket
+    /// (`IP_RECVORIGDSTADDR`), and replies are sent from that destination's
+    /// address so the client sees the remote it spoke to. Linux only and
+    /// loopback only; see `validate_tproxy_listener`.
+    Tproxy {
+        /// Seconds a UDP session may sit idle; sing-box's `udp_timeout`.
+        #[serde(default = "default_tproxy_udp_timeout")]
+        udp_timeout: u64,
+        /// UDP sessions across every client of this listener, and separately
+        /// the reply sockets; sing-box's `udp_nat_max`.
+        #[serde(default = "default_tproxy_udp_nat_max")]
+        udp_nat_max: usize,
+    },
     Hysteria2 {
         password: Redacted<String>,
         #[serde(default = "default_true")]
@@ -884,6 +906,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Redirect {} => write!(f, "Redirect"),
+            Self::Tproxy { .. } => write!(f, "TPROXY"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
@@ -1423,6 +1446,30 @@ upstream:
             err.contains("unknown field") && err.contains("upstream"),
             "Error should mention 'upstream' as unknown field, got: {err}"
         );
+    }
+
+    /// sing-box's `udp_timeout` and `udp_nat_max`, with its defaults, so an
+    /// awg-manager config means the same here as there.
+    #[test]
+    fn tproxy_takes_sing_box_limits_with_their_defaults() {
+        let parsed: ServerProxyConfig = serde_yaml::from_str("type: tproxy").unwrap();
+        assert!(matches!(
+            parsed,
+            ServerProxyConfig::Tproxy {
+                udp_timeout: 300,
+                udp_nat_max: 4096
+            }
+        ));
+        let parsed: ServerProxyConfig =
+            serde_yaml::from_str("{type: tproxy, udp_timeout: 60, udp_nat_max: 16}").unwrap();
+        assert!(matches!(
+            parsed,
+            ServerProxyConfig::Tproxy {
+                udp_timeout: 60,
+                udp_nat_max: 16
+            }
+        ));
+        assert_eq!(parsed.to_string(), "TPROXY");
     }
 
     #[test]
