@@ -491,6 +491,10 @@ mod linux {
             binds.extend(address.to_socket_addrs()?);
         }
         let open_files = raise_open_file_limit(udp_nat_max, binds.len());
+        // IPv6 has no `src_valid_mark`.
+        if binds.iter().any(SocketAddr::is_ipv4) {
+            warn_about_source_validation();
+        }
         let mut listeners = Vec::with_capacity(binds.len());
         for bind in binds {
             let listener = crate::socket_util::new_transparent_udp_listener(bind)
@@ -694,6 +698,60 @@ mod linux {
         (listeners as u64) * (2 * udp_nat_max as u64 + 1) + 64
     }
 
+    /// Interfaces on which the kernel drops what `TPROXY` marks, by name.
+    ///
+    /// With `src_valid_mark` on, the reverse-path check looks the client's
+    /// address up with the datagram's mark, so it finds the policy route's
+    /// `local` default and rejects the source as a martian: silently, with no
+    /// counter. `accept_local` lets that pass unless `rp_filter` is strict.
+    /// Each setting is in force on an interface if it is on there or under
+    /// `all` (`rp_filter`: the larger of the two), as `IN_DEV_ORCONF` and
+    /// `IN_DEV_MAXCONF` read them. `conf` is `/proc/sys/net/ipv4/conf`.
+    fn interfaces_dropping_marked_datagrams(conf: &std::path::Path) -> Vec<String> {
+        let read = |interface: &str, setting: &str| -> u8 {
+            std::fs::read_to_string(conf.join(interface).join(setting))
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let Ok(entries) = std::fs::read_dir(conf) else {
+            return Vec::new();
+        };
+        let mut at_risk: Vec<String> = entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            // `default` is a template for interfaces yet to come, and `lo`
+            // carries only the host's own traffic, whose route is chosen
+            // on the way out.
+            .filter(|name| !matches!(name.as_str(), "all" | "default" | "lo"))
+            .filter(|name| {
+                let on = |setting| read("all", setting) != 0 || read(name, setting) != 0;
+                let strict = read("all", "rp_filter").max(read(name, "rp_filter")) == 1;
+                on("src_valid_mark") && (!on("accept_local") || strict)
+            })
+            .collect();
+        at_risk.sort();
+        at_risk
+    }
+
+    /// Say so at startup when the host would drop what `TPROXY` delivers:
+    /// the listener starts and binds either way, and a client behind one of
+    /// these interfaces gets nothing, with no error anywhere. A warning, not
+    /// a refusal, like the open-file limit: the settings are the host's, and
+    /// clients on other interfaces are unaffected.
+    fn warn_about_source_validation() {
+        let at_risk =
+            interfaces_dropping_marked_datagrams(std::path::Path::new("/proc/sys/net/ipv4/conf"));
+        if !at_risk.is_empty() {
+            println!(
+                "WARNING: tproxy: src_valid_mark is on for {}, so the kernel drops the \
+                 datagrams TPROXY marks on them as martians and their clients get no answer. \
+                 Set net.ipv4.conf.all.src_valid_mark=0 (and per interface), or accept_local=1 \
+                 on the LAN interface with rp_filter other than 1; see CONFIG.md, \"Tproxy\"",
+                at_risk.join(", ")
+            );
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -876,6 +934,60 @@ mod linux {
         fn open_files_are_budgeted_for_every_listener() {
             assert_eq!(open_files_needed(4096, 1), 8193 + 64);
             assert_eq!(open_files_needed(4096, 2), 2 * 8193 + 64);
+        }
+
+        /// A fake `/proc/sys/net/ipv4/conf`: `all` and each interface,
+        /// with the three settings that decide source validation.
+        fn conf(interfaces: &[(&str, [u8; 3])]) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, [src_valid_mark, accept_local, rp_filter]) in interfaces {
+                let d = dir.path().join(name);
+                std::fs::create_dir(&d).unwrap();
+                for (file, value) in [
+                    ("src_valid_mark", src_valid_mark),
+                    ("accept_local", accept_local),
+                    ("rp_filter", rp_filter),
+                ] {
+                    std::fs::write(d.join(file), format!("{value}\n")).unwrap();
+                }
+            }
+            dir
+        }
+
+        /// The combinations `ip route get <dst> from <client> iif <lan> mark 1`
+        /// answered with EINVAL on Linux 7.2, and the ones it routed.
+        #[test]
+        fn interfaces_that_drop_marked_datagrams_are_named() {
+            let at_risk = |interfaces: &[(&str, [u8; 3])]| {
+                let dir = conf(interfaces);
+                interfaces_dropping_marked_datagrams(dir.path())
+            };
+            let defaults = [0, 0, 0];
+            assert!(
+                at_risk(&[("all", defaults), ("default", defaults), ("br0", defaults)]).is_empty()
+            );
+            // On under `all`, as wg-quick leaves it: every interface but `lo`.
+            assert_eq!(
+                at_risk(&[
+                    ("all", [1, 0, 0]),
+                    ("default", defaults),
+                    ("lo", defaults),
+                    ("br0", defaults),
+                    ("eth0", defaults)
+                ]),
+                ["br0", "eth0"]
+            );
+            // On for one interface only.
+            assert_eq!(
+                at_risk(&[("all", defaults), ("br0", [1, 0, 2]), ("eth0", defaults)]),
+                ["br0"]
+            );
+            // `accept_local` is the other remedy, under loose or no rp_filter
+            // but not strict, wherever each is set.
+            assert!(at_risk(&[("all", [1, 0, 2]), ("br0", [0, 1, 0])]).is_empty());
+            assert!(at_risk(&[("all", [1, 1, 0]), ("br0", [0, 0, 0])]).is_empty());
+            assert_eq!(at_risk(&[("all", [1, 0, 1]), ("br0", [0, 1, 0])]), ["br0"]);
+            assert_eq!(at_risk(&[("all", [1, 1, 0]), ("br0", [0, 0, 1])]), ["br0"]);
         }
 
         /// What the demux handed a client's router: its address, its

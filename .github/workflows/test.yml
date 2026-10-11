@@ -98,7 +98,8 @@ jobs:
       # need root. Built as the runner and run under sudo, so nothing in
       # target/ ends up owned by root and the cache step can still read it.
       # The tools are named explicitly so an image that drops one fails here,
-      # not as a test error; setcap is libcap2-bin.
+      # not as a test error; setcap is libcap2-bin, unshare and nsenter
+      # util-linux (the LAN client's namespace).
       - name: Transparent inbound tests (root)
         if: runner.os == 'Linux'
         shell: bash
@@ -107,6 +108,8 @@ jobs:
           command -v iptables
           command -v ip
           command -v setcap
+          command -v unshare
+          command -v nsenter
           test_bin=$(cargo test --locked --test transparent --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "transparent") | .executable')
           sudo "$test_bin" --ignored

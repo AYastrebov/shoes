@@ -398,3 +398,127 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
         .await
         .expect("the datagram went through shoes and came back spoofed");
 }
+
+/// A LAN client, which is what `tproxy` is for: its datagrams arrive on
+/// another interface and are routed, unlike the local client above, whose
+/// datagrams loop through `lo` with their route already chosen. Routing them
+/// is where `src_valid_mark` bites (CONFIG.md, "Tproxy"); this follows the
+/// remedy that note gives, so a host with it on runs the test too.
+///
+/// The client lives in a network namespace of its own, across a veth pair.
+/// Its own mark, table and remote, so it can run beside the test above.
+#[tokio::test]
+#[ignore = "needs root: creates a network namespace, a policy route and an iptables TPROXY rule"]
+async fn tproxy_relays_a_client_on_another_interface() {
+    assert!(is_root(), "needs root for namespaces, iptables and setcap");
+
+    let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+        echo.send_to(&buf[..n], from).await.unwrap();
+    });
+    let remote: SocketAddr = "198.51.100.8:5353".parse().unwrap();
+
+    let listener_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_tproxy_config(
+        dir.path(),
+        listener_port,
+        &format!(
+            "  rules:\n    - masks: 0.0.0.0/0\n      action: allow\n      \
+             override_address: {echo_addr}\n"
+        ),
+    );
+    let mut shoes = spawn_shoes_as_nobody(dir.path(), &config, true);
+    wait_for_udp_bound(&mut shoes, listener_port).await;
+
+    // The LAN: a namespace held open by a sleeping child, which takes the
+    // namespace and the veth pair with it when it dies.
+    let lan = Child(
+        Command::new("unshare")
+            .args(["-n", "sleep", "60"])
+            .spawn()
+            .unwrap(),
+    );
+    let lan_pid = lan.0.id();
+    let own = std::fs::read_link("/proc/self/ns/net").unwrap();
+    for _ in 0..100 {
+        if std::fs::read_link(format!("/proc/{lan_pid}/ns/net")).is_ok_and(|ns| ns != own) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let veth = format!("tpl{listener_port}");
+    run(&format!(
+        "ip link add {veth} type veth peer name eth0 netns {lan_pid} && \
+         ip addr add 192.0.2.1/24 dev {veth} && ip link set {veth} up"
+    ));
+    run(&format!(
+        "nsenter -t {lan_pid} -n sh -c 'ip link set lo up && \
+         ip addr add 192.0.2.2/24 dev eth0 && ip link set eth0 up && \
+         ip route add default via 192.0.2.1'"
+    ));
+    let src_valid_mark = std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/src_valid_mark")
+        .is_ok_and(|v| v.trim() == "1");
+    if src_valid_mark {
+        // Per interface, so it goes with the veth.
+        run(&format!("sysctl -qw net.ipv4.conf.{veth}.accept_local=1"));
+    }
+
+    let mut setup = Setup(Vec::new());
+    setup.run(
+        "ip rule add fwmark 0x2 lookup 101 priority 30001",
+        "ip rule del fwmark 0x2 lookup 101 priority 30001",
+    );
+    setup.run(
+        "ip route add local 0.0.0.0/0 dev lo table 101",
+        "ip route del local 0.0.0.0/0 dev lo table 101",
+    );
+    let tproxy = format!(
+        "PREROUTING -t mangle -i {veth} -p udp -d {} --dport {} -j TPROXY --on-ip 127.0.0.1 \
+         --on-port {listener_port} --tproxy-mark 0x2/0x2",
+        remote.ip(),
+        remote.port()
+    );
+    setup.run(
+        &format!("iptables -A {tproxy}"),
+        &format!("iptables -D {tproxy}"),
+    );
+
+    // A socket keeps the namespace it was made in, so make it on a thread
+    // that has entered the LAN's, and use it from here.
+    let client = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let ns = std::fs::File::open(format!("/proc/{lan_pid}/ns/net")).unwrap();
+        // SAFETY: a valid namespace descriptor; only this thread moves.
+        assert_eq!(
+            unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) },
+            0,
+            "setns: {}",
+            std::io::Error::last_os_error()
+        );
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+    })
+    .join()
+    .unwrap();
+    let client = tokio::net::UdpSocket::from_std(client).unwrap();
+
+    let through_shoes = async {
+        client.send_to(b"ping", remote).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(
+            from, remote,
+            "the reply must appear to come from the remote, not from shoes"
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(5), through_shoes)
+        .await
+        .expect("the LAN client's datagram went through shoes and came back spoofed");
+    drop(lan);
+}

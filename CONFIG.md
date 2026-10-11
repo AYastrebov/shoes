@@ -375,6 +375,21 @@ inbound's.
   itself, but subnet-directed broadcast only the rule can recognise. Do not put
   a UDP `-m socket --transparent` rule ahead of `TPROXY`: it matches shoes'
   reply sockets, which never read, and the client's next datagrams vanish.
+- **`src_valid_mark` must be off for the LAN interface**, or clients behind
+  it get nothing. With it on, the kernel checks a marked datagram's source
+  against the policy route above, finds the `local` default, and drops the
+  datagram as a martian: no error, no counter, and the router's own traffic
+  still works, so it looks like a firewall problem. `wg-quick` turns it on
+  for every interface (`net.ipv4.conf.all.src_valid_mark=1`) when it routes
+  by mark. Either turn it off (`all` and the interface), or leave it and set
+  `accept_local=1` on the LAN interface, which works unless that interface's
+  `rp_filter` is strict (`1`):
+  ```sh
+  sysctl -w net.ipv4.conf.all.src_valid_mark=0 net.ipv4.conf.br0.src_valid_mark=0
+  # or
+  sysctl -w net.ipv4.conf.br0.accept_local=1
+  ```
+  shoes checks these at startup and warns, naming the interfaces at risk.
 - **`udp_nat_max` bounds file descriptors**: the sessions of every client
   together, and as many sockets again for replies. Each listener address has
   its own, so a listener on two addresses can hold twice as many. At startup

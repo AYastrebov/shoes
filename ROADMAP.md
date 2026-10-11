@@ -388,7 +388,9 @@ Network Extension can decline it.
   they need `SO_REUSEADDR`, or they cannot bind beside a router service on
   the remote's port, `dnsmasq` on 53 above all; and the listener must be
   loopback-only, because on the wildcard it relays ordinary traffic to
-  itself. One prediction was wrong in a useful way: the
+  itself. A fourth turned up in the host: with `src_valid_mark` on, as
+  `wg-quick` leaves it, the kernel drops every forwarded datagram TPROXY
+  marks as a martian, so shoes warns about it at startup. One prediction was wrong in a useful way: the
   interesting paths *can* run in CI. GitHub's Linux runners have passwordless
   `sudo`, and both inbounds' tests under real netfilter rules run there on
   every push.

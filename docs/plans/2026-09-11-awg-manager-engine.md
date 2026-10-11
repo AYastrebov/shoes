@@ -882,6 +882,15 @@ commit:
     address-family mapping of the reply source, unreachable because the
     router reports the destination as the demux read it, is gone.
 
+Benchmarking against sing-box 1.14.3 (PR #49's comment has the figures)
+found one more, in the host rather than the code:
+
+19. **`src_valid_mark` on drops every forwarded datagram TPROXY marks**, as a
+    martian source, silently; the root test's local client never routes, so
+    it could not see it. shoes now warns at startup naming the interfaces at
+    risk, CONFIG.md gives both remedies, and a second root test runs a LAN
+    client in its own namespace across a veth pair.
+
 **Files:**
 - Modify: `src/tproxy/mod.rs`
 - Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")
