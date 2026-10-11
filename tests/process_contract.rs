@@ -92,6 +92,17 @@ async fn wait_until(addr: SocketAddr, up: bool) {
     panic!("{addr} never became up={up}");
 }
 
+/// Wait until the child has a listener accepting on `addr`. Its own line
+/// first, so the listener is known to be this child's attempt; then a
+/// connect, because the line is printed before the bind and a bind that
+/// fails prints it too. The connect cannot be answered by another test's
+/// child: `free_ports` gives each port to one test.
+#[cfg(unix)]
+async fn wait_for_listener(stdout: &mut Stdout, addr: SocketAddr) {
+    stdout.wait_for(&format!("server at {addr}"));
+    wait_until(addr, true).await;
+}
+
 #[cfg(unix)]
 fn sighup(child: &Child) {
     // SAFETY: a plain signal to a child this test owns.
@@ -287,14 +298,12 @@ async fn sighup_reloads_immediately_even_with_no_reload() {
     );
     let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    // The child's own word for each listener, not a connect: a connect can
-    // be answered by whatever else holds the port.
-    stdout.wait_for(&format!("server at 127.0.0.1:{first}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], first))).await;
 
     std::fs::write(&config, socks_config(second)).unwrap();
     let started = std::time::Instant::now();
     sighup(&child);
-    stdout.wait_for(&format!("server at 127.0.0.1:{second}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
@@ -349,7 +358,7 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
     }
 
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    stdout.wait_for(&format!("server at 127.0.0.1:{second}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         child.0.try_wait().unwrap().is_none(),
@@ -386,20 +395,19 @@ async fn a_write_then_a_sighup_is_one_reload_not_two() {
     );
     let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    // The child's own word that it bound the first port, not a connect to
-    // it: the ports are free only when allocated, and a sibling test's
-    // process can hold one by now. A connect answered by that process lets
-    // the write below land before this child reads its config; it then
-    // starts on the second port and sees no change. That is the only way
-    // found to produce this test's one Linux failure, a child that started
-    // and never printed "Configs changed".
-    stdout.wait_for(&format!("server at 127.0.0.1:{first}"));
+    // The child's line as well as a connect. A connect alone, answered by a
+    // sibling test's process holding the same port, let the write below
+    // land before this child read its config; it then started on the second
+    // port and saw no change. That was this test's one Linux failure, a
+    // child that started and never printed "Configs changed", and the shared
+    // port behind it is what `free_ports` now rules out.
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], first))).await;
 
     std::fs::write(&config, socks_config(second)).unwrap();
     stdout.wait_for("Configs changed");
     let signalled = std::time::Instant::now();
     sighup(&child);
-    stdout.wait_for(&format!("server at 127.0.0.1:{second}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         signalled.elapsed() < std::time::Duration::from_secs(2),
@@ -447,7 +455,7 @@ async fn a_watcher_event_for_unchanged_bytes_restarts_nothing() {
             .unwrap(),
     );
     let mut stdout = Stdout::tap(&mut child);
-    stdout.wait_for(&format!("server at 127.0.0.1:{port}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], port))).await;
 
     std::fs::write(&config, socks_config(port)).unwrap();
     stdout.wait_for("Configs changed");
