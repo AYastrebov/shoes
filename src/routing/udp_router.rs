@@ -96,6 +96,16 @@ const PING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Ping streams that haven't had writes for this long
 const PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Packet buffers parked by idle routers on this thread, at most. A router
+/// gives its free buffers up each time it goes idle and takes them back on
+/// its next wake, so this is what the routers between datagrams share on a
+/// worker, instead of two 64 KiB buffers each; past it they are freed.
+const SPARE_BUFFERS_PER_THREAD: usize = 16;
+
+thread_local! {
+    static SPARE_BUFFERS: std::cell::RefCell<Vec<Box<[u8]>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Session identifier - incrementing counter, never reused
 type SessionKey = usize;
 
@@ -126,10 +136,11 @@ impl BufferPool {
             return Some(buf);
         }
 
-        // Create new if under limit
+        // Create new if under limit, from those idle routers parked first
         if self.created_count < self.max_count {
             self.created_count += 1;
-            Some(allocate_vec(MAX_UDP_PACKET_SIZE).into_boxed_slice())
+            let parked = SPARE_BUFFERS.with(|spare| spare.borrow_mut().pop());
+            Some(parked.unwrap_or_else(|| allocate_vec(MAX_UDP_PACKET_SIZE).into_boxed_slice()))
         } else {
             None
         }
@@ -138,6 +149,23 @@ impl BufferPool {
     #[inline]
     fn release(&mut self, buf: Box<[u8]>) {
         self.buffers.push(buf);
+    }
+
+    /// Give the free buffers up, for when the router goes idle: to the
+    /// thread's spares while there is room, to the allocator past it.
+    /// Buffers still queued are kept, and counted.
+    fn park(&mut self) {
+        if self.buffers.is_empty() {
+            return;
+        }
+        self.created_count -= self.buffers.len();
+        SPARE_BUFFERS.with(|spare| {
+            let mut spare = spare.borrow_mut();
+            let room = SPARE_BUFFERS_PER_THREAD.saturating_sub(spare.len());
+            let keep = self.buffers.len().min(room);
+            spare.extend(self.buffers.drain(..keep));
+        });
+        self.buffers.clear();
     }
 
     #[inline]
@@ -1360,6 +1388,9 @@ impl<'a> Future for UdpRouter<'a> {
 
         this.drain_remote_shutdowns(cx);
 
+        this.remote_write_pool.park();
+        this.server_write_pool.park();
+
         if this.server_read_eof && this.server_write_eof {
             Poll::Ready(Ok(()))
         } else {
@@ -2018,6 +2049,76 @@ mod tests {
             assert_eq!(inner.replies[0].1, b"ping", "the echo must round-trip");
         }
         router.abort();
+    }
+
+    /// A router between datagrams holds no packet buffers: a tproxy
+    /// listener runs one router per client socket, mostly idle, and two
+    /// 64 KiB buffers kept by each were the bulk of a client's cost.
+    #[tokio::test]
+    async fn test_an_idle_router_holds_no_buffers() {
+        let echo = spawn_udp_echo().await;
+        let (stream, inner) = scripted(vec![(location(echo), b"ping".to_vec())], usize::MAX);
+        let mut server = ServerStream::Targeted(Box::new(stream));
+        let resolver = test_resolver();
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while inner.lock().unwrap().replies.is_empty() {
+            assert!(Instant::now() < deadline, "the echo never came back");
+            let poll = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut router).poll(cx))).await;
+            assert!(poll.is_pending(), "the router must still be running");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut router).poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(
+            (
+                router.remote_write_pool.created_count,
+                router.server_write_pool.created_count
+            ),
+            (0, 0),
+            "buffers held by an idle router"
+        );
+    }
+
+    /// Parked buffers are reused by the next router on the thread rather
+    /// than allocated again, so going idle costs the busy path nothing; and
+    /// the cache is bounded, so many routers parking at once free the rest.
+    #[test]
+    fn test_parked_buffers_are_reused_and_bounded() {
+        SPARE_BUFFERS.with(|spare| spare.borrow_mut().clear());
+        let mut first = BufferPool::new(1);
+        let buf = first.acquire().unwrap();
+        let address = buf.as_ptr();
+        first.release(buf);
+        first.park();
+        assert_eq!(first.created_count, 0);
+
+        let mut second = BufferPool::new(1);
+        let reused = second.acquire().unwrap();
+        assert_eq!(reused.as_ptr(), address, "a parked buffer is reused");
+
+        let mut many = BufferPool::new(SPARE_BUFFERS_PER_THREAD + 4);
+        let bufs: Vec<_> = (0..SPARE_BUFFERS_PER_THREAD + 4)
+            .map(|_| many.acquire().unwrap())
+            .collect();
+        for buf in bufs {
+            many.release(buf);
+        }
+        many.park();
+        assert_eq!(many.created_count, 0);
+        assert_eq!(
+            SPARE_BUFFERS.with(|spare| spare.borrow().len()),
+            SPARE_BUFFERS_PER_THREAD
+        );
     }
 
     #[tokio::test]

@@ -538,6 +538,17 @@ holding a buffer pair per idle client, `udp_nat_max` on a router is a memory
 setting as much as a descriptor one; the router run should measure the
 mipsel figure, where the system allocator may touch every page it zeroes.
 
+**Revised again 2026-10-11.** The router now gives its free packet buffers
+up each time it goes idle, into a per-thread cache of at most 16 that the
+next router to wake on that worker takes them from, so the busy path still
+allocates nothing and the buffers are paid for by routers at work rather
+than routers that exist. On the same bench (a LAN client in its own
+namespace, 3000 client sockets, one 1200-byte exchange each) shoes went
+from 127 to 76.5 MB, about 21 KB a client against sing-box 1.14.3's 25 KB;
+latency, throughput and CPU at 500 Mbps did not move. The remainder is the
+router itself, its task, queues and tables. The mipsel figure is still the
+router run's to measure.
+
 ## Security notes
 
 - **`redirect` and `tproxy` listeners trust the kernel.** They forward

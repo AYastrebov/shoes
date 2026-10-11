@@ -854,7 +854,8 @@ except the third:
    to it directly) was relayed to the listener, starting a client per relay
    until `udp_nat_max` ran out. The demux drops it, with broadcast,
    multicast, unspecified and port-zero destinations.
-10. **A client is a source socket, and each costs about 40 KB** (measured),
+10. **A client is a source socket, and each costs about 40 KB** (measured;
+    about 21 KB since idle routers park their buffers, spec "RSS budget"),
     about 160 MB at the default cap. Documented, and the router-side fix is
     recorded in ROADMAP; not fixed here because the cost is in `UdpRouter`.
 11. **Reply sockets outlived their sessions**, so a few clients could hold
