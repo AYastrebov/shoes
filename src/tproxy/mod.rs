@@ -293,14 +293,27 @@ mod linux {
         tx: mpsc::Sender<Datagram>,
         last_seen: Instant,
         replied: Arc<AtomicBool>,
-        task: JoinHandle<()>,
+        /// Taken only by `cancel`.
+        task: Option<JoinHandle<()>>,
+    }
+
+    impl Client {
+        /// Stop the router, handing back its task so a successor can wait
+        /// for it to be gone.
+        fn cancel(mut self) -> JoinHandle<()> {
+            let task = self.task.take().expect("a client's task is taken once");
+            task.abort();
+            task
+        }
     }
 
     impl Drop for Client {
         /// A client is dropped when it expires or the listener stops; either
         /// way its router goes with it.
         fn drop(&mut self) {
-            self.task.abort();
+            if let Some(task) = &self.task {
+                task.abort();
+            }
         }
     }
 
@@ -332,9 +345,10 @@ mod linux {
         spawn: S,
     }
 
-    impl<S> Clients<S>
+    impl<S, F> Clients<S>
     where
-        S: FnMut(SocketAddr, mpsc::Receiver<Datagram>, Arc<AtomicBool>) -> JoinHandle<()>,
+        S: FnMut(SocketAddr, mpsc::Receiver<Datagram>, Arc<AtomicBool>) -> F,
+        F: std::future::Future<Output = ()> + Send + 'static,
     {
         fn new(listener: SocketAddr, max_clients: usize, idle: Duration, spawn: S) -> Self {
             Self {
@@ -369,21 +383,27 @@ mod linux {
                         // The router has ended: start the client afresh
                         // rather than drop its traffic until the sweep.
                         Err(mpsc::error::TrySendError::Closed(datagram)) => {
-                            self.clients.pop(&source);
-                            datagram
+                            let ended = self.clients.pop(&source).map(Client::cancel);
+                            return self.admit(source, datagram, now, ended);
                         }
                     }
                 }
                 None => (destination, payload),
             };
-            self.admit(source, datagram, now)
+            self.admit(source, datagram, now, None)
         }
 
         /// Start a client for `source` with `datagram` queued, evicting the
         /// least recently heard-from client at the cap: as sing-box's UDP NAT
         /// does, and unlike refusal, which fails every new flow (each DNS
         /// query from a fresh port is one) until the idle sweep runs.
-        fn admit(&mut self, source: SocketAddr, datagram: Datagram, now: Instant) -> Delivery {
+        fn admit(
+            &mut self,
+            source: SocketAddr,
+            datagram: Datagram,
+            now: Instant,
+            mut predecessor: Option<JoinHandle<()>>,
+        ) -> Delivery {
             if self.clients.len() >= self.max_clients {
                 if !self.eviction_reported {
                     self.eviction_reported = true;
@@ -394,15 +414,26 @@ mod linux {
                     );
                 }
                 self.promote_replied_to(now);
-                if let Some((evicted, _)) = self.clients.pop_lru() {
+                if let Some((evicted, client)) = self.clients.pop_lru() {
                     debug!("tproxy: client {evicted} evicted for {source}");
+                    predecessor = Some(client.cancel());
                 }
             }
             let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
             let replied = Arc::new(AtomicBool::new(false));
             // A fresh queue cannot be full.
             let _ = tx.try_send(datagram);
-            let task = (self.spawn)(source, rx, replied.clone());
+            let router = (self.spawn)(source, rx, replied.clone());
+            // A router cancelled to make room still holds its sessions' and
+            // reply sockets' share of the budgets until its cancellation
+            // lands, which on another worker can be after this one's first
+            // datagram asks for a session. Its datagrams wait in the queue.
+            let task = Some(tokio::spawn(async move {
+                if let Some(predecessor) = predecessor {
+                    let _ = predecessor.await;
+                }
+                router.await
+            }));
             self.clients.put(
                 source,
                 Client {
@@ -441,7 +472,9 @@ mod linux {
                     client.last_seen = now;
                     replied.push(*source);
                 }
-                if now.duration_since(client.last_seen) >= idle || client.task.is_finished() {
+                if now.duration_since(client.last_seen) >= idle
+                    || client.task.as_ref().is_some_and(JoinHandle::is_finished)
+                {
                     expired.push(*source);
                 }
             }
@@ -501,10 +534,7 @@ mod linux {
         };
         // Every address resolved and bound before any demux starts, so a
         // failure part-way leaves nothing running behind the error.
-        let mut binds = Vec::new();
-        for address in addresses.into_vec() {
-            binds.extend(address.to_socket_addrs()?);
-        }
+        let binds = resolve_binds(addresses.into_vec())?;
         let open_files = raise_open_file_limit(udp_nat_max, binds.len());
         // IPv6 has no `src_valid_mark`.
         if binds.iter().any(SocketAddr::is_ipv4) {
@@ -556,6 +586,31 @@ mod linux {
         Ok(handles)
     }
 
+    /// Every address the listener binds, resolved, and each answer held to
+    /// loopback again. Validation checked its own lookup, and a name can
+    /// answer differently by now; a transparent socket anywhere else relays
+    /// ordinary traffic to itself (`validate_tproxy_listener`).
+    fn resolve_binds(
+        addresses: Vec<crate::address::NetLocationPortRange>,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        let mut binds = Vec::new();
+        for address in addresses {
+            for bind in address.to_socket_addrs()? {
+                if !bind.ip().is_loopback() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "tproxy listener {address} resolved to {bind}, which is not \
+                             loopback; refusing to bind a transparent socket there"
+                        ),
+                    ));
+                }
+                binds.push(bind);
+            }
+        }
+        Ok(binds)
+    }
+
     async fn demux(
         listener: AsyncFd<socket2::Socket>,
         bind: SocketAddr,
@@ -579,7 +634,7 @@ mod linux {
                 let selector = selector.clone();
                 let resolver = resolver.clone();
                 let limits = limits.clone();
-                tokio::spawn(async move {
+                async move {
                     // One registry row per client source socket, not per
                     // destination: a row per destination would be a registry
                     // write on the session-create path (spec, "Decisions").
@@ -594,7 +649,7 @@ mod linux {
                     {
                         debug!("tproxy client {client} ended: {e}");
                     }
-                })
+                }
             }
         };
         let mut clients = Clients::new(bind, limits.max_sessions, limits.session_timeout, spawn);
@@ -1005,12 +1060,30 @@ mod linux {
             assert_eq!(at_risk(&[("all", [1, 1, 0]), ("br0", [0, 0, 1])]), ["br0"]);
         }
 
+        /// Validation checked loopback on its own lookup; a name that
+        /// answers differently at startup must not get a transparent socket
+        /// on another address, where it relays ordinary traffic to itself.
+        #[test]
+        fn a_bind_that_resolves_off_loopback_at_startup_is_refused() {
+            let at = |addr: &str| {
+                let addr: SocketAddr = addr.parse().unwrap();
+                vec![NetLocation::from(addr).into()]
+            };
+            assert_eq!(
+                resolve_binds(at("127.0.0.1:51271")).unwrap(),
+                ["127.0.0.1:51271".parse::<SocketAddr>().unwrap()]
+            );
+            let err = resolve_binds(at("192.168.1.1:51271")).unwrap_err();
+            assert!(err.to_string().contains("loopback"), "{err}");
+        }
+
         /// What the demux handed a client's router: its address, its
         /// datagrams, and its reply flag.
         type Spawned = (SocketAddr, mpsc::Receiver<Datagram>, Arc<AtomicBool>);
         type Recorded = Arc<std::sync::Mutex<Vec<Spawned>>>;
+        type Router = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
         type Spawn =
-            Box<dyn FnMut(SocketAddr, mpsc::Receiver<Datagram>, Arc<AtomicBool>) -> JoinHandle<()>>;
+            Box<dyn FnMut(SocketAddr, mpsc::Receiver<Datagram>, Arc<AtomicBool>) -> Router>;
 
         /// Clients whose receivers the test keeps, with routers that wait
         /// forever.
@@ -1019,7 +1092,7 @@ mod linux {
             let record = spawned.clone();
             let spawn: Spawn = Box::new(move |source, rx, replied| {
                 record.lock().unwrap().push((source, rx, replied));
-                tokio::spawn(std::future::pending())
+                Box::pin(std::future::pending())
             });
             let clients = Clients::new(LISTENER.parse().unwrap(), max, idle, spawn);
             (clients, spawned)
@@ -1182,6 +1255,61 @@ mod linux {
             let spawned = spawned.lock().unwrap();
             assert!(!spawned[0].1.is_closed(), "a is receiving replies");
             assert!(spawned[1].1.is_closed(), "b went instead");
+        }
+
+        /// An evicted router keeps its sessions' share of the budget until
+        /// its cancellation lands, which on another worker can be after the
+        /// newcomer's first datagram asks for a session. The newcomer waits
+        /// for it to be gone, so the capacity its eviction freed is there.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_newcomer_starts_once_the_evicted_router_is_gone() {
+            /// Holds the evicted router's drop open, as a router with many
+            /// sessions to close would.
+            struct SlowDrop;
+            impl Drop for SlowDrop {
+                fn drop(&mut self) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+
+            let budget = Arc::new(Semaphore::new(1));
+            let admitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let spawn: Spawn = {
+                let admitted = admitted.clone();
+                Box::new(move |source, rx, _replied| {
+                    let budget = budget.clone();
+                    let admitted = admitted.clone();
+                    Box::pin(async move {
+                        let permit = budget.try_acquire_owned();
+                        admitted.lock().unwrap().push((source, permit.is_ok()));
+                        // Dropped before the permit: locals go in reverse.
+                        let _slow = SlowDrop;
+                        let _rx = rx;
+                        std::future::pending::<()>().await;
+                    })
+                })
+            };
+            let mut clients =
+                Clients::new(LISTENER.parse().unwrap(), 1, Duration::from_secs(60), spawn);
+            let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let a: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+            let b: SocketAddr = "10.0.0.6:4000".parse().unwrap();
+            clients.deliver(a, dns, Bytes::from_static(b"x"), Instant::now());
+            while admitted.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            clients.deliver(b, dns, Bytes::from_static(b"x"), Instant::now());
+            for _ in 0..2000 {
+                if admitted.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                *admitted.lock().unwrap(),
+                [(a, true), (b, true)],
+                "b found the budget a held"
+            );
         }
 
         /// A client whose router has ended is replaced by the next datagram

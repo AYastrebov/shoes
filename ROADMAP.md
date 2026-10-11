@@ -709,10 +709,12 @@ here.
 Open, with what each costs while it stays open:
 
 - **Neither transparent inbound has met a router's kernel.** Both are tested
-  under real netfilter rules in CI, from the `OUTPUT` chain of one host
-  looped back through `lo`. The `PREROUTING` path from a LAN client on
-  Keenetic's 4.9 kernel is the one that matters and is untried. Plan task 5's
-  router run.
+  under real netfilter rules in CI. `tproxy` is tested on both paths: a local
+  client marked in `OUTPUT` and looped back through `lo`, and a LAN client in
+  its own network namespace whose datagrams arrive on a veth pair and are
+  taken in `PREROUTING`, which is a router's path. `redirect` is tested only
+  from `OUTPUT`. What is untried is Keenetic's 4.9 kernel, for both. Plan
+  task 5's router run.
 - **A `tproxy` client costs about 40 KB.** A client is a source socket, and
   each runs its own `UdpRouter`, which keeps two 64 KiB pool buffers for its
   whole life; measured on x86_64, that is about 160 MB at the default

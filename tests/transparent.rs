@@ -289,6 +289,23 @@ async fn wait_for_udp_bound(shoes: &mut Child, port: u16) {
     panic!("nothing bound UDP port {port}");
 }
 
+/// Two round trips with `remote` through shoes, each reply spoofed from it.
+/// The second is the point of two: by then a reply socket bound to the
+/// remote exists, and were it connected to the client, TPROXY would hand it
+/// the client's next datagram instead of the listener, and nothing reads it.
+async fn exchange(client: &tokio::net::UdpSocket, remote: SocketAddr) {
+    for payload in [&b"ping"[..], b"again"] {
+        client.send_to(payload, remote).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], payload);
+        assert_eq!(
+            from, remote,
+            "the reply must appear to come from the remote, not from shoes"
+        );
+    }
+}
+
 /// Without `CAP_NET_RAW` or `CAP_NET_ADMIN` the listener cannot be made
 /// transparent, and the process must say which capability it lacks rather
 /// than fail with a bare EPERM. Needs no root, which is the point.
@@ -351,8 +368,10 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
     let echo_addr = echo.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 64];
-        let (n, from) = echo.recv_from(&mut buf).await.unwrap();
-        echo.send_to(&buf[..n], from).await.unwrap();
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], from).await.unwrap();
+        }
     });
     let remote: SocketAddr = "198.51.100.7:5353".parse().unwrap();
     // A router service on the remote's port, bound the way dnsmasq binds 53:
@@ -415,14 +434,7 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
         // The wildcard, so the source is the host's own address: the kernel
         // refuses a loopback source on a route to a remote, with EINVAL.
         let client = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        client.send_to(b"ping", remote).await.unwrap();
-        let mut buf = [0u8; 64];
-        let (n, from) = client.recv_from(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ping");
-        assert_eq!(
-            from, remote,
-            "the reply must appear to come from the remote, not from shoes"
-        );
+        exchange(&client, remote).await;
     };
     tokio::time::timeout(Duration::from_secs(5), through_shoes)
         .await
@@ -446,8 +458,10 @@ async fn tproxy_relays_a_client_on_another_interface() {
     let echo_addr = echo.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 64];
-        let (n, from) = echo.recv_from(&mut buf).await.unwrap();
-        echo.send_to(&buf[..n], from).await.unwrap();
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], from).await.unwrap();
+        }
     });
     let remote: SocketAddr = "198.51.100.8:5353".parse().unwrap();
 
@@ -538,14 +552,7 @@ async fn tproxy_relays_a_client_on_another_interface() {
     let client = tokio::net::UdpSocket::from_std(client).unwrap();
 
     let through_shoes = async {
-        client.send_to(b"ping", remote).await.unwrap();
-        let mut buf = [0u8; 64];
-        let (n, from) = client.recv_from(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ping");
-        assert_eq!(
-            from, remote,
-            "the reply must appear to come from the remote, not from shoes"
-        );
+        exchange(&client, remote).await;
     };
     tokio::time::timeout(Duration::from_secs(5), through_shoes)
         .await

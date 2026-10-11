@@ -905,6 +905,19 @@ Copilot's review of PR #49 found four more, all fixed in a fourth commit:
 23. **The non-root capability test waited without a deadline**, so a
     listener that started after all would have hung the suite.
 
+Its second pass found three more in code it had already read, fixed in a
+fifth commit:
+
+24. **An evicted router held its budget share until its cancellation
+    landed**, so on a multi-threaded runtime the newcomer it was evicted for
+    could find the budget still full and have its first session refused. The
+    newcomer's task now waits for its predecessor's before routing.
+25. **Startup re-resolved bind names and trusted the answer**, so a name
+    that answered loopback at validation and something else at startup got a
+    transparent socket there. Each resolved address is checked again.
+26. **The root tests sent one datagram**, so a reply socket left connected,
+    which takes the client's later datagrams, passed. They send two.
+
 **Files:**
 - Modify: `src/tproxy/mod.rs`
 - Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")
