@@ -891,6 +891,20 @@ found one more, in the host rather than the code:
     risk, CONFIG.md gives both remedies, and a second root test runs a LAN
     client in its own namespace across a veth pair.
 
+Copilot's review of PR #49 found four more, all fixed in a fourth commit:
+
+20. **`udp_nat_max` had no upper bound**, and past tokio's
+    `Semaphore::MAX_PERMITS` building the budgets panics at startup. It is
+    now at most 1048576, the default `fs.nr_open`.
+21. **Eviction ignored replies since the last sweep**, so a client receiving
+    a one-way flow could be evicted as idle. Pending reply flags are applied
+    before the victim is chosen.
+22. **`CAP_NET_RAW` is enough for `IP_TRANSPARENT`**; the kernel accepts it
+    or `CAP_NET_ADMIN`. The docs and the root tests now use the narrower one,
+    and the error names both. The listings above still say `CAP_NET_ADMIN`.
+23. **The non-root capability test waited without a deadline**, so a
+    listener that started after all would have hung the suite.
+
 **Files:**
 - Modify: `src/tproxy/mod.rs`
 - Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")

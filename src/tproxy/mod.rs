@@ -56,7 +56,7 @@ mod linux {
     type Datagram = (SocketAddr, Bytes);
 
     /// How a reply socket is made. A function pointer so the tests can open
-    /// an ordinary socket where production needs `CAP_NET_ADMIN`.
+    /// an ordinary socket where production needs `CAP_NET_RAW`.
     type OpenReplySocket = fn(SocketAddr) -> std::io::Result<tokio::net::UdpSocket>;
 
     /// One client socket's view of the listener: reads are the datagrams the
@@ -393,6 +393,7 @@ mod linux {
                         self.max_clients
                     );
                 }
+                self.promote_replied_to(now);
                 if let Some((evicted, _)) = self.clients.pop_lru() {
                     debug!("tproxy: client {evicted} evicted for {source}");
                 }
@@ -412,6 +413,20 @@ mod linux {
                 },
             );
             Delivery::Delivered
+        }
+
+        /// Move clients replied to since the last look off the eviction end,
+        /// so the victim is idle both ways rather than only quiet. Each turn
+        /// clears a flag, so this ends within one pass of the table.
+        fn promote_replied_to(&mut self, now: Instant) {
+            while let Some((&source, client)) = self.clients.peek_lru() {
+                if !client.replied.swap(false, Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(client) = self.clients.get_mut(&source) {
+                    client.last_seen = now;
+                }
+            }
         }
 
         /// Forget clients idle in both directions for `idle`, and clients
@@ -1144,6 +1159,25 @@ mod linux {
             clients.deliver(b, dns, Bytes::from_static(b"x"), now);
             spawned.lock().unwrap()[0].2.store(true, Ordering::Relaxed);
             clients.sweep(now + Duration::from_secs(1));
+            clients.deliver(c, dns, Bytes::from_static(b"x"), now);
+            let spawned = spawned.lock().unwrap();
+            assert!(!spawned[0].1.is_closed(), "a is receiving replies");
+            assert!(spawned[1].1.is_closed(), "b went instead");
+        }
+
+        /// Replies since the last sweep count too: eviction must not wait
+        /// for the sweep to learn that the oldest client is receiving.
+        #[tokio::test]
+        async fn a_client_replied_to_since_the_sweep_is_not_the_one_evicted() {
+            let (mut clients, spawned) = clients(2, Duration::from_secs(60));
+            let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let now = Instant::now();
+            let a: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+            let b: SocketAddr = "10.0.0.6:4000".parse().unwrap();
+            let c: SocketAddr = "10.0.0.7:4000".parse().unwrap();
+            clients.deliver(a, dns, Bytes::from_static(b"x"), now);
+            clients.deliver(b, dns, Bytes::from_static(b"x"), now);
+            spawned.lock().unwrap()[0].2.store(true, Ordering::Relaxed);
             clients.deliver(c, dns, Bytes::from_static(b"x"), now);
             let spawned = spawned.lock().unwrap();
             assert!(!spawned[0].1.is_closed(), "a is receiving replies");

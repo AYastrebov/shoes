@@ -42,7 +42,7 @@
 #
 # Replies leave from the address each datagram was going to, so the client
 # sees the remote and not shoes. Making a socket that can do that needs
-# CAP_NET_ADMIN: run as root, or `setcap cap_net_admin+ep` the binary.
+# CAP_NET_RAW: run as root, or `setcap cap_net_raw+ep` the binary.
 #
 # Loopback, unlike the TCP listener above, and refused anywhere else: TPROXY
 # delivers to the address --on-ip names whatever the interface, and a

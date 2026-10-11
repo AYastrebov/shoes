@@ -112,9 +112,10 @@ fn spawn_shoes(config: &Path) -> Child {
 }
 
 /// shoes as `nobody`, from a copy in `dir`: `target/` usually sits under a
-/// home directory `nobody` cannot traverse. With `net_admin` the copy gets
-/// the one capability `tproxy` needs, which also proves it needs no more.
-fn spawn_shoes_as_nobody(dir: &Path, config: &Path, net_admin: bool) -> Child {
+/// home directory `nobody` cannot traverse. With `transparent` the copy gets
+/// `CAP_NET_RAW`, the narrower of the two capabilities the kernel accepts
+/// for `IP_TRANSPARENT`, which also proves `tproxy` needs no more.
+fn spawn_shoes_as_nobody(dir: &Path, config: &Path, transparent: bool) -> Child {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
@@ -123,8 +124,8 @@ fn spawn_shoes_as_nobody(dir: &Path, config: &Path, net_admin: bool) -> Child {
     for (path, mode) in [(dir, 0o755), (bin.as_path(), 0o755), (config, 0o644)] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
-    if net_admin {
-        run(&format!("setcap cap_net_admin+ep {}", bin.display()));
+    if transparent {
+        run(&format!("setcap cap_net_raw+ep {}", bin.display()));
     }
     Child(
         Command::new(&bin)
@@ -288,24 +289,53 @@ async fn wait_for_udp_bound(shoes: &mut Child, port: u16) {
     panic!("nothing bound UDP port {port}");
 }
 
-/// Without `CAP_NET_ADMIN` the listener cannot be made transparent, and the
-/// process must say which capability it lacks rather than fail with a bare
-/// EPERM. Needs no root, which is the point.
+/// Without `CAP_NET_RAW` or `CAP_NET_ADMIN` the listener cannot be made
+/// transparent, and the process must say which capability it lacks rather
+/// than fail with a bare EPERM. Needs no root, which is the point.
 #[test]
-fn a_tproxy_listener_without_cap_net_admin_says_so() {
+fn a_tproxy_listener_without_the_capability_says_so() {
+    use std::io::Read;
+
     if is_root() {
         return; // root has the capability; the ignored test covers that side
     }
     let dir = tempfile::tempdir().unwrap();
     let config = write_tproxy_config(dir.path(), free_port(), "");
-    let out = Command::new(env!("CARGO_BIN_EXE_shoes"))
-        .arg("--no-reload")
-        .arg(&config)
-        .output()
+    let mut shoes = Child(
+        Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg("--no-reload")
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // A deadline, because the failure this guards against is a listener
+    // that starts after all (a regression, or a user who already holds the
+    // capability), and a running server would hang the suite. Fifteen
+    // seconds for the reason `wait_for` gives.
+    let mut status = None;
+    for _ in 0..300 {
+        status = shoes.0.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = status.expect("the listener started; it must refuse without the capability");
+    let mut stderr = String::new();
+    shoes
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains("CAP_NET_ADMIN"), "stderr: {stderr}");
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("CAP_NET_RAW") && stderr.contains("CAP_NET_ADMIN"),
+        "stderr: {stderr}"
+    );
 }
 
 #[tokio::test]

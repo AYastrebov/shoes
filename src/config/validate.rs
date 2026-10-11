@@ -1102,10 +1102,17 @@ fn validate_tproxy_listener(
         }
     }
 
-    if udp_nat_max == 0 {
+    // Each session holds a descriptor, and Linux caps a process's at
+    // `fs.nr_open`, 1048576 by default, so more could never be used. The cap
+    // also keeps the figure inside tokio's `Semaphore::MAX_PERMITS`, past
+    // which building the listener's budgets panics at startup.
+    if udp_nat_max == 0 || udp_nat_max > MAX_TPROXY_UDP_NAT_MAX {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "tproxy udp_nat_max must be at least 1",
+            format!(
+                "tproxy udp_nat_max must be between 1 and {MAX_TPROXY_UDP_NAT_MAX}, \
+                 not {udp_nat_max}"
+            ),
         ));
     }
     // Zero would expire every session as it opened. The upper bound is the
@@ -1124,6 +1131,7 @@ fn validate_tproxy_listener(
 }
 
 const MAX_TPROXY_UDP_TIMEOUT_SECS: u64 = 86400;
+const MAX_TPROXY_UDP_NAT_MAX: usize = 1 << 20;
 
 /// A sniff block that is on but can never sniff anything is a typo, not a
 /// preference. Fail at load rather than quietly doing nothing at runtime.
@@ -5396,6 +5404,9 @@ mod tproxy_validation_tests {
             (", udp_timeout: 0", "udp_timeout"),
             (", udp_timeout: 86401", "udp_timeout"),
             (", udp_nat_max: 0", "udp_nat_max"),
+            (", udp_nat_max: 1048577", "udp_nat_max"),
+            // Past tokio's Semaphore::MAX_PERMITS, which panics at startup.
+            (", udp_nat_max: 18446744073709551615", "udp_nat_max"),
         ] {
             let err = refusal(&tproxy("127.0.0.1:51271", fields));
             assert!(err.contains(name), "{fields}: {err}");

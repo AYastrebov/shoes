@@ -556,9 +556,11 @@ mipsel figure, where the system allocator may touch every page it zeroes.
   reaches the port without being redirected reports the listener's own
   address and is refused. A reachable `redirect` port is therefore a port
   that resets, not an open proxy.
-- **`IP_TRANSPARENT` needs `CAP_NET_ADMIN`.** The listener reports the
-  failure to set it as a startup error naming the capability rather than
-  falling through to a socket that receives nothing.
+- **`IP_TRANSPARENT` needs `CAP_NET_RAW` or `CAP_NET_ADMIN`**, either one
+  (`do_ip_setsockopt`, back to Linux 4.9 at least); the docs name the
+  narrower `CAP_NET_RAW`. The listener reports the failure to set it as a
+  startup error naming both, rather than falling through to a socket that
+  receives nothing.
 - **`SIGHUP` is a control path** from anything that can signal the process.
   It reloads the same file the process was started with and nothing else;
   it cannot be made to read a different one.

@@ -102,8 +102,10 @@ mod linux {
 
     /// `IP_TRANSPARENT`: the socket may receive datagrams the policy route
     /// delivered for other addresses, and bind an address that is not the
-    /// host's. Needs `CAP_NET_ADMIN`, and the error says so: a listener
-    /// without it would otherwise be refused with a bare `EPERM`.
+    /// host's. Needs `CAP_NET_RAW` or `CAP_NET_ADMIN`, either one, as
+    /// `do_ip_setsockopt` and `do_ipv6_setsockopt` check (back to Linux 4.9
+    /// at least), and the error says so: a listener without one would
+    /// otherwise be refused with a bare `EPERM`.
     pub fn make_transparent(fd: RawFd, ipv6: bool) -> std::io::Result<()> {
         let (level, name, option) = if ipv6 {
             (libc::SOL_IPV6, libc::IPV6_TRANSPARENT, "IPV6_TRANSPARENT")
@@ -113,7 +115,7 @@ mod linux {
         setsockopt_on(fd, level, name).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("{option}: {e} (this needs CAP_NET_ADMIN)"),
+                format!("{option}: {e} (this needs CAP_NET_RAW or CAP_NET_ADMIN)"),
             )
         })
     }

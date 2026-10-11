@@ -332,7 +332,7 @@ a hostname, since the original destination is always an IP address.
     type: tproxy
     udp_timeout: 300           # Seconds a UDP session may sit idle. Default: 300
     udp_nat_max: 4096          # UDP sessions, and separately reply sockets,
-                               # across all clients. Default: 4096
+                               # across all clients. 1 to 1048576. Default: 4096
 ```
 
 The target of the kernel's `TPROXY`, for UDP: QUIC, DNS, games and calls from
@@ -347,10 +347,11 @@ inbound's.
 - **Linux only**, `transport: udp` only, and only as a listener's own
   protocol. `transport: udp` with any other protocol is refused when the
   config is loaded.
-- **It needs `CAP_NET_ADMIN`**, for `IP_TRANSPARENT`. Root has it; otherwise
-  give it to the binary (`setcap cap_net_admin+ep shoes`) rather than running
-  as root. Without it the listener fails to start and says so. A filesystem
-  mounted `nosuid` ignores file capabilities.
+- **It needs `CAP_NET_RAW`**, for `IP_TRANSPARENT`; the kernel accepts
+  `CAP_NET_ADMIN` instead, which grants much more. Root has both; otherwise
+  give the binary the narrower one (`setcap cap_net_raw+ep shoes`) rather
+  than running as root. Without it the listener fails to start and says so.
+  A filesystem mounted `nosuid` ignores file capabilities.
 - **Bind loopback; anything else is refused.** A transparent socket on another
   address also receives datagrams delivered to the host the ordinary way, and
   relays them to the address they were already at, which is shoes talking to
