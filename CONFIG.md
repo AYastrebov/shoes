@@ -402,10 +402,11 @@ inbound's.
   random port and each QUIC connection is one, and lives until it has been
   idle for `udp_timeout`. At `udp_nat_max` clients a new one evicts the client
   heard from least recently, as sing-box does, and one warning says the cap
-  was reached. Each client holds its own UDP router, about 40 KB measured on
-  x86_64, so `udp_nat_max` is a memory setting as much as a descriptor one:
-  the default 4096 can reach about 160 MB. On a router with 256 MB or less,
-  set it to what the memory allows, 1024 for example. A client is one entry
+  was reached. Each client holds its own UDP router, about 21 KB measured on
+  x86_64 (an idle router gives its packet buffers back, to a spare pool of
+  at most 2 MiB for the whole process), so `udp_nat_max` is a memory setting
+  as well as a descriptor one: the default 4096 can reach about 90 MB. On a router with 256 MB or less, set it to what the memory
+  allows, 1024 for example. A client is one entry
   in `/connections`; its sessions are routed one destination at a time.
 - **A reply is sent from the remote's own address and port**, so it shares
   that port with any service on the router holding its wildcard: `dnsmasq` on

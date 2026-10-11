@@ -715,14 +715,17 @@ Open, with what each costs while it stays open:
   taken in `PREROUTING`, which is a router's path. `redirect` is tested only
   from `OUTPUT`. What is untried is Keenetic's 4.9 kernel, for both. Plan
   task 5's router run.
-- **A `tproxy` client costs about 40 KB.** A client is a source socket, and
-  each runs its own `UdpRouter`, which keeps two 64 KiB pool buffers for its
-  whole life; measured on x86_64, that is about 160 MB at the default
-  `udp_nat_max` of 4096, which a busy LAN can reach in `udp_timeout`. The fix
-  is in the router, shared by every UDP inbound: give its pool buffers back
-  when it goes idle, or run one router per listener keyed by client socket
-  and destination. Until then CONFIG.md advises a router-sized `udp_nat_max`.
-  Spec, "RSS budget".
+- **A `tproxy` client costs about 21 KB.** A client is a source socket, and
+  each runs its own `UdpRouter`. It was 38 KB while every router kept its
+  64 KiB packet buffers for life; an idle router now parks them in a spare
+  pool of at most 32 for the whole process (2 MiB at most, a fixed cost the
+  TUN shutdown frees). What remains is the router, its task, queues and tables,
+  about 90 MB at the default `udp_nat_max` of 4096, which a busy LAN can
+  reach in `udp_timeout`; sing-box measured 25 KB a client on the same
+  bench. Going further means one router per listener keyed by client socket
+  and destination, which changes the shared router's lookup for every UDP
+  inbound. CONFIG.md advises a router-sized `udp_nat_max`, and the mipsel
+  figure is unmeasured. Spec, "RSS budget".
 - **`tproxy` on MIPS reads its control messages unaligned**, which is correct
   and untested there: no datagram has crossed it on mipsel, under QEMU or on
   a router.

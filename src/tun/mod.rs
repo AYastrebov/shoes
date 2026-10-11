@@ -414,6 +414,8 @@ pub async fn run_tun_server(
     // outlives the tunnel by hours. Nothing reads from it once the stack thread
     // is gone, so hand the memory back.
     stack_common::clear_buffer_pool();
+    // Likewise the buffers idle UDP routers parked for the next one.
+    crate::routing::clear_spare_buffers();
 
     // Freeing the connection buffers does not shrink the process; the allocator
     // keeps the pages. On a phone that leaves an idle tunnel sitting at the

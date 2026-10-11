@@ -96,26 +96,91 @@ const PING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Ping streams that haven't had writes for this long
 const PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Packet buffers idle routers have parked, at most, across the process:
+/// 2 MiB, a fixed cost whatever the number of clients or worker threads.
+const SPARE_BUFFERS_MAX: usize = 32;
+
+/// Packet buffers idle routers have given up, for the next router that needs
+/// one. A router parks its free buffers each time it goes idle and takes from
+/// here before allocating, so routers between datagrams hold none, and a
+/// burst allocates only when more buffers are in use at once than this has
+/// spare. Process-wide behind a lock, as the TUN read path's pool is, so the
+/// shutdown path can empty it from any thread.
+struct SparePool {
+    buffers: std::sync::Mutex<Vec<Box<[u8]>>>,
+    max: usize,
+}
+
+impl SparePool {
+    const fn new(max: usize) -> Self {
+        Self {
+            buffers: std::sync::Mutex::new(Vec::new()),
+            max,
+        }
+    }
+
+    /// Best effort throughout: a poisoned lock means allocate or free.
+    fn take(&self) -> Option<Box<[u8]>> {
+        self.buffers.lock().ok()?.pop()
+    }
+
+    /// Keep what fits, free the rest; `parked` is left empty.
+    fn give(&self, parked: &mut Vec<Box<[u8]>>) {
+        if let Ok(mut buffers) = self.buffers.lock() {
+            let keep = parked.len().min(self.max.saturating_sub(buffers.len()));
+            buffers.extend(parked.drain(..keep));
+        }
+        parked.clear();
+    }
+
+    fn clear(&self) {
+        if let Ok(mut buffers) = self.buffers.lock() {
+            *buffers = Vec::new();
+        }
+    }
+}
+
+static SPARE_BUFFERS: SparePool = SparePool::new(SPARE_BUFFERS_MAX);
+
+/// Free the buffers idle routers parked. For a tunnel's shutdown on mobile,
+/// where the process outlives it and every resident page counts.
+pub fn clear_spare_buffers() {
+    SPARE_BUFFERS.clear();
+}
+
 /// Session identifier - incrementing counter, never reused
 type SessionKey = usize;
 
-/// Lazy buffer pool for backpressure management.
+/// A router's packet buffers, for backpressure management.
 ///
-/// Buffers are created on-demand up to max_count, then reused.
-/// Acquired buffers are either released immediately (if write succeeds)
-/// or moved into a queue (zero-copy).
+/// Up to `max_count` are held at once: free ones here, the rest queued with
+/// a pending write. Acquired buffers are either released immediately (if the
+/// write succeeds) or moved into a queue (zero-copy). Free buffers are parked
+/// in the process's spares whenever the router goes idle.
 struct BufferPool {
     buffers: Vec<Box<[u8]>>,
     max_count: usize,
-    created_count: usize,
+    /// Free and queued together; free ones leave when parked.
+    held: usize,
+    /// How far into its buffers any read has written since this pool last
+    /// held none: what must be zeroed before a buffer leaves for another
+    /// router, which may be another client's or another user's.
+    dirty: usize,
+    spares: &'static SparePool,
 }
 
 impl BufferPool {
     fn new(max_count: usize) -> Self {
+        Self::with_spares(max_count, &SPARE_BUFFERS)
+    }
+
+    fn with_spares(max_count: usize, spares: &'static SparePool) -> Self {
         Self {
             buffers: Vec::with_capacity(max_count),
             max_count,
-            created_count: 0,
+            held: 0,
+            dirty: 0,
+            spares,
         }
     }
 
@@ -126,10 +191,14 @@ impl BufferPool {
             return Some(buf);
         }
 
-        // Create new if under limit
-        if self.created_count < self.max_count {
-            self.created_count += 1;
-            Some(allocate_vec(MAX_UDP_PACKET_SIZE).into_boxed_slice())
+        // Take one an idle router parked, or create one, if under limit
+        if self.held < self.max_count {
+            self.held += 1;
+            Some(
+                self.spares
+                    .take()
+                    .unwrap_or_else(|| allocate_vec(MAX_UDP_PACKET_SIZE).into_boxed_slice()),
+            )
         } else {
             None
         }
@@ -140,10 +209,29 @@ impl BufferPool {
         self.buffers.push(buf);
     }
 
+    /// Note that a read wrote `len` bytes into one of this pool's buffers.
     #[inline]
-    fn deallocate(&mut self) {
-        let buffers = std::mem::take(&mut self.buffers);
-        self.created_count -= buffers.len();
+    fn mark_used(&mut self, len: usize) {
+        self.dirty = self.dirty.max(len);
+    }
+
+    /// Give the free buffers up, for when the router goes idle or its server
+    /// side is gone. Each is zeroed as far as reads have written, since its
+    /// next router may serve someone else; that is a datagram's length, not
+    /// the buffer's. Buffers still queued are kept, and counted.
+    fn park(&mut self) {
+        if !self.buffers.is_empty() {
+            let dirty = self.dirty.min(MAX_UDP_PACKET_SIZE);
+            for buf in &mut self.buffers {
+                buf[..dirty].fill(0);
+            }
+            self.held -= self.buffers.len();
+            self.spares.give(&mut self.buffers);
+        }
+        // A queued buffer carries data until it too is parked.
+        if self.held == 0 {
+            self.dirty = 0;
+        }
     }
 }
 
@@ -598,7 +686,7 @@ impl<'a> UdpRouter<'a> {
         for pending in self.server_write_queue.drain(..) {
             self.server_write_pool.release(pending.buf);
         }
-        self.server_write_pool.deallocate();
+        self.server_write_pool.park();
     }
 
     /// Drain pending session shutdowns (best-effort, non-blocking)
@@ -650,6 +738,7 @@ impl<'a> UdpRouter<'a> {
             };
 
             let len = read_buf.filled().len();
+            self.remote_write_pool.mark_used(len);
             if len == 0 {
                 self.set_server_read_eof();
                 break;
@@ -875,6 +964,7 @@ impl<'a> UdpRouter<'a> {
                 match Pin::new(&mut session.remote).poll_read_message(cx, &mut read_buf) {
                     Poll::Ready(Ok(())) => {
                         let len = read_buf.filled().len();
+                        self.server_write_pool.mark_used(len);
                         debug!(
                             "[UdpRouter] Read {} bytes from session remote (session {})",
                             len, session.destination
@@ -1101,6 +1191,7 @@ impl<'a> UdpRouter<'a> {
                             if let Some(mut buf) = self.remote_write_pool.acquire() {
                                 let len = initial_data.len();
                                 buf[..len].copy_from_slice(&initial_data);
+                                self.remote_write_pool.mark_used(len);
                                 session.in_remote_write_queue += 1;
                                 self.remote_write_queue
                                     .push_back(PendingWrite { id, buf, len });
@@ -1359,6 +1450,9 @@ impl<'a> Future for UdpRouter<'a> {
         this.process_expired(cx);
 
         this.drain_remote_shutdowns(cx);
+
+        this.remote_write_pool.park();
+        this.server_write_pool.park();
 
         if this.server_read_eof && this.server_write_eof {
             Poll::Ready(Ok(()))
@@ -2018,6 +2112,102 @@ mod tests {
             assert_eq!(inner.replies[0].1, b"ping", "the echo must round-trip");
         }
         router.abort();
+    }
+
+    /// A router between datagrams holds no packet buffers: a tproxy
+    /// listener runs one router per client socket, mostly idle, and two
+    /// 64 KiB buffers kept by each were the bulk of a client's cost.
+    #[tokio::test]
+    async fn test_an_idle_router_holds_no_buffers() {
+        let echo = spawn_udp_echo().await;
+        let (stream, inner) = scripted(vec![(location(echo), b"ping".to_vec())], usize::MAX);
+        let mut server = ServerStream::Targeted(Box::new(stream));
+        let resolver = test_resolver();
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while inner.lock().unwrap().replies.is_empty() {
+            assert!(Instant::now() < deadline, "the echo never came back");
+            let poll = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut router).poll(cx))).await;
+            assert!(poll.is_pending(), "the router must still be running");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut router).poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(
+            (router.remote_write_pool.held, router.server_write_pool.held),
+            (0, 0),
+            "buffers held by an idle router"
+        );
+    }
+
+    /// Parked buffers are reused by the next router rather than allocated
+    /// again, so going idle costs the busy path nothing; and the spares are
+    /// bounded, so many routers parking at once free the rest. Each test has
+    /// spares of its own: the process's are shared by every router in the
+    /// suite.
+    #[test]
+    fn test_parked_buffers_are_reused_and_bounded() {
+        static SPARES: SparePool = SparePool::new(4);
+        let mut first = BufferPool::with_spares(1, &SPARES);
+        let buf = first.acquire().unwrap();
+        let address = buf.as_ptr();
+        first.release(buf);
+        first.park();
+        assert_eq!(first.held, 0);
+
+        let mut second = BufferPool::with_spares(1, &SPARES);
+        let reused = second.acquire().unwrap();
+        assert_eq!(reused.as_ptr(), address, "a parked buffer is reused");
+
+        let mut many = BufferPool::with_spares(6, &SPARES);
+        let bufs: Vec<_> = (0..6).map(|_| many.acquire().unwrap()).collect();
+        for buf in bufs {
+            many.release(buf);
+        }
+        many.park();
+        assert_eq!(many.held, 0);
+        assert_eq!(SPARES.buffers.lock().unwrap().len(), 4);
+
+        SPARES.clear();
+        assert!(SPARES.buffers.lock().unwrap().is_empty());
+    }
+
+    /// A parked buffer goes to whichever router wakes next, which may serve
+    /// another client or another user: what a read left in it is zeroed
+    /// first, including in a buffer that was still queued at the last park.
+    #[test]
+    fn test_a_parked_buffer_carries_no_datagram_to_its_next_router() {
+        static SPARES: SparePool = SparePool::new(4);
+        let mut pool = BufferPool::with_spares(2, &SPARES);
+        let mut free = pool.acquire().unwrap();
+        let mut queued = pool.acquire().unwrap();
+        free[..100].fill(0xAA);
+        pool.mark_used(100);
+        queued[..1400].fill(0xBB);
+        pool.mark_used(1400);
+
+        pool.release(free);
+        pool.park(); // `queued` is still out, waiting on a write
+        pool.release(queued);
+        pool.park();
+
+        let mut spares = SPARES.buffers.lock().unwrap();
+        assert_eq!(spares.len(), 2);
+        for buf in spares.drain(..) {
+            assert!(
+                buf[..1400].iter().all(|&b| b == 0),
+                "a datagram's bytes survived parking"
+            );
+        }
     }
 
     #[tokio::test]

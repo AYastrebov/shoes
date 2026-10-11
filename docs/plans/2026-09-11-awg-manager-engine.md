@@ -854,9 +854,11 @@ except the third:
    to it directly) was relayed to the listener, starting a client per relay
    until `udp_nat_max` ran out. The demux drops it, with broadcast,
    multicast, unspecified and port-zero destinations.
-10. **A client is a source socket, and each costs about 40 KB** (measured),
-    about 160 MB at the default cap. Documented, and the router-side fix is
-    recorded in ROADMAP; not fixed here because the cost is in `UdpRouter`.
+10. **A client is a source socket, and each cost about 40 KB** (measured),
+    about 160 MB at the default cap. Documented here, and left to the router
+    because the cost was in `UdpRouter`; fixed after this task by PR #50,
+    where an idle router parks its packet buffers: about 21 KB a client,
+    about 90 MB at the default cap (spec, "RSS budget").
 11. **Reply sockets outlived their sessions**, so a few clients could hold
     the whole reply budget; they now close after `udp_timeout` unused.
 12. **The documented `TPROXY` rule took broadcast and multicast**, DHCP
