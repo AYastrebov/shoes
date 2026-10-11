@@ -961,6 +961,25 @@ fn validate_server_config(
         return validate_redirect_listener(server_config);
     }
 
+    // `tproxy` is the only UDP-native inbound, and needs it. Anything else on
+    // `transport: udp` used to pass here and panic on a `todo!()` at startup.
+    if let ServerProxyConfig::Tproxy {
+        udp_timeout,
+        udp_nat_max,
+    } = server_config.protocol
+    {
+        return validate_tproxy_listener(server_config, udp_timeout, udp_nat_max);
+    }
+    if server_config.transport == Transport::Udp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "transport: udp is for the tproxy inbound only; {} runs on tcp or quic",
+                server_config.protocol
+            ),
+        ));
+    }
+
     validate_server_proxy_config(
         &mut server_config.protocol,
         client_groups,
@@ -1016,6 +1035,103 @@ fn validate_redirect_listener(server_config: &ServerConfig) -> std::io::Result<(
     // refusal.
     Ok(())
 }
+
+/// Where a `tproxy` listener may run, and the limits it may set.
+fn validate_tproxy_listener(
+    server_config: &ServerConfig,
+    udp_timeout: u64,
+    udp_nat_max: usize,
+) -> std::io::Result<()> {
+    // IP_TRANSPARENT and IP_RECVORIGDSTADDR are Linux's.
+    if !cfg!(target_os = "linux") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the tproxy inbound needs Linux: it reads IP_RECVORIGDSTADDR, which TPROXY sets",
+        ));
+    }
+
+    if server_config.transport != Transport::Udp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the tproxy inbound needs transport: udp; TCP is the redirect inbound's",
+        ));
+    }
+
+    // Sniffing reads a TCP stream's first bytes. Refused rather than accepted
+    // and ignored: a datagram inbound has no stream to read.
+    if server_config
+        .sniff
+        .as_ref()
+        .is_some_and(|sniff| sniff.enabled)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the tproxy inbound cannot sniff: sniffing reads a TCP stream, and tproxy carries \
+             UDP datagrams; drop the sniff block",
+        ));
+    }
+
+    let super::types::BindLocation::Address(addresses) = &server_config.bind_location else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the tproxy inbound listens on a UDP address, not a Unix socket: TPROXY delivers \
+             to a port",
+        ));
+    };
+
+    // Loopback only. A transparent socket on the wildcard also receives
+    // datagrams delivered to the host in the ordinary way, and relays them to
+    // the address they were already at: shoes talking to itself without end
+    // (awg-manager #689, in the spec's security notes). TPROXY's `--on-ip`
+    // names the listener, so loopback costs a router nothing. It keeps the
+    // LAN from reaching the listener directly; the host still can, and the
+    // demux drops a datagram addressed to the listener itself
+    // (`tproxy::worth_routing`).
+    for address in addresses.iter() {
+        for socket_addr in address.to_socket_addrs()? {
+            if !socket_addr.ip().is_loopback() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "the tproxy inbound must bind a loopback address, not {socket_addr}: \
+                         on any other a transparent socket relays ordinary traffic to itself. \
+                         Point TPROXY's --on-ip at 127.0.0.1"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Each session holds a descriptor, and Linux caps a process's at
+    // `fs.nr_open`, 1048576 by default, so more could never be used. The cap
+    // also keeps the figure inside tokio's `Semaphore::MAX_PERMITS`, past
+    // which building the listener's budgets panics at startup.
+    if udp_nat_max == 0 || udp_nat_max > MAX_TPROXY_UDP_NAT_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "tproxy udp_nat_max must be between 1 and {MAX_TPROXY_UDP_NAT_MAX}, \
+                 not {udp_nat_max}"
+            ),
+        ));
+    }
+    // Zero would expire every session as it opened. The upper bound is the
+    // router's timer, which panics on a duration it cannot hold (about two
+    // years); a day is far past any UDP flow worth keeping.
+    if udp_timeout == 0 || udp_timeout > MAX_TPROXY_UDP_TIMEOUT_SECS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "tproxy udp_timeout must be between 1 and {MAX_TPROXY_UDP_TIMEOUT_SECS} seconds, \
+                 not {udp_timeout}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_TPROXY_UDP_TIMEOUT_SECS: u64 = 86400;
+const MAX_TPROXY_UDP_NAT_MAX: usize = 1 << 20;
 
 /// A sniff block that is on but can never sniff anything is a typo, not a
 /// preference. Fail at load rather than quietly doing nothing at runtime.
@@ -1710,6 +1826,13 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 "redirect can only be a listener's own protocol, not an inner one: it reads the \
                  original destination from the accepted socket",
+            ));
+        }
+        ServerProxyConfig::Tproxy { .. } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tproxy can only be a listener's own protocol, not an inner one: it reads each \
+                 datagram's original destination from the listening socket",
             ));
         }
         ServerProxyConfig::Vless { user_id, .. } => {
@@ -5196,6 +5319,133 @@ mod redirect_validation_tests {
     #[test]
     fn redirect_is_refused_off_linux_by_name() {
         let err = refusal("- address: \"127.0.0.1:51272\"\n  protocol: {type: redirect}\n");
+        assert!(err.contains("Linux"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod tproxy_validation_tests {
+    use crate::config::load_config_str;
+
+    fn validate(yaml: &str) -> std::io::Result<()> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    fn refusal(yaml: &str) -> String {
+        validate(yaml)
+            .expect_err("this tproxy listener must be refused")
+            .to_string()
+    }
+
+    fn tproxy(bind: &str, fields: &str) -> String {
+        format!("- address: \"{bind}\"\n  transport: udp\n  protocol: {{type: tproxy{fields}}}\n")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tproxy_listener_is_accepted_on_loopback() {
+        for bind in ["127.0.0.1:51271", "[::1]:51271"] {
+            validate(&tproxy(bind, "")).unwrap_or_else(|e| panic!("{bind}: {e}"));
+        }
+        validate(&tproxy(
+            "127.0.0.1:51271",
+            ", udp_timeout: 86400, udp_nat_max: 1",
+        ))
+        .unwrap();
+    }
+
+    /// The loopback rule keeps a transparent socket from relaying ordinarily
+    /// delivered datagrams to itself (awg-manager #689, quoted in the spec's
+    /// security notes). A datagram from the host itself to the listener is
+    /// the demux's to drop, as `redirect` refuses its own address.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tproxy_listener_off_loopback_is_refused() {
+        for bind in ["0.0.0.0:51271", "[::]:51271", "192.168.1.1:51271"] {
+            let err = refusal(&tproxy(bind, ""));
+            assert!(err.contains("loopback"), "{bind}: {err}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tproxy_listener_on_a_unix_socket_is_refused() {
+        // Refused before the tproxy rules are reached, by the general rule
+        // that Unix sockets are TCP only.
+        let err = refusal(
+            "- path: /tmp/shoes-tproxy.sock\n  transport: udp\n  protocol: {type: tproxy}\n",
+        );
+        assert!(err.contains("Unix domain socket"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_needs_transport_udp() {
+        let err = refusal("- address: \"127.0.0.1:51271\"\n  protocol: {type: tproxy}\n");
+        assert!(err.contains("transport: udp"), "{err}");
+    }
+
+    /// `transport: udp` with any other protocol used to pass validation and
+    /// then panic on a `todo!()` at startup.
+    #[test]
+    fn transport_udp_with_another_protocol_is_refused() {
+        let err =
+            refusal("- address: \"127.0.0.1:1080\"\n  transport: udp\n  protocol: {type: socks}\n");
+        assert!(err.contains("tproxy"), "{err}");
+    }
+
+    /// Zero would expire every session at once or admit none; past a day the
+    /// router's timer panics on a duration it cannot hold.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_limits_out_of_range_are_refused() {
+        for (fields, name) in [
+            (", udp_timeout: 0", "udp_timeout"),
+            (", udp_timeout: 86401", "udp_timeout"),
+            (", udp_nat_max: 0", "udp_nat_max"),
+            (", udp_nat_max: 1048577", "udp_nat_max"),
+            // Past tokio's Semaphore::MAX_PERMITS, which panics at startup.
+            (", udp_nat_max: 18446744073709551615", "udp_nat_max"),
+        ] {
+            let err = refusal(&tproxy("127.0.0.1:51271", fields));
+            assert!(err.contains(name), "{fields}: {err}");
+        }
+    }
+
+    /// Sniffing reads a TCP stream's first bytes; a datagram inbound has no
+    /// stream, so the block would be accepted and do nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_with_sniff_is_refused() {
+        let err = refusal(&format!("{}  sniff: true\n", tproxy("127.0.0.1:51271", "")));
+        assert!(err.contains("sniff"), "{err}");
+        validate(&format!(
+            "{}  sniff: {{enabled: false}}\n",
+            tproxy("127.0.0.1:51271", "")
+        ))
+        .expect("a disabled sniff block asks for nothing");
+    }
+
+    #[test]
+    fn tproxy_as_an_inner_protocol_is_refused() {
+        let err = refusal(
+            r#"
+- address: "127.0.0.1:51272"
+  protocol:
+    type: ws
+    targets:
+      - matching_path: /
+        protocol: {type: tproxy}
+"#,
+        );
+        assert!(err.contains("not an inner one"), "{err}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tproxy_is_refused_off_linux_by_name() {
+        let err = refusal(&tproxy("127.0.0.1:51271", ""));
         assert!(err.contains("Linux"), "{err}");
     }
 }

@@ -480,7 +480,22 @@ async fn start_tcp_or_quic_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => todo!(),
+        // Validation admits `transport: udp` only for `tproxy`, and only on
+        // Linux.
+        #[cfg(target_os = "linux")]
+        Transport::Udp => {
+            match crate::tproxy::start_tproxy_udp_server(config.clone(), resolver).await {
+                Ok(handles) => join_handles.extend(handles),
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Transport::Udp => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "transport: udp is the tproxy inbound's, which needs Linux",
+            ));
+        }
     }
 
     if join_handles.is_empty() {

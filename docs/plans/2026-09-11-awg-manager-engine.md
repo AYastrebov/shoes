@@ -814,6 +814,110 @@ git -c user.email=ayastrebov@gmail.com commit -m "udp router: per-listener sessi
 
 Spec: "Slice 2" → "`tproxy`".
 
+**Status, 2026-10-11: done**, with Task 5's documentation share in the same
+commit (AGENTS.md: an option is documented in the commit that adds it). Where
+the build departed from the listing below:
+
+1. **The receive buffer.** `buf.resize(MAX_DATAGRAM)` after `split_to(n)`
+   would make `BytesMut` reallocate and copy about 64 KiB per datagram, since
+   the frozen half keeps the old block alive. `recvmsg` reads into one
+   reusable 64 KiB buffer (`&mut [MaybeUninit<u8>]`) and the datagram is
+   copied out at its own size. (A first build carved datagrams out of 1 MiB
+   blocks to save that allocation; the code review found each queued
+   datagram then pinned its whole block, up to 256 MiB for one stalled
+   client.)
+2. **A refused reply is dropped, not an error.** `UdpRouter` takes a server
+   write error as the end of the whole client, so the listing's `Err` on an
+   exhausted reply budget would have silenced every flow of that client.
+3. **Replies count as activity.** The listing expired a client on client-side
+   silence alone, which ends a one-way download after `udp_timeout`.
+4. **`make_transparent` lost its third argument.** `receive_original_destination`
+   is separate, because it needs no capability and so lets the `recvmsg` walk
+   be tested without root.
+5. **The root test sends to a remote that is not on the host** (198.51.100.7)
+   and reaches the echo through a rule's `override_address`. The listing's
+   echo on `127.0.0.2` would have held the very address the reply socket
+   binds. The client binds the wildcard, because the kernel refuses a loopback
+   source on a route to a remote, and no owner match is needed, because shoes
+   dials the echo, not the remote. Verified by hand in an unprivileged
+   user-and-network namespace; `tests/transparent.rs` says how.
+6. **A non-root test** checks that a listener without `CAP_NET_ADMIN` fails
+   saying so.
+7. **The re-exports are Linux-only**, because their only caller is.
+
+The final review (2026-10-11) found five more, fixed in the same commit
+except the third:
+
+8. **An empty datagram ended its client's reads**, because the router reads
+   zero bytes as end of stream; the demux drops it.
+9. **A datagram addressed to the listener itself** (a local process sending
+   to it directly) was relayed to the listener, starting a client per relay
+   until `udp_nat_max` ran out. The demux drops it, with broadcast,
+   multicast, unspecified and port-zero destinations.
+10. **A client is a source socket, and each costs about 40 KB** (measured),
+    about 160 MB at the default cap. Documented, and the router-side fix is
+    recorded in ROADMAP; not fixed here because the cost is in `UdpRouter`.
+11. **Reply sockets outlived their sessions**, so a few clients could hold
+    the whole reply budget; they now close after `udp_timeout` unused.
+12. **The documented `TPROXY` rule took broadcast and multicast**, DHCP
+    among them; it now excludes `addrtype LOCAL,BROADCAST,MULTICAST`.
+
+The code review on PR #49 (2026-10-11) found more, all fixed in a second
+commit:
+
+13. **Reply sockets set `SO_REUSEPORT` but not `SO_REUSEADDR`**, so a reply
+    spoofed from `8.8.8.8:53` failed to bind beside `dnsmasq` on
+    `0.0.0.0:53`, and every such reply was dropped.
+14. **A full client table refused newcomers**; it now evicts the least
+    recently heard-from client, as sing-box does, and warns once per
+    stretch at the cap rather than once per datagram.
+15. **A client whose router had ended** was reported as a full queue until
+    the sweep; the next datagram now starts it afresh.
+16. **`sniff:` on a `tproxy` listener** was accepted and ignored; refused.
+17. **Several bind addresses**: the open-file warning counted one listener's
+    budgets, and an error on a later address left earlier demuxes running.
+    Every address is now resolved and bound before any demux starts.
+18. **A reply socket that could not open** cost the client a working one
+    when the budget was spent; the new socket now opens first. The
+    address-family mapping of the reply source, unreachable because the
+    router reports the destination as the demux read it, is gone.
+
+Benchmarking against sing-box 1.14.3 (PR #49's comment has the figures)
+found one more, in the host rather than the code:
+
+19. **`src_valid_mark` on drops every forwarded datagram TPROXY marks**, as a
+    martian source, silently; the root test's local client never routes, so
+    it could not see it. shoes now warns at startup naming the interfaces at
+    risk, CONFIG.md gives both remedies, and a second root test runs a LAN
+    client in its own namespace across a veth pair.
+
+Copilot's review of PR #49 found four more, all fixed in a fourth commit:
+
+20. **`udp_nat_max` had no upper bound**, and past tokio's
+    `Semaphore::MAX_PERMITS` building the budgets panics at startup. It is
+    now at most 1048576, the default `fs.nr_open`.
+21. **Eviction ignored replies since the last sweep**, so a client receiving
+    a one-way flow could be evicted as idle. Pending reply flags are applied
+    before the victim is chosen.
+22. **`CAP_NET_RAW` is enough for `IP_TRANSPARENT`**; the kernel accepts it
+    or `CAP_NET_ADMIN`. The docs and the root tests now use the narrower one,
+    and the error names both. The listings above still say `CAP_NET_ADMIN`.
+23. **The non-root capability test waited without a deadline**, so a
+    listener that started after all would have hung the suite.
+
+Its second pass found three more in code it had already read, fixed in a
+fifth commit:
+
+24. **An evicted router held its budget share until its cancellation
+    landed**, so on a multi-threaded runtime the newcomer it was evicted for
+    could find the budget still full and have its first session refused. The
+    newcomer's task now waits for its predecessor's before routing.
+25. **Startup re-resolved bind names and trusted the answer**, so a name
+    that answered loopback at validation and something else at startup got a
+    transparent socket there. Each resolved address is checked again.
+26. **The root tests sent one datagram**, so a reply socket left connected,
+    which takes the client's later datagrams, passed. They send two.
+
 **Files:**
 - Modify: `src/tproxy/mod.rs`
 - Modify: `src/config/types/server.rs`, `src/config/validate.rs`, `src/tcp/tcp_server_handler_factory.rs`, `src/routing/mod.rs` (see "What Tasks 2 and 3 left")

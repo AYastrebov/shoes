@@ -40,6 +40,7 @@ All server protocols plus:
 
 ### Transparent Proxy (Linux)
 - **Redirect** - the target of NAT `REDIRECT` for TCP; forwards each connection to where the kernel says it was going (`examples/transparent_proxy.yaml`). shoes installs no firewall rules: the host, or a manager such as awg-manager, has to add the `REDIRECT` rule that sends traffic to the listener
+- **Tproxy** - the target of `TPROXY` for UDP; routes each datagram to where it was going and answers from that address, so the client sees the remote rather than shoes (`examples/transparent_proxy.yaml`). Needs `CAP_NET_RAW`, binds loopback only, and, like `redirect`, relies on the host for its firewall rule and policy route
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
@@ -285,6 +286,20 @@ See the [examples](./examples) directory for all examples.
   sniff: true
 ```
 See [CONFIG.md](CONFIG.md#redirect-transparent-tcp-linux) for why the bind is the wildcard and why a direct connection to the port is refused.
+
+UDP takes `TPROXY` instead, which needs a policy route as well as the rule, and `CAP_NET_RAW`:
+```yaml
+#   ip rule add fwmark 0x1 lookup 100
+#   ip route add local 0.0.0.0/0 dev lo table 100
+#   iptables -t mangle -A PREROUTING -i br0 -p udp ! -d 192.168.1.0/24 \
+#       -m addrtype ! --dst-type LOCAL,BROADCAST,MULTICAST \
+#       -j TPROXY --on-ip 127.0.0.1 --on-port 51271 --tproxy-mark 0x1/0x1
+- address: 127.0.0.1:51271
+  transport: udp
+  protocol:
+    type: tproxy
+```
+See [CONFIG.md](CONFIG.md#tproxy-transparent-udp-linux) for why this one binds loopback and what `udp_nat_max` bounds.
 
 ### TUN VPN
 ```yaml
