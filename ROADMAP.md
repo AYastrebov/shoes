@@ -717,8 +717,9 @@ Open, with what each costs while it stays open:
   task 5's router run.
 - **A `tproxy` client costs about 21 KB.** A client is a source socket, and
   each runs its own `UdpRouter`. It was 38 KB while every router kept its
-  64 KiB packet buffers for life; an idle router now parks them in a small
-  per-thread cache. What remains is the router, its task, queues and tables,
+  64 KiB packet buffers for life; an idle router now parks them in a spare
+  pool of at most 32 for the whole process (2 MiB at most, a fixed cost the
+  TUN shutdown frees). What remains is the router, its task, queues and tables,
   about 90 MB at the default `udp_nat_max` of 4096, which a busy LAN can
   reach in `udp_timeout`; sing-box measured 25 KB a client on the same
   bench. Going further means one router per listener keyed by client socket
