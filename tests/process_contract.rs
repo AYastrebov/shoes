@@ -28,22 +28,45 @@ fn shoes_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_shoes"))
 }
 
-/// `N` distinct free ports.
+/// `N` free ports, none of them ever handed out before in this process.
 ///
-/// Every listener stays bound until all are allocated: binding and
-/// releasing one at a time can hand the same port back twice, and a test
-/// that reloads onto "a different port" then reloads onto the same one and
-/// waits forever for the old listener to go away.
+/// A port is free only while it is being allocated, and the kernel hands a
+/// released one back readily. Every test here is a thread of one process
+/// that gives its ports to a shoes it spawns, so a port given to two tests
+/// has two children racing to bind it: the loser never starts, and a probe
+/// of the port is answered by the winner. That was the one Linux failure of
+/// `sighup_reloads_immediately_even_with_no_reload`. Remembering every port
+/// handed out rules it out within the binary; the listeners stay bound
+/// until all `N` are picked, so one call cannot repeat itself either.
 #[cfg(unix)]
 fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: Vec<std::net::TcpListener> = (0..N)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: Vec<u16> = listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect();
+    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut handed_out = HANDED_OUT.lock().unwrap();
+    let mut held = Vec::new();
+    let mut ports = Vec::with_capacity(N);
+    while ports.len() < N {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if !handed_out.contains(&port) {
+            handed_out.push(port);
+            ports.push(port);
+        }
+        held.push(listener);
+    }
     ports.try_into().unwrap()
+}
+
+/// The tests in this file run as threads of one process, each spawning a
+/// shoes that binds the ports it was given. A port handed to two of them
+/// makes the second shoes fail to bind while the first answers for it.
+#[cfg(unix)]
+#[test]
+fn free_ports_never_hands_out_a_port_twice() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..2000 {
+        let [port] = free_ports::<1>();
+        assert!(seen.insert(port), "port {port} handed out twice");
+    }
 }
 
 fn socks_config(port: u16) -> String {
@@ -67,6 +90,17 @@ async fn wait_until(addr: SocketAddr, up: bool) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("{addr} never became up={up}");
+}
+
+/// Wait until the child has a listener accepting on `addr`. Its own line
+/// first, so the listener is known to be this child's attempt; then a
+/// connect, because the line is printed before the bind and a bind that
+/// fails prints it too. The connect cannot be answered by another test's
+/// child: `free_ports` gives each port to one test.
+#[cfg(unix)]
+async fn wait_for_listener(stdout: &mut Stdout, addr: SocketAddr) {
+    stdout.wait_for(&format!("server at {addr}"));
+    wait_until(addr, true).await;
 }
 
 #[cfg(unix)]
@@ -252,23 +286,24 @@ async fn sighup_reloads_immediately_even_with_no_reload() {
     let [first, second] = free_ports::<2>();
     assert_ne!(first, second);
     std::fs::write(&config, socks_config(first)).unwrap();
-    let child = Child(
+    let mut child = Child(
         std::process::Command::new(shoes_bin())
             .arg("--no-reload")
             .arg(&config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            // Inherited, so a failed bind is in the test's output.
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
+    let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
-    wait_until(first_addr, true).await;
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], first))).await;
 
     std::fs::write(&config, socks_config(second)).unwrap();
     let started = std::time::Instant::now();
     sighup(&child);
-    wait_until(second_addr, true).await;
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
@@ -304,7 +339,7 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
             .arg("--no-reload")
             .arg(&config)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
@@ -323,8 +358,7 @@ async fn sighup_during_startup_is_buffered_not_fatal() {
     }
 
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
-    wait_until(second_addr, true).await;
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         child.0.try_wait().unwrap().is_none(),
@@ -355,27 +389,25 @@ async fn a_write_then_a_sighup_is_one_reload_not_two() {
             // The watcher on: this is the case where two sources exist.
             .arg(&config)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
     let mut stdout = Stdout::tap(&mut child);
     let first_addr: SocketAddr = format!("127.0.0.1:{first}").parse().unwrap();
-    let second_addr: SocketAddr = format!("127.0.0.1:{second}").parse().unwrap();
-    // The child's own word that it bound the first port, not a connect to
-    // it: the ports are free only when allocated, and a sibling test's
-    // process can hold one by now. A connect answered by that process lets
-    // the write below land before this child reads its config; it then
-    // starts on the second port and sees no change. That is the only way
-    // found to produce this test's one Linux failure, a child that started
-    // and never printed "Configs changed".
-    stdout.wait_for(&format!("server at 127.0.0.1:{first}"));
+    // The child's line as well as a connect. A connect alone, answered by a
+    // sibling test's process holding the same port, let the write below
+    // land before this child read its config; it then started on the second
+    // port and saw no change. That was this test's one Linux failure, a
+    // child that started and never printed "Configs changed", and the shared
+    // port behind it is what `free_ports` now rules out.
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], first))).await;
 
     std::fs::write(&config, socks_config(second)).unwrap();
     stdout.wait_for("Configs changed");
     let signalled = std::time::Instant::now();
     sighup(&child);
-    wait_until(second_addr, true).await;
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], second))).await;
     wait_until(first_addr, false).await;
     assert!(
         signalled.elapsed() < std::time::Duration::from_secs(2),
@@ -418,12 +450,12 @@ async fn a_watcher_event_for_unchanged_bytes_restarts_nothing() {
         std::process::Command::new(shoes_bin())
             .arg(&config)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
     let mut stdout = Stdout::tap(&mut child);
-    stdout.wait_for(&format!("server at 127.0.0.1:{port}"));
+    wait_for_listener(&mut stdout, SocketAddr::from(([127, 0, 0, 1], port))).await;
 
     std::fs::write(&config, socks_config(port)).unwrap();
     stdout.wait_for("Configs changed");
