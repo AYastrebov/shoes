@@ -1282,6 +1282,45 @@ rules:
       client_chain: my-upstream  # Reference by name
 ```
 
+By default each connection takes the group's next member in turn. With
+`mode: select`, every new connection takes one chosen member instead, which
+a Clash controller changes at runtime -- sing-box's `selector`:
+
+```yaml
+- client_group: exit
+  mode: select                 # Default: round_robin
+  default: proxy-1             # Optional; the first member when absent
+  client_proxies:
+    - name: proxy-1
+      address: "proxy1.example.com:1080"
+      protocol:
+        type: socks
+    - name: proxy-2
+      address: "proxy2.example.com:1080"
+      protocol:
+        type: socks
+    - direct                   # A group of exactly one outbound is one member
+```
+
+- **`default`** names a member by its `name` (or, for an unnamed one, its
+  address; `direct` for the built-in direct outbound).
+- **Changing the choice** is `PUT /proxies/exit` with `{"name": "proxy-2"}`
+  on the [Clash API](#clash-api); `DELETE /proxies/exit` returns to
+  `default`. Connections already open keep the member they started on; UDP
+  sessions too. A selected member that cannot carry UDP refuses UDP rather
+  than routing it through another member.
+- **A reload keeps the choice** while the group and that member both
+  survive; otherwise the group goes back to `default`, with a warning.
+  `state_file` keeps it across restarts.
+- **Restrictions**, each refused at load with the reason:
+  - every member must be one outbound (an inline config, or a group of
+    exactly one), named uniquely within the group;
+  - a selector must be the only entry of the hop that names it, not one
+    entry of a `pool`;
+  - `default` is accepted only with `mode: select`.
+
+See `examples/clash_api_selector.yaml`.
+
 ### Rule Group
 ```yaml
 - rule_group: standard-rules
@@ -1377,10 +1416,13 @@ feature and ignores it, so one config serves both.
 - **`max_tracked_connections`** bounds the connection registry. Past it a
   connection is served and not tracked, and the omission is reported in
   `/connections`.
-- **`state_file`** is where a proxy selection will survive a restart once
-  selecting a proxy exists; until then the field is accepted and unused.
-  Its own setting rather than a path beside the config, because a router's
-  config directory is often read-only.
+- **`state_file`** is where the choices of `mode: select` groups survive a
+  restart: written after every `PUT`/`DELETE /proxies/{group}`, read at
+  every start and reload. A choice naming a member the config no longer has
+  is dropped with a warning; a file that cannot be written leaves the
+  selection in effect until the next restart. Its own setting rather than a
+  path beside the config, because a router's config directory is often
+  read-only.
 
 Only one `clash_api` block is allowed across the loaded files.
 

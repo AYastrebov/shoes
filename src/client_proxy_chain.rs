@@ -32,6 +32,7 @@ use log::debug;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
+use crate::group_selection::GroupSelection;
 #[cfg(feature = "control-stats")]
 use crate::outbound_stats::OutboundCounters;
 use crate::resolver::Resolver;
@@ -113,6 +114,10 @@ enum ClientProxyChainKind {
 /// or a virtual network tunnel connector.
 pub struct ClientProxyChain {
     kind: ClientProxyChainKind,
+    /// One entry per hop: the `select` group a hop's pool follows, if any.
+    /// Empty when no hop does, which is every chain built from a round-robin
+    /// group or an inline config.
+    selections: Box<[Option<Arc<GroupSelection>>]>,
 }
 
 impl std::fmt::Debug for ClientProxyChain {
@@ -207,6 +212,7 @@ impl ClientProxyChain {
             .collect();
 
         Self {
+            selections: Box::new([]),
             kind: ClientProxyChainKind::StreamChain {
                 initial_hop,
                 initial_hop_next_index: AtomicU32::new(0),
@@ -237,6 +243,7 @@ impl ClientProxyChain {
         let connector_counters = vec![crate::outbound_stats::unattributed(); connectors.len()];
 
         Self {
+            selections: Box::new([]),
             kind: ClientProxyChainKind::Terminal {
                 connectors,
                 next_index: AtomicU32::new(0),
@@ -244,6 +251,43 @@ impl ClientProxyChain {
                 connector_counters,
             },
         }
+    }
+
+    /// Make each hop's pool follow its `select` group, one entry per hop
+    /// (hop 0 first). Panics on a length mismatch or a group whose member
+    /// count differs from its pool's: both are construction bugs in
+    /// `chain_builder`, and following the wrong member silently would be
+    /// worse than failing at startup.
+    pub fn with_selections(mut self, selections: Vec<Option<Arc<GroupSelection>>>) -> Self {
+        let pool_sizes: Vec<usize> = match &self.kind {
+            ClientProxyChainKind::StreamChain {
+                initial_hop,
+                subsequent_hops,
+                ..
+            } => std::iter::once(initial_hop.len())
+                .chain(subsequent_hops.iter().map(Vec::len))
+                .collect(),
+            ClientProxyChainKind::Terminal { connectors, .. } => vec![connectors.len()],
+        };
+        assert_eq!(selections.len(), pool_sizes.len(), "one selection per hop");
+        for (selection, size) in selections.iter().zip(&pool_sizes) {
+            if let Some(selection) = selection {
+                assert_eq!(
+                    selection.members().len(),
+                    *size,
+                    "group '{}' members against its pool",
+                    selection.name()
+                );
+            }
+        }
+        if selections.iter().any(Option::is_some) {
+            self.selections = selections.into_boxed_slice();
+        }
+        self
+    }
+
+    fn hop_selection(&self, hop: usize) -> Option<&GroupSelection> {
+        self.selections.get(hop).and_then(|s| s.as_deref())
     }
 
     /// Attach the counters for each pool member, in the order the pools were
@@ -432,12 +476,15 @@ impl ClientProxyChain {
                 subsequent_hop_counters,
                 ..
             } => {
-                let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
+                let (entry, _initial_idx) =
+                    select_from_pool(initial_hop, initial_hop_next_index, self.hop_selection(0));
                 // One allocation per connection, the same one this path always
                 // made. The indices ride along in it rather than in a second
                 // vector, so a build without counters carries them without
                 // paying for them.
-                let selected = select_subsequent(subsequent_hops, subsequent_next_indices);
+                let selected = select_subsequent(subsequent_hops, subsequent_next_indices, |hop| {
+                    self.hop_selection(hop + 1)
+                });
                 #[cfg(feature = "control-stats")]
                 let subsequent_exit_idx = selected.last().map(|(_, i)| *i);
 
@@ -552,7 +599,8 @@ impl ClientProxyChain {
                 #[cfg(feature = "control-stats")]
                 connector_counters,
             } => {
-                let (connector, _idx) = select_terminal(connectors, next_index);
+                let (connector, _idx) =
+                    select_terminal(connectors, next_index, self.hop_selection(0));
                 debug!("Terminal TCP connect -> {}", remote_location.location());
                 let result = connector.connect_tcp(resolver, remote_location).await?;
 
@@ -611,8 +659,11 @@ impl ClientProxyChain {
                 }
 
                 if *udp_uses_initial_hop {
-                    let idx = udp_final_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    let pool_idx = udp_final_hop_indices[idx % udp_final_hop_indices.len()];
+                    let pool_idx = select_udp_final(
+                        udp_final_hop_indices,
+                        udp_final_hop_next_index,
+                        self.hop_selection(0),
+                    )?;
                     let entry = &initial_hop[pool_idx];
 
                     debug!(
@@ -648,27 +699,32 @@ impl ClientProxyChain {
 
                     Ok(stream)
                 } else {
-                    let (entry, _initial_idx) =
-                        select_from_pool(initial_hop, initial_hop_next_index);
+                    let (entry, _initial_idx) = select_from_pool(
+                        initial_hop,
+                        initial_hop_next_index,
+                        self.hop_selection(0),
+                    );
 
                     let intermediate_proxies: Vec<&dyn ProxyConnector> = subsequent_hops
                         .iter()
                         .enumerate()
                         .take(subsequent_hops.len() - 1)
                         .map(|(i, hop)| {
-                            if hop.len() == 1 {
-                                hop[0].as_ref()
-                            } else {
-                                let idx = subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed)
-                                    as usize;
-                                hop[idx % hop.len()].as_ref()
-                            }
+                            let idx = pick(
+                                hop.len(),
+                                &subsequent_next_indices[i],
+                                self.hop_selection(i + 1),
+                            );
+                            hop[idx].as_ref()
                         })
                         .collect();
 
                     let final_hop_pool = subsequent_hops.last().unwrap();
-                    let idx = udp_final_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    let pool_idx = udp_final_hop_indices[idx % udp_final_hop_indices.len()];
+                    let pool_idx = select_udp_final(
+                        udp_final_hop_indices,
+                        udp_final_hop_next_index,
+                        self.hop_selection(subsequent_hops.len()),
+                    )?;
                     let final_proxy = final_hop_pool[pool_idx].as_ref();
 
                     debug!(
@@ -750,7 +806,8 @@ impl ClientProxyChain {
                 #[cfg(feature = "control-stats")]
                 connector_counters,
             } => {
-                let (connector, _idx) = select_terminal(connectors, next_index);
+                let (connector, _idx) =
+                    select_terminal(connectors, next_index, self.hop_selection(0));
                 debug!("Terminal UDP connect -> {}", target.location());
                 let stream = connector
                     .connect_udp_bidirectional(resolver, target)
@@ -794,45 +851,81 @@ impl ClientProxyChain {
     }
 }
 
+/// The pool index a connection takes: the group's choice when the hop
+/// follows a `select` group, otherwise the next one in turn.
+fn pick(len: usize, index: &AtomicU32, selection: Option<&GroupSelection>) -> usize {
+    if let Some(selection) = selection {
+        selection.selected_index()
+    } else if len == 1 {
+        0
+    } else {
+        index.fetch_add(1, Ordering::Relaxed) as usize % len
+    }
+}
+
 fn select_from_pool<'a>(
     pool: &'a [InitialHopEntry],
     index: &AtomicU32,
+    selection: Option<&GroupSelection>,
 ) -> (&'a InitialHopEntry, usize) {
-    if pool.len() == 1 {
-        (&pool[0], 0)
-    } else {
-        let idx = index.fetch_add(1, Ordering::Relaxed) as usize % pool.len();
-        (&pool[idx], idx)
-    }
+    let idx = pick(pool.len(), index, selection);
+    (&pool[idx], idx)
 }
 
 fn select_terminal<'a>(
     pool: &'a [Arc<dyn TerminalConnector>],
     index: &AtomicU32,
+    selection: Option<&GroupSelection>,
 ) -> (&'a Arc<dyn TerminalConnector>, usize) {
-    if pool.len() == 1 {
-        (&pool[0], 0)
-    } else {
-        let idx = index.fetch_add(1, Ordering::Relaxed) as usize % pool.len();
-        (&pool[idx], idx)
-    }
+    let idx = pick(pool.len(), index, selection);
+    (&pool[idx], idx)
 }
 
-fn select_subsequent<'a>(
+/// `selection_of(i)` is the selection of subsequent hop `i`.
+fn select_subsequent<'a, 's>(
     hops: &'a [Vec<Box<dyn ProxyConnector>>],
     indices: &[AtomicU32],
+    selection_of: impl Fn(usize) -> Option<&'s GroupSelection>,
 ) -> Vec<(&'a dyn ProxyConnector, usize)> {
     hops.iter()
         .enumerate()
         .map(|(i, hop)| {
-            if hop.len() == 1 {
-                (hop[0].as_ref(), 0)
-            } else {
-                let idx = indices[i].fetch_add(1, Ordering::Relaxed) as usize % hop.len();
-                (hop[idx].as_ref(), idx)
-            }
+            let idx = pick(hop.len(), &indices[i], selection_of(i));
+            (hop[idx].as_ref(), idx)
         })
         .collect()
+}
+
+/// The final hop's member for a UDP session. Round-robin over the members
+/// that carry UDP, or the group's choice -- which is refused rather than
+/// swapped for another member when it cannot carry UDP, because a selector
+/// that quietly routes somewhere else is not a selector.
+fn select_udp_final(
+    udp_indices: &[usize],
+    index: &AtomicU32,
+    selection: Option<&GroupSelection>,
+) -> std::io::Result<usize> {
+    match selection {
+        Some(selection) => {
+            let chosen = selection.selected_index();
+            if udp_indices.contains(&chosen) {
+                Ok(chosen)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "'{}', the member group '{}' has selected, does not carry UDP",
+                        selection.selected_member(),
+                        selection.name()
+                    ),
+                ))
+            }
+        }
+        None => {
+            let idx = index.fetch_add(1, Ordering::Relaxed) as usize;
+            Ok(udp_indices[idx % udp_indices.len()])
+        }
+    }
 }
 
 /// Who a connection's bytes were credited to.
@@ -1243,7 +1336,7 @@ mod tests {
         let (initial_hop, initial_hop_next_index, _, _, _, _) = chain.as_stream_chain();
 
         for iteration in 0..6 {
-            let (entry, _) = select_from_pool(initial_hop, initial_hop_next_index);
+            let (entry, _) = select_from_pool(initial_hop, initial_hop_next_index, None);
             let expected_idx = iteration % 3;
 
             match (expected_idx, entry) {
@@ -1323,7 +1416,7 @@ mod tests {
         assert_eq!(*udp_indices, vec![1, 2]);
 
         for i in 0..4 {
-            let (entry, _) = select_from_pool(initial_hop, initial_hop_next);
+            let (entry, _) = select_from_pool(initial_hop, initial_hop_next, None);
             let expected_idx = i % 2;
             match (expected_idx, entry) {
                 (0, InitialHopEntry::Proxy { proxy, .. }) => {
@@ -1842,5 +1935,142 @@ mod tests {
         assert_eq!(only.upload_bytes, 11, "registry held {all:?}");
         // A datagram session is not a connection.
         assert_eq!(only.active_connections, 0);
+    }
+
+    /// A socket that records which pool member it is, then refuses: enough
+    /// to see which member a chain chose without a network.
+    #[derive(Debug)]
+    struct RecordingSocket {
+        id: usize,
+        log: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl SocketConnector for RecordingSocket {
+        async fn connect(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _address: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.log.lock().push(self.id);
+            Err(std::io::Error::other("recorded"))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            self.log.lock().push(self.id);
+            Err(std::io::Error::other("recorded"))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn recording_chain(
+        members: usize,
+        log: &Arc<parking_lot::Mutex<Vec<usize>>>,
+    ) -> ClientProxyChain {
+        ClientProxyChain::new(
+            (0..members)
+                .map(|id| {
+                    InitialHopEntry::Direct(Box::new(RecordingSocket {
+                        id,
+                        log: log.clone(),
+                    }))
+                })
+                .collect(),
+            vec![],
+        )
+    }
+
+    fn selection_spec(name: &str, members: &[&str]) -> crate::group_selection::SelectionSpec {
+        crate::group_selection::SelectionSpec {
+            name: name.to_string(),
+            members: members.iter().map(|m| m.to_string()).collect(),
+            default_index: 0,
+        }
+    }
+
+    fn here() -> ResolvedLocation {
+        ResolvedLocation::new(NetLocation::from_ip_addr(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            443,
+        ))
+    }
+
+    fn native_resolver() -> Arc<dyn Resolver> {
+        Arc::new(crate::resolver::NativeResolver::new())
+    }
+
+    /// Two chains built from one `select` group -- what two listeners naming
+    /// it get -- both follow a change of selection, for TCP and UDP alike.
+    #[tokio::test]
+    async fn chains_from_one_selector_follow_its_choice() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // One Arc, as chain_builder hands every chain of the group: looking
+        // it up again could race a parallel test replacing the registry.
+        let selection =
+            crate::group_selection::for_chain(&selection_spec("cpc-follow", &["a", "b", "c"]));
+        let one = recording_chain(3, &log).with_selections(vec![Some(selection.clone())]);
+        let two = recording_chain(3, &log).with_selections(vec![Some(selection.clone())]);
+
+        let _ = one.connect_tcp(here(), &native_resolver()).await;
+        let _ = two.connect_tcp(here(), &native_resolver()).await;
+        assert_eq!(*log.lock(), [0, 0]);
+
+        assert!(selection.select("c"));
+        let _ = one.connect_tcp(here(), &native_resolver()).await;
+        let _ = two.connect_tcp(here(), &native_resolver()).await;
+        let _ = one
+            .connect_udp_bidirectional(&native_resolver(), here())
+            .await;
+        assert_eq!(*log.lock(), [0, 0, 2, 2, 2]);
+    }
+
+    /// Without a selection the pool rotates, exactly as before.
+    #[tokio::test]
+    async fn a_pool_without_a_selection_still_rotates() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let chain = recording_chain(3, &log).with_selections(vec![None]);
+        for _ in 0..4 {
+            let _ = chain.connect_tcp(here(), &native_resolver()).await;
+        }
+        assert_eq!(*log.lock(), [0, 1, 2, 0]);
+    }
+
+    /// A selected member that cannot carry UDP is refused for a UDP session,
+    /// not swapped for one that can: that would route somewhere the
+    /// selection did not say.
+    #[tokio::test]
+    async fn a_selected_member_without_udp_refuses_udp() {
+        let spec = selection_spec("cpc-udp", &["udp", "tcp-only"]);
+        let selection = crate::group_selection::for_chain(&spec);
+        let chain = ClientProxyChain::new(
+            vec![proxy_entry(0, 1080, true), proxy_entry(1, 1081, false)],
+            vec![],
+        )
+        .with_selections(vec![Some(selection.clone())]);
+
+        assert!(selection.select("tcp-only"));
+        let err = chain
+            .connect_udp_bidirectional(&native_resolver(), here())
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("tcp-only"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "members against its pool")]
+    fn a_selection_that_does_not_fit_its_pool_is_a_construction_bug() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let spec = selection_spec("cpc-mismatch", &["a", "b"]);
+        let _ = recording_chain(3, &log)
+            .with_selections(vec![Some(crate::group_selection::for_chain(&spec))]);
     }
 }

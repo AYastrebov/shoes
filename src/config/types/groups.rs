@@ -25,6 +25,31 @@ pub struct ClientConfigGroup {
     pub client_group: String,
     #[serde(alias = "client_proxy")]
     pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+    /// How a connection picks a member. See [`GroupMode`].
+    #[serde(default, skip_serializing_if = "GroupMode::is_round_robin")]
+    pub mode: GroupMode,
+    /// The member a `select` group starts on, by outbound name. The first
+    /// member when absent, as sing-box's selector does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// How a client group picks the member a connection goes through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMode {
+    /// Each connection takes the next member in turn.
+    #[default]
+    RoundRobin,
+    /// Every connection takes one chosen member, which a controller can
+    /// change at runtime (`PUT /proxies/{group}`). sing-box's `selector`.
+    Select,
+}
+
+impl GroupMode {
+    fn is_round_robin(&self) -> bool {
+        *self == GroupMode::RoundRobin
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -444,6 +469,8 @@ mod tests {
                     quic_settings: None,
                 }),
             ]),
+            mode: Default::default(),
+            default: None,
         })];
 
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");

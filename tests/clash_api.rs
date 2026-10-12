@@ -36,6 +36,7 @@ pub async fn spawn(
             mixed: 0,
             tun: false,
         }),
+        state_file: parking_lot::RwLock::new(None),
         started: std::time::Instant::now(),
         shutdown: tokio_util::sync::CancellationToken::new(),
         log: None,
@@ -403,6 +404,209 @@ async fn the_listener_survives_a_config_reload() {
         still_open.is_ok(),
         "the dashboard's socket died across a reload"
     );
+    drop(child);
+}
+
+/// The selector contract awg-manager relies on, end to end through the real
+/// binary: the choice is reported, routes new connections, survives a
+/// restart through `state_file`, and the refusals are sing-box's.
+#[tokio::test]
+async fn a_selector_routes_by_choice_and_remembers_it() {
+    let [socks_port, api_port] = free_ports::<2>();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let state_path = dir.path().join("state.json");
+    // `dead` is a SOCKS server nothing listens on, so a connection routed
+    // there fails; `live` goes direct. The default is `dead`, so routing that
+    // ignored the selection fails the second half of this test.
+    std::fs::write(
+        &config_path,
+        format!(
+            "- client_group: sel 1\n\
+             \x20 mode: select\n\
+             \x20 client_proxies:\n\
+             \x20   - name: dead\n\
+             \x20     address: 127.0.0.1:1\n\
+             \x20     protocol:\n\
+             \x20       type: socks\n\
+             \x20   - name: live\n\
+             \x20     protocol:\n\
+             \x20       type: direct\n\
+             - client_group: rotating\n\
+             \x20 client_proxies:\n\
+             \x20   - name: other\n\
+             \x20     address: 127.0.0.1:2\n\
+             \x20     protocol:\n\
+             \x20       type: socks\n\
+             - address: 127.0.0.1:{socks_port}\n\
+             \x20 protocol:\n\
+             \x20   type: socks\n\
+             \x20 rules:\n\
+             \x20   - masks: 0.0.0.0/0\n\
+             \x20     action: allow\n\
+             \x20     client_chain: sel 1\n\
+             - clash_api:\n\
+             \x20   listen: 127.0.0.1:{api_port}\n\
+             \x20   state_file: {}\n",
+            state_path.display()
+        ),
+    )
+    .unwrap();
+    let start = || {
+        Child(
+            std::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .arg("--no-reload")
+                .arg(&config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let api: SocketAddr = format!("127.0.0.1:{api_port}").parse().unwrap();
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            tokio::spawn(async move {
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).await.is_ok() {
+                    if stream.write_all(&byte).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    // SOCKS5 CONNECT through shoes; Some(reply code).
+    let reaches = |proxy: SocketAddr| async move {
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.ok()?;
+        stream.write_all(&[5, 1, 0]).await.ok()?;
+        let mut greeting = [0u8; 2];
+        stream.read_exact(&mut greeting).await.ok()?;
+        let std::net::SocketAddr::V4(v4) = upstream_addr else {
+            unreachable!()
+        };
+        let mut req = vec![5, 1, 0, 1];
+        req.extend_from_slice(&v4.ip().octets());
+        req.extend_from_slice(&v4.port().to_be_bytes());
+        stream.write_all(&req).await.ok()?;
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.ok()?;
+        Some(reply[1])
+    };
+    let json_body = [("Content-Type", "application/json")];
+
+    let child = start();
+    wait_for(api).await;
+    wait_for(proxy).await;
+
+    // Reported as mihomo/sing-box do, and the built-in `direct` group no
+    // longer hides the `direct` outbound.
+    let sel = json(&get(api, "/proxies/sel%201", None).await);
+    assert_eq!(sel["type"], "Selector", "{sel}");
+    assert_eq!(sel["now"], "dead");
+    assert_eq!(sel["all"], serde_json::json!(["dead", "live"]));
+    let all = json(&get(api, "/proxies", None).await);
+    assert_eq!(all["proxies"]["direct"]["type"], "Direct", "{all}");
+    assert_eq!(all["proxies"]["rotating"]["type"], "LoadBalance");
+    // Three each, so a pool that rotated instead of following the choice
+    // cannot pass by landing on the right member once.
+    for _ in 0..3 {
+        assert_ne!(reaches(proxy).await, Some(0), "routed through `dead`");
+    }
+
+    // awg-manager's SetSelector, byte for byte (internal/singbox/clash.go).
+    let put = request(
+        api,
+        "PUT",
+        "/proxies/sel%201",
+        &json_body,
+        r#"{"name":"live"}"#,
+    )
+    .await;
+    assert_eq!(put.code, 204, "{}", put.body);
+    assert_eq!(
+        json(&get(api, "/proxies/sel%201", None).await)["now"],
+        "live"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            reaches(proxy).await,
+            Some(0),
+            "a new connection takes the choice"
+        );
+    }
+
+    // The refusals.
+    for (method, path, body, code, message) in [
+        (
+            "PUT",
+            "/proxies/sel%201",
+            r#"{"name":"nope"}"#,
+            400,
+            "Selector update error: not found",
+        ),
+        ("PUT", "/proxies/sel%201", "not json", 400, "Body invalid"),
+        (
+            "PUT",
+            "/proxies/rotating",
+            r#"{"name":"other"}"#,
+            400,
+            "Must be a Selector",
+        ),
+        (
+            "PUT",
+            "/proxies/live",
+            r#"{"name":"live"}"#,
+            400,
+            "Must be a Selector",
+        ),
+        (
+            "PUT",
+            "/proxies/absent",
+            r#"{"name":"x"}"#,
+            404,
+            "proxy not found",
+        ),
+    ] {
+        let reply = request(api, method, path, &json_body, body).await;
+        assert_eq!(reply.code, code, "{method} {path} {body}: {}", reply.body);
+        assert_eq!(json(&reply)["message"], message);
+    }
+    assert_eq!(
+        json(&get(api, "/proxies/sel%201", None).await)["now"],
+        "live",
+        "a refused change changes nothing"
+    );
+
+    // Restarted, it comes back on the choice, not the default.
+    drop(child);
+    let child = start();
+    wait_for(api).await;
+    wait_for(proxy).await;
+    assert_eq!(
+        json(&get(api, "/proxies/sel%201", None).await)["now"],
+        "live"
+    );
+    assert_eq!(reaches(proxy).await, Some(0));
+
+    // DELETE goes back to the default, and that is saved too.
+    assert_eq!(
+        request(api, "DELETE", "/proxies/sel%201", &[], "")
+            .await
+            .code,
+        204
+    );
+    assert_eq!(
+        json(&get(api, "/proxies/sel%201", None).await)["now"],
+        "dead"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(saved["selections"]["sel 1"], "dead", "{saved}");
     drop(child);
 }
 
@@ -937,6 +1141,7 @@ async fn logs_replay_the_backlog_then_stream() {
             state_file: None,
         },
         ports: parking_lot::RwLock::new(Ports::default()),
+        state_file: parking_lot::RwLock::new(None),
         started: std::time::Instant::now(),
         shutdown: tokio_util::sync::CancellationToken::new(),
         log: Some(ring.clone()),

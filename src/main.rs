@@ -31,6 +31,7 @@ mod dns;
 // caller in this binary, which is a property of the build.
 #[allow(dead_code)]
 mod fatal;
+mod group_selection;
 mod h2mux;
 mod http_handler;
 mod http_parse;
@@ -850,6 +851,7 @@ async fn reconcile_api(
         // stays.
         connection_registry::set_cap(want.max_tracked_connections);
         *running.state.ports.write() = clash_api::Ports::from_configs(server_configs);
+        *running.state.state_file.write() = want.state_file.clone();
         return current;
     }
 
@@ -876,6 +878,7 @@ async fn reconcile_api(
     let state = std::sync::Arc::new(clash_api::ApiState {
         config: want.clone(),
         ports: parking_lot::RwLock::new(clash_api::Ports::from_configs(server_configs)),
+        state_file: parking_lot::RwLock::new(want.state_file.clone()),
         started: std::time::Instant::now(),
         shutdown: tokio_util::sync::CancellationToken::new(),
         log: Some(ring),
@@ -906,6 +909,8 @@ struct PreparedServers {
     outbounds: outbound_stats::OutboundSet,
     /// Group membership, installed beside the outbounds.
     groups: outbound_stats::OutboundGroupSet,
+    /// The `select` groups, installed before any chain is built.
+    selections: Vec<group_selection::SelectionSpec>,
     /// The controller this configuration asks for, if any. Carried through
     /// the reload path so the serve loop can compare it to the running one.
     ///
@@ -1029,6 +1034,7 @@ async fn prepare_servers(
         outbounds,
         clash_api,
         groups,
+        selections,
     } = config::create_server_configs(configs)
         .map_err(|e| format!("Failed to create server configs: {e}"))?;
 
@@ -1044,6 +1050,7 @@ async fn prepare_servers(
         dns_registry,
         outbounds,
         groups,
+        selections,
         clash_api,
         sources,
     })
@@ -1062,9 +1069,11 @@ async fn launch_servers(
         mut dns_registry,
         outbounds,
         groups,
+        selections,
         // The serve loop reconciles the controller; launching servers does
         // not touch it, so that a reload's listener survives the restart.
-        clash_api: _,
+        // Only its saved selections are read here.
+        clash_api,
         // The serve loop keeps these to judge the next watcher event.
         sources: _,
     } = prepared;
@@ -1078,6 +1087,17 @@ async fn launch_servers(
     }
     // A reload replaces the listeners, so it replaces their rules too.
     crate::connection_registry::reset_rule_lists();
+    // Before any chain is built, so chains find their group's choice, and
+    // after validation, so a rejected config never touches it.
+    crate::group_selection::install(&selections);
+    // The file mirrors the live choices, so applying it after a reload that
+    // kept them changes nothing; on a start, it is what brings them back.
+    #[cfg(feature = "clash-api")]
+    if let Some(path) = clash_api.as_ref().and_then(|api| api.state_file.as_deref()) {
+        crate::clash_api::state::restore(path);
+    }
+    #[cfg(not(feature = "clash-api"))]
+    let _ = clash_api;
     #[cfg(not(feature = "control-stats"))]
     let _ = (outbounds, groups);
 

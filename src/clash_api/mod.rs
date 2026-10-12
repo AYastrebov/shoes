@@ -16,6 +16,7 @@ pub mod logs;
 pub mod memory;
 pub mod metrics;
 pub mod render;
+pub mod state;
 pub mod streams;
 pub mod ws;
 
@@ -90,6 +91,11 @@ pub struct ApiState {
     /// Behind a lock: a reload that keeps this controller -- same listen,
     /// same secret -- may still have moved the proxies' ports.
     pub ports: parking_lot::RwLock<Ports>,
+    /// Where selections are saved, if anywhere. Behind a lock for the same
+    /// reason as `ports`: a reload that keeps this controller may name a
+    /// different file, and `config` is the block this controller started
+    /// with.
+    pub state_file: parking_lot::RwLock<Option<std::path::PathBuf>>,
     pub started: std::time::Instant,
     /// Cancelled when the controller stops. Every stream it served ends on
     /// it, close frame first, and so does every connection still being
@@ -482,10 +488,10 @@ async fn dispatch(
                 None => error(StatusCode::NOT_FOUND, "proxy not found"),
             }
         }
-        // Selecting a member needs a selectable group, which is the next
-        // slice. Refusing honestly beats a fake success.
-        (Method::PUT, ["proxies", _]) | (Method::DELETE, ["proxies", _]) => {
-            error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+        (Method::PUT, ["proxies", name]) | (Method::DELETE, ["proxies", name]) => {
+            let name = percent_decode(name, false);
+            let method = req.method().clone();
+            select_proxy(req, method, &name, state).await
         }
 
         (Method::GET, ["rules"]) => json(StatusCode::OK, render::rules()),
@@ -569,6 +575,50 @@ async fn dispatch(
         | (_, ["metrics"]) => error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed"),
         _ => error(StatusCode::NOT_FOUND, "Not Found"),
     }
+}
+
+/// `PUT /proxies/{group}` with `{"name": member}` chooses a member;
+/// `DELETE` goes back to the group's default. The responses are sing-box's
+/// (`experimental/clashapi/proxies.go`, `updateProxy`), which is what
+/// awg-manager was written against.
+async fn select_proxy(
+    req: Request<Incoming>,
+    method: Method,
+    name: &str,
+    state: &Arc<ApiState>,
+) -> Response<ApiBody> {
+    // Every dashboard's mode picker; it means something once modes do.
+    if name == "GLOBAL" {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+    }
+    let Some(selection) = crate::group_selection::get(name) else {
+        return match render::proxy(name) {
+            Some(_) => error(StatusCode::BAD_REQUEST, "Must be a Selector"),
+            None => error(StatusCode::NOT_FOUND, "proxy not found"),
+        };
+    };
+    if method == Method::DELETE {
+        selection.reset();
+    } else {
+        #[derive(serde::Deserialize)]
+        struct Choice {
+            name: String,
+        }
+        let body = match read_body(req).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        let Ok(choice) = serde_json::from_slice::<Choice>(&body) else {
+            return error(StatusCode::BAD_REQUEST, "Body invalid");
+        };
+        if !selection.select(&choice.name) {
+            return error(StatusCode::BAD_REQUEST, "Selector update error: not found");
+        }
+    }
+    if let Some(path) = state.state_file.read().as_deref() {
+        state::save(path);
+    }
+    empty(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

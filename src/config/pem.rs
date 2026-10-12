@@ -372,6 +372,16 @@ fn gather_pem_file_paths_from_chain_hop(
                 // GroupName selections are resolved later, skip here
             }
         }
+        // Produced by validation, after this pass; nothing to gather.
+        ClientChainHop::Selected { members, .. } => {
+            for client_config in members.iter_mut() {
+                gather_pem_file_paths_from_client_config(
+                    client_config,
+                    known_pem_paths,
+                    unknown_pem_paths,
+                );
+            }
+        }
     }
 }
 

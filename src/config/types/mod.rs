@@ -41,7 +41,7 @@ pub use client::{
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
-pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
+pub use groups::{ClientConfigGroup, Config, GroupMode, NamedPem, PemSource};
 // Part of the public config surface; the protocol configs that carry it name
 // the module type directly, so the binary does not yet reach for this alias.
 #[allow(unused_imports)]

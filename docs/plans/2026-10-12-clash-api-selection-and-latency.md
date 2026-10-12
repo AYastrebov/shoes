@@ -79,7 +79,7 @@ Verified at `bf1740f`. These facts shape the design.
 | --- | --- | --- |
 | `urltest` interval defaults to 5m | 3m, plus `idle_timeout` default 30m | sing-box's defaults (`constant/timeout.go`), which awg-manager configs were tuned against |
 | `PUT` on a urltest group pins a member until `DELETE` (mihomo) | `400 {"message":"Must be a Selector"}` | sing-box (`updateProxy`); awg-manager only selects on selectors |
-| `select` refuses a chain member that is a pool | `select`/`urltest` members must be leaves, and the group must be the sole entry of the hop that names it | Members are leaves already (groups flatten); a group mixed into a larger pool has no single "selected member" |
+| `select` refuses a chain member that is a pool | `select`/`urltest` members must each be one outbound (a leaf, or a group of one such as `direct`), and the group must be the sole entry of the hop that names it | Members are leaves already (groups flatten); a group mixed into a larger pool has no single "selected member" |
 | Per-leaf ring of ten `history` entries | Kept: ten, newest last | mihomo dashboards plot it; awg-manager reads the last entry; sing-box keeps one, which is a subset |
 | `delay` takes any URL | `http://` is replaced by the default HTTPS URL | sing-box does exactly this (`getProxyDelay`), and awg-manager's default URL is `http://` |
 | `GLOBAL` routing chains built at install for every leaf | Built lazily, per selector, on first use of `mode: global` | A router with hundreds of subscription leaves and a listener per subscription should not pay for a mode it never enters |
@@ -115,9 +115,11 @@ client_proxies: [eu-1, eu-2]
 
 **Validation** (`validate.rs`), each with a test asserting the message:
 - In a `select` group:
-  - a member that is another group's name is refused: "group 'eu' is a
-    selector, so its members must be outbounds, not groups ('asia' is a
-    group)";
+  - a member naming a group of more than one outbound is refused: "client
+    group 'eu' is a selector, so each member must be one outbound; 'asia'
+    is a group of 3". A group of exactly one, such as the built-in
+    `direct`, is one outbound and is accepted;
+  - two members with the same outbound name are refused;
   - `default` must name a member by its `stats_key`.
 - A `select` group referenced inside a `Pool` hop alongside anything else is
   refused: "selector group 'eu' must be the only entry of its hop".

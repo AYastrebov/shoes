@@ -396,6 +396,15 @@ pub enum ClientChainHop {
     /// Can mix inline configs and group references.
     /// Group references are expanded, and all configs are combined into one pool.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
+
+    /// A `select` group, expanded. Never parsed: validation produces it from a
+    /// `Single` reference to a group with `mode: select`, so the chain built
+    /// from it can follow the group's live choice instead of rotating.
+    /// `members` is in the order of `selection.members`.
+    Selected {
+        selection: crate::group_selection::SelectionSpec,
+        members: Vec<ClientConfig>,
+    },
 }
 
 impl<'de> serde::de::Deserialize<'de> for ClientChainHop {
@@ -498,6 +507,9 @@ impl serde::ser::Serialize for ClientChainHop {
                 map.serialize_entry("pool", selections)?;
                 map.end()
             }
+            // As the reference it was expanded from, which is what parses
+            // back into the same thing.
+            ClientChainHop::Selected { selection, .. } => serializer.serialize_str(&selection.name),
         }
     }
 }

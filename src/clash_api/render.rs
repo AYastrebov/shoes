@@ -113,16 +113,29 @@ pub fn proxies(groups_only: bool) -> Value {
     }
 
     for g in outbound_stats::groups() {
-        // A round-robin group is a LoadBalance in Clash terms, and has no
-        // chosen member to report.
+        // The built-in group of one direct outbound shares its name with
+        // that outbound, and the outbound is what a dashboard expects under
+        // it. Listed here, the group replaced the leaf.
+        if g.name == outbound_stats::DIRECT_KEY {
+            continue;
+        }
         let udp = g
             .members
             .iter()
             .all(|m| udp_by_name.get(m.as_str()).copied().unwrap_or(true));
-        map.insert(
-            g.name.clone(),
-            group(&g.name, "LoadBalance", "", &g.members, udp),
-        );
+        // A select group reports its choice; a round-robin group is a
+        // LoadBalance in Clash terms, and has no chosen member to report.
+        let entry = match crate::group_selection::get(&g.name) {
+            Some(selection) => group(
+                &g.name,
+                "Selector",
+                selection.selected_member(),
+                &g.members,
+                udp,
+            ),
+            None => group(&g.name, "LoadBalance", "", &g.members, udp),
+        };
+        map.insert(g.name.clone(), entry);
     }
 
     // Synthetic: every dashboard assumes GLOBAL exists and uses it as the

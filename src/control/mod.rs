@@ -572,6 +572,7 @@ async fn prepare_configs(
         outbounds,
         clash_api,
         groups,
+        selections,
     } = create_server_configs(configs)?;
 
     // A library host -- the daemon, a mobile extension -- does not mount the
@@ -647,6 +648,8 @@ async fn prepare_configs(
     }
     // A reload replaces the listeners, so it replaces their rules too.
     crate::connection_registry::reset_rule_lists();
+    // Before any chain is built, so chains find their group's choice.
+    crate::group_selection::install(&selections);
     #[cfg(not(feature = "control-stats"))]
     let _ = (outbounds, groups);
 

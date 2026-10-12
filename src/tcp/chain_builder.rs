@@ -22,32 +22,15 @@ pub fn build_client_proxy_chain(
     client_chain: crate::option_util::OneOrSome<ClientChainHop>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientProxyChain {
+    // The `select` group each hop follows, if any, in hop order.
+    let mut selections: Vec<Option<Arc<crate::group_selection::GroupSelection>>> = Vec::new();
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
-        .map(|hop| match hop {
-            ClientChainHop::Single(selection) => match selection {
-                ConfigSelection::Config(config) => vec![config],
-                ConfigSelection::GroupName(group_name) => {
-                    panic!(
-                        "Group reference '{}' was not resolved during config validation.",
-                        group_name
-                    );
-                }
-            },
-            ClientChainHop::Pool(selections) => selections
-                .into_vec()
-                .into_iter()
-                .flat_map(|selection| match selection {
-                    ConfigSelection::Config(config) => vec![config],
-                    ConfigSelection::GroupName(group_name) => {
-                        panic!(
-                            "Group reference '{}' was not resolved during config validation.",
-                            group_name
-                        );
-                    }
-                })
-                .collect(),
+        .map(|hop| {
+            let (selection, configs) = hop_configs(hop);
+            selections.push(selection);
+            configs
         })
         .collect();
 
@@ -55,6 +38,58 @@ pub fn build_client_proxy_chain(
         panic!("Client chain must have at least one hop");
     }
 
+    build_chain_from_hops(hops, selections, resolver)
+}
+
+/// A hop's members, and the shared selection when the hop is a `select`
+/// group.
+fn hop_configs(
+    hop: ClientChainHop,
+) -> (
+    Option<Arc<crate::group_selection::GroupSelection>>,
+    Vec<ClientConfig>,
+) {
+    match hop {
+        ClientChainHop::Selected { selection, members } => {
+            (Some(crate::group_selection::for_chain(&selection)), members)
+        }
+        hop => (None, plain_hop_configs(hop)),
+    }
+}
+
+fn plain_hop_configs(hop: ClientChainHop) -> Vec<ClientConfig> {
+    match hop {
+        ClientChainHop::Selected { .. } => unreachable!("handled by hop_configs"),
+        ClientChainHop::Single(selection) => match selection {
+            ConfigSelection::Config(config) => vec![config],
+            ConfigSelection::GroupName(group_name) => {
+                panic!(
+                    "Group reference '{}' was not resolved during config validation.",
+                    group_name
+                );
+            }
+        },
+        ClientChainHop::Pool(selections) => selections
+            .into_vec()
+            .into_iter()
+            .flat_map(|selection| match selection {
+                ConfigSelection::Config(config) => vec![config],
+                ConfigSelection::GroupName(group_name) => {
+                    panic!(
+                        "Group reference '{}' was not resolved during config validation.",
+                        group_name
+                    );
+                }
+            })
+            .collect(),
+    }
+}
+
+fn build_chain_from_hops(
+    hops: Vec<Vec<ClientConfig>>,
+    selections: Vec<Option<Arc<crate::group_selection::GroupSelection>>>,
+    resolver: Arc<dyn Resolver>,
+) -> ClientProxyChain {
     // Same shape as `hops`, so a pool index selects the same member in both.
     // A lookup, not a registration: the running config's outbounds were
     // installed before any chain was built, and building one must not be able
@@ -86,7 +121,7 @@ pub fn build_client_proxy_chain(
             .into_iter()
             .map(build_terminal_connector)
             .collect();
-        let chain = ClientProxyChain::new_terminal(connectors);
+        let chain = ClientProxyChain::new_terminal(connectors).with_selections(selections);
         #[cfg(feature = "control-stats")]
         let chain = chain.with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
         return chain;
@@ -144,7 +179,7 @@ pub fn build_client_proxy_chain(
         })
         .collect();
 
-    let chain = ClientProxyChain::new(initial_hop, subsequent_hops);
+    let chain = ClientProxyChain::new(initial_hop, subsequent_hops).with_selections(selections);
     #[cfg(feature = "control-stats")]
     let chain = {
         let mut counters = hop_counters.into_iter();

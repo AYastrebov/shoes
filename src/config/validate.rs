@@ -16,8 +16,8 @@ use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, HttpUpgradeServerConfig, ObfsConfig, PemSource, RuleActionConfig, RuleConfig,
-    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
+    ExpandedDnsSpec, GroupMode, HttpUpgradeServerConfig, ObfsConfig, PemSource, RuleActionConfig,
+    RuleConfig, ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
     ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
     WebsocketServerConfig, direct_allow_rule,
 };
@@ -51,6 +51,32 @@ pub struct ValidatedConfigs {
     /// proxies by group. Built before expansion, which is the only point
     /// where the nesting is still visible.
     pub groups: crate::outbound_stats::OutboundGroupSet,
+    /// Every `select` group, sorted by name. Installed where a service starts
+    /// (`group_selection::install`), never here, for the reason `outbounds`
+    /// gives.
+    pub selections: Vec<crate::group_selection::SelectionSpec>,
+}
+
+/// Resolved client groups: each name's member configs, flattened, plus the
+/// groups whose connections follow a selection rather than rotating.
+///
+/// Derefs to the member map, which is what nearly every caller reads.
+struct ClientGroups {
+    configs: HashMap<String, Vec<ClientConfig>>,
+    selectors: HashMap<String, crate::group_selection::SelectionSpec>,
+}
+
+impl std::ops::Deref for ClientGroups {
+    type Target = HashMap<String, Vec<ClientConfig>>;
+    fn deref(&self) -> &Self::Target {
+        &self.configs
+    }
+}
+
+impl std::ops::DerefMut for ClientGroups {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.configs
+    }
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -107,10 +133,12 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
     let mut rule_sets: HashMap<String, Arc<RuleSet>> = HashMap::new();
     let mut clash_api: Option<super::types::ClashApiConfig> = None;
+    let mut group_modes: HashMap<String, (GroupMode, Option<String>)> = HashMap::new();
 
     for config in all_configs.into_iter() {
         match config {
             Config::ClientConfigGroup(group) => {
+                group_modes.insert(group.client_group.clone(), (group.mode, group.default));
                 if raw_client_groups
                     .insert(group.client_group.clone(), group.client_proxies)
                     .is_some()
@@ -190,8 +218,25 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         }
     }
 
+    // Selector members are checked against the groups as written, before
+    // resolution flattens away which member was a reference.
+    let raw_selector_members: HashMap<String, Vec<ConfigSelection<ClientConfig>>> = group_modes
+        .iter()
+        .filter(|(_, (mode, _))| *mode == GroupMode::Select)
+        .filter_map(|(name, _)| {
+            raw_client_groups
+                .get(name)
+                .map(|members| (name.clone(), members.iter().cloned().collect()))
+        })
+        .collect();
+
     // Resolve client groups using topological sort
-    let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
+    let resolved = resolve_client_groups_topologically(raw_client_groups)?;
+    let selectors = selector_specs(&resolved, &group_modes, &raw_selector_members)?;
+    let mut client_groups = ClientGroups {
+        configs: resolved,
+        selectors,
+    };
 
     // A group nothing references is still a configured server, and a person
     // expects to see it listed at zero rather than missing.
@@ -295,13 +340,82 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
+    let mut selections: Vec<_> = client_groups.selectors.into_values().collect();
+    selections.sort_by(|a, b| a.name.cmp(&b.name));
+
     Ok(ValidatedConfigs {
         configs: result,
         dns_groups: final_dns_groups,
         outbounds,
         clash_api,
         groups,
+        selections,
     })
+}
+
+/// Check every `select` group and describe it for the runtime.
+///
+/// A selector's choice is one outbound, so each member must be one: an inline
+/// config, or a reference to a group that resolves to exactly one (such as the
+/// built-in `direct`). Members are named by outbound name, so two members with
+/// the same name could not be told apart.
+fn selector_specs(
+    resolved: &HashMap<String, Vec<ClientConfig>>,
+    modes: &HashMap<String, (GroupMode, Option<String>)>,
+    raw_members: &HashMap<String, Vec<ConfigSelection<ClientConfig>>>,
+) -> std::io::Result<HashMap<String, crate::group_selection::SelectionSpec>> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    let mut specs = HashMap::new();
+    for (name, (mode, default)) in modes {
+        if *mode != GroupMode::Select {
+            if default.is_some() {
+                return Err(invalid(format!(
+                    "client group '{name}': 'default' applies only to mode: select"
+                )));
+            }
+            continue;
+        }
+        for member in raw_members.get(name).into_iter().flatten() {
+            if let ConfigSelection::GroupName(reference) = member {
+                let size = resolved.get(reference).map_or(0, Vec::len);
+                if size != 1 {
+                    return Err(invalid(format!(
+                        "client group '{name}' is a selector, so each member must be one \
+                         outbound; '{reference}' is a group of {size}"
+                    )));
+                }
+            }
+        }
+        let members = resolved[name]
+            .iter()
+            .map(ClientConfig::stats_key)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let mut seen = HashSet::new();
+        if let Some(duplicate) = members.iter().find(|m| !seen.insert(m.as_str())) {
+            return Err(invalid(format!(
+                "client group '{name}' lists '{duplicate}' twice; a selector's members need \
+                 distinct names"
+            )));
+        }
+        let default_index = match default {
+            None => 0,
+            Some(wanted) => members.iter().position(|m| m == wanted).ok_or_else(|| {
+                invalid(format!(
+                    "client group '{name}': default '{wanted}' is not one of its members ({})",
+                    members.join(", ")
+                ))
+            })?,
+        };
+        specs.insert(
+            name.clone(),
+            crate::group_selection::SelectionSpec {
+                name: name.clone(),
+                members,
+                default_index,
+            },
+        );
+    }
+    Ok(specs)
 }
 
 /// Resolves client group references using topological sort.
@@ -536,21 +650,22 @@ struct TunDnsVerdict {
 
 fn tun_dns_verdicts(groups: &[ExpandedDnsGroup]) -> HashMap<&str, TunDnsVerdict> {
     fn chain_hop_hostname(chains: &[ClientChain]) -> Option<&str> {
-        chains
-            .iter()
-            .flat_map(|chain| chain.hops.iter())
-            .flat_map(
-                |hop| -> Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> {
-                    match hop {
-                        ClientChainHop::Single(sel) => Box::new(std::iter::once(sel)),
-                        ClientChainHop::Pool(pool) => Box::new(pool.iter()),
-                    }
-                },
-            )
-            .find_map(|sel| match sel {
+        fn selection_hostname(sel: &ConfigSelection<ClientConfig>) -> Option<&str> {
+            match sel {
                 ConfigSelection::Config(cfg) => cfg.address.address().hostname(),
                 // Group refs are resolved to configs during expansion.
                 ConfigSelection::GroupName(_) => None,
+            }
+        }
+        chains
+            .iter()
+            .flat_map(|chain| chain.hops.iter())
+            .find_map(|hop| match hop {
+                ClientChainHop::Single(sel) => selection_hostname(sel),
+                ClientChainHop::Pool(pool) => pool.iter().find_map(selection_hostname),
+                ClientChainHop::Selected { members, .. } => members
+                    .iter()
+                    .find_map(|cfg| cfg.address.address().hostname()),
             })
     }
 
@@ -752,7 +867,7 @@ fn validate_dns_group_ref(
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     named_pems: &HashMap<String, String>,
     dns_group_names: &HashSet<&str>,
     outbounds: &mut crate::outbound_stats::OutboundSet,
@@ -871,12 +986,15 @@ fn is_chain_direct_only(chain: &ClientChain) -> bool {
             ConfigSelection::Config(config) => config.protocol.is_direct(),
             ConfigSelection::GroupName(_) => false,
         }),
+        ClientChainHop::Selected { members, .. } => {
+            members.iter().all(|config| config.protocol.is_direct())
+        }
     }
 }
 
 fn validate_server_config(
     server_config: &mut ServerConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
@@ -1803,7 +1921,7 @@ fn parse_ip_prefix(s: &str) -> Result<(std::net::IpAddr, u8), String> {
 
 fn validate_server_proxy_config(
     server_proxy_config: &mut ServerProxyConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
@@ -2223,7 +2341,7 @@ fn validate_macos_tun_device(
 
 fn validate_tun_config(
     config: &mut TunConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
     outbounds: &mut crate::outbound_stats::OutboundSet,
@@ -2381,7 +2499,7 @@ fn validate_tun_config(
 
 fn validate_rule_config(
     rule_config: &mut RuleConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
     outbounds: &mut crate::outbound_stats::OutboundSet,
@@ -2482,6 +2600,9 @@ fn validate_direct_connector_positions(
                     }
                 })
             }
+            ClientChainHop::Selected { members, .. } => {
+                members.iter().any(|config| config.protocol.is_direct())
+            }
         };
 
         if has_direct {
@@ -2562,7 +2683,7 @@ fn validate_amneziawg_chain_position(
 
 fn validate_client_chain_hop(
     hop: &mut ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
     match hop {
@@ -2574,6 +2695,13 @@ fn validate_client_chain_hop(
                 validate_and_expand_selection(selection, client_groups, named_pems)?;
             }
         }
+        // Only expansion produces it, and its members came from a group that
+        // was validated as a group.
+        ClientChainHop::Selected { members, .. } => {
+            for config in members.iter_mut() {
+                validate_client_config(config, named_pems)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2581,7 +2709,7 @@ fn validate_client_chain_hop(
 /// Validates a ConfigSelection and expands group references to inline configs.
 fn validate_and_expand_selection(
     selection: &mut ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
     match selection {
@@ -2609,7 +2737,7 @@ fn validate_and_expand_selection(
 /// selections with their actual configs.
 fn expand_client_chain(
     client_chain: &mut OneOrSome<ClientChainHop>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     let expanded_hops: Vec<ClientChainHop> = client_chain
@@ -2628,10 +2756,23 @@ fn expand_client_chain(
 /// Expands a single chain hop by resolving all group references.
 fn expand_chain_hop(
     hop: &ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<ClientChainHop> {
     match hop {
+        ClientChainHop::Single(ConfigSelection::GroupName(name))
+            if client_groups.selectors.contains_key(name) =>
+        {
+            let members = expand_selection(
+                &ConfigSelection::GroupName(name.clone()),
+                client_groups,
+                outbounds,
+            )?;
+            Ok(ClientChainHop::Selected {
+                selection: client_groups.selectors[name].clone(),
+                members,
+            })
+        }
         ClientChainHop::Single(selection) => {
             let configs = expand_selection(selection, client_groups, outbounds)?;
             // Single becomes a Pool if the group has multiple configs
@@ -2648,6 +2789,19 @@ fn expand_chain_hop(
         ClientChainHop::Pool(selections) => {
             let mut all_configs = vec![];
             for selection in selections.iter() {
+                // A selector picks one member; inside a larger pool there
+                // would be no single member for it to pick.
+                if let ConfigSelection::GroupName(name) = selection
+                    && client_groups.selectors.contains_key(name)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "client group '{name}' is a selector, so it must be the only \
+                             entry of its hop, not part of a pool"
+                        ),
+                    ));
+                }
                 all_configs.extend(expand_selection(selection, client_groups, outbounds)?);
             }
             Ok(ClientChainHop::Pool(OneOrSome::Some(
@@ -2657,13 +2811,14 @@ fn expand_chain_hop(
                     .collect(),
             )))
         }
+        ClientChainHop::Selected { .. } => Ok(hop.clone()),
     }
 }
 
 /// Expands a single selection to its constituent configs.
 fn expand_selection(
     selection: &ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &ClientGroups,
     outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<Vec<ClientConfig>> {
     let configs = match selection {
@@ -3301,6 +3456,221 @@ mod tests {
         Ok(validated.configs)
     }
 
+    /// Two named socks leaves, a group over them with `extra` group fields,
+    /// and a listener whose one rule routes through `hop` (YAML for a hop).
+    fn selector_yaml(extra: &str, hop: &str) -> String {
+        format!(
+            r#"
+- client_group: eu
+  {extra}
+  client_proxies:
+    - name: eu-1
+      address: 127.0.0.1:1081
+      protocol:
+        type: socks
+    - name: eu-2
+      address: 127.0.0.1:1082
+      protocol:
+        type: socks
+- client_group: pair
+  client_proxies:
+    - name: p-1
+      address: 127.0.0.1:1083
+      protocol:
+        type: socks
+    - name: p-2
+      address: 127.0.0.1:1084
+      protocol:
+        type: socks
+- address: 127.0.0.1:0
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain: {hop}
+"#
+        )
+    }
+
+    async fn validate_selector_yaml(extra: &str, hop: &str) -> std::io::Result<ValidatedConfigs> {
+        let configs: Vec<Config> = serde_yaml::from_str(&selector_yaml(extra, hop)).unwrap();
+        let (configs, _) = convert_cert_paths(configs).await?;
+        create_server_configs(configs)
+    }
+
+    fn refused(result: std::io::Result<ValidatedConfigs>) -> std::io::Error {
+        match result {
+            Ok(_) => panic!("the config was accepted"),
+            Err(e) => e,
+        }
+    }
+
+    fn the_rule_hop(validated: &ValidatedConfigs) -> ClientChainHop {
+        let server = validated
+            .configs
+            .iter()
+            .find_map(|c| match c {
+                Config::Server(s) => Some(s),
+                _ => None,
+            })
+            .expect("a listener");
+        let rule = match &server.rules {
+            NoneOrSome::One(ConfigSelection::Config(rule)) => rule,
+            NoneOrSome::Some(rules) => match &rules[0] {
+                ConfigSelection::Config(rule) => rule,
+                other => panic!("unexpanded rule {other:?}"),
+            },
+            other => panic!("no rule: {other:?}"),
+        };
+        match &rule.action {
+            RuleActionConfig::Allow { client_chains, .. } => client_chains
+                .iter()
+                .next()
+                .unwrap()
+                .hops
+                .iter()
+                .next()
+                .unwrap()
+                .clone(),
+            other => panic!("not allow: {other:?}"),
+        }
+    }
+
+    /// A rule naming a `select` group gets a hop that carries the group, its
+    /// members in order and its default -- what the chain follows at runtime.
+    #[tokio::test]
+    async fn a_selector_reference_becomes_a_selected_hop() {
+        let validated = validate_selector_yaml("mode: select\n  default: eu-2", "eu")
+            .await
+            .unwrap();
+        let expected = crate::group_selection::SelectionSpec {
+            name: "eu".into(),
+            members: vec!["eu-1".into(), "eu-2".into()],
+            default_index: 1,
+        };
+        assert_eq!(validated.selections, vec![expected.clone()]);
+        match the_rule_hop(&validated) {
+            ClientChainHop::Selected { selection, members } => {
+                assert_eq!(selection, expected);
+                let names: Vec<_> = members.iter().map(|m| m.stats_key().unwrap()).collect();
+                assert_eq!(names, ["eu-1", "eu-2"]);
+            }
+            other => panic!("expected a selected hop, got {other:?}"),
+        }
+    }
+
+    /// Without `default` a selector starts on its first member, as sing-box's
+    /// does; a round-robin group still expands to a plain pool.
+    #[tokio::test]
+    async fn defaults_and_round_robin_are_unchanged() {
+        let validated = validate_selector_yaml("mode: select", "pair")
+            .await
+            .unwrap();
+        assert_eq!(validated.selections[0].default_index, 0);
+        assert!(matches!(the_rule_hop(&validated), ClientChainHop::Pool(_)));
+    }
+
+    /// A member that is a group of one outbound -- the built-in `direct` is
+    /// the common case -- is still one outbound, so it may be selected.
+    #[tokio::test]
+    async fn a_selector_may_name_a_single_outbound_group() {
+        let yaml = r#"
+- client_group: pick
+  mode: select
+  default: direct
+  client_proxies:
+    - direct
+    - name: eu-1
+      address: 127.0.0.1:1081
+      protocol:
+        type: socks
+- address: 127.0.0.1:0
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain: pick
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let validated = create_server_configs(configs).unwrap();
+        assert_eq!(validated.selections[0].members, ["direct", "eu-1"]);
+        assert_eq!(validated.selections[0].default_index, 0);
+    }
+
+    #[tokio::test]
+    async fn selector_mistakes_are_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "mode: select\n  default: eu-9",
+                "eu",
+                "default 'eu-9' is not one of its members (eu-1, eu-2)",
+            ),
+            (
+                "default: eu-1",
+                "eu",
+                "'default' applies only to mode: select",
+            ),
+            (
+                "mode: select",
+                "[{ pool: [eu, pair] }]",
+                "client group 'eu' is a selector, so it must be the only entry of its hop",
+            ),
+        ];
+        for (extra, hop, expected) in cases {
+            let err = refused(validate_selector_yaml(extra, hop).await);
+            assert!(err.to_string().contains(expected), "{extra} / {hop}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_selector_member_must_be_one_outbound() {
+        let yaml = r#"
+- client_group: pair
+  client_proxies:
+    - name: p-1
+      address: 127.0.0.1:1083
+      protocol:
+        type: socks
+    - name: p-2
+      address: 127.0.0.1:1084
+      protocol:
+        type: socks
+- client_group: pick
+  mode: select
+  client_proxies: [pair, direct]
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = refused(create_server_configs(configs));
+        assert!(
+            err.to_string().contains(
+                "'pick' is a selector, so each member must be one outbound; 'pair' is a group of 2"
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selector_member_name_must_be_unique() {
+        let yaml = r#"
+- client_group: pick
+  mode: select
+  client_proxies:
+    - name: same
+      address: 127.0.0.1:1083
+      protocol:
+        type: socks
+    - name: same
+      address: 127.0.0.1:1083
+      protocol:
+        type: socks
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = refused(create_server_configs(configs));
+        assert!(err.to_string().contains("lists 'same' twice"), "{err}");
+    }
+
     fn tun_yaml_with_dns(server_url: &str, bootstrap: Option<&str>) -> String {
         let bootstrap_line = match bootstrap {
             Some(b) => format!("\n        bootstrap_url: \"{b}\""),
@@ -3466,6 +3836,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-group".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
         ];
 
@@ -3481,10 +3853,14 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
         ];
 
@@ -3499,10 +3875,14 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string())),
+                mode: Default::default(),
+                default: None,
             }),
         ];
 
@@ -3522,6 +3902,8 @@ mod tests {
         let configs = vec![Config::ClientConfigGroup(ClientConfigGroup {
             client_group: "group-a".to_string(),
             client_proxies: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string())),
+            mode: Default::default(),
+            default: None,
         })];
 
         let result = validate_configs_test(configs).await;
@@ -3542,14 +3924,20 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-d".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-c".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "group-a".to_string(),
@@ -3557,6 +3945,8 @@ mod tests {
                     ConfigSelection::GroupName("group-b".to_string()),
                     ConfigSelection::GroupName("group-c".to_string()),
                 ]),
+                mode: Default::default(),
+                default: None,
             }),
         ];
 
@@ -3571,10 +3961,14 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "us-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "eu-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "all-proxies".to_string(),
@@ -3582,6 +3976,8 @@ mod tests {
                     ConfigSelection::GroupName("us-proxies".to_string()),
                     ConfigSelection::GroupName("eu-proxies".to_string()),
                 ]),
+                mode: Default::default(),
+                default: None,
             }),
         ];
 
@@ -4205,6 +4601,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4241,6 +4639,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4279,6 +4679,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4315,6 +4717,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4344,6 +4748,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4374,6 +4780,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -4404,6 +4812,8 @@ mod tests {
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+                mode: Default::default(),
+                default: None,
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
