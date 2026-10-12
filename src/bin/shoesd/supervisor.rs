@@ -35,10 +35,11 @@ use crate::host::{AppliedState, HostNetwork, Plan, Session};
 #[cfg(unix)]
 fn device_policy() -> DeviceOverride {
     DeviceOverride {
-        // Left to the kernel: choosing a `utun` unit races every other utun
-        // user on the machine, and the name comes back through
-        // `StatusSnapshot::device_name`.
-        device_name: None,
+        // macOS leaves it to the kernel: choosing a `utun` unit races every
+        // other utun user on the machine, and the name comes back through
+        // `StatusSnapshot::device_name`. Linux is the opposite and requires
+        // one (`config::validate`), so it gets the name Windows uses.
+        device_name: cfg!(target_os = "linux").then(|| DAEMON_DEVICE_NAME.to_string()),
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
         netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
         destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
@@ -58,7 +59,7 @@ fn device_policy() -> DeviceOverride {
 #[cfg(windows)]
 fn device_policy() -> DeviceOverride {
     DeviceOverride {
-        device_name: Some(WINDOWS_ADAPTER_NAME.to_string()),
+        device_name: Some(DAEMON_DEVICE_NAME.to_string()),
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
         netmask: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
         destination: None,
@@ -66,10 +67,11 @@ fn device_policy() -> DeviceOverride {
     }
 }
 
-/// The wintun adapter's name, which is also its interface alias -- what the
-/// Windows host resolves to a LUID for every route and DNS call.
-#[cfg(windows)]
-const WINDOWS_ADAPTER_NAME: &str = "shoesd";
+/// The device's name where the daemon chooses one. On Windows it is the
+/// wintun adapter's name, which is also its interface alias -- what the host
+/// resolves to a LUID for every route and DNS call. On Linux it is the
+/// interface name; macOS does not use it.
+const DAEMON_DEVICE_NAME: &str = "shoesd";
 
 /// How long to wait for the engine to create its device.
 ///
@@ -681,6 +683,26 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, StopOutcome::Released));
+    }
+
+    /// The document the proto tells clients to send passes this platform's
+    /// own validation once the daemon's policy replaces its device section.
+    ///
+    /// Linux requires a device name, and a policy that left it to the kernel
+    /// -- right on macOS -- refused every `Start` there before the engine
+    /// was reached.
+    #[test]
+    fn the_device_policy_passes_this_platforms_validation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(control::prepare_from_config_owning_device(
+                "---\n- device_fd: 0\n",
+                device_policy(),
+            ))
+            .expect("the policy yields a device this platform accepts");
     }
 
     /// A config that will not parse fails in front of the caller, with
