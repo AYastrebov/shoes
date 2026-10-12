@@ -50,7 +50,12 @@ message StartRequest {
   // stand-in, and any `device_name`, `address` or `netmask`: the daemon
   // replaces that whole section with its own per-OS device policy, so the
   // client has no platform branches. On macOS that is 10.0.0.2 peer 10.0.0.1,
-  // netmask 255.255.255.0 -- the same values the iOS provider uses.
+  // netmask 255.255.255.0 -- the same values the iOS provider uses. On Linux
+  // and Windows the interface is named `shoesd`.
+  //
+  // The document may hold only the TUN entry and what it routes to. A server
+  // section -- a SOCKS, HTTP or any other listener -- is INVALID_ARGUMENT: the
+  // daemon runs as root and never opens a port.
   //
   // `mtu` is the exception and stays the client's: it is a property of the
   // path rather than of the host.

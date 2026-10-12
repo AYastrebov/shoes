@@ -433,6 +433,20 @@ pub struct PreparedService {
     policy: DevicePolicy,
 }
 
+impl PreparedService {
+    /// Where each listener the document declares would bind, one entry per
+    /// server section. Empty for a document that is only a TUN.
+    ///
+    /// For a host that must not run listeners at all: `shoesd` runs as root,
+    /// and a listener there is a port anyone in the socket's group could open.
+    pub fn listener_addresses(&self) -> Vec<String> {
+        self.server_configs
+            .iter()
+            .map(|config| config.bind_location.to_string())
+            .collect()
+    }
+}
+
 /// Start the service from a config YAML string.
 ///
 /// This parses the config YAML and starts both TUN and any Server configs

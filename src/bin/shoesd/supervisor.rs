@@ -419,6 +419,24 @@ impl<N: HostNetwork> Inner<N> {
                 StartError::Config(e)
             })?;
 
+        // Refused rather than stripped: a client that asked for a listener
+        // believes it has one. The engine would run it as root, so this is
+        // the daemon's founding rule, not a preference.
+        let listeners = prepared.listener_addresses();
+        if !listeners.is_empty() {
+            self.transition(State::Stopped {
+                reason: StopReason::Requested,
+            });
+            return Err(StartError::Config(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "this daemon runs only the tunnel, and the config also declares a \
+                     listener on {}; remove the server section",
+                    listeners.join(", ")
+                ),
+            )));
+        }
+
         let exit_channel = self.exit_channel.clone();
         let handle = control::start(runtime, prepared, move |reason| {
             // Posted rather than acted on: this runs on one of the engine's
@@ -735,6 +753,37 @@ mod tests {
             },
             "a failed start must not leave the session Starting"
         );
+    }
+
+    /// A listener in the document is refused, not started. The engine would
+    /// run it as root, and anyone in the socket's group could open a SOCKS
+    /// port with no authentication just by asking for one.
+    ///
+    /// The document is otherwise valid, so the refusal is the only thing that
+    /// can produce a config error here: without it, prepare succeeds and the
+    /// start fails later, on the device.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listener_in_the_document_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(&dir);
+
+        let yaml = "---\n\
+                    - device_fd: 0\n\
+                    - address: 127.0.0.1:0\n  \
+                      protocol:\n    \
+                        type: socks\n"
+            .to_owned();
+        let result = tokio::task::spawn_blocking(move || supervisor.start(yaml, vec![], vec![]))
+            .await
+            .unwrap();
+
+        match result {
+            Err(StartError::Config(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(e.to_string().contains("127.0.0.1:0"), "got: {e}");
+            }
+            other => panic!("expected a config refusal, got {other:?}"),
+        }
     }
 
     /// Transitions reach a watcher, which is what `WatchStatus` streams. The
