@@ -574,7 +574,12 @@ impl ShadowsocksStream {
                     buf.len(),
                     self.write_cache.len() - self.write_cache_end_offset - METADATA_SIZE,
                 );
-                assert!(handled_len > 0);
+                if handled_len == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "empty initial shadowsocks write",
+                    ));
+                }
 
                 self.encrypt_single(&buf[0..handled_len], true)
                     .map_err(|_| std::io::Error::other("failed to encrypt initial packet"))?;
@@ -631,13 +636,14 @@ impl ShadowsocksStream {
                 // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
                 // with the address and padding, and we need to send it all off in a single packet.
                 let buf_len = buf.len();
-                assert!(
-                    buf_len
-                        <= self.write_cache.len()
-                            - self.salt_len
-                            - (request_header.len() + TAG_LEN)
-                            - TAG_LEN
-                );
+                if buf_len
+                    > self.write_cache.len()
+                        - self.salt_len
+                        - (request_header.len() + TAG_LEN)
+                        - TAG_LEN
+                {
+                    return Err(message_too_large(buf_len));
+                }
 
                 request_header[9] = (buf_len >> 8) as u8;
                 request_header[10] = (buf_len & 0xff) as u8;
@@ -784,9 +790,13 @@ impl AsyncWrite for ShadowsocksStream {
         // do something smarter?
         let this = self.get_mut();
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if this.is_initial_write {
             let handled_len = this.process_write_header(buf)?;
-            assert!(handled_len > 0 && this.write_cache_end_offset > 0);
+            debug_assert!(handled_len > 0 && this.write_cache_end_offset > 0);
             this.is_initial_write = false;
 
             if let Err(e) = this.do_write_cache(cx) {
@@ -871,6 +881,13 @@ impl AsyncReadMessage for ShadowsocksStream {
     }
 }
 
+fn message_too_large(len: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{len}-byte message does not fit one shadowsocks chunk"),
+    )
+}
+
 impl AsyncWriteMessage for ShadowsocksStream {
     fn poll_write_message(
         self: Pin<&mut Self>,
@@ -881,14 +898,18 @@ impl AsyncWriteMessage for ShadowsocksStream {
 
         if this.is_initial_write {
             let handled_len = this.process_write_header(buf)?;
-            assert!(handled_len == buf.len());
             this.is_initial_write = false;
+            if handled_len != buf.len() {
+                return Poll::Ready(Err(message_too_large(buf.len())));
+            }
             return Poll::Ready(Ok(()));
         }
 
         let write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
         let packet_size = buf.len() + METADATA_SIZE;
-        assert!(packet_size <= this.write_cache.len());
+        if packet_size > this.write_cache.len() {
+            return Poll::Ready(Err(message_too_large(buf.len())));
+        }
 
         if packet_size > write_cache_space {
             return Poll::Pending;
@@ -987,6 +1008,30 @@ mod tests {
 
         client.abort();
         Ok(received)
+    }
+
+    /// A message stream carries one datagram per chunk; one too big for a chunk is the
+    /// caller's error, not an abort, on the first write and on later ones.
+    #[tokio::test]
+    async fn test_a_message_over_the_chunk_cap_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut client = stream(tcp, ShadowsocksStreamType::Aead);
+        let too_big = vec![0u8; 20_000];
+
+        let first =
+            std::future::poll_fn(|cx| Pin::new(&mut client).poll_write_message(cx, &too_big))
+                .await
+                .unwrap_err();
+        assert_eq!(first.kind(), std::io::ErrorKind::InvalidInput);
+
+        let later =
+            std::future::poll_fn(|cx| Pin::new(&mut client).poll_write_message(cx, &too_big))
+                .await
+                .unwrap_err();
+        assert_eq!(later.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
