@@ -429,7 +429,6 @@ async fn handle_h2mux_tcp(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-            ..
         } => {
             debug!("H2MUX TCP: connecting to {} via chain", remote_location);
 
@@ -473,7 +472,6 @@ async fn handle_h2mux_udp(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-            ..
         } => {
             // Connect to destination
             let client_stream = chain_group

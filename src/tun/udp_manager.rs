@@ -513,17 +513,6 @@ async fn destination_task(
     mut write_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<UdpMessage>,
 ) {
-    // One entry per flow, which is what this task is. `source_addr` is the
-    // destination the flow talks to (it is the *source* of the replies this
-    // task reads, which is where the name comes from).
-    let registered = crate::connection_registry::register(
-        peer_addr,
-        "tun",
-        crate::connection_registry::Network::Udp,
-    );
-    registered.set_destination(&crate::address::NetLocation::from(source_addr));
-    let _flow_counters = registered.counters();
-
     let mut read_buf = vec![0u8; 65535];
     let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
     tokio::pin!(sleep);
@@ -554,11 +543,6 @@ async fn destination_task(
                     break;
                 }
                 traffic::add_download_bytes(len as u64);
-                if let Some(counters) = _flow_counters.as_ref() {
-                    counters
-                        .down
-                        .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
-                }
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
 
                 debug!(
@@ -592,11 +576,6 @@ async fn destination_task(
                 {
                     Ok(Ok(())) => {
                         traffic::add_upload_bytes(payload_len);
-                        if let Some(counters) = _flow_counters.as_ref() {
-                            counters
-                                .up
-                                .fetch_add(payload_len, std::sync::atomic::Ordering::Relaxed);
-                        }
                     }
                     Ok(Err(e)) => {
                         debug!(
@@ -638,7 +617,6 @@ async fn create_connection(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-            ..
         } => {
             let stream = chain_group
                 .connect_udp_bidirectional(resolver, remote_location)

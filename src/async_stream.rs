@@ -218,6 +218,9 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync 
     /// permit -- forwards its inner stream's answer, adding itself to
     /// `counters` if it counts, since the bytes will no longer pass through
     /// its `poll_read` and `poll_write`.
+    ///
+    /// Only the Linux relay asks; elsewhere every answer goes unread.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
         None
     }

@@ -526,7 +526,6 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                     ConnectDecision::Allow {
                         chain_group,
                         remote_location,
-                        ..
                     } => {
                         let client_stream = chain_group
                             .connect_udp_bidirectional(&resolver, remote_location)
@@ -575,7 +574,6 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-            ..
         } => {
             let result = chain_group.connect_tcp(remote_location, &resolver).await?;
             result.client_stream

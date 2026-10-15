@@ -34,7 +34,6 @@ async fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
     sniff: Option<SniffSettings>,
-    inbound: &'static str,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
@@ -111,8 +110,7 @@ async fn start_quic_server(
                 let sniff = sniff.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) =
-                        process_connection(resolver, server_handler, conn, sniff, inbound).await
+                    if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
                     {
                         // Same triage as the TCP accept loops: scanner
                         // probes and half-open handshakes are continuous on
@@ -142,12 +140,8 @@ async fn process_connection(
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
     sniff: Option<SniffSettings>,
-    inbound: &'static str,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
-    // One QUIC connection carries many streams, each of which is its own
-    // entry; the peer address is the same for all of them.
-    let source = connection.remote_address();
 
     loop {
         let stream = match connection.accept_bi().await {
@@ -164,15 +158,8 @@ async fn process_connection(
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_streams(
-                cloned_resolver,
-                cloned_handler,
-                stream,
-                cloned_sniff,
-                source,
-                inbound,
-            )
-            .await
+            if let Err(e) =
+                process_streams(cloned_resolver, cloned_handler, stream, cloned_sniff).await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -187,18 +174,8 @@ async fn process_streams(
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
     sniff: Option<SniffSettings>,
-    source: std::net::SocketAddr,
-    inbound: &'static str,
 ) -> std::io::Result<()> {
-    let handle = crate::connection_registry::register(
-        source,
-        inbound,
-        crate::connection_registry::Network::Tcp,
-    );
-    let quic_stream: Box<dyn AsyncStream> = Box::new(crate::connection_registry::counted(
-        QuicStream::from(send, recv),
-        &handle,
-    ));
+    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
@@ -221,16 +198,6 @@ async fn process_streams(
         }
     };
 
-    match &setup_result {
-        TcpServerSetupResult::TcpForward {
-            remote_location, ..
-        }
-        | TcpServerSetupResult::BidirectionalUdp {
-            remote_location, ..
-        } => handle.set_destination(remote_location),
-        _ => {}
-    }
-
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -249,7 +216,6 @@ async fn process_streams(
                 proxy_selector,
                 resolver,
                 sniff,
-                handle,
             })
             .await
         }
@@ -259,7 +225,6 @@ async fn process_streams(
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let _handle = handle;
             let action = proxy_selector
                 .judge(remote_location.into(), &resolver)
                 .await?;
@@ -267,7 +232,6 @@ async fn process_streams(
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
-                    ..
                 } => {
                     let client_stream = chain_group
                         .connect_udp_bidirectional(&resolver, remote_location)
@@ -289,7 +253,6 @@ async fn process_streams(
             need_initial_flush,
             proxy_selector,
         } => {
-            let _handle = handle;
             // Routes each packet based on its destination
             run_udp_routing(
                 ServerStream::Targeted(server_stream),
@@ -304,7 +267,6 @@ async fn process_streams(
             need_initial_flush,
             proxy_selector,
         } => {
-            let _handle = handle;
             // Routes each session based on its destination
             run_udp_routing(
                 ServerStream::Session(server_stream),
@@ -315,8 +277,6 @@ async fn process_streams(
             .await
         }
         TcpServerSetupResult::AlreadyHandled => {
-            // The entry goes with the handle as this arm returns; see the
-            // TCP path for why, and why there is no explicit `drop`.
             // Connection already handled by a spawned task (e.g., Reality fallback)
             Ok(())
         }
@@ -476,8 +436,6 @@ pub async fn start_quic_servers(
                     .clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
-                let inbound =
-                    crate::tcp::tcp_server::inbound_label(&tcp_protocol, &bind_address.to_string());
                 let quic_handles = start_quic_server(
                     bind_address,
                     quic_server_config,
@@ -485,7 +443,6 @@ pub async fn start_quic_servers(
                     tcp_handler,
                     num_endpoints,
                     sniff.clone(),
-                    inbound,
                 )
                 .await?;
 
