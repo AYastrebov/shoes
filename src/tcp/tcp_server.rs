@@ -511,7 +511,8 @@ async fn start_tcp_servers(
     Ok(handles)
 }
 
-#[cfg(test)]
+// Unix only: the errnos the one test names are libc's.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -519,7 +520,6 @@ mod tests {
     /// spins; ECONNABORTED does consume it, so backing off would only
     /// slow real clients behind it.
     #[test]
-    #[cfg(unix)]
     fn only_resource_exhaustion_backs_the_accept_loop_off() {
         for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
             assert!(accept_exhausted_a_resource(
