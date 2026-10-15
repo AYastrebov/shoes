@@ -8,14 +8,13 @@ use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::Redacted;
 use crate::config::{
-    ClientChainHop, ClientProxyConfig, ConfigSelection, HttpUpgradeClientConfig, RuleActionConfig,
-    RuleConfig, ShadowsocksConfig, TlsClientConfig, WebsocketClientConfig,
+    ClientProxyConfig, HttpUpgradeClientConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig,
+    TlsClientConfig, WebsocketClientConfig,
 };
 use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
 use crate::httpupgrade::HttpUpgradeTcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
-use crate::option_util::OneOrSome;
 use crate::port_forward_handler::PortForwardClientHandler;
 use crate::resolver::Resolver;
 use crate::rustls_config_util::create_client_config;
@@ -410,23 +409,8 @@ pub fn create_tcp_client_proxy_selector(
                 masks,
                 loaded_rule_sets,
                 action,
-                group_name,
                 ..
             } = rule_config;
-            // What to show as this rule's proxy when it has no group name:
-            // the one outbound it routes through, when there is exactly one.
-            // Anything else is a chain or a pool and shows as such.
-            let proxy_hint = match &action {
-                RuleActionConfig::Allow { client_chains, .. } if client_chains.len() == 1 => {
-                    match client_chains.iter().next().map(|c| &c.hops) {
-                        Some(OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                            config,
-                        )))) => config.stats_key().ok(),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
@@ -438,13 +422,7 @@ pub fn create_tcp_client_proxy_selector(
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
             ConnectRule::new(masks.into_vec(), loaded_rule_sets, connect_action)
-                .with_group(group_name)
-                .with_proxy_hint(proxy_hint)
         })
         .collect::<Vec<_>>();
-    let selector = ClientProxySelector::new(rules);
-    // Recorded for a controller listing rules. Identity-deduplicated there,
-    // so several listeners sharing one selector list their rules once.
-    crate::connection_registry::install_rule_list(selector.rule_summaries());
-    selector
+    ClientProxySelector::new(rules)
 }

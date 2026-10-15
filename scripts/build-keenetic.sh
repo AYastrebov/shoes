@@ -15,7 +15,7 @@
 #
 # Usage: scripts/build-keenetic.sh [profile] [features]
 #   profile   release (default) or release-mobile (opt-level s, panic abort)
-#   features  default: clash-api
+#   features  default: none
 #
 # Output: dist/keenetic/shoes-<profile>-<entware arch>
 set -euo pipefail
@@ -29,19 +29,21 @@ cd "$(dirname "$0")/.."
 NIGHTLY=${NIGHTLY:-nightly-2026-09-11}
 
 profile=${1:-release}
-features=${2:-clash-api}
+features=${2:-}
 export CROSS_CONTAINER_ENGINE=${CROSS_CONTAINER_ENGINE:-$(command -v podman >/dev/null && echo podman || echo docker)}
 mkdir -p dist/keenetic
 
 build() {
     local triple=$1 arch=$2 toolchain=$3 extra=$4
-    echo "==> $arch ($triple, $profile, features: $features$extra)"
+    local feat="$features$extra"
+    feat="${feat#,}"
+    echo "==> $arch ($triple, $profile, features: $feat)"
     # The nightly MIPS backend crashes now and then (a transient SIGSEGV in
     # LLVM's scheduler); a resumed build keeps everything that compiled.
     local attempt
     for attempt in 1 2 3; do
         if cross $toolchain build --locked --profile "$profile" --target "$triple" \
-            --features "$features$extra"; then
+            --features "$feat"; then
             break
         fi
         [ "$attempt" -lt 3 ] || { echo "$arch: build failed"; exit 1; }

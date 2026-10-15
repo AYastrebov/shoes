@@ -32,7 +32,23 @@ corrected four claims about our own tree that had gone stale rather than
 merely old: macOS was missing from the TUN platforms, HTTPUpgrade from both
 protocol lists, destination-port matching from the routing row, and
 `src/control/` was being described as a "control API" when it is an in-process
-module with no network surface at all.
+module with no network surface at all. Refreshed 2026-10-15, when the focus
+was narrowed: mobile clients, desktop clients over the daemon, performance
+and stability. The Clash API that had landed on 2026-09-11 (slice 1: the
+controller, a connection registry threaded through every inbound, Prometheus
+`/metrics`) was removed the same day, since its only consumers were the
+postponed awg-manager engine and a web panel that was never started. The
+awg-manager section below is now a note on what was postponed.
+
+## Focus, as of 2026-10-15
+
+In order: mobile clients (Android and iOS through the FFI), desktop clients
+through `shoesd`, and performance, architecture and stability of what already
+ships. Not now: the awg-manager engine, any web panel, and any management
+interface over the network beyond the daemon's own socket. A network API that
+reaches into every inbound is exactly the kind of surface this narrowing is
+meant to stop accumulating; if one is wanted later it starts from a spec, not
+from the removed code.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -46,7 +62,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
 - [Desktop clients](#desktop-clients)
 - [Apple integration: what the first consumer asked for](#apple-integration-what-the-first-consumer-asked-for)
-- [awg-manager engine: what is left](#awg-manager-engine-what-is-left)
+- [awg-manager engine: postponed](#awg-manager-engine-postponed)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
@@ -143,7 +159,8 @@ extracted from the FFI so a Rust host can drive a tunnel — no listener, no
 endpoints, no port, no auth — and it is feature-gated off by default. Both
 competitors ship a real network management API, and sing-box 1.14 just made
 that a first-party gRPC service with its own dashboard rather than leaning on
-the Clash API. This is now the widest single gap in the table.
+the Clash API. This is the widest single gap in the table, and as of
+2026-10-15 it is a deliberate one: see item 9 below.
 
 ## Tier 1 — closes most of the gap
 
@@ -275,8 +292,10 @@ What is left is a connection *list* — destination, protocol, the rule that
 matched, and bytes each way, per connection rather than per outbound. That is
 the part that would need a table keyed by connection, which is exactly the RSS
 the mobile budget declined; it wants a design that lets a host ask for it
-rather than one that keeps it always. Either over FFI, or as a subset of the
-Clash API, which inherits the existing dashboards (yacd, metacubexd) for free.
+rather than one that keeps it always, and it would be over FFI or the daemon
+socket. A connection registry was built for the Clash API in September 2026
+and removed with it on 2026-10-15; the removal is the data point that an
+always-on table threaded through every inbound is the wrong shape.
 
 ### 7. HTTPUpgrade transport — done
 
@@ -313,6 +332,14 @@ Note the mobile constraint this does *not* escape: a management API that keeps
 a connection table costs the RSS item 6 declined. Whatever ships should be
 feature-gated the way `control-logs` and `control-stats` already are, so a
 Network Extension can decline it.
+
+**Decided 2026-10-15: not now.** A Clash-compatible controller was built
+(PRs #22 and #30, feature `clash-api`) and removed a month later, unrun by
+any dashboard, because the consumers it was written for were postponed and
+its registry reached into every inbound's accept path. The desktop GUI talks
+to `shoesd` over gRPC on a local socket, and the mobile apps over FFI; neither
+needs a network API. This item stays on the list as the known gap it is, and
+reopens only with a consumer in hand.
 
 ## Tier 3 — not urgent
 
@@ -364,9 +391,9 @@ Network Extension can decline it.
   router proxying *other* devices, where sing-box, mihomo and v2ray all ship
   them and where routing every byte through the userspace netstack in
   `src/tun/` costs more than plain `accept()` on kernel sockets. That argument
-  acquired a consumer, awg-manager, and the work moved to
-  [awg-manager engine: what is left](#awg-manager-engine-what-is-left), which
-  is where its status lives now.
+  acquired a consumer, awg-manager, which has since been postponed
+  ([awg-manager engine: postponed](#awg-manager-engine-postponed)); both
+  inbounds stay, as ordinary Linux inbounds.
 
   `redirect` shipped as `src/redirect_handler.rs` and `src/tproxy/sys.rs`. Two
   things this entry predicted turned out otherwise. The destination is not
@@ -692,57 +719,23 @@ failures through `getLastError()` and a poll of `isRunning()`. The Rust side
 is shared, so the Kotlin half is a `StopListener` interface and a global
 reference; the question is whether anyone is asking.
 
-## awg-manager engine: what is left
+## awg-manager engine: postponed
 
 shoes as the engine behind awg-manager on Keenetic routers, in place of a
-61 MB sing-box fork. Design in `docs/specs/2026-09-11-awg-manager-engine.md`,
-tasks in `docs/plans/2026-09-11-awg-manager-engine.md`.
+61 MB sing-box fork. Postponed 2026-10-15 in favour of the mobile and desktop
+clients; the spec and plan (`docs/specs/2026-09-11-awg-manager-engine.md`,
+`docs/plans/2026-09-11-awg-manager-engine.md`) were removed from the tree
+and live in git history at `bf1740f`.
 
-Done: the process contract (`check`, `version`, `SIGHUP`), the Clash API
-slice awg-manager's health probe and log tail need, aarch64 and mipsel builds
-(`scripts/build-keenetic.sh`), the `redirect` inbound for transparent TCP, and
-the `tproxy` inbound for transparent UDP. That is enough for awg-manager's
-legacy-tunnel mode and, with both inbounds, its tproxy router mode. Neither has
-been run on a router yet: they wait on awg-manager's emitter, not on anything
-here.
-
-Open, with what each costs while it stays open:
-
-- **Neither transparent inbound has met a router's kernel.** Both are tested
-  under real netfilter rules in CI. `tproxy` is tested on both paths: a local
-  client marked in `OUTPUT` and looped back through `lo`, and a LAN client in
-  its own network namespace whose datagrams arrive on a veth pair and are
-  taken in `PREROUTING`, which is a router's path. `redirect` is tested only
-  from `OUTPUT`. What is untried is Keenetic's 4.9 kernel, for both. Plan
-  task 5's router run.
-- **A `tproxy` client costs about 21 KB.** A client is a source socket, and
-  each runs its own `UdpRouter`. It was 38 KB while every router kept its
-  64 KiB packet buffers for life; an idle router now parks them in a spare
-  pool of at most 32 for the whole process (2 MiB at most, a fixed cost the
-  TUN shutdown frees). What remains is the router, its task, queues and tables,
-  about 90 MB at the default `udp_nat_max` of 4096, which a busy LAN can
-  reach in `udp_timeout`; sing-box measured 25 KB a client on the same
-  bench. Going further means one router per listener keyed by client socket
-  and destination, which changes the shared router's lookup for every UDP
-  inbound. CONFIG.md advises a router-sized `udp_nat_max`, and the mipsel
-  figure is unmeasured. Spec, "RSS budget".
-- **`tproxy` on MIPS reads its control messages unaligned**, which is correct
-  and untested there: no datagram has crossed it on mipsel, under QEMU or on
-  a router.
-- **No logical or source-address rules, no per-rule UDP timeout, no `.srs`
-  encoder.** awg-manager's rule editor emits all four; until they exist its
-  emitter has to refuse those rules for shoes. Spec slice 3.
-- **No DNS rules, and no port-53 hijack outside TUN.** On the tproxy mode a
-  LAN client's DNS goes wherever the host's firewall sends it, not through
-  shoes' resolver, and awg-manager's DNS rewrites have nowhere to land. Spec
-  slice 4.
-- **No Chrome-shaped ClientHello.** Unmeasured rather than known to matter;
-  the first router run with a Reality link is the measurement. Spec slice 5,
-  and see [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting).
-- **MIPS is a build, not a release.** mipsel comes from a script on a
-  developer's machine; big-endian `mips`, which awg-manager also ships for, has
-  not been attempted; and nothing beyond `version` and `check` has run on the
-  target, so the lock-backed 64-bit atomics it uses are compiled and untested.
+What stays, because it is useful without awg-manager: the process contract
+(`check`, `version`, `SIGHUP`), the `redirect` and `tproxy` inbounds, and
+`scripts/build-keenetic.sh` with its measurements in
+[docs/keenetic-build-2026-09-11.md](./docs/keenetic-build-2026-09-11.md).
+What went with the Clash API: the health probe and log tail awg-manager would
+have read. What was never built: logical and source-address rules, per-rule
+UDP timeouts, an `.srs` encoder, DNS rules outside TUN, a Chrome-shaped
+ClientHello, and a run on a router's kernel. The Keenetic script is kept as
+a build, not a release, and nothing checks it in CI.
 
 ## Hysteria: the rest of the surface
 

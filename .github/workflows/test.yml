@@ -88,12 +88,6 @@ jobs:
       - name: Run tests with the desktop control surface enabled
         run: cargo test --locked --features desktop
 
-      # The controller and the connection registry. Both feature states of
-      # the registry are exercised: the shim by the default run above, the
-      # real one here, and only one of them is what mobile compiles.
-      - name: Run tests with the Clash API enabled
-        run: cargo test --locked --features clash-api
-
       # The redirect and tproxy inbounds under real netfilter rules, which
       # need root. Built as the runner and run under sudo, so nothing in
       # target/ ends up owned by root and the cache step can still read it.
@@ -113,9 +107,6 @@ jobs:
           test_bin=$(cargo test --locked --test transparent --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.name == "transparent") | .executable')
           sudo "$test_bin" --ignored
-
-      - name: Guard the mobile builds against the controller
-        run: scripts/check-mobile-features.sh
 
       # The privileged daemon, which exists on macOS, Linux and Windows: its
       # dependencies sit under a target section naming all three. Without this

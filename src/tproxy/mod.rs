@@ -572,7 +572,6 @@ mod linux {
                 shared_budget: Some(Arc::new(Semaphore::new(udp_nat_max))),
             };
             let reply_budget = Arc::new(Semaphore::new(udp_nat_max));
-            let label = crate::tcp::tcp_server::inbound_label(&config.protocol, &bind.to_string());
             handles.push(tokio::spawn(demux(
                 listener,
                 bind,
@@ -580,7 +579,6 @@ mod linux {
                 resolver.clone(),
                 limits,
                 reply_budget,
-                label,
             )));
         }
         Ok(handles)
@@ -618,7 +616,6 @@ mod linux {
         resolver: Arc<dyn Resolver>,
         limits: RouterLimits,
         reply_budget: Arc<Semaphore>,
-        label: &'static str,
     ) {
         let spawn = {
             let limits = limits.clone();
@@ -635,14 +632,6 @@ mod linux {
                 let resolver = resolver.clone();
                 let limits = limits.clone();
                 async move {
-                    // One registry row per client source socket, not per
-                    // destination: a row per destination would be a registry
-                    // write on the session-create path (spec, "Decisions").
-                    let _handle = crate::connection_registry::register(
-                        client,
-                        label,
-                        crate::connection_registry::Network::Udp,
-                    );
                     let stream = ServerStream::Targeted(Box::new(stream));
                     if let Err(e) =
                         run_udp_routing_with_limits(stream, selector, resolver, false, limits).await

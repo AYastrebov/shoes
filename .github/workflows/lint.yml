@@ -79,11 +79,6 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked -- -D warnings
 
-      # The controller compiles only with its feature, so the default run
-      # above lints none of it.
-      - name: Run clippy with the Clash API enabled
-        run: cargo clippy --locked --features clash-api --bins --tests -- -D warnings
-
   # Every platform the daemon builds on, because the `HostNetwork` arms share a
   # trait and a sequencer but no code -- a change that satisfies one compiles
   # perfectly while breaking another, and only the arm that is built says so.

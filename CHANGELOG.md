@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+The project narrows its focus to the mobile clients, the desktop clients
+over `shoesd`, and performance and stability. The awg-manager engine and
+any web panel are postponed, and the Clash API built for them is removed:
+
+- **Removed the `clash_api` config block, the `clash-api` and
+  `control-connections` features, the controller, the Prometheus `/metrics`
+  endpoint and the per-connection registry.** A config that still carries a
+  `clash_api:` block is refused at validation as an unknown block, so an
+  operator hears about it at `check` rather than after a restart. No mobile
+  or daemon surface changes: neither ever served the controller, and
+  `control-stats` counters are untouched.
+- **`scripts/build-keenetic.sh` defaults to no features** instead of
+  `clash-api`. The Keenetic build stays; its specs moved to git history.
+
 ## v0.4.1
 
 `awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no
