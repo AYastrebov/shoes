@@ -33,7 +33,7 @@ impl SnellUdpStream {
 
             read_buf: allocate_vec(65535).into_boxed_slice(),
 
-            write_buf: allocate_vec(65535).into_boxed_slice(),
+            write_buf: allocate_vec(max_payload_size).into_boxed_slice(),
             write_buf_end_offset: 0,
 
             is_eof: false,
@@ -149,9 +149,14 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
         }
 
         let buf_len = buf.len();
-        if buf_len + 19 > this.write_buf.len() {
-            // TODO: if it's too big, we need to split up the message into this.max_payload_size chunks.
-            panic!("single message is larger than our write buf: {buf_len}");
+        let header_len = if source.is_ipv4() { 7 } else { 19 };
+        if header_len + buf_len > this.max_payload_size {
+            // One Snell UDP datagram is one Shadowsocks AEAD chunk, capped at 0x3FFF bytes.
+            // A reply that cannot fit is dropped, as the network would drop it.
+            log::debug!(
+                "snell: dropping {buf_len}-byte UDP reply from {source}: over the chunk cap"
+            );
+            return Poll::Ready(Ok(()));
         }
 
         let offset = match source {
@@ -236,7 +241,7 @@ impl SnellUdpClientStream {
 
             read_buf: allocate_vec(65535).into_boxed_slice(),
 
-            write_buf: allocate_vec(65535).into_boxed_slice(),
+            write_buf: allocate_vec(max_payload_size).into_boxed_slice(),
             write_buf_end_offset: 0,
 
             is_eof: false,
@@ -335,9 +340,17 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
         }
 
         let buf_len = buf.len();
-        // Max header: cmd(1) + addr_len(1) + ip_version(1) + ipv6(16) + port(2) = 21
-        if buf_len + 21 > this.write_buf.len() {
-            panic!("single message is larger than our write buf: {buf_len}");
+        // cmd(1) + addr_len(1), then ip_version(1) + ip + port(2), or hostname + port(2).
+        let header_len = match target.address() {
+            Address::Ipv4(_) => 9,
+            Address::Ipv6(_) => 21,
+            Address::Hostname(hostname) => 4 + hostname.len(),
+        };
+        if header_len + buf_len > this.max_payload_size {
+            log::debug!(
+                "snell: dropping {buf_len}-byte UDP datagram to {target}: over the chunk cap"
+            );
+            return Poll::Ready(Ok(()));
         }
 
         this.write_buf[0] = 1; // cmd = data
@@ -416,3 +429,117 @@ impl AsyncPing for SnellUdpClientStream {
 }
 
 impl AsyncSourcedMessageStream for SnellUdpClientStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shadowsocks::ShadowsocksStreamType;
+    use std::future::poll_fn;
+    use std::sync::{Arc, Mutex};
+
+    /// Records every message written to it.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl AsyncReadMessage for Recorder {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for Recorder {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<()>> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for Recorder {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for Recorder {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for Recorder {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for Recorder {}
+
+    fn cap() -> usize {
+        ShadowsocksStreamType::Aead.max_payload_len()
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_chunk_cap_is_dropped_not_fatal() {
+        let recorder = Recorder::default();
+        let mut stream = SnellUdpStream::new(Box::new(recorder.clone()), cap());
+        let source: SocketAddr = "203.0.113.7:53".parse().unwrap();
+
+        let big = vec![0u8; 20_000];
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_sourced_message(cx, &big, &source))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+        assert!(recorder.0.lock().unwrap().is_empty());
+
+        // The largest reply that fits still goes out, header included.
+        let fits = vec![1u8; cap() - 7];
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_sourced_message(cx, &fits, &source))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+        let written = recorder.0.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].len(), cap());
+    }
+
+    #[tokio::test]
+    async fn a_datagram_over_the_chunk_cap_is_dropped_client_side() {
+        let recorder = Recorder::default();
+        let mut stream = SnellUdpClientStream::new(Box::new(recorder.clone()), cap());
+        let target = NetLocation::new(Address::Hostname("example.com".to_string()), 53);
+
+        let big = vec![0u8; 20_000];
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_targeted_message(cx, &big, &target))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+        assert!(recorder.0.lock().unwrap().is_empty());
+    }
+}

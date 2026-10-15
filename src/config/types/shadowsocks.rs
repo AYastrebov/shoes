@@ -54,6 +54,19 @@ impl ShadowsocksConfig {
                         ),
                     )
                 })?;
+                // SIP022: the PSK is exactly the cipher's key length (16 for aes-128-gcm, 32
+                // otherwise), which is also its salt length.
+                if key_bytes.len() != cipher.salt_len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "2022-blake3-{} needs a {}-byte base64 key, got {} bytes",
+                            cipher.name(),
+                            cipher.salt_len(),
+                            key_bytes.len()
+                        ),
+                    ));
+                }
                 Ok(ShadowsocksConfig::Aead2022 {
                     cipher,
                     key_bytes: key_bytes.into_boxed_slice(),
@@ -116,5 +129,41 @@ impl serde::ser::Serialize for ShadowsocksConfig {
         let mut state = serializer.serialize_struct("ShadowsocksConfig", 2)?;
         self.serialize_fields(&mut state)?;
         state.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_2022_key_of_the_wrong_length_is_a_config_error() {
+        let short = BASE64.encode([7u8; 16]);
+        let err = ShadowsocksConfig::from_fields("2022-blake3-aes-256-gcm", &short).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("2022-blake3-aes-256-gcm"), "{msg}");
+        assert!(msg.contains("32-byte"), "{msg}");
+
+        let long = BASE64.encode([7u8; 32]);
+        assert!(ShadowsocksConfig::from_fields("2022-blake3-aes-128-gcm", &long).is_err());
+    }
+
+    #[test]
+    fn a_2022_key_of_the_cipher_length_loads() {
+        for (cipher, len) in [
+            ("2022-blake3-aes-128-gcm", 16),
+            ("2022-blake3-aes-256-gcm", 32),
+            ("2022-blake3-chacha20-poly1305", 32),
+        ] {
+            let key = BASE64.encode(vec![7u8; len]);
+            assert!(
+                matches!(
+                    ShadowsocksConfig::from_fields(cipher, &key),
+                    Ok(ShadowsocksConfig::Aead2022 { .. })
+                ),
+                "{cipher}"
+            );
+        }
     }
 }

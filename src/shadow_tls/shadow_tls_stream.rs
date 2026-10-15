@@ -167,7 +167,7 @@ impl ShadowTlsStream {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
                     self.unprocessed_end_offset -= total_len;
-                    return Ok(DeframeState::HandshakeFrame);
+                    return Ok(DeframeState::Skipped);
                 } else {
                     self.unprocessed_end_offset = 0;
                     return Ok(DeframeState::NeedData);
@@ -200,7 +200,7 @@ impl ShadowTlsStream {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
                     self.unprocessed_end_offset -= total_len;
-                    return Ok(DeframeState::HandshakeFrame);
+                    return Ok(DeframeState::Skipped);
                 } else {
                     self.unprocessed_end_offset = 0;
                     return Ok(DeframeState::NeedData);
@@ -232,6 +232,16 @@ impl ShadowTlsStream {
             self.unprocessed_end_offset = 0;
         }
 
+        if payload_len == 0 {
+            // An authenticated empty frame carries nothing to return; its tag is already in
+            // the running HMAC.
+            return Ok(if self.unprocessed_end_offset > 0 {
+                DeframeState::Skipped
+            } else {
+                DeframeState::NeedData
+            });
+        }
+
         Ok(DeframeState::Success)
     }
 }
@@ -240,7 +250,9 @@ enum DeframeState {
     NeedData,
     Success,
     ReceivedAlert,
-    HandshakeFrame,
+    // A record was consumed without yielding data (a handshake frame, or an empty data
+    // frame); deframe again.
+    Skipped,
 }
 
 impl AsyncRead for ShadowTlsStream {
@@ -268,7 +280,7 @@ impl AsyncRead for ShadowTlsStream {
                     }
                     DeframeState::NeedData => break,
                     DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                    DeframeState::HandshakeFrame => {}
+                    DeframeState::Skipped => {}
                 }
             }
 
@@ -297,7 +309,7 @@ impl AsyncRead for ShadowTlsStream {
                             }
                             DeframeState::NeedData => break,
                             DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                            DeframeState::HandshakeFrame => {}
+                            DeframeState::Skipped => {}
                         }
                     }
                 }
@@ -335,6 +347,11 @@ impl AsyncWrite for ShadowTlsStream {
 
         this.write_buf_pos = 0;
         this.write_buf_end = 0;
+
+        if buf.is_empty() {
+            // An empty frame would be a 4-byte record no real TLS stack sends.
+            return Poll::Ready(Ok(0));
+        }
 
         let consumed_buf_len = std::cmp::min(buf.len(), MAX_WRITE_PAYLOAD_LEN);
         let consumed_buf = &buf[0..consumed_buf_len];
@@ -408,3 +425,85 @@ impl AsyncPing for ShadowTlsStream {
 }
 
 impl AsyncStream for ShadowTlsStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::testing::TestStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn hmac(seed: u8) -> ShadowTlsHmac {
+        let key =
+            aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &[seed; 16]);
+        ShadowTlsHmac::new(&key)
+    }
+
+    /// One application-data record carrying `payload`, chained the way `poll_write` chains.
+    fn frame(chain: &mut ShadowTlsHmac, payload: &[u8]) -> Vec<u8> {
+        chain.update(payload);
+        let digest = chain.digest();
+        chain.update(&digest);
+        let mut out = vec![CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03];
+        out.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+        out.extend_from_slice(&digest);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn an_empty_write_emits_no_record() {
+        let (local, mut peer) = tokio::io::duplex(1 << 16);
+        let mut stream =
+            ShadowTlsStream::new(Box::new(TestStream(local)), &[], hmac(1), hmac(2), None).unwrap();
+
+        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+        stream.write_all(b"abc").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut wire = [0u8; TLS_HEADER_LEN + 4 + 3];
+        peer.read_exact(&mut wire).await.unwrap();
+        assert_eq!(
+            &wire[..TLS_HEADER_LEN],
+            &[CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0x00, 0x07],
+            "the first record on the wire is the 3-byte one"
+        );
+        assert_eq!(&wire[TLS_HEADER_LEN + 4..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn an_empty_data_record_is_consumed() {
+        let (local, mut peer) = tokio::io::duplex(1 << 16);
+        let mut stream =
+            ShadowTlsStream::new(Box::new(TestStream(local)), &[], hmac(1), hmac(2), None).unwrap();
+
+        let mut chain = hmac(1);
+        let mut wire = frame(&mut chain, &[]);
+        wire.extend(frame(&mut chain, b"hello"));
+        peer.write_all(&wire).await.unwrap();
+
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello");
+    }
+
+    #[tokio::test]
+    async fn an_empty_data_record_arriving_alone_is_consumed() {
+        let (local, mut peer) = tokio::io::duplex(1 << 16);
+        let mut stream =
+            ShadowTlsStream::new(Box::new(TestStream(local)), &[], hmac(1), hmac(2), None).unwrap();
+
+        let mut chain = hmac(1);
+        peer.write_all(&frame(&mut chain, &[])).await.unwrap();
+        let second = frame(&mut chain, b"hi");
+        let writer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            peer.write_all(&second).await.unwrap();
+            peer
+        });
+
+        let mut got = [0u8; 2];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hi");
+        drop(writer.await.unwrap());
+    }
+}

@@ -16,6 +16,24 @@ any web panel are postponed, and the Clash API built for them is removed:
 - **`scripts/build-keenetic.sh` defaults to no features** instead of
   `clash-api`. The Keenetic build stays; its specs moved to git history.
 
+No peer or config can abort the process any more through these paths, all
+reachable under `panic = "abort"` (audit 2026-10-15, SS-D1, SS-D2, ST-S3,
+RE-R6, VL-V4):
+
+- **Snell UDP drops a datagram too large for one Shadowsocks chunk** instead
+  of panicking; a target answering with a 16–65 KB datagram used to take the
+  process down. The Shadowsocks message writer returns `InvalidInput` for one.
+- **A Shadowsocks 2022 key of the wrong length is refused at config load**,
+  naming the cipher and the length it needs, instead of aborting on the first
+  stream.
+- **ShadowTLS consumes an authenticated empty data frame and never sends
+  one**; either used to trip an assertion.
+- **A REALITY peer that sends KeyUpdate fails the connection** rather than
+  aborting. The client discards a NewSessionTicket and keeps reading.
+- **Vision splits a padded write over 8171 bytes into several frames**, as
+  Xray does; one of 64 KB or more used to wrap the u16 length and corrupt the
+  stream.
+
 ## v0.4.1
 
 `awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no

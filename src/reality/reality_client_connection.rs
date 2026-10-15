@@ -11,6 +11,7 @@ use super::common::{
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, MAX_TLS_PLAINTEXT_LEN,
     PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
+    check_post_handshake_messages,
 };
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
 use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
@@ -862,12 +863,17 @@ impl RealityClientConnection {
                         }
                     }
                 }
-                // CONTENT_TYPE_HANDSHAKE is invalid after handshake complete
-                // strip_content_type() validates and returns error for invalid types
-                _ => unreachable!(
-                    "strip_content_type validates content type; unexpected: 0x{:02x}",
-                    content_type
-                ),
+                CONTENT_TYPE_HANDSHAKE => {
+                    check_post_handshake_messages(plaintext, true)?;
+                    log::debug!("REALITY CLIENT: Discarded post-handshake NewSessionTicket");
+                }
+                // strip_content_type_slice admits only the three types above
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected content type 0x{:02x}", content_type),
+                    ));
+                }
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)
@@ -967,6 +973,19 @@ impl RealityClientConnection {
         // Note: If plaintext buffer has data, the caller should consume it first.
         // If ciphertext buffer has complete records, process_new_packets should be called.
         self.plaintext_read_buf.is_empty()
+    }
+
+    /// Seal `msg` as one post-handshake handshake record, as a peer that sends KeyUpdate
+    /// or NewSessionTicket would.
+    #[cfg(test)]
+    pub(super) fn queue_post_handshake_message(&mut self, msg: &[u8]) {
+        let (key, iv) = (
+            self.app_write_key.as_ref().unwrap(),
+            self.app_write_iv.as_ref().unwrap(),
+        );
+        RecordEncryptor::new(key, iv, &mut self.write_seq)
+            .encrypt_handshake(msg, &mut self.ciphertext_write_buf)
+            .unwrap();
     }
 
     /// Queue a close notification alert

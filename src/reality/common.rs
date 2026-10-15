@@ -23,6 +23,39 @@ pub const HANDSHAKE_TYPE_CERTIFICATE: u8 = 11;
 pub const HANDSHAKE_TYPE_CERTIFICATE_VERIFY: u8 = 15;
 pub const HANDSHAKE_TYPE_FINISHED: u8 = 20;
 
+pub const HANDSHAKE_TYPE_NEW_SESSION_TICKET: u8 = 4;
+
+/// Vet the handshake messages in one post-handshake record (RFC 8446 §4.6).
+///
+/// A client may discard NewSessionTicket: shoes never resumes. Everything else, KeyUpdate
+/// included, is unsupported and fails the connection instead of desynchronising it.
+pub fn check_post_handshake_messages(mut plaintext: &[u8], is_client: bool) -> io::Result<()> {
+    while !plaintext.is_empty() {
+        if plaintext.len() < 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "truncated post-handshake message",
+            ));
+        }
+        let msg_type = plaintext[0];
+        let len = u32::from_be_bytes([0, plaintext[1], plaintext[2], plaintext[3]]) as usize;
+        if plaintext.len() - 4 < len {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "post-handshake message split across records",
+            ));
+        }
+        if !(is_client && msg_type == HANDSHAKE_TYPE_NEW_SESSION_TICKET) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("post-handshake message type {msg_type} unsupported"),
+            ));
+        }
+        plaintext = &plaintext[4 + len..];
+    }
+    Ok(())
+}
+
 // TLS 1.3 record size limits per RFC 8446
 //
 // The TLS record header's `length` field specifies the size of the ENCRYPTED payload.
