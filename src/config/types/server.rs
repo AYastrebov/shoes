@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::redacted::Redacted;
 use super::uuid::Uuid;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, NetLocationPortRange};
 use crate::option_util::{NoneOrSome, OneOrSome};
 
 use super::client::TuicCongestionControl;
@@ -197,6 +197,30 @@ pub struct ServerConfig {
     pub sniff: Option<super::sniff::SniffConfig>,
 }
 
+/// [`ServerConfig`] as written. Derived, so serde owns the unknown-field
+/// check: `bind_location` is flattened, and flatten cannot be combined with
+/// `deny_unknown_fields`, which is why this type exists at all.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerConfigFields {
+    address: Option<OneOrSome<NetLocationPortRange>>,
+    addresses: Option<OneOrSome<NetLocationPortRange>>,
+    path: Option<std::path::PathBuf>,
+    protocol: ServerProxyConfig,
+    #[serde(default)]
+    transport: Option<Transport>,
+    #[serde(default)]
+    tcp_settings: Option<TcpConfig>,
+    #[serde(default)]
+    quic_settings: Option<ServerQuicConfig>,
+    #[serde(alias = "rule", default)]
+    rules: Option<NoneOrSome<ConfigSelection<RuleConfig>>>,
+    #[serde(default)]
+    dns: Option<DnsConfig>,
+    #[serde(default)]
+    sniff: Option<super::sniff::SniffConfig>,
+}
+
 impl<'de> serde::de::Deserialize<'de> for ServerConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -204,121 +228,30 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
     {
         use serde::de::Error;
 
-        let value = serde_yaml::Value::deserialize(deserializer)?;
-        let map = value
-            .as_mapping()
-            .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
-
-        const VALID_FIELDS: &[&str] = &[
-            "address",
-            "addresses",
-            "path", // BindLocation (flattened)
-            "protocol",
-            "transport",
-            "tcp_settings",
-            "quic_settings",
-            "rules",
-            "rule",
-            "dns",
-            "sniff",
-        ];
-
-        // Check for unknown fields
-        for key in map.keys() {
-            if let Some(key_str) = key.as_str()
-                && !VALID_FIELDS.contains(&key_str)
-            {
-                return Err(Error::custom(format!(
-                    "unknown field `{}` in server config. Expected one of: {}",
-                    key_str,
-                    VALID_FIELDS.join(", ")
-                )));
+        let fields = ServerConfigFields::deserialize(deserializer)?;
+        let bind_location = match (fields.address.or(fields.addresses), fields.path) {
+            (Some(addresses), None) => BindLocation::Address(addresses),
+            (None, Some(path)) => BindLocation::Path(path),
+            (Some(_), Some(_)) => {
+                return Err(Error::custom(
+                    "server config takes 'address'/'addresses' or 'path', not both",
+                ));
             }
-        }
-
-        // Parse bind_location (flattened - either address or path)
-        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Address)
-                .map_err(|e| Error::custom(format!("invalid address: {e}")))?
-        } else if let Some(v) = map.get("path") {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Path)
-                .map_err(|e| Error::custom(format!("invalid path: {e}")))?
-        } else {
-            return Err(Error::custom(
-                "server config must have 'address', 'addresses', or 'path' field",
-            ));
+            (None, None) => {
+                return Err(Error::custom(
+                    "server config must have 'address', 'addresses', or 'path' field",
+                ));
+            }
         };
-
-        // Parse protocol (required)
-        let protocol: ServerProxyConfig = map
-            .get("protocol")
-            .ok_or_else(|| Error::custom("missing 'protocol' field in server config"))
-            .and_then(|v| {
-                serde_yaml::from_value(v.clone())
-                    .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
-            })?;
-
-        // Parse transport (optional, default)
-        let transport: Transport = map
-            .get("transport")
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid transport: {e}")))?
-            .unwrap_or_default();
-
-        // Parse tcp_settings (optional, skip if null)
-        let tcp_settings: Option<TcpConfig> = map
-            .get("tcp_settings")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid tcp_settings: {e}")))?;
-
-        // Parse quic_settings (optional, skip if null)
-        let quic_settings: Option<ServerQuicConfig> = map
-            .get("quic_settings")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid quic_settings: {e}")))?;
-
-        // Parse rules (optional, with alias "rule", default to direct_allow_rule, skip if null)
-        let rules: NoneOrSome<ConfigSelection<RuleConfig>> = map
-            .get("rules")
-            .or_else(|| map.get("rule"))
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid rules: {e}")))?
-            .unwrap_or_else(direct_allow_rule);
-
-        // Parse dns (optional)
-        let dns: Option<DnsConfig> = map
-            .get("dns")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid dns: {e}")))?;
-
-        // Parse sniff (optional)
-        let sniff: Option<super::sniff::SniffConfig> = map
-            .get("sniff")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid sniff: {e}")))?;
-
         Ok(ServerConfig {
             bind_location,
-            protocol,
-            transport,
-            tcp_settings,
-            quic_settings,
-            rules,
-            dns,
-            sniff,
+            protocol: fields.protocol,
+            transport: fields.transport.unwrap_or_default(),
+            tcp_settings: fields.tcp_settings,
+            quic_settings: fields.quic_settings,
+            rules: fields.rules.unwrap_or_else(direct_allow_rule),
+            dns: fields.dns,
+            sniff: fields.sniff,
         })
     }
 }

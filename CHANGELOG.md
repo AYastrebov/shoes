@@ -89,6 +89,12 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
   expansion; the TUN-DNS check and the resolver builder use the parsed form
   instead of parsing the string again.
 
+- **Config parsing is read one way per concept.** A rule's action is parsed
+  by one function whether it sits beside its masks or on its own; the
+  top-level entry types are told apart by one ordered table, with a test that
+  every type, written back out, is read back as itself; a server entry's
+  unknown fields are refused by serde rather than a hand-kept list.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
