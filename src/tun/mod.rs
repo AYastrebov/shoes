@@ -107,8 +107,20 @@ static DEVICE_NAME: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new
 /// Serialises the tests that write [`DEVICE_NAME`]. Same reasoning as
 /// `traffic::TEST_LOCK`: the state is process-global, so tests that set it
 /// have to take turns or they read each other's writes.
+///
+/// "Write" includes ending a session: every session's exit guard clears the
+/// name, so a test that starts one -- whatever it asserts -- takes this too.
 #[cfg(test)]
-pub(crate) static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`DEVICE_NAME_TEST_LOCK`]. Through the poison: one failing test
+/// reports its own failure rather than failing every test after it.
+#[cfg(test)]
+pub(crate) fn device_name_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    DEVICE_NAME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The interface the running session created, if it created one.
 ///
@@ -780,7 +792,7 @@ mod tests {
     /// what it waits on has changed -- not by a polling interval.
     #[test]
     fn a_device_name_wait_is_woken_by_the_event() {
-        let _lock = DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        let _lock = device_name_test_lock();
         clear_device_name();
         let long = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
