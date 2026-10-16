@@ -62,6 +62,11 @@ Typed outcomes at the layer boundaries (plan PR 1.3; A-3):
   `FAILED_PRECONDITION`**, not `INVALID_ARGUMENT`: the document is well-formed,
   and what fails is the host.
 
+- **YAML parsing moves to `serde_norway`**, a maintained fork of the
+  archived `serde_yaml` 0.9 with the same behaviour, which takes the
+  unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449) out of the build. The
+  security-advisory check is green again.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

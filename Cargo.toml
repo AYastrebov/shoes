@@ -181,7 +181,11 @@ rust-argon2 = "3"
 rustc-hash = "2"
 rustls = "0.23"
 serde = { version = "1", features = ["derive", "std"] }
-serde_yaml = "0.9"
+# serde_yaml 0.9 is archived and its libyaml port is unmaintained
+# (RUSTSEC-2024-0449). serde_norway is a maintained fork of the same 0.9 API,
+# on unsafe-libyaml-norway; renamed here so the code keeps its `serde_yaml::`
+# paths. serde_yaml_ng was the other candidate and still uses unsafe-libyaml.
+serde_yaml = { package = "serde_norway", version = "0.9.42" }
 shake = "0.1"
 # auto-icmp-echo-reply: without it smoltcp silently ignores echo requests
 # (src/iface/interface/ipv4.rs gates the reply arm on it), so `icmp_enabled`
