@@ -206,9 +206,11 @@ sockets constantly means closing whichever socket has since taken the number.
 Close it yourself after `stop` returns true; a false return means the engine
 may still hold it, and leaking one descriptor beats racing a reader.
 
-There is one tunnel per process. All state lives in the `TUN_SERVICE` global in
-`common.rs`, and starting over a running service is refused rather than
-permitted.
+There is one tunnel per process. Its state is one `Session` value in the
+`SESSION` global in `common.rs` -- the service handle and, on iOS, the stopped
+callback -- installed whole by `start` and taken whole by `stop`, so no part of
+a session can be cleared while the rest of it stays. Starting over a running
+service is refused rather than permitted.
 
 ## Threading contract
 
@@ -228,11 +230,17 @@ permitted.
   once at the start of a session and then only on a tick where a counter moved,
   so an idle tunnel is silent rather than reporting the same numbers 3,600 times
   an hour.
-- Both callbacks are stored in globals and cleared inside `stop`, along with the
-  socket protector — which on Android holds a JNI global reference to the
-  `VpnService`, so leaving it installed kept a destroyed service and its
-  `Context` alive. Do not retain objects across a stop/start cycle and assume
-  they are still wired.
+- The traffic callback and the socket protector stay in the globals their
+  readers consult, but one function in `common.rs` installs both and the stop
+  clears both, after the engine has wound down, so a socket opened during the
+  wind-down is still protected. The protector on Android holds a JNI global
+  reference to the `VpnService`, so leaving it installed kept a destroyed
+  service and its `Context` alive. On iOS the protector holds the host's
+  callback itself; there is no second slot for it. Do not retain objects across
+  a stop/start cycle and assume they are still wired.
+- The iOS stopped callback is part of the session and leaves with it at the
+  start of `stop`, so the exit a requested stop causes is never reported to the
+  host as one it did not ask for. It fires at most once per session.
 
 ## Example configs
 
@@ -440,7 +448,7 @@ and the KDoc sample now does that, closes the descriptor afterwards, and checks
 
 `shoes_start` returns the literal `1` (`src/ffi/ios.rs:224`,
 `src/ffi/android.rs:307`), and `shoes_stop(_handle)` ignores its argument
-entirely — all state lives in the `TUN_SERVICE` global. That is fine as long as
+entirely — all state lives in the `SESSION` global. That is fine as long as
 there is exactly one tunnel, which the code enforces ("Multiple TUN configs
 found - only one is allowed for mobile", `common.rs:181`).
 

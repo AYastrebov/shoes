@@ -55,8 +55,30 @@ pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<crate::logging::Rotating
 /// Global flag to track if logger has been initialized.
 pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Global state for the TUN service.
-pub static TUN_SERVICE: OnceLock<parking_lot::Mutex<Option<TunServiceHandle>>> = OnceLock::new();
+/// What a host hands shoes to be told a session ended without being asked.
+/// Called at most once, with the reason; never for a stop the host requested.
+pub type StoppedCallback = Box<dyn FnOnce(&ExitReason) + Send>;
+
+/// The running session: its handle, and the one-shot callback for its end.
+///
+/// One value in one slot, installed by [`start_session`] and taken whole by
+/// [`stop_service_locked`], so nothing about a session can be cleared while
+/// the rest of it stays -- the class of bug three earlier fixes were about,
+/// when these were parallel statics and a slot could be emptied outside the
+/// lock that guarded the others.
+///
+/// The two callbacks that are read on the engine's own paths -- the socket
+/// protector, consulted whenever a socket is opened, and the traffic
+/// callback, ticked once a second -- stay in the slots their readers look in
+/// (`socket_protector`, `tun::traffic`), but are installed by
+/// [`install_callbacks`] and cleared by the stop, both here, so neither
+/// platform can forget one.
+struct Session {
+    handle: TunServiceHandle,
+    on_stop: Option<StoppedCallback>,
+}
+
+static SESSION: parking_lot::Mutex<Option<Session>> = parking_lot::Mutex::new(None);
 
 /// Last error message from the service. Set when `start_from_config` fails
 /// or the service stops with an error. Read via `shoes_get_last_error()`.
@@ -72,7 +94,7 @@ struct LastError {
 
 /// Serializes start/stop transitions across the FFI surface.
 ///
-/// `stop_service_locked` takes the handle out of `TUN_SERVICE` and then waits up
+/// `stop_service_locked` takes the session out of `SESSION` and then waits up
 /// to five seconds for the engine to wind down. For that whole window the
 /// slot is empty and `is_service_running()` answers false -- so a start
 /// arriving on another thread would pass its already-running guard and put
@@ -101,10 +123,70 @@ static TRANSITION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// start hostage to it.
 pub const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Proof of holding [`TRANSITION`], which every function that installs or
+/// removes session state asks for.
+pub type Transition = parking_lot::MutexGuard<'static, ()>;
+
 /// Take the transition lock. Held across all of a stop and all of
 /// each platform's start path.
-pub fn transition_guard() -> parking_lot::MutexGuard<'static, ()> {
+pub fn transition_guard() -> Transition {
     TRANSITION.lock()
+}
+
+/// Install the callbacks the engine reads while it runs, from zeroed
+/// counters. [`stop_service_locked`] removes them; a start that fails after
+/// this calls [`clear_callbacks`].
+pub fn install_callbacks(
+    _transition: &Transition,
+    protector: std::sync::Arc<dyn crate::socket_protector::SocketProtector>,
+    traffic: std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>,
+) {
+    crate::socket_protector::set_global_socket_protector(protector);
+    crate::tun::traffic::reset_traffic_counters();
+    crate::tun::traffic::set_traffic_callback(traffic);
+}
+
+/// Remove what [`install_callbacks`] installed.
+pub fn clear_callbacks(_transition: &Transition) {
+    crate::tun::traffic::clear_traffic_callback();
+    crate::socket_protector::clear_global_socket_protector();
+}
+
+/// Start the prepared service as the session, with `on_stop` for an end the
+/// host did not ask for.
+///
+/// The session is in its slot before the task is spawned, so an exit in the
+/// first instant finds its callback, and a callback that calls stop finds the
+/// handle. The previous session's handle, if any, is taken out under the lock
+/// and released after it, in the background: dropping its runtime in place
+/// would wait for its workers, one of which may be inside that session's
+/// callback and about to take this very lock.
+pub fn start_session(
+    _transition: &Transition,
+    runtime: tokio::runtime::Runtime,
+    prepared: crate::control::PreparedService,
+    on_stop: Option<StoppedCallback>,
+) {
+    let mut previous = None;
+    crate::control::start_and_install(runtime, prepared, fire_stopped, |handle| {
+        previous = SESSION.lock().replace(Session { handle, on_stop });
+    });
+    if let Some(previous) = previous {
+        previous.handle.discard();
+    }
+}
+
+/// Deliver an exit: the reason is stored for `get_last_error` first, then the
+/// session's callback, if it still has one, is taken and called with the
+/// slot's lock released -- a callback that calls stop must not deadlock on
+/// it. Taken, not read, so it fires at most once; a stop takes the whole
+/// session out first, so a requested stop never reaches it.
+fn fire_stopped(reason: ExitReason) {
+    set_last_exit(&reason);
+    let on_stop = SESSION.lock().as_mut().and_then(|s| s.on_stop.take());
+    if let Some(on_stop) = on_stop {
+        on_stop(&reason);
+    }
 }
 
 /// Set up log file for file-based logging.
@@ -143,27 +225,23 @@ pub fn max_log_level_name() -> &'static std::ffi::CStr {
     }
 }
 
-/// Stop the TUN service and wait for shutdown, for a caller that holds the
-/// transition lock -- the platform stop functions, which must clear their
-/// callback slots inside the same locked scope.
+/// End the session and wait for shutdown, then remove its callbacks -- all
+/// inside the caller's transition lock. Clearing them after the lock was
+/// released once wiped the callbacks a queued start had just installed,
+/// leaving its fresh engine with no socket protector.
 ///
 /// Returns `true` if the service confirmed it stopped, `false` if the wait
 /// timed out. See [`crate::control::stop_handle`] for what that distinction
-/// costs the caller. Clearing them after the
-/// lock is released wiped the callbacks a queued start had just
-/// installed, leaving its fresh engine with no socket protector.
-pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -> bool {
+/// costs the caller.
+pub fn stop_service_locked(transition: &Transition) -> bool {
     info!("Stopping TUN service");
 
-    let handle = if let Some(service) = TUN_SERVICE.get() {
-        service.lock().take()
-    } else {
-        None
-    };
-
-    let Some(handle) = handle else {
+    // The whole session at once, its stopped callback with it: the service
+    // task exits during the wait below, and that exit is one the host asked
+    // for, so it must find nothing to call.
+    let Some(Session { handle, .. }) = SESSION.lock().take() else {
         info!("TUN service was not running");
-        crate::socket_protector::clear_global_socket_protector();
+        clear_callbacks(transition);
         return true;
     };
 
@@ -189,10 +267,11 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
         store_last_error(before);
     }
 
-    // The protector holds a reference to the platform's VPN service object.
-    // Released here rather than in the platform modules so that neither one can
-    // forget.
-    crate::socket_protector::clear_global_socket_protector();
+    // After the wait, not before: a socket the engine opens while it winds
+    // down is still protected. The protector holds a reference to the
+    // platform's VPN service object, released here rather than in the
+    // platform modules so that neither one can forget.
+    clear_callbacks(transition);
 
     info!("TUN service stop completed");
     stopped
@@ -280,13 +359,10 @@ pub fn get_last_error() -> Option<String> {
 
 /// Check if the TUN service is running.
 pub fn is_service_running() -> bool {
-    if let Some(service) = TUN_SERVICE.get() {
-        let guard = service.lock();
-        if let Some(ref handle) = *guard {
-            return handle.is_running();
-        }
-    }
-    false
+    SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|s| s.handle.is_running())
 }
 
 /// Serialize tests that mutate the shared LAST_ERROR state. pub(crate)
@@ -383,6 +459,75 @@ mod tests {
         set_last_error("first error".to_string());
         set_last_error("second error".to_string());
         assert_eq!(get_last_error().as_deref(), Some("second error"));
+    }
+
+    /// A session whose service runs until it is told to stop, installed the
+    /// way `start_session` installs one, with `fire_stopped` as its exit.
+    fn install_test_session(_transition: &Transition, on_stop: Option<StoppedCallback>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = crate::control::start_with(
+            runtime,
+            |shutdown| async move {
+                let _ = shutdown.await;
+                Ok(())
+            },
+            fire_stopped,
+        );
+        *SESSION.lock() = Some(Session { handle, on_stop });
+    }
+
+    fn counting() -> (
+        StoppedCallback,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let callback: StoppedCallback = Box::new(move |_reason| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (callback, calls)
+    }
+
+    /// A stop takes the whole session, its callback with it, before it waits:
+    /// the exit the stop causes is one the host asked for, and must not be
+    /// reported to it as an end it did not.
+    #[test]
+    fn a_requested_stop_never_reaches_the_stopped_callback() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let (callback, calls) = counting();
+        install_test_session(&transition, Some(callback));
+        assert!(is_service_running());
+
+        assert!(stop_service_locked(&transition));
+        assert!(!is_service_running());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An end the host did not ask for records its reason for
+    /// `get_last_error` and reaches the callback -- once, however many times
+    /// it is delivered.
+    #[test]
+    fn an_unrequested_end_records_then_calls_once() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let (callback, calls) = counting();
+        install_test_session(&transition, Some(callback));
+
+        for _ in 0..2 {
+            fire_stopped(ExitReason::Failed("engine fell over".to_string()));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(get_last_error().as_deref(), Some("engine fell over"));
+
+        assert!(stop_service_locked(&transition));
     }
 
     /// The property the transition lock buys: a stop queues behind a

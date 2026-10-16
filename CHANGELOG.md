@@ -152,6 +152,16 @@ One attribution path (plan PR 1.6, part 3; A-9 in part):
   The shipped (with-stats) arm64 library is 664 bytes smaller; a build
   without the feature is 5,632 bytes larger.
 
+One session value on the FFI side (plan PR 1.6, part 4; A-9):
+
+- The mobile FFI keeps a session as one value -- the service handle and, on
+  iOS, the stopped callback -- installed whole by `start` and taken whole by
+  `stop`, where it was three parallel statics (`TUN_SERVICE`,
+  `STOPPED_CALLBACK`, `PROTECT_CALLBACK`). The socket protector and traffic
+  callback are installed by one function and cleared by the stop on both
+  platforms; the iOS protector holds its callback itself. No change to the C
+  or JNI surface or to callback timing.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
