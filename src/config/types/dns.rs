@@ -280,16 +280,18 @@ impl DnsConfig {
     }
 }
 
-/// A DNS server spec with all group references expanded.
-/// Client chains contain actual ClientConfig objects, not group names.
+/// A DNS server spec with all group references expanded and its URLs
+/// parsed. Client chains contain actual ClientConfig objects, not group names.
 #[derive(Debug, Clone)]
 pub struct ExpandedDnsSpec {
+    /// The URL as written, for messages and the resolver's description.
     pub url: String,
-    pub server_name: Option<String>,
+    /// The URL, parsed once during expansion with any `server_name` applied.
+    pub parsed_url: crate::dns::ParsedDnsUrl,
     /// Client chains with all group refs resolved to configs.
     pub client_chains: Vec<ClientChain>,
-    /// Bootstrap resolver URL or group name. Groups are resolved at runtime.
-    pub bootstrap_url: Option<String>,
+    /// What resolves the server's own hostname.
+    pub bootstrap: Option<DnsBootstrap>,
     pub ip_strategy: IpStrategy,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
     pub timeout_secs: u32,
@@ -297,6 +299,27 @@ pub struct ExpandedDnsSpec {
     pub connect_timeout_secs: u32,
     /// Number of retry attempts for failed queries.
     pub attempts: usize,
+}
+
+/// A `bootstrap_url`: a dns_group named by it, or an IP-only URL, parsed.
+#[derive(Debug, Clone)]
+pub enum DnsBootstrap {
+    /// Resolved at runtime: the group is built first (topological order).
+    Group(String),
+    Url {
+        url: String,
+        parsed: crate::dns::ParsedDnsUrl,
+    },
+}
+
+impl DnsBootstrap {
+    /// As written: the group name or the URL.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Group(name) => name,
+            Self::Url { url, .. } => url,
+        }
+    }
 }
 
 /// A DNS group with all specs expanded.

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
-use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
+use crate::config::{DnsBootstrap, DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -579,9 +579,8 @@ async fn build_entry_and_plan(
     spec: &ExpandedDnsSpec,
     registry: &DnsRegistry,
 ) -> std::io::Result<(ParsedDnsServerEntry, Option<HickoryResolverPlan>)> {
-    // Parse URL
-    let parsed_url = ParsedDnsUrl::parse_with_server_name(&spec.url, spec.server_name.as_deref())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Parsed during config expansion.
+    let parsed_url = spec.parsed_url.clone();
 
     // Build client chain group
     let chain_resolver = Arc::new(NativeResolver::new());
@@ -597,38 +596,32 @@ async fn build_entry_and_plan(
     };
 
     // Build or get bootstrap resolver
-    let bootstrap_resolver: Arc<dyn Resolver> = match &spec.bootstrap_url {
-        Some(bootstrap_url) => {
-            // Try to get from registry first (group reference)
-            if let Some(resolver) = registry.get_by_name(bootstrap_url) {
-                resolver
-            } else {
-                // Parse as URL and build a simple resolver
-                let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "invalid bootstrap_url '{}': {}",
-                        bootstrap_url, e
-                    ))
-                })?;
+    let bootstrap_resolver: Arc<dyn Resolver> = match &spec.bootstrap {
+        // Built before this one: groups are in bootstrap-dependency order.
+        Some(DnsBootstrap::Group(name)) => registry.get_by_name(name).ok_or_else(|| {
+            std::io::Error::other(format!("bootstrap dns group '{name}' was not built"))
+        })?,
+        Some(DnsBootstrap::Url {
+            parsed: bootstrap_parsed,
+            ..
+        }) => {
+            let bootstrap_server = bootstrap_parsed
+                .to_parsed_server(None)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                let bootstrap_server = bootstrap_parsed
-                    .to_parsed_server(None)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                let native = Arc::new(NativeResolver::new());
-                let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
-                // Bootstrap resolvers use default timeout (10s) and 2 attempts
-                let bootstrap_entry = ParsedDnsServerEntry::new(
-                    bootstrap_server,
-                    direct_chain,
-                    native,
-                    super::IpStrategy::default(),
-                    10, // Default timeout for bootstrap
-                    5,  // Default connect timeout for bootstrap
-                    2,  // Default attempts for bootstrap
-                );
-                build_resolver(vec![bootstrap_entry])?
-            }
+            let native = Arc::new(NativeResolver::new());
+            let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
+            // Bootstrap resolvers use default timeout (10s) and 2 attempts
+            let bootstrap_entry = ParsedDnsServerEntry::new(
+                bootstrap_server,
+                direct_chain,
+                native,
+                super::IpStrategy::default(),
+                10, // Default timeout for bootstrap
+                5,  // Default connect timeout for bootstrap
+                2,  // Default attempts for bootstrap
+            );
+            build_resolver(vec![bootstrap_entry])?
         }
         None => Arc::new(NativeResolver::new()),
     };
@@ -650,7 +643,7 @@ async fn build_entry_and_plan(
             chain_key: serde_yaml::to_string(&spec.client_chains).map_err(|e| {
                 std::io::Error::other(format!("failed to serialize client_chains: {e}"))
             })?,
-            bootstrap_key: spec.bootstrap_url.clone(),
+            bootstrap_key: spec.bootstrap.as_ref().map(|b| b.as_str().to_string()),
             options,
             description: spec.url.clone(),
         })
@@ -751,9 +744,9 @@ mod tests {
     fn make_spec(url: &str) -> ExpandedDnsSpec {
         ExpandedDnsSpec {
             url: url.to_string(),
-            server_name: None,
+            parsed_url: ParsedDnsUrl::parse(url).unwrap(),
             client_chains: vec![],
-            bootstrap_url: None,
+            bootstrap: None,
             ip_strategy: IpStrategy::default(),
             timeout_secs: 5,
             connect_timeout_secs: 5,
