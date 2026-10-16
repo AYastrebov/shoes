@@ -212,9 +212,10 @@ impl<'a, N: HostNetwork> Session<'a, N> {
     /// otherwise the revert that follows, or a later recovery, would delete a
     /// route this daemon never created.
     fn add_recorded(&self, route: Route, state: &mut AppliedState) -> std::io::Result<()> {
-        state.routes.push(route.clone());
+        state.routes.push(route);
         state.save(&self.state_path)?;
-        if let Err(e) = self.net.add_route(&route) {
+        let route = &state.routes[state.routes.len() - 1];
+        if let Err(e) = self.net.add_route(route) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 state.routes.pop();
                 state.save(&self.state_path)?;

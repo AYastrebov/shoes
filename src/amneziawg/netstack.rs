@@ -8,6 +8,12 @@
 //! (from tun/tcp_conn.rs) for bridging smoltcp's synchronous sockets to
 //! tokio's async traits.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;

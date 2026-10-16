@@ -271,7 +271,7 @@ pub async fn setup_reality_server_stream(
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
     drop(dest_stream);
-    reality_conn.build_server_response(dest_records)?;
+    reality_conn.build_server_response(&dest_records)?;
 
     let mut connection = CryptoConnection::new_reality_server(reality_conn);
     perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;

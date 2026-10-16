@@ -4,6 +4,12 @@
 //! `LogWriter` destinations. Formats each record once into a thread-local buffer,
 //! then passes the resulting `&str` to all writers.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;

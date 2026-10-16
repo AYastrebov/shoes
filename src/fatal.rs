@@ -41,10 +41,10 @@ pub fn generation() -> u64 {
 /// longer the current one -- are logged and dropped, because the host
 /// should hear the original cause of *this* session's death, not the
 /// echo of a previous one's.
-pub fn report(generation: u64, reason: String) {
+pub fn report(generation: u64, reason: &str) {
     let stored = FATAL.send_if_modified(|slot| {
         if slot.0 == generation && slot.1.is_none() {
-            slot.1 = Some(reason.clone());
+            slot.1 = Some(reason.to_string());
             true
         } else {
             false
@@ -89,8 +89,8 @@ mod tests {
         assert_eq!(rx.borrow().1, None);
 
         let generation = generation();
-        report(generation, "first".to_string());
-        report(generation, "second".to_string());
+        report(generation, "first");
+        report(generation, "second");
         assert_eq!(rx.borrow().1.as_deref(), Some("first"));
 
         reset();
@@ -108,10 +108,10 @@ mod tests {
         let stale = generation();
         reset(); // the session `stale` belongs to is over
 
-        report(stale, "old tunnel died".to_string());
+        report(stale, "old tunnel died");
         assert_eq!(subscribe().borrow().1, None);
 
-        report(generation(), "new tunnel died".to_string());
+        report(generation(), "new tunnel died");
         assert_eq!(subscribe().borrow().1.as_deref(), Some("new tunnel died"));
 
         reset();
@@ -129,7 +129,7 @@ mod tests {
         reset();
 
         let mut rx = subscribe();
-        report(generation(), "boom".to_string());
+        report(generation(), "boom");
         let value = rx.wait_for(|slot| slot.1.is_some()).await.unwrap();
         assert_eq!(value.1.as_deref(), Some("boom"));
         drop(value);

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 // TLS 1.3 Key Schedule Implementation
 //
 // Implements RFC 8446 key derivation for TLS 1.3

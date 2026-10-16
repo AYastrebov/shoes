@@ -106,7 +106,8 @@ impl HickoryResolver {
         bootstrap: Arc<dyn ShoesResolver>,
         options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
-        let mut conn_config = ConnectionConfig::tls(server_name.clone());
+        let description = format!("tls://{}#{}", addr, server_name);
+        let mut conn_config = ConnectionConfig::tls(server_name);
         conn_config.port = addr.port();
         Self::build(
             addr.ip(),
@@ -114,7 +115,7 @@ impl HickoryResolver {
             chain_group,
             bootstrap,
             options,
-            format!("tls://{}#{}", addr, server_name),
+            description,
         )
     }
 
@@ -127,7 +128,8 @@ impl HickoryResolver {
         bootstrap: Arc<dyn ShoesResolver>,
         options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
-        let mut conn_config = ConnectionConfig::https(server_name.clone(), Some(path));
+        let description = format!("https://{}", server_name);
+        let mut conn_config = ConnectionConfig::https(server_name, Some(path));
         conn_config.port = addr.port();
         Self::build(
             addr.ip(),
@@ -135,7 +137,7 @@ impl HickoryResolver {
             chain_group,
             bootstrap,
             options,
-            format!("https://{}", server_name),
+            description,
         )
     }
 
@@ -150,8 +152,9 @@ impl HickoryResolver {
     ) -> std::io::Result<Self> {
         // Cloudflare has a broken GREASE implementation.
         // See: https://github.com/hyperium/h3/issues/206
+        let description = format!("h3://{}", server_name);
         let protocol = ProtocolConfig::H3 {
-            server_name: server_name.clone(),
+            server_name,
             path,
             disable_grease: true,
         };
@@ -163,7 +166,7 @@ impl HickoryResolver {
             chain_group,
             bootstrap,
             options,
-            format!("h3://{}", server_name),
+            description,
         )
     }
 

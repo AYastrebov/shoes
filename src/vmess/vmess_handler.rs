@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::{HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -718,7 +724,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 }
 
                 // Wrap VmessStream with XudpMessageStream for session multiplexing
-                let xudp_stream = XudpMessageStream::new(Box::new(vmess_stream));
+                let xudp_stream =
+                    XudpMessageStream::new(Box::new(vmess_stream), self.resolver.clone());
 
                 // No unparsed data to feed since VmessStream already consumed it
                 // (XUDP framing starts after VMess header)

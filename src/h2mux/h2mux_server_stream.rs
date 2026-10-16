@@ -35,12 +35,6 @@ impl H2MuxServerStream {
         }
     }
 
-    /// Get reference to inner stream.
-    #[allow(dead_code)]
-    pub fn inner_mut(&mut self) -> &mut H2MuxStream {
-        &mut self.inner
-    }
-
     /// Send an error response to the client before closing.
     ///
     /// This should be called when rejecting a stream (e.g., UDP disabled).

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -272,7 +278,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 // MUX/XUDP: Destination comes in XUDP frames, not VLESS header
                 let unparsed_data = stream_reader.unparsed_data();
                 write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
-                let mut xudp_stream = XudpMessageStream::new(server_stream);
+                let mut xudp_stream = XudpMessageStream::new(server_stream, self.resolver.clone());
                 if !unparsed_data.is_empty() {
                     xudp_stream.feed_initial_read_data(unparsed_data)?;
                 }
@@ -432,7 +438,7 @@ where
                     VisionStream::new_server(io, session, user_uuid, unparsed_data)?;
 
                 // Wrap VISION stream in XUDP stream
-                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream));
+                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream), resolver.clone());
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
@@ -448,7 +454,8 @@ where
                 write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
 
                 // Wrap TLS stream in XUDP stream
-                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream));
+                let mut xudp_stream =
+                    XudpMessageStream::new(Box::new(tls_stream), resolver.clone());
 
                 // Feed any unparsed data to XUDP stream
                 if !unparsed_data.is_empty() {

@@ -1,10 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[cfg(unix)]
-use std::mem::ManuallyDrop;
-
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 #[cfg(target_family = "unix")]
 use std::path::Path;
 
@@ -19,7 +22,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 /// alone; an outbound built on one of those has to protect itself.
 pub fn new_udp_socket(
     is_ipv6: bool,
-    bind_interface: Option<String>,
+    bind_interface: Option<&str>,
 ) -> std::io::Result<tokio::net::UdpSocket> {
     let socket = new_socket2_udp_socket(
         is_ipv6,
@@ -131,7 +134,7 @@ pub fn dual_stack_dest(addr: SocketAddr) -> SocketAddr {
 
 pub fn new_socket2_udp_socket(
     is_ipv6: bool,
-    bind_interface: Option<String>,
+    bind_interface: Option<&str>,
     bind_address: Option<SocketAddr>,
     reuse_port: bool,
 ) -> std::io::Result<socket2::Socket> {
@@ -140,7 +143,7 @@ pub fn new_socket2_udp_socket(
 
 pub fn new_socket2_udp_socket_with_buffer_size(
     is_ipv6: bool,
-    bind_interface: Option<String>,
+    bind_interface: Option<&str>,
     bind_address: Option<SocketAddr>,
     reuse_port: bool,
     buffer_size: Option<usize>,
@@ -177,7 +180,7 @@ pub fn new_socket2_udp_socket_with_buffer_size(
 
     // Underscore-prefixed like `_b` below: consumed only on the platforms
     // that can bind a socket to a device.
-    if let Some(ref _interface) = bind_interface {
+    if let Some(_interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(_interface.as_bytes()))?;
 
@@ -247,17 +250,7 @@ fn new_unbound_reply_socket(ipv6: bool) -> std::io::Result<socket2::Socket> {
 }
 
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
-    #[cfg(unix)]
-    {
-        let raw_fd = socket.into_raw_fd();
-        let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
-        tokio::net::UdpSocket::from_std(std_udp_socket)
-    }
-    #[cfg(windows)]
-    {
-        let std_udp_socket: std::net::UdpSocket = socket.into();
-        tokio::net::UdpSocket::from_std(std_udp_socket)
-    }
+    tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(socket))
 }
 
 /// Create an outbound TCP socket.
@@ -265,7 +258,7 @@ fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net:
 /// Excluded from the VPN route where a protector is installed, for the reason
 /// given on [`new_udp_socket`].
 pub fn new_tcp_socket(
-    bind_interface: Option<String>,
+    bind_interface: Option<&str>,
     is_ipv6: bool,
 ) -> std::io::Result<tokio::net::TcpSocket> {
     let tcp_socket = if is_ipv6 {
@@ -293,26 +286,20 @@ pub fn set_tcp_keepalive(
     idle_time: std::time::Duration,
     send_interval: std::time::Duration,
 ) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let raw_fd = tcp_stream.as_raw_fd();
-        let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
-        if idle_time.is_zero() && send_interval.is_zero() {
-            socket2_socket.set_keepalive(false)?;
-        } else {
-            let keepalive = socket2::TcpKeepalive::new()
-                .with_time(idle_time)
-                .with_interval(send_interval);
-            socket2_socket.set_keepalive(true)?;
-            socket2_socket.set_tcp_keepalive(&keepalive)?;
-        }
-        Ok(())
+    // A borrowed view: the stream keeps ownership of the descriptor, which a
+    // `from_raw_fd` here used to need a ManuallyDrop and an `unsafe` to say.
+    // The same call works on Windows, where this used to do nothing.
+    let socket2_socket = socket2::SockRef::from(tcp_stream);
+    if idle_time.is_zero() && send_interval.is_zero() {
+        socket2_socket.set_keepalive(false)?;
+    } else {
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(idle_time)
+            .with_interval(send_interval);
+        socket2_socket.set_keepalive(true)?;
+        socket2_socket.set_tcp_keepalive(&keepalive)?;
     }
-    #[cfg(windows)]
-    {
-        let _ = (tcp_stream, idle_time, send_interval);
-        Ok(())
-    }
+    Ok(())
 }
 
 // TODO: change backlog to Option<u32> and make configuration, backlog -1 uses somaxconn on linux
@@ -320,7 +307,7 @@ pub fn set_tcp_keepalive(
 pub fn new_tcp_listener(
     bind_address: SocketAddr,
     backlog: u32,
-    bind_interface: Option<String>,
+    bind_interface: Option<&str>,
 ) -> std::io::Result<tokio::net::TcpListener> {
     let domain = if bind_address.is_ipv6() {
         Domain::IPV6
@@ -334,7 +321,7 @@ pub fn new_tcp_listener(
 
     // Underscore-prefixed like `_b` below: consumed only on the platforms
     // that can bind a socket to a device.
-    if let Some(ref _interface) = bind_interface {
+    if let Some(_interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(_interface.as_bytes()))?;
 

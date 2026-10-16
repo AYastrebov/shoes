@@ -1,5 +1,11 @@
 //! Server configuration types.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

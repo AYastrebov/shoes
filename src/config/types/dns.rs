@@ -1,5 +1,11 @@
 //! DNS configuration types.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::types::rules::ClientChain;

@@ -1,5 +1,11 @@
 //! Configuration validation - validates configs and creates final ServerConfigs.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -169,7 +175,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     }
 
     // Resolve client groups using topological sort
-    let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
+    let mut client_groups = resolve_client_groups_topologically(&raw_client_groups)?;
 
     // A group nothing references is still a configured server, and a person
     // expects to see it listed at zero rather than missing.
@@ -197,7 +203,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     }
 
     // Expand DNS group composition references for ALL groups (named + inline).
-    let expanded_dns_groups = expand_dns_groups_composition(dns_groups)?;
+    let expanded_dns_groups = expand_dns_groups_composition(&dns_groups)?;
 
     // Topological sort by bootstrap dependencies and detect errors
     // This is necessary if we have a DNS group A with bootstrap set to DNS group B, we need
@@ -270,11 +276,11 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 /// 2. Detects cycles
 /// 3. Resolves groups in topological order
 fn resolve_client_groups_topologically(
-    raw_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>>,
+    raw_groups: &HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>>,
 ) -> std::io::Result<HashMap<String, Vec<ClientConfig>>> {
     // Build dependency graph: for each group, collect which groups it references
     let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
-    for (group_name, selections) in &raw_groups {
+    for (group_name, selections) in raw_groups {
         let mut deps = vec![];
         for selection in selections.iter() {
             if let ConfigSelection::GroupName(ref_name) = selection {
@@ -409,12 +415,12 @@ fn topological_sort(dependencies: &HashMap<String, Vec<String>>) -> std::io::Res
 /// Phase 1: Expand DNS group composition references.
 /// Returns a map of group name to flat list of server specs (no group references).
 fn expand_dns_groups_composition(
-    dns_groups: HashMap<String, DnsConfigGroup>,
+    dns_groups: &HashMap<String, DnsConfigGroup>,
 ) -> std::io::Result<HashMap<String, Vec<DnsServerSpec>>> {
     // Build composition dependency graph and validate references
     let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
-    for (group_name, group) in &dns_groups {
+    for (group_name, group) in dns_groups {
         let deps: Vec<String> = group
             .dns_servers
             .iter()
@@ -3486,8 +3492,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_recursive_certificate_embedding() {
-        crate::thread_util::set_num_threads(1);
-
         let test_dir = tempfile::tempdir().unwrap();
         let cert_dir = test_dir.path().join("certs");
         tokio::fs::create_dir_all(&cert_dir).await.unwrap();

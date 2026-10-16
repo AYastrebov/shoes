@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 // XUDP message stream - protocol-agnostic UDP session multiplexing
 // Wraps any AsyncStream and provides XUDP frame encoding/decoding with session management
 // Used by both VLESS and VMess protocols
@@ -21,7 +27,7 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
     AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage,
 };
-use crate::resolver::{NativeResolver, ResolverCache};
+use crate::resolver::{Resolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
@@ -66,9 +72,9 @@ pub struct XudpMessageStream {
 }
 
 impl XudpMessageStream {
-    pub fn new(inner_stream: Box<dyn AsyncStream>) -> Self {
-        // Create resolver implicitly like UdpMessageStream does
-        let resolver = Arc::new(NativeResolver::new());
+    /// `resolver` is the server's own, so a hostname target resolves through
+    /// the configured DNS (routing, fake IP) like any other connection.
+    pub fn new(inner_stream: Box<dyn AsyncStream>, resolver: Arc<dyn Resolver>) -> Self {
         Self {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
@@ -439,6 +445,7 @@ impl AsyncSessionMessageStream for XudpMessageStream {}
 mod tests {
     use super::*;
     use crate::async_stream::testing::TestStream;
+    use crate::quic_outbound::testing::test_resolver;
     use std::future::poll_fn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -486,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn data_on_a_keepalive_is_skipped_with_its_frame() {
         let (near, _far) = tokio::io::duplex(1024);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
         let target = dns_server();
 
         stream
@@ -509,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn a_partial_keepalive_waits_for_its_data() {
         let (near, _far) = tokio::io::duplex(1024);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
         let whole = frame(SessionStatus::KeepAlive, None, &[0xAA; 10]);
         stream
             .read_buffer
@@ -526,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn the_clients_session_ids_are_reported_and_echoed() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
 
         far.write_all(&frame_for(7, SessionStatus::New, Some(dns_server()), b"a"))
             .await
@@ -563,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn a_keep_for_an_unknown_session_is_answered_with_end() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
 
         far.write_all(&frame_for(5, SessionStatus::Keep, None, b"lost"))
             .await
@@ -588,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_over_512_bytes_is_refused() {
         let (near, _far) = tokio::io::duplex(1024);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
         stream.read_buffer.extend_from_slice(&513u16.to_be_bytes());
         stream.read_buffer.extend_from_slice(&[0u8; 513]);
 
@@ -601,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn a_response_over_the_client_frame_limit_is_dropped() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
         let source: SocketAddr = "1.1.1.1:53".parse().unwrap();
 
         let too_big = vec![0u8; MAX_RESPONSE_LEN + 1];

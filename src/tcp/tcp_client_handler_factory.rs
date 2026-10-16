@@ -1,5 +1,11 @@
 //! Factory functions for creating TCP client handlers from config.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::sync::Arc;
 
 use log::debug;
@@ -98,7 +104,7 @@ pub fn create_tcp_client_handler(
             ))
         }
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
-            create_auth_credentials(username, password.map(Redacted::into_inner)),
+            create_auth_credentials(username, password.map(Redacted::into_inner)).as_ref(),
         )),
         ClientProxyConfig::Shadowsocks {
             config,
@@ -195,8 +201,8 @@ pub fn create_tcp_client_handler(
 
             let client_config = Arc::new(create_client_config(
                 verify,
-                server_fingerprints.into_vec(),
-                alpn_protocols.into_vec(),
+                &server_fingerprints.into_vec(),
+                &alpn_protocols.into_vec(),
                 sni_hostname.is_some(),
                 key_and_cert_bytes,
                 false, // tls13_only
@@ -325,8 +331,8 @@ pub fn create_tcp_client_handler(
             // here provides defense in depth and fails fast at the TLS level.
             let client_config = Arc::new(create_client_config(
                 false,      // No WebPKI verification needed for ShadowTLS
-                Vec::new(), // No fingerprints
-                Vec::new(), // No ALPN
+                &[],        // No fingerprints
+                &[],        // No ALPN
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert
                 true,       // tls13_only - required for ShadowTLS v3

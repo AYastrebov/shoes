@@ -69,33 +69,13 @@ impl MuxProtocol {
             _ => None,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "" | "h2mux" => Some(Self::H2Mux),
-            "smux" => Some(Self::Smux),
-            "yamux" => Some(Self::Yamux),
-            _ => None,
-        }
-    }
 }
 
 /// Configuration options for h2mux.
-/// Some fields are reserved for future connection pool management.
 #[derive(Debug, Clone)]
 pub struct H2MuxOptions {
     /// Protocol to use (default: H2Mux)
     pub protocol: MuxProtocol,
-    /// Maximum number of concurrent streams per connection
-    #[allow(dead_code)]
-    pub max_streams: u32,
-    /// Minimum number of streams before opening new connection
-    #[allow(dead_code)]
-    pub min_streams: u32,
-    /// Maximum number of connections
-    #[allow(dead_code)]
-    pub max_connections: u32,
     /// Enable padding
     pub padding: bool,
 }
@@ -104,9 +84,6 @@ impl Default for H2MuxOptions {
     fn default() -> Self {
         Self {
             protocol: MuxProtocol::H2Mux,
-            max_streams: 0, // unlimited
-            min_streams: 4,
-            max_connections: 4,
             padding: false,
         }
     }

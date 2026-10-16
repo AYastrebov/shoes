@@ -99,6 +99,20 @@ name = "shoesd"
 path = "src/bin/shoesd/main.rs"
 required-features = ["daemon"]
 
+# Crate-wide, so a new file starts under them. See AGENTS.md: a local allow
+# names the change that removes it.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+large_enum_variant = "warn"
+# Tests may unwrap (clippy.toml). The files that still do outside tests carry
+# a file-level allow naming plan PR 1.4, which removes the config-time ones;
+# the rest are reviewed as each file is next touched.
+unwrap_used = "warn"
+expect_used = "warn"
+
 [dependencies]
 # Every requirement names the major the lockfile resolved (the minor below
 # 1.0), never "*". The lockfile already fixes what CI builds; this bounds

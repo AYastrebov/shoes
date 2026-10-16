@@ -1,7 +1,7 @@
-// This library shares code with the shoes binary. Server-side code appears "unused"
-// in lib builds but is used by: (1) the binary for server mode, (2) FFI for mobile.
-// The client/server code is intermingled within modules - a proper fix would require
-// splitting into separate client/server modules or using feature flags.
+// The binary declares its own copy of the module tree (main.rs), so code only
+// the binary uses reads as dead here. Removed by plan PR 1.2, which makes
+// main.rs a client of this library
+// (docs/plans/2026-10-15-quality-and-correctness.md).
 #![allow(dead_code)]
 
 //! shoes - A high-performance multi-protocol proxy server.
@@ -16,34 +16,27 @@
 //! - **Proxy chaining**: Connect through multiple proxies
 //! - **Flexible routing**: Rule-based traffic routing
 //!
-//! # Mobile Integration
+//! # Entry points
 //!
-//! For Android, use the FFI module:
+//! - The `shoes` binary (`src/main.rs`) runs servers from config files.
+//! - `shoesd` (`src/bin/shoesd`) is the desktop daemon; it drives [`control`]
+//!   over a local socket.
+//! - Android calls the JNI functions in `ffi/android.rs` through the
+//!   `com.shoesproxy.ShoesNative` object in `android/`:
 //!
 //! ```kotlin
-//! // Load native library
-//! System.loadLibrary("shoes")
-//!
-//! // Initialize
 //! ShoesNative.init("info")
-//!
-//! // Start VPN with TUN fd from VpnService
-//! val handle = ShoesNative.startTun(tunFd, configYaml, protectCallback)
-//!
-//! // Stop VPN
-//! ShoesNative.stop(handle)
+//! val handle = ShoesNative.start(configYaml, protectCallback, trafficCallback)
+//! ShoesNative.stop(handle)  // off the main thread: it waits for the engine
 //! ```
 //!
-//! For iOS, use the C FFI module from Swift:
+//! - iOS and macOS call the C functions in `ffi/ios.rs`, whose header is
+//!   `include/shoes.h` and whose Swift package is `Package.swift`:
 //!
 //! ```swift
-//! // Initialize
 //! shoes_init("info")
-//!
-//! // Start VPN with packet tunnel fd
-//! let handle = shoes_start(configYaml, protectCallback)
-//!
-//! // Stop VPN
+//! let handle = shoes_start(configYaml, protectCallback, trafficCallback)
+//! // or shoes_start_with_fd(configYaml, fd, protect, traffic, stopped)
 //! shoes_stop(handle)
 //! ```
 //!

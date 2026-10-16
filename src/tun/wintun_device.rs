@@ -4,6 +4,12 @@
 //! load `wintun.dll`, create the adapter, give it its address and MTU, and
 //! start the ring-buffer session the stack thread will drive.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;

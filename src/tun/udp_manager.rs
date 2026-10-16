@@ -5,6 +5,12 @@
 //! via channel. This eliminates the busy-polling loop that previously caused
 //! CPU runaway under high-churn UDP workloads.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;

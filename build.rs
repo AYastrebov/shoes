@@ -8,6 +8,11 @@
 //! one, so it is an install step rather than a crate: `brew install protobuf`
 //! on macOS, and the release workflow does the same before it builds `shoesd`.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a build script reports failure by panicking"
+)]
+
 #[cfg(not(feature = "daemon"))]
 fn main() {}
 

@@ -748,9 +748,6 @@ protocol:
   cipher: string
   user_id: string
   h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
     padding: false
 ```
 
@@ -762,9 +759,6 @@ protocol:
   type: vless
   user_id: string
   h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
     padding: false
 ```
 
@@ -777,23 +771,19 @@ protocol:
     cipher: string
     password: string
   h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
     padding: false
 ```
 
 ### H2MUX Multiplexing
 
-H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reducing connection overhead. Compatible with sing-box. Available for VMess, VLESS, and Trojan client protocols.
+H2MUX speaks sing-box's multiplexing protocol, for VMess, VLESS, and Trojan client protocols. Each proxied connection opens its own h2mux session; there is no session pool, so streams are not yet shared between connections.
 
 ```yaml
 h2mux:
-  max_connections: 4           # Maximum connections to maintain (default: 4)
-  min_streams: 4               # Min streams before opening new connection (default: 4)
-  max_streams: 0               # Max streams per connection, 0 = unlimited (default: 0)
   padding: false               # Enable padding for traffic obfuscation (default: false)
 ```
+
+`max_connections`, `min_streams` and `max_streams` are accepted so a config written for sing-box loads, and have no effect: setting one logs a warning.
 
 **Server support:** H2MUX is auto-detected on servers. No configuration needed.
 

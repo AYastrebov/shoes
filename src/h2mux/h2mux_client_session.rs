@@ -189,17 +189,6 @@ impl H2MuxClientSession {
         });
     }
 
-    /// Check if the session is still usable.
-    pub fn is_ready(&self) -> bool {
-        !self.is_closed.load(Ordering::Relaxed)
-    }
-
-    /// Get the number of active streams.
-    #[allow(dead_code)]
-    pub fn active_streams(&self) -> u32 {
-        self.active_streams.load(Ordering::Relaxed)
-    }
-
     /// Open a new TCP stream to the specified destination.
     pub async fn open_tcp(
         &mut self,

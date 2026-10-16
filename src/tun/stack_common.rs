@@ -7,6 +7,12 @@
 //! Windows. [`StackDevice`] is that seam, and [`run_stack_loop`] is the loop,
 //! moved here verbatim from `tcp_stack_direct.rs` so both backends share it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::{
     collections::HashMap,
     io, mem,

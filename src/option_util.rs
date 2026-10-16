@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;

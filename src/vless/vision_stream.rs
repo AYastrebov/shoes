@@ -5,6 +5,12 @@
 //! - Detect TLS-in-TLS scenarios by analyzing traffic patterns
 //! - Switch to direct I/O mode, bypassing TLS for zero-copy performance
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use bytes::{Buf, BytesMut};
 
 use crate::crypto::CryptoConnection;
@@ -876,8 +882,7 @@ where
                             "VISION READ: Read invalid TLS data after valid records - stopping filtering: {}",
                             e
                         );
-                        self.filter
-                            .stop_filtering("read invalid TLS data".to_string());
+                        self.filter.stop_filtering("read invalid TLS data");
                         break;
                     }
                 }
@@ -1356,8 +1361,7 @@ where
 
                     self.pending_tls_mode_switch = true;
 
-                    self.filter
-                        .stop_filtering("write invalid TLS data".to_string());
+                    self.filter.stop_filtering("write invalid TLS data");
 
                     let remaining_data = self.inner_write_deframer.remaining_data();
 

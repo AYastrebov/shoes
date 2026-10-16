@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 // REALITY server-side connection
 //
 // This implements a rustls-compatible API for REALITY protocol server connections,
@@ -282,7 +288,7 @@ impl RealityServerConnection {
     /// received from the destination server to match their structure.
     ///
     /// dest_records should contain: [ServerHello, CCS, encrypted_handshake..., NewSessionTicket...]
-    pub fn build_server_response(&mut self, dest_records: Vec<bytes::Bytes>) -> io::Result<()> {
+    pub fn build_server_response(&mut self, dest_records: &[bytes::Bytes]) -> io::Result<()> {
         // Must be in ClientHelloValidated state
         if !matches!(
             self.handshake_state,
@@ -294,7 +300,7 @@ impl RealityServerConnection {
             ));
         }
 
-        self.build_server_response_internal(&dest_records)
+        self.build_server_response_internal(dest_records)
     }
 
     /// Phase 1: Validate ClientHello and extract info for later response building
@@ -582,7 +588,7 @@ impl RealityServerConnection {
         let encrypted_extensions = construct_encrypted_extensions()?;
         handshake_transcript.update(&encrypted_extensions);
 
-        let certificate = construct_certificate(cert)?;
+        let certificate = construct_certificate(&cert)?;
         handshake_transcript.update(&certificate);
 
         let cert_verify_hash = handshake_transcript.clone().finish();

@@ -229,6 +229,7 @@ fn forward_table(family: ADDRESS_FAMILY) -> std::io::Result<Vec<MIB_IPFORWARD_RO
 fn interface_metric(luid: NET_LUID_LH, family: ADDRESS_FAMILY) -> std::io::Result<u32> {
     // SAFETY: zeroed, initialised, then keyed by LUID and family as documented.
     let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+    // SAFETY: `row` is a live row on the stack.
     unsafe { InitializeIpInterfaceEntry(&mut row) };
     row.Family = family;
     row.InterfaceLuid = luid;
@@ -245,6 +246,7 @@ fn luid_of_alias(alias: &str) -> std::io::Result<NET_LUID_LH> {
         .collect();
     // SAFETY: a NUL-terminated alias; the LUID is written on success.
     let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+    // SAFETY: `wide` is NUL-terminated and alive; `luid` is on the stack.
     let rc = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
     check(rc, || format!("no interface named {alias:?}"))?;
     Ok(luid)
@@ -256,7 +258,10 @@ fn luid_reaching(gateway: IpAddr) -> std::io::Result<NET_LUID_LH> {
     let destination = sockaddr(gateway);
     // SAFETY: zeroed out-parameters, written on success.
     let mut best: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; an all-zero SOCKADDR_INET is a valid value.
     let mut source: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+    // SAFETY: `destination`, `best` and `source` are live locals; the null
+    // arguments are the documented "any interface" and "no source".
     let rc = unsafe {
         GetBestRoute2(
             std::ptr::null(),

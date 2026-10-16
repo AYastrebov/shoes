@@ -12,6 +12,12 @@
 //! Outbound naming is specified in
 //! `docs/superpowers/specs/2026-08-26-named-outbounds-design.md`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 /// A point-in-time reading of the counters.
 ///
 /// Not `Copy`: `outbounds` is a `Vec`, one entry per configured server.

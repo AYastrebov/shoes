@@ -4,6 +4,12 @@
 //! change to either side that breaks the pairing fails a test rather than
 //! waiting for a user to notice.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};

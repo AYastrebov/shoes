@@ -7,6 +7,12 @@
 //! - DelayQueue for O(1) session expiry (no iteration)
 //! - Work queues for pending writes/flushes/responses (no iteration over all sessions)
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io;

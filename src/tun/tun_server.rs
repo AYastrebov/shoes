@@ -36,6 +36,12 @@
 //! utun frames every packet with a 4-byte address family, and the stack
 //! handles that itself on macOS and iOS; nothing needs to be set for it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::IpAddr;
 
 #[cfg(unix)]

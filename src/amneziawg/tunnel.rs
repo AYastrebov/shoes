@@ -432,7 +432,7 @@ impl TunnelRuntime {
                 error!("AmneziaWG receive path failed: {reason}");
                 crate::fatal::report(
                     fatal_generation,
-                    format!("AmneziaWG receive path failed: {reason}"),
+                    &format!("AmneziaWG receive path failed: {reason}"),
                 );
             })
         };
@@ -1049,7 +1049,7 @@ async fn liveness_loop(
                 );
                 dead.store(true, Ordering::SeqCst);
                 error!("{reason}");
-                crate::fatal::report(fatal_generation, reason);
+                crate::fatal::report(fatal_generation, &reason);
                 return;
             }
         }

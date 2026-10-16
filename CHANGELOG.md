@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Lints, dead code and unsafe hygiene (plan PR 1.1; Q-1 to Q-4):
+
+- **h2mux client sessions are no longer kept forever.** Every connection's
+  session was pushed into a pool that only dead code ever pruned, so a
+  long-running h2mux outbound held every session it had opened. The pool and
+  the unused `max_connections`, `min_streams` and `max_streams` handling are
+  gone; the three settings still load, and setting one logs that it has no
+  effect -- each connection has always opened its own session. CONFIG.md says
+  so.
+- **The `shoes` binary no longer panics on a watcher it cannot start.** The
+  file watcher is built after the first configuration loads, so a missing
+  file is reported by the load, and a watcher that fails (an inotify limit)
+  costs reload-on-edit rather than the servers; SIGHUP still reloads.
+- **The library's thread count defaults** to the binary's (the CPU count, at
+  least two) where nothing set it, instead of panicking -- the QUIC endpoint
+  count under FFI or `shoesd` reached it.
+- **XUDP resolves hostnames through the server's configured resolver**, so
+  DNS routing and fake IP apply, instead of a fresh system resolver per stream.
+- **TCP keepalive is set on Windows**, where `set_tcp_keepalive` did nothing.
+- A `[lints]` table: `unsafe_op_in_unsafe_fn` and
+  `undocumented_unsafe_blocks` deny, `unwrap_used` and `expect_used` warn
+  (tests exempt in `clippy.toml`; files that predate the lint carry a
+  file-level allow). Every unsafe block has a SAFETY comment; the raw-fd
+  conversions in `socket_util` and the DNS runtime are safe conversions now.
+- Dead code removed: `stream_worker_pool.rs`, `udp_message_stream.rs`, three
+  FFI functions, the unused h2mux items, `outbound_stats::Entry.address`.
+  Crate-root and FFI docs describe the real entry points.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

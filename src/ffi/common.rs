@@ -7,6 +7,12 @@
 //! because a caller on the far side addresses its service by an integer rather
 //! than by holding a value, and the log-file plumbing those callers configure.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
@@ -59,7 +65,7 @@ pub static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::
 
 /// Serializes start/stop transitions across the FFI surface.
 ///
-/// `stop_service` takes the handle out of `TUN_SERVICE` and then waits up
+/// `stop_service_locked` takes the handle out of `TUN_SERVICE` and then waits up
 /// to five seconds for the engine to wind down. For that whole window the
 /// slot is empty and `is_service_running()` answers false -- so a start
 /// arriving on another thread would pass its already-running guard and put
@@ -88,7 +94,7 @@ static TRANSITION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// start hostage to it.
 pub const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Take the transition lock. Held across all of `stop_service` and all of
+/// Take the transition lock. Held across all of a stop and all of
 /// each platform's start path.
 pub fn transition_guard() -> parking_lot::MutexGuard<'static, ()> {
     TRANSITION.lock()
@@ -130,47 +136,13 @@ pub fn max_log_level_name() -> &'static std::ffi::CStr {
     }
 }
 
-/// Write a log message to the log file if configured.
-pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let line = format!("{} [{}] {}\n", level, target, message);
-            if !writer.write_line(line.as_bytes()) {
-                *guard = None;
-            }
-        }
-    }
-}
-
-/// Flush the log file.
-pub fn flush_log_file() {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            writer.flush();
-        }
-    }
-}
-
-/// Stop the TUN service and wait for shutdown.
-///
-/// This is the common shutdown logic used by both iOS and Android.
+/// Stop the TUN service and wait for shutdown, for a caller that holds the
+/// transition lock -- the platform stop functions, which must clear their
+/// callback slots inside the same locked scope.
 ///
 /// Returns `true` if the service confirmed it stopped, `false` if the wait
 /// timed out. See [`crate::control::stop_handle`] for what that distinction
-/// costs the caller.
-pub fn stop_service() -> bool {
-    // Held to the end: a start that arrives mid-stop must wait until the
-    // engine is gone, and a second stop must not clear the protector out
-    // from under a teardown still in flight.
-    let transition = transition_guard();
-    stop_service_locked(&transition)
-}
-
-/// The body of [`stop_service`], for a caller that already holds the
-/// transition lock -- the platform stop functions, which must clear their
-/// callback slots inside the same locked scope. Clearing them after the
+/// costs the caller. Clearing them after the
 /// lock is released wiped the callbacks a queued start had just
 /// installed, leaving its fresh engine with no socket protector.
 pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -> bool {
@@ -230,7 +202,7 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
 /// one state the contract reserves for "no reason". Shared here so every
 /// C-string-producing sink uses the same rule; a file-private copy is how
 /// the next symbol reintroduces the bug.
-pub fn c_string_lossy(s: String) -> std::ffi::CString {
+pub fn c_string_lossy(s: &str) -> std::ffi::CString {
     std::ffi::CString::new(s.replace('\0', "\u{fffd}")).expect("NULs were just replaced")
 }
 
@@ -356,11 +328,14 @@ mod tests {
     fn a_stop_waits_for_the_transition_in_flight() {
         let held = transition_guard();
 
-        let stopper = std::thread::spawn(stop_service);
+        let stopper = std::thread::spawn(|| {
+            let transition = transition_guard();
+            stop_service_locked(&transition)
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
             !stopper.is_finished(),
-            "stop_service must wait for the transition lock"
+            "a stop must wait for the transition lock"
         );
 
         drop(held);

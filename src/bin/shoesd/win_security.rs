@@ -259,10 +259,13 @@ mod tests {
         // SAFETY: tests in this binary do not read ProgramFiles concurrently;
         // the variable is restored before returning.
         let saved = std::env::var_os("ProgramFiles");
+        // SAFETY: see above.
         unsafe { std::env::set_var("ProgramFiles", std::env::temp_dir()) };
         let after = program_files();
         match saved {
+            // SAFETY: as above; this restores the variable.
             Some(value) => unsafe { std::env::set_var("ProgramFiles", value) },
+            // SAFETY: as above; this restores the variable's absence.
             None => unsafe { std::env::remove_var("ProgramFiles") },
         }
         assert_eq!(after.as_deref(), Some(real.as_path()));

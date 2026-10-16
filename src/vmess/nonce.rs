@@ -54,7 +54,7 @@ mod tests {
     use super::*;
 
     // Helper function to convert Nonce to [u8; 12]
-    fn nonce_to_bytes(nonce: Nonce) -> [u8; 12] {
+    fn nonce_to_bytes(nonce: &Nonce) -> [u8; 12] {
         let slice: &[u8] = nonce.as_ref();
         let mut arr = [0u8; 12];
         arr.copy_from_slice(slice);
@@ -71,7 +71,7 @@ mod tests {
 
         // First advance returns the nonce with counter=0 (first two bytes are 0)
         let nonce = seq.advance().unwrap();
-        let nonce_bytes = nonce_to_bytes(nonce);
+        let nonce_bytes = nonce_to_bytes(&nonce);
         // First two bytes should be 0 (counter before increment)
         assert_eq!(&nonce_bytes[0..2], &[0x00, 0x00]);
         // Remaining 10 bytes should be from data[2..12]
@@ -88,13 +88,13 @@ mod tests {
 
         // Second nonce: counter = 1
         let n2 = seq.advance().unwrap();
-        let n2_bytes = nonce_to_bytes(n2);
+        let n2_bytes = nonce_to_bytes(&n2);
         // Big-endian counter = 1: [0x00, 0x01]
         assert_eq!(&n2_bytes[0..2], &[0x00, 0x01]);
 
         // Third nonce: counter = 2
         let n3 = seq.advance().unwrap();
-        let n3_bytes = nonce_to_bytes(n3);
+        let n3_bytes = nonce_to_bytes(&n3);
         assert_eq!(&n3_bytes[0..2], &[0x00, 0x02]);
     }
 
@@ -110,7 +110,7 @@ mod tests {
         }
 
         let nonce = seq.advance().unwrap();
-        let nonce_bytes = nonce_to_bytes(nonce);
+        let nonce_bytes = nonce_to_bytes(&nonce);
         // Counter = 256 in big-endian: [0x01, 0x00]
         assert_eq!(&nonce_bytes[0..2], &[0x01, 0x00]);
     }
@@ -127,7 +127,7 @@ mod tests {
         // by checking a few iterations work correctly
         for i in 0..10 {
             let nonce = seq.advance().unwrap();
-            let nonce_bytes = nonce_to_bytes(nonce);
+            let nonce_bytes = nonce_to_bytes(&nonce);
             let counter = ((nonce_bytes[0] as u16) << 8) | (nonce_bytes[1] as u16);
             assert_eq!(counter, i);
         }
@@ -144,7 +144,7 @@ mod tests {
 
         for _ in 0..5 {
             let nonce = seq.advance().unwrap();
-            let nonce_bytes = nonce_to_bytes(nonce);
+            let nonce_bytes = nonce_to_bytes(&nonce);
             // Bytes 2-11 should always be the same
             assert_eq!(
                 &nonce_bytes[2..],
@@ -161,7 +161,7 @@ mod tests {
         let mut nonce = SingleUseNonce::new(&data);
 
         let result = nonce.advance().unwrap();
-        let result_bytes = nonce_to_bytes(result);
+        let result_bytes = nonce_to_bytes(&result);
         assert_eq!(result_bytes, data);
     }
 
@@ -184,7 +184,7 @@ mod tests {
         let mut nonce = SingleUseNonce::new(&data);
 
         let result = nonce.advance().unwrap();
-        let result_bytes = nonce_to_bytes(result);
+        let result_bytes = nonce_to_bytes(&result);
         assert_eq!(result_bytes, data);
     }
 
@@ -201,13 +201,13 @@ mod tests {
 
         // First packet: counter = 0
         let n1 = seq.advance().unwrap();
-        let n1_bytes = nonce_to_bytes(n1);
+        let n1_bytes = nonce_to_bytes(&n1);
         assert_eq!(n1_bytes[0], 0x00);
         assert_eq!(n1_bytes[1], 0x00);
 
         // Second packet: counter = 1
         let n2 = seq.advance().unwrap();
-        let n2_bytes = nonce_to_bytes(n2);
+        let n2_bytes = nonce_to_bytes(&n2);
         assert_eq!(n2_bytes[0], 0x00);
         assert_eq!(n2_bytes[1], 0x01);
     }

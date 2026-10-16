@@ -10,6 +10,12 @@
 //! Replies go out through a per-client cache of sockets bound transparently
 //! to the remote's address, so the client sees the remote it spoke to.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 pub mod sys;
 
 #[cfg(target_os = "linux")]

@@ -119,7 +119,7 @@ pub fn construct_encrypted_extensions() -> Result<Vec<u8>> {
 ///
 /// # Arguments
 /// * `cert` - Certificate from rcgen (takes ownership to avoid allocation)
-pub fn construct_certificate(cert: rcgen::Certificate) -> Result<Vec<u8>> {
+pub fn construct_certificate(cert: &rcgen::Certificate) -> Result<Vec<u8>> {
     let cert_der = cert.der();
 
     // Certificate structure:
@@ -458,7 +458,7 @@ mod tests {
         use crate::reality::reality_certificate::generate_hmac_certificate;
         let auth_key = [0x42u8; 32];
         let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
-        let result = construct_certificate(cert);
+        let result = construct_certificate(&cert);
         assert!(result.is_ok());
         let msg = result.unwrap();
         assert_eq!(msg[0], HANDSHAKE_TYPE_CERTIFICATE);

@@ -16,6 +16,12 @@
 //! reach tonic. Not a named pipe: the consumer is a JVM, and grpc-java has no
 //! pipe transport. See docs/specs/2026-10-06-windows-privileged-daemon.md.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::path::Path;
 
 /// Bind the control socket at `path`, restricted to `access`.
@@ -306,6 +312,7 @@ mod platform {
         // SAFETY: a NUL-terminated path; `data` is written on success and the
         // handle is closed below.
         let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
         let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
         if handle == INVALID_HANDLE_VALUE {
             return None;

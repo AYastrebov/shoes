@@ -5,6 +5,12 @@
 //! - StreamRequest prepended to first write
 //! - Status response read on first read
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};

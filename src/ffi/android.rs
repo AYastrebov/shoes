@@ -19,6 +19,12 @@
 //! The JNI function would be:
 //! `Java_com_shoesproxy_ShoesNative_init`
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -46,7 +52,7 @@ impl LogWriter for LogcatWriter {
             // Lossy, not unwrap_or_default: a log line containing a NUL
             // became an EMPTY logcat entry -- the line most worth reading
             // (it quoted hostile input) was the one that vanished.
-            let msg = common::c_string_lossy(format!("{}", record.args()));
+            let msg = common::c_string_lossy(&format!("{}", record.args()));
             let priority = match record.level() {
                 log::Level::Error => 6, // ANDROID_LOG_ERROR
                 log::Level::Warn => 5,  // ANDROID_LOG_WARN
@@ -54,6 +60,8 @@ impl LogWriter for LogcatWriter {
                 log::Level::Debug => 3, // ANDROID_LOG_DEBUG
                 log::Level::Trace => 2, // ANDROID_LOG_VERBOSE
             };
+            // SAFETY: `tag` and `msg` are CStrings alive across the call, so
+            // both pointers are valid and NUL-terminated.
             unsafe {
                 ndk_sys::__android_log_write(priority, tag.as_ptr(), msg.as_ptr());
             }

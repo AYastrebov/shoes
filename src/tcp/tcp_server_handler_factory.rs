@@ -1,5 +1,11 @@
 //! Factory functions for creating TCP server handlers from config.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::IpAddr;
 use std::sync::Arc;
 

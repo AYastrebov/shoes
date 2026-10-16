@@ -148,7 +148,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             if bind_interface.is_some() {
                 // Use our socket_util which supports bind_interface, and which
                 // excludes the socket from the VPN route for us.
-                new_udp_socket(local_addr.is_ipv6(), bind_interface)
+                new_udp_socket(local_addr.is_ipv6(), bind_interface.as_deref())
             } else {
                 // Bind directly, then protect it: a query that goes out through
                 // the tunnel it is meant to resolve for never comes back.
@@ -180,25 +180,11 @@ impl QuicSocketBinder for ProxyQuicBinder {
             // Use socket2 for bind_interface support.
             let socket2_socket = crate::socket_util::new_socket2_udp_socket(
                 local_addr.is_ipv6(),
-                self.bind_interface.clone(),
+                self.bind_interface.as_deref(),
                 Some(local_addr),
                 false,
             )?;
-            // Convert socket2 -> std::net::UdpSocket.
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::FromRawFd;
-                use std::os::unix::io::IntoRawFd;
-                let raw_fd = socket2_socket.into_raw_fd();
-                unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::FromRawSocket;
-                use std::os::windows::io::IntoRawSocket;
-                let raw_socket = socket2_socket.into_raw_socket();
-                unsafe { std::net::UdpSocket::from_raw_socket(raw_socket) }
-            }
+            std::net::UdpSocket::from(socket2_socket)
         } else {
             // Default: bind directly.
             std::net::UdpSocket::bind(local_addr)?

@@ -7,6 +7,12 @@
 //! The signal tests are Unix-only, and so are the helpers only they use:
 //! the test matrix includes Windows, where an unused helper is a warning.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 #[cfg(unix)]
 use std::net::SocketAddr;
 #[cfg(unix)]

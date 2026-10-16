@@ -4,6 +4,12 @@
 //! command is `[u8 version][u8 type][type-specific data]`, and every field is
 //! big endian.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 

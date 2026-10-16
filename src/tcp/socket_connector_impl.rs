@@ -3,6 +3,12 @@
 //! Handles TCP and QUIC transports with bind_interface support.
 //! Created from the socket-related fields of any ClientConfig.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -130,8 +136,8 @@ impl SocketConnectorImpl {
 
                 let rustls_client_config = create_client_config(
                     verify,
-                    server_fingerprints.into_vec(),
-                    alpn_protocols.into_vec(),
+                    &server_fingerprints.into_vec(),
+                    &alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
@@ -161,7 +167,7 @@ impl SocketConnectorImpl {
                 for _ in 0..endpoints_len {
                     let udp_socket = match new_udp_socket(
                         target_address.address().is_ipv6(),
-                        bind_interface.clone(),
+                        bind_interface.as_deref(),
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -234,7 +240,7 @@ impl SocketConnector for SocketConnectorImpl {
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
                     let tcp_socket =
-                        new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
+                        new_tcp_socket(self.bind_interface.as_deref(), target_addr.is_ipv6())?;
                     let attempt =
                         tokio::time::timeout(CONNECT_TIMEOUT, tcp_socket.connect(*target_addr))
                             .await
@@ -351,7 +357,7 @@ impl SocketConnector for SocketConnectorImpl {
         );
 
         let remote_addr = resolve_location(&mut target, resolver).await?;
-        let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
+        let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.as_deref())?;
 
         // Don't use connect() - wrap in UnconnectedUdpSocket instead.
         // A connected UDP socket filters incoming packets by source address,
