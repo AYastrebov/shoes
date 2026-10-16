@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 
-use super::shadow_tls_hmac::{ShadowTlsHmac, tags_equal};
+use super::shadow_tls_hmac::{ShadowTlsHmac, ShadowTlsXorContext, tags_equal};
 use super::shadow_tls_stream::ShadowTlsStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -27,15 +27,6 @@ use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
-
-// context wrapper because it's not Debug
-struct ShadowTlsXorContext(aws_lc_rs::digest::Context);
-
-impl Debug for ShadowTlsXorContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[ShadowTlsXorContext]")
-    }
-}
 
 #[derive(Debug)]
 pub struct ShadowTlsServerTarget {
@@ -57,11 +48,9 @@ impl ShadowTlsServerTarget {
             &password_bytes,
         );
         let initial_hmac = ShadowTlsHmac::new(&hmac_key);
-        let mut initial_xor_context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-        initial_xor_context.update(&password_bytes);
         Self {
             initial_hmac,
-            initial_xor_context: ShadowTlsXorContext(initial_xor_context),
+            initial_xor_context: ShadowTlsXorContext::new(&password_bytes),
             handshake,
             handler,
         }
@@ -114,7 +103,7 @@ const RETRY_REQUEST_RANDOM_BYTES: [u8; 32] = [
 
 /// Validates the ClientHello for ShadowTLS authentication.
 /// Returns Ok(()) on success, or Err with PermissionDenied on auth failure.
-fn validate_shadowtls_client_hello(
+pub(super) fn validate_shadowtls_client_hello(
     parsed_client_hello: &ParsedClientHello,
     initial_hmac: &ShadowTlsHmac,
 ) -> std::io::Result<()> {
@@ -684,7 +673,7 @@ pub fn parse_validated_server_hello(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
-async fn setup_remote_handshake(
+pub(super) async fn setup_remote_handshake(
     mut server_stream: Box<dyn AsyncStream>,
     mut client_reader: StreamReader,
     client_hello_frame: Vec<u8>,
@@ -787,11 +776,7 @@ async fn setup_remote_handshake(
     let mut hmac_server_data = hmac_server_random.clone();
     hmac_server_data.update(b"S");
 
-    let server_app_data_xor = {
-        let mut key_context = initial_xor_context.0.clone();
-        key_context.update(&server_random);
-        key_context.finish().as_ref().to_vec()
-    };
+    let server_app_data_xor = initial_xor_context.key(&server_random);
 
     let mut server_frame = vec![];
     let mut client_frame = vec![];
@@ -1008,11 +993,7 @@ async fn setup_local_handshake(
     let mut hmac_server_data = hmac_server_random.clone();
     hmac_server_data.update(b"S");
 
-    let server_app_data_xor = {
-        let mut key_context = initial_xor_context.0.clone();
-        key_context.update(&server_random);
-        key_context.finish().as_ref().to_vec()
-    };
+    let server_app_data_xor = initial_xor_context.key(&server_random);
 
     // Copies bidirectionally until finding a matching HMAC at the front of an app data frame.
     loop {

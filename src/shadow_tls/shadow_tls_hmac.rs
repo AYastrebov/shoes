@@ -39,3 +39,31 @@ pub fn tags_equal(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
 }
+
+/// SHA256(password), ready to take the ServerRandom: the key the server XORs
+/// over the handshake server's encrypted records, so a passive observer
+/// cannot match them against the decoy's real traffic. Both ends build it.
+#[derive(Clone)]
+pub struct ShadowTlsXorContext(aws_lc_rs::digest::Context);
+
+impl std::fmt::Debug for ShadowTlsXorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[ShadowTlsXorContext]")
+    }
+}
+
+impl ShadowTlsXorContext {
+    pub fn new(password: &[u8]) -> Self {
+        let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        context.update(password);
+        Self(context)
+    }
+
+    /// SHA256(password ‖ server_random), applied cyclically from the first
+    /// byte of each record's payload.
+    pub fn key(&self, server_random: &[u8]) -> Vec<u8> {
+        let mut context = self.0.clone();
+        context.update(server_random);
+        context.finish().as_ref().to_vec()
+    }
+}
