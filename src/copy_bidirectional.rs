@@ -469,7 +469,9 @@ mod starvation_tests {
             Poll::Ready(Ok(false))
         }
     }
+    impl crate::async_stream::SocketPassthrough for Firehose {}
     impl AsyncStream for Firehose {}
+    impl crate::async_stream::SocketPassthrough for Sink {}
     impl AsyncStream for Sink {}
 
     /// One poll over a pair that is never pending must still come back.

@@ -145,4 +145,6 @@ where
     }
 }
 
+impl<IO> crate::async_stream::SocketPassthrough for VlessResponseStream<IO> where IO: AsyncStream {}
+
 impl<IO> AsyncStream for VlessResponseStream<IO> where IO: AsyncStream {}

@@ -864,6 +864,8 @@ impl AsyncPing for WebsocketStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for WebsocketStream {}
+
 impl AsyncStream for WebsocketStream {}
 
 #[inline]

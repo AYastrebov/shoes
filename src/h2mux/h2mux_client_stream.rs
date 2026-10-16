@@ -515,4 +515,6 @@ impl AsyncPing for H2MuxClientStream {
 
 impl Unpin for H2MuxClientStream {}
 
+impl crate::async_stream::SocketPassthrough for H2MuxClientStream {}
+
 impl AsyncStream for H2MuxClientStream {}

@@ -83,6 +83,11 @@ impl<S: crate::async_stream::AsyncPing + Unpin> crate::async_stream::AsyncPing
     }
 }
 
+// Replays a prefix before the inner stream's bytes, so it is not the socket.
+impl<S: crate::async_stream::AsyncStream> crate::async_stream::SocketPassthrough
+    for PrependStream<S>
+{
+}
 impl<S: crate::async_stream::AsyncStream> crate::async_stream::AsyncStream for PrependStream<S> {}
 
 #[cfg(test)]

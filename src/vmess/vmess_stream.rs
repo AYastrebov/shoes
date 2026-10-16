@@ -920,6 +920,8 @@ impl AsyncPing for VmessStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for VmessStream {}
+
 impl AsyncStream for VmessStream {}
 
 impl AsyncReadMessage for VmessStream {

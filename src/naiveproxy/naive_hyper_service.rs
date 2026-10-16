@@ -102,6 +102,8 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
 // AsyncStream but the stream is never actually shared across threads.
 unsafe impl Sync for HyperUpgradedStream {}
 
+impl crate::async_stream::SocketPassthrough for HyperUpgradedStream {}
+
 impl AsyncStream for HyperUpgradedStream {}
 
 /// Service configuration for hyper NaiveProxy handler

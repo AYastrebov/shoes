@@ -424,6 +424,8 @@ impl AsyncPing for ShadowTlsStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for ShadowTlsStream {}
+
 impl AsyncStream for ShadowTlsStream {}
 
 #[cfg(test)]
