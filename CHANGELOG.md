@@ -95,6 +95,15 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
   every type, written back out, is read back as itself; a server entry's
   unknown fields are refused by serde rather than a hand-kept list.
 
+- **A misspelled field in a protocol block is an error.** `protocol:` blocks,
+  inbound and outbound, ignored unknown fields: `usrname:` on a SOCKS
+  inbound or `pasword:` on a Trojan outbound loaded, and the setting the
+  user meant silently did not apply. Both are refused at load, naming the
+  field and the expected ones. **A config that carries extra fields in a
+  protocol block -- one an app generated, say -- now fails to load.**
+- A property test checks that a generated config parses, writes back, and
+  parses to the same thing.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

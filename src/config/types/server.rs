@@ -621,7 +621,7 @@ fn default_tproxy_udp_nat_max() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ServerProxyConfig {
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
