@@ -70,44 +70,18 @@ gated behind `cfg(any(target_os = "android", target_os = "ios", feature =
 protector out of `tun::platform` left duplicate definitions and a stale test
 import behind, and the ordinary gate stayed green throughout.
 
-Note what those two FFI lines do *not* include: `--features ffi --bins` compiles
-FFI-gated code into the binary, which does not declare `mod ffi`, so anything
-whose only caller is the FFI looks dead there. `config::load_config_str` carries
-an allow saying exactly that. Prefer that shape — a narrow allow with the reason
-— over dropping the configuration from the gate.
+The binary links the library (`src/main.rs` declares no modules of its own), so
+code is dead or alive the same way in every build: an item with no caller in a
+configuration is reported there. A narrow allow with the reason -- "called only
+from the FFI" -- is the shape for an item whose caller is compiled out of some
+configuration.
 
 ## Traps in this codebase
 
-### `src/lib.rs` and `src/main.rs` declare the module tree separately
-
-A new top-level module has to be added to both, or the binary fails to build
-while the library succeeds.
-
-The consequence that actually bites: **a module declared in `src/main.rs` that
-nothing in the binary's code path uses is dead code**, and `-D warnings`
-rejects it. The library never tells you this — `src/lib.rs` opens with a
-crate-wide `#![allow(dead_code)]`, because server-side code looks unused there
-and is reached through the binary and the FFI. So `--lib` stays green and
-`--bins` is the half that catches it. This happens constantly when a module
-lands before its consumer. The options, in order of preference:
-
-1. Delay the declaration in `src/main.rs` until the consumer exists.
-2. Use the item for its real purpose — a constant that duplicates a literal
-   elsewhere should replace that literal.
-3. `#[allow(dead_code)]` scoped as narrowly as possible, with a comment naming
-   the change that removes it. Put that removal in the plan.
-
-A permanent allow is correct in exactly one situation: `mod socket_protector`
-in `src/main.rs`, because installing a protector is the FFI's job and the FFI
-is compiled out of this binary. The comment above it explains that this is a
-property of the build rather than something a later change will fix. Write that
-kind of comment, not the word `dead_code` on its own.
-
 ### Config re-exports are part of the public surface
 
-`src/config/types/mod.rs` re-exports config types. Four carry
-`#[allow(unused_imports)]` because the binary names the module type directly.
-Follow the neighbouring pattern rather than deleting the re-export.
+`src/config/types/mod.rs` re-exports config types for the library's users.
+Follow the neighbouring pattern rather than deleting a re-export.
 
 ### The socket constructors protect outbound sockets for you
 

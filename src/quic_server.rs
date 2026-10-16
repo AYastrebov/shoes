@@ -9,8 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error};
-use quinn::EndpointConfig;
+use log::debug;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -25,7 +24,6 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::sniff::SniffSettings;
-use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -33,7 +31,7 @@ use crate::tcp::tcp_server::run_udp_copy;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 use crate::uuid_util::parse_uuid;
 
-async fn start_quic_server(
+fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     resolver: Arc<dyn Resolver>,
@@ -41,104 +39,26 @@ async fn start_quic_server(
     num_endpoints: usize,
     sniff: Option<SniffSettings>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    // TODO: consider setting transport config
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-
-    // As in quic_transport::start_quic_listeners: several endpoints on one
-    // address need SO_REUSEPORT, which Windows does not have. Said out loud,
-    // so a user who configured more is not left guessing why their listener
-    // count differs from a Linux deployment.
-    let num_endpoints = if cfg!(windows) {
-        if num_endpoints > 1 {
-            log::info!(
-                "QUIC listener on {}: num_endpoints {} reduced to 1 (no SO_REUSEPORT on Windows)",
-                bind_address,
-                num_endpoints
-            );
-        }
-        1
-    } else {
-        num_endpoints
-    };
-
-    let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
-
-        // `?`, not unwrap: a bind conflict here reaches the launch path as
-        // an error it can keep the previous configuration over, instead of
-        // panicking the main task and taking the whole process with it.
-        let socket2_socket = new_socket2_udp_socket(
-            bind_address.is_ipv6(),
-            None,
-            Some(bind_address),
-            cfg!(not(windows)),
-        )?;
-
-        let endpoint = quinn::Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            socket2_socket.into(),
-            Arc::new(quinn::TokioRuntime),
-        )?;
-
-        let resolver = resolver.clone();
-        let server_handler = server_handler.clone();
-        let sniff = sniff.clone();
-        let join_handle = tokio::spawn(async move {
-            // The same per-listener cap as the TCP accept loops; the
-            // permit lives in the per-connection task, which owns the
-            // connection for its whole life here.
-            let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(
-                crate::util::MAX_INFLIGHT_PER_LISTENER,
-            ));
-            loop {
-                let permit = limiter
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("the limiter is never closed");
-                let Some(conn) = endpoint.accept().await else {
-                    break;
-                };
-                // See `quic_transport::retry_wanted`; the permit taken above
-                // goes back with the `continue`.
-                let Some(conn) = crate::quic_transport::admit_or_retry(conn, &limiter) else {
-                    continue;
-                };
-                let resolver = resolver.clone();
-                let server_handler = server_handler.clone();
-                let sniff = sniff.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) = process_connection(resolver, server_handler, conn, sniff).await
-                    {
-                        // Same triage as the TCP accept loops: scanner
-                        // probes and half-open handshakes are continuous on
-                        // an internet-facing listener, and at error level
-                        // they rotated the real errors away.
-                        log::log!(
-                            crate::util::connection_end_level(&e),
-                            "Connection ended with error: {e}"
-                        );
-                    }
-                });
-            }
-            // accept() returning None means the endpoint closed. Ending
-            // silently left the process running with a QUIC port that no
-            // longer accepts and nothing in the log to say so.
-            error!("QUIC endpoint closed; this listener is no longer accepting connections");
-        });
-
-        join_handles.push(join_handle);
-    }
-
-    Ok(join_handles)
+    // The accept loop, the per-listener cap, Retry under pressure and the
+    // end-of-connection triage are quic_transport's, shared with Hysteria2
+    // and TUIC. `None`: this transport runs on quinn's default parameters.
+    crate::quic_transport::start_quic_listeners(
+        QuicListenerSettings {
+            bind_address,
+            quic_server_config,
+            num_endpoints,
+            obfs: None,
+        },
+        None,
+        move |conn| {
+            process_connection(
+                resolver.clone(),
+                server_handler.clone(),
+                conn,
+                sniff.clone(),
+            )
+        },
+    )
 }
 
 async fn process_connection(
@@ -167,7 +87,12 @@ async fn process_connection(
             if let Err(e) =
                 process_streams(cloned_resolver, cloned_handler, stream, cloned_sniff).await
             {
-                error!("Failed to process streams: {e}");
+                // The accept loops' triage: a probe or a peer going away is
+                // routine, and at error level it buried the real failures.
+                log::log!(
+                    crate::util::connection_end_level(&e),
+                    "Failed to process streams: {e}"
+                );
             }
         });
     }
@@ -451,8 +376,7 @@ pub async fn start_quic_servers(
                     tcp_handler,
                     num_endpoints,
                     sniff.clone(),
-                )
-                .await?;
+                )?;
 
                 handles.extend(quic_handles);
             }

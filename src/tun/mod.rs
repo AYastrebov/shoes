@@ -108,7 +108,6 @@ static DEVICE_NAME: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new
 /// `traffic::TEST_LOCK`: the state is process-global, so tests that set it
 /// have to take turns or they read each other's writes.
 #[cfg(test)]
-#[allow(dead_code)] // The binary's test build has no test that takes it.
 pub(crate) static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The interface the running session created, if it created one.
@@ -116,16 +115,7 @@ pub(crate) static DEVICE_NAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex
 /// Cleared at both ends of a session, so this does not outlive the device it
 /// names. A host that wants the answer tied to a lifecycle state should read
 /// `control::StatusSnapshot::device_name`, which additionally gates it on the
-/// service actually running.
-///
-/// Unused by the `shoes` binary, and permanently so: reading this is a
-/// privileged host's job, and `src/main.rs` is not one -- it runs a config and
-/// configures no routes. Its consumers are `shoes::control::StatusSnapshot`
-/// and the `shoesd` daemon, both of which reach it through the library crate,
-/// which `src/main.rs` does not use (it re-declares the module tree). Same
-/// shape as the permanent allow on `mod socket_protector` there: a property of
-/// the build, not something a later change removes.
-#[allow(dead_code)]
+/// service actually running. Read by `shoesd`, which routes through it.
 pub fn device_name() -> Option<String> {
     DEVICE_NAME.lock().clone()
 }
@@ -136,10 +126,7 @@ pub fn device_name() -> Option<String> {
 ///
 /// Windows was missing until the daemon needed it: `shoesd`'s supervisor
 /// waits for this name before it installs routes, so a Windows session that
-/// never published one would time out every start. The allow stays for the
-/// `shoes` binary, which creates devices but reads no names -- see
-/// [`device_name`].
-#[allow(dead_code)]
+/// never published one would time out every start.
 pub(crate) fn set_device_name(name: String) {
     *DEVICE_NAME.lock() = Some(name);
 }
@@ -150,9 +137,6 @@ pub(crate) fn set_device_name(name: String) {
 /// leave the previous session's interface visible, and when the service task
 /// exits, so nothing reports a device that is gone. The second is the first
 /// thing `control`'s exit guard does -- see the ordering note there.
-///
-/// Unused by the `shoes` binary -- see [`device_name`].
-#[allow(dead_code)]
 pub fn clear_device_name() {
     *DEVICE_NAME.lock() = None;
 }

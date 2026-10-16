@@ -1051,7 +1051,7 @@ pub async fn start_hysteria2_server(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let params = transport_params(listener.obfs.as_ref());
 
-    start_quic_listeners(listener, params, move |conn| {
+    start_quic_listeners(listener, Some(params), move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         async move {

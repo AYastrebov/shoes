@@ -1,86 +1,3 @@
-mod address;
-mod amneziawg;
-mod anytls;
-mod async_stream;
-mod buf_reader;
-mod buffer_sizing;
-mod client_proxy_chain;
-mod client_proxy_selector;
-mod config;
-mod copy_bidirectional;
-mod copy_bidirectional_message;
-mod crypto;
-mod dns;
-// The tunnel reports into this module in both builds, but only the
-// library's control layer subscribes -- the standalone server must not
-// die because one outbound lost a socket. So the subscribing half has no
-// caller in this binary, which is a property of the build.
-#[allow(dead_code)]
-mod fatal;
-mod h2mux;
-mod http_handler;
-mod http_parse;
-mod httpupgrade;
-mod hysteria2;
-mod logging;
-mod memory;
-mod mieru;
-mod mixed_handler;
-mod naiveproxy;
-mod option_util;
-#[cfg(feature = "control-stats")]
-mod outbound_counting_stream;
-mod outbound_stats;
-mod port_forward_handler;
-mod prepend_stream;
-mod quic_outbound;
-mod quic_server;
-mod quic_stream;
-mod quic_transport;
-mod reality;
-mod reality_client_handler;
-mod redirect_handler;
-mod resolver;
-mod routing;
-mod rule_set;
-mod rustls_config_util;
-mod rustls_connection_util;
-mod shadow_tls;
-mod shadowsocks;
-mod slide_buffer;
-mod snell;
-mod sniff;
-// Consulting a protector happens on every outbound socket; installing one is
-// the FFI's job, and the FFI is compiled out of this binary. So the installer
-// half of this module has no caller here and never will, which is a property of
-// the build rather than something a later change will fix.
-#[allow(dead_code)]
-mod socket_protector;
-mod socket_util;
-mod socks5_udp_relay;
-mod socks_handler;
-#[cfg(target_os = "linux")]
-mod splice;
-mod stream_reader;
-mod sync_adapter;
-mod tcp;
-mod thread_util;
-mod tls_client_handler;
-mod tls_server_handler;
-mod tproxy;
-mod trojan_handler;
-mod tuic;
-#[cfg(any(unix, windows))]
-mod tun;
-mod udp_route_cache;
-mod uot;
-mod util;
-mod uuid_util;
-mod vless;
-mod vmess;
-mod websocket;
-mod xudp;
-
 #[cfg(not(any(
     target_env = "msvc",
     target_os = "ios",
@@ -105,14 +22,12 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tcp_server::start_servers;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::reality::generate_keypair;
-use crate::shadowsocks::ShadowsocksCipher;
-use crate::thread_util::set_num_threads;
-use tcp::*;
+use shoes::cli::{generate_reality_keypair, get_num_threads, set_num_threads};
+use shoes::control::servers::{PreparedServers, launch_servers, prepare_servers};
+use shoes::{config, logging};
 
 #[derive(Debug)]
 struct ConfigChanged;
@@ -280,7 +195,7 @@ fn main() {
     logging::install_panic_hook();
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
-        let (private_key, public_key) = generate_keypair().unwrap_or_else(|e| {
+        let (private_key, public_key) = generate_reality_keypair().unwrap_or_else(|e| {
             eprintln!("Could not generate a keypair: {e}");
             std::process::exit(1);
         });
@@ -312,10 +227,10 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                match ShadowsocksCipher::try_from(base_cipher) {
-                    Ok(cipher) => {
+                match shoes::cli::shadowsocks_2022_key_len(base_cipher) {
+                    Some(key_len) => {
                         let rng = SystemRandom::new();
-                        let mut key_bytes = vec![0u8; cipher.key_len()];
+                        let mut key_bytes = vec![0u8; key_len];
                         if rng.fill(&mut key_bytes).is_err() {
                             eprintln!("The system random number generator failed.");
                             std::process::exit(1);
@@ -330,7 +245,7 @@ fn main() {
                             "--------------------------------------------------------------------------------"
                         );
                     }
-                    Err(_) => {
+                    None => {
                         eprintln!("Unknown cipher: {}", c);
                         eprintln!("Supported shadowsocks 2022 ciphers:");
                         eprintln!("  2022-blake3-aes-128-gcm");
@@ -356,7 +271,7 @@ fn main() {
     }
 
     if args.iter().any(|s| s == "generate-vless-user-id") {
-        let uuid = uuid_util::generate_uuid();
+        let uuid = shoes::cli::generate_user_id();
         println!(
             "--------------------------------------------------------------------------------"
         );
@@ -377,7 +292,7 @@ fn main() {
     }
 
     if num_threads == 0 {
-        num_threads = thread_util::get_num_threads();
+        num_threads = get_num_threads();
         debug!("Runtime threads: {num_threads}");
     } else {
         println!("Using custom thread count ({num_threads})");
@@ -446,7 +361,7 @@ fn main() {
         // avoid, and there is nothing to clean up before the first launch.
         let mut reload = ReloadSignal::install();
 
-        let mut prepared = match prepare_servers(&args, None).await {
+        let mut prepared = match prepare(&args, None).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{e}\n");
@@ -476,10 +391,13 @@ fn main() {
 
         let mut first_launch = true;
         loop {
-            let loaded = std::mem::take(&mut prepared.sources);
+            let Loaded {
+                servers,
+                sources: loaded,
+            } = prepared;
             let mut running = None;
 
-            let join_handles = match launch_servers(prepared).await {
+            let join_handles = match launch(servers).await {
                 Ok(handles) => {
                     running = Some(loaded);
                     handles
@@ -593,7 +511,7 @@ fn main() {
                             while rx.try_recv().is_ok() {}
                         }
                         reload.drain();
-                        Some(prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await)
+                        Some(prepare(&args, reload_state.as_mut().map(|(w, _)| w)).await)
                     } => outcome,
                     (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
                 };
@@ -793,12 +711,10 @@ impl ShutdownSignals {
     }
 }
 
-/// Everything a validated configuration needs to start serving.
-struct PreparedServers {
-    server_configs: Vec<config::Config>,
-    dns_registry: dns::DnsRegistry,
-    outbounds: outbound_stats::OutboundSet,
-    /// The watched files as they were read for this configuration.
+/// A configuration ready to launch, and the watched files as they were read
+/// for it.
+struct Loaded {
+    servers: PreparedServers,
     sources: Sources,
 }
 
@@ -843,33 +759,18 @@ impl Sources {
 /// Load, validate, and resolve a configuration without touching the servers
 /// that may be running -- the reload path decides what to do with the result.
 /// The error is the full message to print.
-async fn prepare_servers(
+async fn prepare(
     args: &Vec<String>,
     watcher: Option<&mut RecommendedWatcher>,
-) -> Result<PreparedServers, String> {
+) -> Result<Loaded, String> {
     let config_sources = Sources::read(args.iter().cloned()).await;
     let configs = config::load_configs(args)
         .await
         .map_err(|e| format!("Failed to load server configs: {e}"))?;
 
-    let (configs, load_file_count) = config::convert_cert_paths(configs)
-        .await
-        .map_err(|e| format!("Failed to load cert files: {e}"))?;
-
-    if load_file_count > 0 {
-        println!("Loaded {load_file_count} certs/keys from files");
-    }
-
-    for config in configs.iter() {
-        debug!("================================================================================");
-        debug!("{config:#?}");
-    }
-    debug!("================================================================================");
-
     // Rule-set files are only known once the configs are parsed, and
     // which ones exist can change across a reload, so the watch set is
-    // refreshed here rather than built once at startup. A rule-set edit
-    // then takes the same reload path a config edit does.
+    // extended here rather than once at startup.
     if let Some(watcher) = watcher {
         watch_rule_set_paths(watcher, &configs);
     }
@@ -881,74 +782,13 @@ async fn prepare_servers(
     let mut sources = config_sources;
     sources.0.extend(rule_set_sources.0);
 
-    let config::ValidatedConfigs {
-        configs: server_configs,
-        dns_groups,
-        outbounds,
-    } = config::create_server_configs(configs)
-        .map_err(|e| format!("Failed to create server configs: {e}"))?;
-
-    // Build DNS registry from expanded groups (async - resolves hostnames)
-    let dns_registry = dns::build_dns_registry(dns_groups)
-        .await
-        .map_err(|e| format!("Failed to build DNS registry: {e}"))?;
-
-    Ok(PreparedServers {
-        server_configs,
-        dns_registry,
-        outbounds,
-        sources,
-    })
+    let servers = prepare_servers(configs).await.map_err(|e| e.to_string())?;
+    Ok(Loaded { servers, sources })
 }
 
-/// Commit a prepared configuration: install its outbounds and spawn its
-/// servers. Only called with a `PreparedServers` that validated whole.
-/// A launch failure -- a bind conflict, fd exhaustion -- aborts whatever
-/// did start and returns the message to print, so the serve loop decides
-/// what happens next instead of a panic deciding for it.
-async fn launch_servers(
-    prepared: PreparedServers,
-) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
-    let PreparedServers {
-        server_configs,
-        mut dns_registry,
-        outbounds,
-        // The serve loop keeps these to judge the next watcher event.
-        sources: _,
-    } = prepared;
-
-    // Replace, not add: a reload must not carry the previous config's
-    // servers into the new list.
-    #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
-    #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
-
-    println!("\nStarting {} server(s)..", server_configs.len());
-
-    let mut join_handles: Vec<tokio::task::JoinHandle<()>> = vec![];
-    for server_config in server_configs {
-        // Get the resolver for this server from the registry. TUN entries
-        // without a dns: block keep the uncached system resolver they
-        // always had -- see DnsRegistry::get_for_tun.
-        let resolver = match &server_config {
-            config::Config::Server(s) => dns_registry.get_for_server(s.dns.as_ref()),
-            config::Config::TunServer(t) => dns_registry.get_for_tun(t.dns.as_ref()),
-            _ => dns_registry.get_for_server(None),
-        };
-        match start_servers(server_config, resolver).await {
-            Ok(handles) => join_handles.extend(handles),
-            Err(e) => {
-                // Half a configuration must not keep serving as if whole.
-                for handle in &join_handles {
-                    handle.abort();
-                }
-                for handle in join_handles {
-                    let _ = handle.await;
-                }
-                return Err(format!("Failed to start servers: {e}"));
-            }
-        }
-    }
-    Ok(join_handles)
+async fn launch(servers: PreparedServers) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
+    println!("\nStarting {} server(s)..", servers.len());
+    launch_servers(servers)
+        .await
+        .map_err(|e| format!("Failed to start servers: {e}"))
 }

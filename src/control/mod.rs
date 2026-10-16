@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 mod device;
 #[cfg(feature = "control-logs")]
 pub mod logs;
+pub mod servers;
 #[cfg(feature = "control-stats")]
 pub mod stats;
 mod stop;
@@ -37,9 +38,7 @@ mod status;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use status::{Status, StatusSnapshot, StopReason};
 
-use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
-use crate::dns::build_dns_registry;
-use crate::tcp::tcp_server::start_servers;
+use crate::config::{Config, load_config_str};
 #[cfg(any(unix, windows))]
 use crate::tun::run_tun_from_config;
 
@@ -575,19 +574,11 @@ async fn prepare_configs(
         apply_device_override(&mut configs, device);
     }
 
-    let (configs, pem_count) = convert_cert_paths(configs).await?;
-    if pem_count > 0 {
-        info!("Loaded {} PEM files", pem_count);
-    }
-
-    let crate::config::ValidatedConfigs {
+    let servers::PreparedServers {
         configs: validated_configs,
-        dns_groups,
+        dns_registry,
         outbounds,
-    } = create_server_configs(configs)?;
-
-    // Build DNS registry from expanded groups
-    let dns_registry = build_dns_registry(dns_groups).await?;
+    } = servers::prepare_servers(configs).await?;
 
     // Separate TUN config from server configs, and check the one TUN against
     // what this host can provide -- see DevicePolicy.
@@ -642,10 +633,7 @@ async fn prepare_configs(
     // went on holding them, so its traffic would vanish from every later
     // snapshot. Replace rather than merge: a reload must not carry the
     // previous config's servers into the new list.
-    #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
-    #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
+    servers::install_outbounds(&outbounds);
 
     Ok(PreparedService {
         tun_config,
@@ -711,10 +699,13 @@ pub async fn run_prepared(
     // Start TCP servers (like mixed)
     let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
 
-    for server_config in server_configs {
-        let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
-        join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
-    }
+    join_handles.extend(
+        servers::start_configs(
+            server_configs.into_iter().map(Config::Server).collect(),
+            &mut dns_registry,
+        )
+        .await?,
+    );
 
     // The TUN honours one oneshot. Merge the host's shutdown and the
     // process-wide fatal signal into it, rather than selecting over the
