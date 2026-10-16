@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use http::Response;
 use log::{debug, info};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -382,6 +382,10 @@ async fn handle_h2mux_stream(
     let packet_addr = request.packet_addr;
     let destination = request.destination;
 
+    if !is_udp && is_brutal_exchange(&destination) {
+        return answer_brutal_exchange(&mut stream).await;
+    }
+
     info!(
         "H2MUX stream: {} -> {} (udp={}, packet_addr={})",
         if is_udp { "UDP" } else { "TCP" },
@@ -412,6 +416,50 @@ async fn handle_h2mux_stream(
         // TCP stream - regular forwarding
         handle_h2mux_tcp(stream, destination, proxy_selector, resolver).await
     }
+}
+
+/// The destination a sing-mux client opens to negotiate TCP Brutal
+/// (sing-mux brutal.go, `BrutalExchangeDomain`).
+const BRUTAL_EXCHANGE_DOMAIN: &str = "_BrutalBwExchange";
+
+fn is_brutal_exchange(destination: &crate::address::NetLocation) -> bool {
+    matches!(destination.address(), crate::address::Address::Hostname(host) if host == BRUTAL_EXCHANGE_DOMAIN)
+}
+
+/// Decline TCP Brutal, as a sing-mux server with brutal disabled does
+/// (sing-mux server.go, newSession): read the client's u64 receive rate and
+/// answer `bool(false)` and a varbin message. A brutal-enabled client then
+/// carries on without it. Dialled as a hostname instead, the exchange failed
+/// and the client tore the whole session down.
+///
+/// On an `H2MuxServerStream` the write is preceded by the success status
+/// byte, as sing-mux's serverConn writes it.
+async fn answer_brutal_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> io::Result<()> {
+    const MESSAGE: &[u8] = b"brutal is not enabled by the server";
+
+    let mut client_receive_bps = [0u8; 8];
+    stream.read_exact(&mut client_receive_bps).await?;
+    debug!(
+        "H2MUX: declining TCP Brutal (client receives {} B/s)",
+        u64::from_be_bytes(client_receive_bps)
+    );
+
+    // bool(false), then the message as varbin: a uvarint length and the bytes.
+    let mut response = vec![0u8];
+    let mut len = MESSAGE.len();
+    while len >= 0x80 {
+        response.push((len as u8) | 0x80);
+        len >>= 7;
+    }
+    response.push(len as u8);
+    response.extend_from_slice(MESSAGE);
+
+    stream.write_all(&response).await?;
+    stream.flush().await?;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 /// Handle TCP stream from h2mux
@@ -522,8 +570,35 @@ async fn handle_h2mux_udp_packet_addr(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::address::{Address, NetLocation};
+    use tokio::io::duplex;
+
+    #[test]
+    fn only_the_exchange_hostname_is_the_brutal_exchange() {
+        let exchange = NetLocation::new(Address::Hostname(BRUTAL_EXCHANGE_DOMAIN.into()), 444);
+        let other = NetLocation::new(Address::Hostname("example.com".into()), 443);
+        assert!(is_brutal_exchange(&exchange));
+        assert!(!is_brutal_exchange(&other));
+    }
+
+    /// The decline is the bytes sing-mux's WriteBrutalResponse writes for
+    /// `ok = false`: a zero bool, a uvarint length, the message.
     #[tokio::test]
-    async fn test_server_session_creation() {
-        // Verifies types compile correctly; full integration tests require a matching client
+    async fn the_brutal_exchange_is_declined_with_the_exact_bytes() {
+        let (mut server, mut client) = duplex(1024);
+        client
+            .write_all(&100_000_000u64.to_be_bytes())
+            .await
+            .unwrap();
+
+        answer_brutal_exchange(&mut server).await.unwrap();
+        drop(server);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let mut expected = vec![0x00, 35];
+        expected.extend_from_slice(b"brutal is not enabled by the server");
+        assert_eq!(response, expected);
     }
 }

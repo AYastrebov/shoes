@@ -73,6 +73,7 @@ mod tuic;
 #[cfg(any(unix, windows))]
 mod tun;
 mod udp_message_stream;
+mod udp_route_cache;
 mod uot;
 mod util;
 mod uuid_util;

@@ -29,12 +29,13 @@ use crate::quic_transport::{
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::setup_client_tcp_stream;
+use crate::udp_route_cache::{UdpRouteCache, judge_and_resolve};
 use crate::util::{allocate_vec, write_all};
 
 use super::frame::{
     COMMAND_TYPE_AUTHENTICATE, COMMAND_TYPE_CONNECT, COMMAND_TYPE_DISSOCIATE,
     COMMAND_TYPE_HEARTBEAT, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION,
-    encode_packet_header_with_address, read_address, serialize_address, serialize_socket_addr,
+    encode_packet_header_with_address, read_address, serialize_socket_addr,
 };
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -92,21 +93,22 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            connection.close(0u32.into(), b"auth failed");
-            return Err(e);
-        }
-        Err(_elapsed) => {
-            error!("Authentication timeout");
-            connection.close(0u32.into(), b"auth timeout");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "authentication timeout",
-            ));
-        }
-    }
+    let streams_before_auth =
+        match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
+            Ok(Ok(parked)) => parked,
+            Ok(Err(e)) => {
+                connection.close(0u32.into(), b"auth failed");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                error!("Authentication timeout");
+                connection.close(0u32.into(), b"auth timeout");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authentication timeout",
+                ));
+            }
+        };
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
@@ -155,6 +157,7 @@ async fn process_connection(
         uni_udp_session_map,
         uni_fragments,
         uni_cancel_token,
+        streams_before_auth,
     );
 
     let datagram_loop = run_datagram_loop(
@@ -217,11 +220,42 @@ async fn run_heartbeat_loop(
     }
 }
 
+/// How many streams may wait for Authenticate. A client sends a handful at
+/// most (the first packets of a `quic`-mode association); this only bounds
+/// what a peer that never authenticates can make us hold.
+const MAX_STREAMS_BEFORE_AUTH: usize = 32;
+
+/// A uni stream whose version and command type are already read.
+type ParkedStream = (quinn::RecvStream, u8);
+
+/// Read a command's version and type bytes, and nothing past them, so a
+/// stream can be handed on intact.
+async fn read_command_type(recv_stream: &mut quinn::RecvStream) -> std::io::Result<u8> {
+    let mut header = [0u8; 2];
+    recv_stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to read command header: {e}")))?;
+    let [tuic_version, command_type] = header;
+    if tuic_version != TUIC_VERSION {
+        return Err(std::io::Error::other(format!(
+            "invalid tuic version: {tuic_version}"
+        )));
+    }
+    Ok(command_type)
+}
+
+/// Wait for Authenticate, and return the uni streams that arrived before it.
+///
+/// Commands may be sent before Authenticate, and the server is to hold them
+/// until it arrives (SPEC.md, "Authenticate"; tuic-server handle_stream.rs
+/// waits on the auth before running a uni-stream task). In `quic` relay mode
+/// the first Packet - often a DNS query - is such a stream.
 async fn auth_connection(
     connection: &quinn::Connection,
     uuid: &'static [u8],
     password: &'static str,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<ParkedStream>> {
     let mut expected_token_bytes = [0u8; 32];
     connection
         .export_keying_material(
@@ -231,31 +265,29 @@ async fn auth_connection(
         )
         .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
 
-    // Loop until we receive an AUTH command.
-    // Other commands (like DISSOCIATE) may arrive on uni streams before AUTH.
-    // We discard non-AUTH streams and wait for the next one.
     // The outer timeout in process_connection ensures we don't wait forever.
+    let mut parked = Vec::new();
     loop {
         let mut recv_stream = connection.accept_uni().await?;
-        let mut stream_reader = StreamReader::new_with_buffer_size(80);
-        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-        if tuic_version != TUIC_VERSION {
-            return Err(std::io::Error::other(format!(
-                "invalid tuic version: {tuic_version}"
-            )));
-        }
-        let command_type = stream_reader.read_u8(&mut recv_stream).await?;
+        let command_type = read_command_type(&mut recv_stream).await?;
 
         if command_type != COMMAND_TYPE_AUTHENTICATE {
-            // Not an AUTH command - discard this stream and wait for the next one.
-            debug!("Received command type {command_type} before auth, waiting for auth command");
+            if parked.len() < MAX_STREAMS_BEFORE_AUTH {
+                debug!("Holding command type {command_type} until auth");
+                parked.push((recv_stream, command_type));
+            } else {
+                debug!("Dropping command type {command_type}: too many before auth");
+            }
             continue;
         }
 
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
+        let mut credentials = [0u8; 16 + 32];
+        recv_stream
+            .read_exact(&mut credentials)
+            .await
+            .map_err(|e| std::io::Error::other(format!("failed to read auth command: {e}")))?;
+        let (specified_uuid, token_bytes) = credentials.split_at(16);
         let uuid_match = specified_uuid.ct_eq(uuid);
-
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
         let token_match = token_bytes.ct_eq(&expected_token_bytes);
 
         // Constant time, and both are read and compared before either is
@@ -269,7 +301,7 @@ async fn auth_connection(
             ));
         }
 
-        return Ok(());
+        return Ok(parked);
     }
 }
 
@@ -406,11 +438,10 @@ async fn process_tcp_stream(
 
 struct UdpSession {
     send_socket: Arc<UdpSocket>,
-    // we cache the last location in case of mid-session address changes, and
-    // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
-    override_remote_write_address: Option<SocketAddr>,
+    /// Each packet goes to the target it names ("Full Cone", as tuic-server
+    /// does); this keeps the last one's routing decision so a single-peer
+    /// association is judged once.
+    route: UdpRouteCache,
     last_activity: std::time::Instant,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
@@ -562,15 +593,11 @@ fn push_fragment(
 }
 
 impl UdpSession {
-    #[allow(clippy::too_many_arguments)]
     fn start_with_uni_streams(
         assoc_id: u16,
         connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
-        override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        route: UdpRouteCache,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -578,9 +605,7 @@ impl UdpSession {
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
+            route,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
         };
@@ -590,7 +615,6 @@ impl UdpSession {
                 assoc_id,
                 connection,
                 client_socket,
-                override_local_write_location,
                 session_cancel_token,
             )
             .await
@@ -602,15 +626,11 @@ impl UdpSession {
         session
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_with_datagram(
         assoc_id: u16,
         connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
-        override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        route: UdpRouteCache,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -618,9 +638,7 @@ impl UdpSession {
 
         let session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
+            route,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
         };
@@ -630,7 +648,6 @@ impl UdpSession {
                 assoc_id,
                 connection,
                 client_socket,
-                override_local_write_location,
                 session_cancel_token,
             )
             .await
@@ -642,55 +659,30 @@ impl UdpSession {
         session
     }
 
-    #[inline]
+    /// Where `location` goes, and whether it is a new target to remember.
     async fn resolve_address(
         &self,
         location: &NetLocation,
         client_proxy_selector: &Arc<ClientProxySelector>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<(SocketAddr, bool)> {
-        let (addr, is_updated) = match self.override_remote_write_address {
-            Some(addr) => (addr, false),
-            None => {
-                if location == &self.last_location {
-                    (self.last_socket_addr, false)
-                } else {
-                    let action = client_proxy_selector
-                        .judge(location.clone().into(), resolver)
-                        .await?;
-
-                    let updated_location = match action {
-                        ConnectDecision::Allow {
-                            chain_group: _,
-                            remote_location,
-                        } => remote_location,
-                        ConnectDecision::Block => {
-                            return Err(std::io::Error::other(format!(
-                                "Blocked UDP forward to {location}"
-                            )));
-                        }
-                    };
-                    let updated_address =
-                        match resolve_single_address(resolver, updated_location.location()).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("Failed to resolve updated remote location {location}: {e}");
-                                return Err(e);
-                            }
-                        };
-
-                    (updated_address, true)
-                }
-            }
-        };
-
-        Ok((addr, is_updated))
+        if let Some(socket_addr) = self.route.cached(location) {
+            return Ok((socket_addr, false));
+        }
+        let socket_addr = judge_and_resolve(location, client_proxy_selector, resolver).await?;
+        Ok((socket_addr, true))
     }
+}
 
-    fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
-        self.last_location = location;
-        self.last_socket_addr = socket_addr;
+/// The wire address a reply is labelled with: its real source, as
+/// tuic-server labels it (handle_task.rs). The socket is dual-stack, so an
+/// IPv4 source arrives mapped and is sent as the IPv4 it is.
+fn reply_source(cached_src: &mut Option<(SocketAddr, Bytes)>, src_addr: SocketAddr) -> Bytes {
+    if cached_src.as_ref().is_none_or(|(a, _)| *a != src_addr) {
+        let source = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
+        *cached_src = Some((src_addr, serialize_socket_addr(&source).into()));
     }
+    cached_src.as_ref().unwrap().1.clone()
 }
 
 /// Send replies to the client over unidirectional streams.
@@ -705,18 +697,14 @@ async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
-    override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let original_address_bytes: Option<Bytes> =
-        override_local_write_address.map(|a| serialize_address(&a).into());
-
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
     // Cache the serialized reply source address; it is constant for the common
     // single-peer flow, so the steady state is a refcount bump rather than a
-    // serialize_socket_addr allocation per packet. Unused when there is an override.
+    // serialize_socket_addr allocation per packet.
     let mut cached_src: Option<(SocketAddr, Bytes)> = None;
 
     loop {
@@ -750,15 +738,7 @@ async fn run_udp_remote_to_local_stream_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes = match original_address_bytes {
-            Some(ref a) => a.clone(),
-            None => {
-                if cached_src.as_ref().is_none_or(|(a, _)| *a != src_addr) {
-                    cached_src = Some((src_addr, serialize_socket_addr(&src_addr).into()));
-                }
-                cached_src.as_ref().unwrap().1.clone()
-            }
-        };
+        let address_bytes = reply_source(&mut cached_src, src_addr);
 
         let mut packet = encode_packet_header_with_address(
             assoc_id,
@@ -788,7 +768,6 @@ async fn run_udp_remote_to_local_datagram_loop(
     assoc_id: u16,
     connection: quinn::Connection,
     client_socket: Arc<UdpSocket>,
-    override_local_write_location: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     use bytes::BufMut;
@@ -797,15 +776,12 @@ async fn run_udp_remote_to_local_datagram_loop(
         .max_datagram_size()
         .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
 
-    let original_address_bytes: Option<Bytes> =
-        override_local_write_location.map(|a| serialize_address(&a).into());
-
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
     // Cache the serialized reply source address; it is constant for the common
     // single-peer flow, so the steady state is a refcount bump rather than a
-    // serialize_socket_addr allocation per packet. Unused when there is an override.
+    // serialize_socket_addr allocation per packet.
     let mut cached_src: Option<(SocketAddr, Bytes)> = None;
 
     loop {
@@ -839,15 +815,7 @@ async fn run_udp_remote_to_local_datagram_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes: Bytes = match &original_address_bytes {
-            Some(a) => a.clone(),
-            None => {
-                if cached_src.as_ref().is_none_or(|(a, _)| *a != src_addr) {
-                    cached_src = Some((src_addr, serialize_socket_addr(&src_addr).into()));
-                }
-                cached_src.as_ref().unwrap().1.clone()
-            }
-        };
+        let address_bytes: Bytes = reply_source(&mut cached_src, src_addr);
         let address_bytes_len = address_bytes.len();
 
         // Header format:
@@ -922,6 +890,7 @@ async fn run_unidirectional_loop(
     udp_session_map: UdpSessionMap,
     fragments: FragmentCache,
     cancel_token: CancellationToken,
+    streams_before_auth: Vec<ParkedStream>,
 ) -> std::io::Result<()> {
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
@@ -949,20 +918,25 @@ async fn run_unidirectional_loop(
         }
     });
 
+    let mut streams_before_auth = streams_before_auth.into_iter();
     loop {
-        let recv_stream = match connection.accept_uni().await {
-            Ok(recv_stream) => recv_stream,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                break;
-            }
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to accept unidirectional stream: {e}"
-                )));
-            }
+        let parked = streams_before_auth.next();
+        let (recv_stream, command_type) = match parked {
+            Some((recv_stream, command_type)) => (recv_stream, Some(command_type)),
+            None => match connection.accept_uni().await {
+                Ok(recv_stream) => (recv_stream, None),
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                    break;
+                }
+                Err(quinn::ConnectionError::ConnectionClosed(_)) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "failed to accept unidirectional stream: {e}"
+                    )));
+                }
+            },
         };
 
         let connection = connection.clone();
@@ -979,6 +953,7 @@ async fn run_unidirectional_loop(
                 client_proxy_selector,
                 resolver,
                 recv_stream,
+                command_type,
                 udp_session_map,
                 fragments,
                 cancel_token,
@@ -1000,24 +975,24 @@ async fn run_unidirectional_loop(
 
 /// Process a single uni stream command. Per TUIC protocol, each uni stream
 /// carries exactly one command (PACKET or DISSOCIATE on server side).
+/// `command_type` is given for a stream held over from before auth, whose
+/// header is already read.
+#[allow(clippy::too_many_arguments)]
 async fn process_uni_stream(
     connection: &quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     mut recv_stream: quinn::RecvStream,
+    command_type: Option<u8>,
     udp_session_map: UdpSessionMap,
     fragments: FragmentCache,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
+    let command_type = match command_type {
+        Some(command_type) => command_type,
+        None => read_command_type(&mut recv_stream).await?,
+    };
     let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
-
-    let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-    if tuic_version != TUIC_VERSION {
-        return Err(std::io::Error::other(format!(
-            "invalid tuic version: {tuic_version}"
-        )));
-    }
-    let command_type = stream_reader.read_u8(&mut recv_stream).await?;
 
     if command_type == COMMAND_TYPE_DISSOCIATE {
         let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
@@ -1145,15 +1120,6 @@ async fn process_udp_packet(
                             ))
                         })?;
 
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        // since we don't replace addresses, support the case where a future
-                        // address is ipv6
-                        (None, None)
-                    };
-
                 // Use IPv6 dual-stack socket for direct UDP
                 let client_socket = crate::socket_util::new_udp_socket(true, None)?;
 
@@ -1162,10 +1128,7 @@ async fn process_udp_packet(
                         assoc_id,
                         connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
-                        resolved_address,
-                        override_local_write_location,
-                        override_remote_write_address,
+                        UdpRouteCache::new(remote_location.clone(), resolved_address),
                         cancel_token,
                     )
                 } else {
@@ -1173,10 +1136,7 @@ async fn process_udp_packet(
                         assoc_id,
                         connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
-                        resolved_address,
-                        override_local_write_location,
-                        override_remote_write_address,
+                        UdpRouteCache::new(remote_location.clone(), resolved_address),
                         cancel_token,
                     )
                 };
@@ -1229,7 +1189,7 @@ async fn process_udp_packet(
         if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
             session.last_activity = std::time::Instant::now();
             if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
+                session.route.remember(remote_location.clone(), socket_addr);
             }
         }
     } else {
@@ -1280,7 +1240,7 @@ async fn process_udp_packet(
         if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
             session.last_activity = std::time::Instant::now();
             if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
+                session.route.remember(remote_location.clone(), socket_addr);
             }
         }
     }

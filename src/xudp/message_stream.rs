@@ -1,6 +1,11 @@
 // XUDP message stream - protocol-agnostic UDP session multiplexing
 // Wraps any AsyncStream and provides XUDP frame encoding/decoding with session management
 // Used by both VLESS and VMess protocols
+//
+// This is the server side of mux.cool as Xray runs it (common/mux/server.go):
+// session ids belong to the client (common/mux/client.go allocates them), so
+// every packet is reported under the id it arrived with and every response
+// echoes that id in a Keep frame (NewResponseWriter, common/mux/writer.go).
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
@@ -20,6 +25,22 @@ use crate::resolver::{NativeResolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
+/// Xray refuses frame metadata longer than this (common/mux/frame.go, Unmarshal).
+const MAX_METADATA_LEN: usize = 512;
+
+/// The largest response payload sent. Xray reads a frame into one 8192-byte
+/// buffer and its own XUDP writer skips anything over 8192 - 666
+/// (common/xudp/xudp.go, PacketWriter.WriteMultiBuffer).
+const MAX_RESPONSE_LEN: usize = 8192 - 666;
+
+/// A decoded payload frame: the client's session id, the payload, and the
+/// target as the client named it (may be a hostname).
+struct InboundFrame {
+    session_id: u16,
+    data: Vec<u8>,
+    target: NetLocation,
+}
+
 pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
@@ -30,30 +51,15 @@ pub struct XudpMessageStream {
     /// Write buffer for outgoing XUDP frames
     write_buffer: BytesMut,
 
-    /// Session ID counter (starts at 1, wraps at u16::MAX)
-    next_session_id: u16,
+    /// Open sessions: the client's session id -> the target of its last
+    /// frame, used by Keep frames that carry no address.
+    sessions: HashMap<u16, NetLocation>,
 
-    /// Active sessions: destination (RESOLVED IP) -> session_id
-    /// Keys are always resolved IP addresses, never hostnames
-    /// This ensures responses from UDP sockets (which give us IPs) can find the correct session
-    destination_to_session: HashMap<NetLocation, u16>,
-
-    /// Reverse mapping: session_id -> destination (RESOLVED IP)
-    /// Used to remember which session_id maps to which destination
-    session_to_destination: HashMap<u16, NetLocation>,
-
-    /// Maps session_id -> ORIGINAL destination (before resolution)
-    /// This preserves hostnames for encoding in response frames
-    session_to_original_destination: HashMap<u16, NetLocation>,
-
-    /// Resolver cache for hostname resolution
-    /// Resolves hostnames to IPs before storing in session maps
+    /// Resolver cache for hostname targets
     resolver_cache: ResolverCache,
 
-    /// Buffered incoming message (if we read a complete frame)
-    /// Stores: (data, original_destination, optional_resolved_destination)
-    /// If resolved_destination is None, we still need to resolve it
-    incoming_message: Option<(Vec<u8>, NetLocation, Option<NetLocation>)>,
+    /// A decoded frame whose target is still resolving
+    incoming_frame: Option<InboundFrame>,
 
     /// EOF flag
     is_eof: bool,
@@ -67,12 +73,9 @@ impl XudpMessageStream {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
             write_buffer: BytesMut::with_capacity(65536),
-            next_session_id: 1,
-            destination_to_session: HashMap::new(),
-            session_to_destination: HashMap::new(),
-            session_to_original_destination: HashMap::new(),
+            sessions: HashMap::new(),
             resolver_cache: ResolverCache::new(resolver),
-            incoming_message: None,
+            incoming_frame: None,
             is_eof: false,
         }
     }
@@ -92,76 +95,31 @@ impl XudpMessageStream {
         Ok(())
     }
 
-    /// Allocate new session ID
-    fn allocate_session_id(&mut self) -> u16 {
-        loop {
-            let id = self.next_session_id;
-            self.next_session_id = self.next_session_id.wrapping_add(1);
-            if self.next_session_id == 0 {
-                self.next_session_id = 1; // Skip 0
-            }
-
-            // Check if ID is already in use (unlikely with u16 space)
-            if !self.session_to_destination.contains_key(&id) {
-                return id;
-            }
+    /// Queue an End for a session the client keeps using but this side does
+    /// not know, as Xray's handleStatusKeep does. It goes out ahead of the
+    /// next response, or on the next flush.
+    fn queue_end(&mut self, session_id: u16) -> std::io::Result<()> {
+        FrameMetadata {
+            session_id,
+            status: SessionStatus::End,
+            option: FrameOption::new(),
+            target: None,
+            network: None,
         }
+        .encode(&mut self.write_buffer)
     }
 
-    /// Get or create session ID for destination, preserving original address
-    /// resolved_destination: IP address (used for reverse lookup from UDP responses)
-    /// original_destination: Original address from XUDP frame (may be hostname, used in response frames)
-    fn get_or_create_session(
-        &mut self,
-        resolved_destination: &NetLocation,
-        original_destination: &NetLocation,
-    ) -> (u16, bool) {
-        if let Some(&session_id) = self.destination_to_session.get(resolved_destination) {
-            log::debug!(
-                "[XUDP] Found existing session {} for destination {}",
-                session_id,
-                resolved_destination
-            );
-            (session_id, false) // Existing session
-        } else {
-            let session_id = self.allocate_session_id();
-            log::debug!(
-                "[XUDP] Creating NEW session {} for resolved dest {} (original: {})",
-                session_id,
-                resolved_destination,
-                original_destination
-            );
-            self.destination_to_session
-                .insert(resolved_destination.clone(), session_id);
-            self.session_to_destination
-                .insert(session_id, resolved_destination.clone());
-            // Store original destination for use in response frames
-            self.session_to_original_destination
-                .insert(session_id, original_destination.clone());
-            log::debug!(
-                "[XUDP] Session maps updated. Total sessions: {}",
-                self.destination_to_session.len()
-            );
-            (session_id, true) // New session
-        }
-    }
-
-    /// Try to decode one complete XUDP frame from the read buffer.
+    /// Try to decode one complete XUDP payload frame from the read buffer.
     ///
     /// This function must NOT consume any bytes from the buffer unless
     /// it successfully decodes a complete frame. Otherwise, partial frames would
     /// be lost when the function is called again with more data.
     ///
     /// Returns:
-    ///   Ok(Some((data, destination))) - Successfully decoded a complete frame
+    ///   Ok(Some(frame)) - Successfully decoded a complete payload frame
     ///   Ok(None) - Buffer doesn't contain a complete frame yet (need more data)
     ///   Err(e) - Error during decoding
-    fn try_decode_one_frame(&mut self) -> std::io::Result<Option<(Vec<u8>, NetLocation)>> {
-        log::debug!(
-            "[XUDP READ] Attempting to decode frame, buffer len: {}",
-            self.read_buffer.len()
-        );
-
+    fn try_decode_one_frame(&mut self) -> std::io::Result<Option<InboundFrame>> {
         // Iteratively skip control/empty frames (End, KeepAlive, no-data) instead of
         // recursing: a peer can pack thousands of tiny such frames into one read buffer,
         // and tail-recursion there would exhaust the stack. Each iteration consumes bytes,
@@ -172,20 +130,24 @@ impl XudpMessageStream {
 
             // Need at least 2 bytes for metadata length
             if self.read_buffer.len() < 2 {
-                log::debug!("[XUDP READ] Buffer too short for metadata length field");
                 return Ok(None);
             }
 
             let metadata_len =
                 u16::from_be_bytes([self.read_buffer[0], self.read_buffer[1]]) as usize;
 
+            if metadata_len > MAX_METADATA_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("metadata too long: {metadata_len}"),
+                ));
+            }
+
             // Check if we have complete metadata
             if self.read_buffer.len() < 2 + metadata_len {
-                log::debug!("[XUDP READ] Buffer too short for complete metadata");
                 return Ok(None);
             }
 
-            // Peek at metadata to check if frame has data
             if metadata_len < 4 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -193,105 +155,36 @@ impl XudpMessageStream {
                 ));
             }
 
-            // Peek at status and option bytes (at offset 2 + 2 + 1 = 5 for status, 6 for option)
-            let status_byte = self.read_buffer[2 + 2]; // Skip metadata_len(2) + session_id(2)
-            let option_byte = self.read_buffer[2 + 3]; // Skip metadata_len(2) + session_id(2) + status(1)
+            // Peek at the option byte: skip metadata_len(2) + session_id(2) + status(1)
+            let has_data = (self.read_buffer[2 + 3] & 0x01) != 0; // FrameOption::DATA
 
-            let has_data = (option_byte & 0x01) != 0; // FrameOption::DATA = 0x01
-            let is_end = status_byte == 0x03; // SessionStatus::End
-            let is_keepalive = status_byte == 0x04; // SessionStatus::KeepAlive
-
-            // For End or KeepAlive frames, or frames without data, nothing is delivered
-            if is_end || is_keepalive || !has_data {
-                // An End or KeepAlive may carry OptionData, which Xray reads and discards
-                // (common/mux/server.go, handleStatusKeepAlive and handleStatusEnd). Its
-                // length and bytes must be consumed with the frame, or the next frame is
-                // read from the middle of them.
-                let discard_len = if has_data {
-                    let data_len_offset = 2 + metadata_len;
-                    if self.read_buffer.len() < data_len_offset + 2 {
-                        return Ok(None);
-                    }
-                    let data_len = u16::from_be_bytes([
-                        self.read_buffer[data_len_offset],
-                        self.read_buffer[data_len_offset + 1],
-                    ]) as usize;
-                    if self.read_buffer.len() < data_len_offset + 2 + data_len {
-                        return Ok(None);
-                    }
-                    2 + data_len
-                } else {
-                    0
-                };
-
-                // We have enough data to decode this frame - proceed with actual decode
-                let metadata = FrameMetadata::decode(&mut self.read_buffer)?
-                    .expect("metadata decode should succeed after length check");
-                self.read_buffer.advance(discard_len);
-
-                log::debug!(
-                    "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
-                    metadata.session_id,
-                    metadata.status,
-                    metadata.option.has_data(),
-                    metadata.target,
-                    metadata.network
-                );
-
-                // Handle session mappings
-                if let Some(ref target) = metadata.target {
-                    log::debug!(
-                        "[XUDP READ] Updating session {} mapping to target {}",
-                        metadata.session_id,
-                        target
-                    );
-                    self.session_to_destination
-                        .insert(metadata.session_id, target.clone());
-                    self.session_to_original_destination
-                        .insert(metadata.session_id, target.clone());
-                }
-
-                if metadata.status == SessionStatus::End {
-                    if let Some(destination) =
-                        self.session_to_destination.remove(&metadata.session_id)
-                    {
-                        self.destination_to_session.remove(&destination);
-                    }
-                    self.session_to_original_destination
-                        .remove(&metadata.session_id);
-                    continue;
-                }
-
-                // No data, try to decode next frame
-                continue;
-            }
-
-            // Frame has data - check if we have the data length and data
+            // The whole frame, data included, must be buffered before any of it
+            // is consumed. Every status may carry OptionData: an End or KeepAlive
+            // carries it too, and Xray reads and discards it (common/mux/server.go,
+            // handleStatusKeepAlive and handleStatusEnd).
             let data_len_offset = 2 + metadata_len;
-            if self.read_buffer.len() < data_len_offset + 2 {
-                log::debug!("[XUDP READ] Buffer too short for data length field");
-                return Ok(None);
-            }
+            let data_len = if has_data {
+                if self.read_buffer.len() < data_len_offset + 2 {
+                    return Ok(None);
+                }
+                let data_len = u16::from_be_bytes([
+                    self.read_buffer[data_len_offset],
+                    self.read_buffer[data_len_offset + 1],
+                ]) as usize;
+                if self.read_buffer.len() < data_len_offset + 2 + data_len {
+                    return Ok(None);
+                }
+                Some(data_len)
+            } else {
+                None
+            };
 
-            let data_len = u16::from_be_bytes([
-                self.read_buffer[data_len_offset],
-                self.read_buffer[data_len_offset + 1],
-            ]) as usize;
-
-            // Check if we have all the data
-            let total_frame_len = data_len_offset + 2 + data_len;
-            if self.read_buffer.len() < total_frame_len {
-                log::debug!(
-                    "[XUDP READ] Buffer too short for complete frame: have {}, need {}",
-                    self.read_buffer.len(),
-                    total_frame_len
-                );
-                return Ok(None);
-            }
-
-            // Now we know we have a complete frame - consume it all
             let metadata = FrameMetadata::decode(&mut self.read_buffer)?
                 .expect("metadata decode should succeed after length check");
+            let data = data_len.map(|len| {
+                self.read_buffer.advance(2);
+                self.read_buffer.split_to(len)
+            });
 
             log::debug!(
                 "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -302,74 +195,78 @@ impl XudpMessageStream {
                 metadata.network
             );
 
-            // Check for TCP destination - we don't support TCP over XUDP
-            if let Some(TargetNetwork::Tcp) = metadata.network {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "XUDP with TCP destinations is not supported. Only UDP destinations are supported.",
-                ));
+            match metadata.status {
+                SessionStatus::End => {
+                    self.sessions.remove(&metadata.session_id);
+                    continue;
+                }
+                SessionStatus::KeepAlive => continue,
+                SessionStatus::New => {
+                    // Check for TCP destination - we don't support TCP over XUDP
+                    if let Some(TargetNetwork::Tcp) = metadata.network {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "XUDP with TCP destinations is not supported. Only UDP destinations are supported.",
+                        ));
+                    }
+                    let target = metadata.target.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "New frame without a target",
+                        )
+                    })?;
+                    self.sessions.insert(metadata.session_id, target);
+                }
+                SessionStatus::Keep => {
+                    if data.is_none() {
+                        continue;
+                    }
+                    if !self.sessions.contains_key(&metadata.session_id) {
+                        log::debug!(
+                            "[XUDP READ] Keep for unknown session {}, answering End",
+                            metadata.session_id
+                        );
+                        self.queue_end(metadata.session_id)?;
+                        continue;
+                    }
+                    if let Some(target) = metadata.target {
+                        self.sessions.insert(metadata.session_id, target);
+                    }
+                }
             }
 
             // Check for ERROR option bit - remote side is signaling an error
             if metadata.option.has_error() {
-                log::error!(
-                    "[XUDP READ] Received frame with ERROR option set for session {}",
-                    metadata.session_id
-                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "XUDP session closed by remote with error",
                 ));
             }
 
-            // Store/update session mapping for session_id → destination
-            if let Some(ref target) = metadata.target {
-                log::debug!(
-                    "[XUDP READ] Updating session {} mapping to target {}",
-                    metadata.session_id,
-                    target
-                );
-                self.session_to_destination
-                    .insert(metadata.session_id, target.clone());
-                self.session_to_original_destination
-                    .insert(metadata.session_id, target.clone());
-            }
-
-            // Consume data length (already verified we have it)
-            self.read_buffer.advance(2);
-
-            if data_len == 0 {
-                // Empty data, try to decode next frame
+            let Some(data) = data.filter(|data| !data.is_empty()) else {
                 continue;
-            }
-
-            // Extract data (already verified we have it)
-            let data = self.read_buffer[..data_len].to_vec();
-            self.read_buffer.advance(data_len);
-
-            // Determine destination
-            let destination = if let Some(ref target) = metadata.target {
-                target.clone()
-            } else {
-                // Look up in session map
-                self.session_to_destination
-                    .get(&metadata.session_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown session ID: {}", metadata.session_id),
-                        )
-                    })?
             };
 
-            log::debug!(
-                "[XUDP READ] Decoded complete frame with {} bytes for destination {}",
-                data.len(),
-                destination
-            );
-            return Ok(Some((data, destination)));
+            let target = self.sessions[&metadata.session_id].clone();
+            return Ok(Some(InboundFrame {
+                session_id: metadata.session_id,
+                data: data.to_vec(),
+                target,
+            }));
         }
+    }
+
+    /// Start writing what is buffered without waiting for it, so a queued
+    /// End reaches the client even while no response is being written.
+    fn poll_write_buffered(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
+        while !self.write_buffer.is_empty() {
+            match Pin::new(&mut self.inner_stream).poll_write(cx, &self.write_buffer) {
+                Poll::Ready(Ok(0)) | Poll::Pending => break,
+                Poll::Ready(Ok(n)) => self.write_buffer.advance(n),
+                Poll::Ready(Err(e)) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -414,179 +311,80 @@ impl AsyncReadSessionMessage for XudpMessageStream {
     ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
         let this = self.get_mut();
 
-        // Return buffered message if available
-        if let Some((data, original_destination, resolved_opt)) = this.incoming_message.take() {
-            if data.len() > buf.remaining() {
-                // Re-buffer it
-                this.incoming_message = Some((data, original_destination, resolved_opt));
+        loop {
+            let frame = match this.incoming_frame.take() {
+                Some(frame) => frame,
+                None => {
+                    if this.is_eof {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "EOF reached",
+                        )));
+                    }
+                    let decoded = this.try_decode_one_frame()?;
+                    this.poll_write_buffered(cx)?;
+                    match decoded {
+                        Some(frame) => frame,
+                        None => {
+                            ready!(this.poll_fill_read_buffer(cx))?;
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let socket_addr = match this.resolver_cache.poll_resolve_location(cx, &frame.target) {
+                Poll::Ready(Ok(addr)) => addr,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    // DNS resolution pending - keep the frame and wait
+                    this.incoming_frame = Some(frame);
+                    return Poll::Pending;
+                }
+            };
+
+            if frame.data.len() > buf.remaining() {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "buffer too small for incoming message",
                 )));
             }
 
-            // Resolve if not already resolved
-            let resolved_destination = if let Some(resolved) = resolved_opt {
-                resolved
-            } else {
-                match this
-                    .resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-                {
-                    Poll::Ready(Ok(socket_addr)) => match socket_addr {
-                        SocketAddr::V4(addr) => {
-                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                        }
-                        SocketAddr::V6(addr) => {
-                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                        }
-                    },
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Pending => {
-                        // Re-buffer and wait for DNS
-                        this.incoming_message = Some((data, original_destination, None));
-                        return Poll::Pending;
-                    }
-                }
-            };
+            buf.put_slice(&frame.data);
+            return Poll::Ready(Ok((frame.session_id, socket_addr)));
+        }
+    }
+}
 
-            // Find session ID for resolved destination, preserving original
-            let (session_id, _is_new) =
-                this.get_or_create_session(&resolved_destination, &original_destination);
+impl XudpMessageStream {
+    /// Read more bytes from the inner stream into the read buffer.
+    fn poll_fill_read_buffer(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // Read into reserved but still uninitialized capacity. Using
+        // ReadBuf::uninit avoids zero-filling 8 KiB on every poll, which is
+        // pure waste since poll_read overwrites it and any unwritten tail is
+        // dropped.
+        let original_filled = self.read_buffer.len();
+        self.read_buffer.reserve(8192);
+        let mut temp_buf = ReadBuf::uninit(&mut self.read_buffer.spare_capacity_mut()[..8192]);
+        let poll_result = Pin::new(&mut self.inner_stream).poll_read(cx, &mut temp_buf);
 
-            // Convert to SocketAddr for return
-            let socket_addr = futures::ready!(
-                this.resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-            )?;
-
-            buf.put_slice(&data);
-            return Poll::Ready(Ok((session_id, socket_addr)));
+        let n = temp_buf.filled().len();
+        // SAFETY: poll_read reported `n` bytes written through `temp_buf` into
+        // the reserved spare capacity, so bytes [0, original_filled + n) are
+        // now initialized. `reserve(8192)` guaranteed the capacity exists.
+        unsafe {
+            self.read_buffer.set_len(original_filled + n);
         }
 
-        if this.is_eof {
+        ready!(poll_result)?;
+        if n == 0 {
+            self.is_eof = true;
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF reached",
             )));
         }
-
-        loop {
-            // Try to decode a complete frame from the read buffer
-            match this.try_decode_one_frame()? {
-                Some((data, destination)) => {
-                    // Resolve hostname to IP if needed
-                    log::debug!("[XUDP SESSION READ] Resolving destination: {}", destination);
-                    let socket_addr =
-                        match this.resolver_cache.poll_resolve_location(cx, &destination) {
-                            Poll::Ready(Ok(addr)) => addr,
-                            Poll::Ready(Err(e)) => {
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => {
-                                // DNS resolution pending - buffer the frame and wait
-                                this.incoming_message = Some((data, destination, None));
-                                return Poll::Pending;
-                            }
-                        };
-
-                    let resolved_destination = match socket_addr {
-                        SocketAddr::V4(addr) => {
-                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                        }
-                        SocketAddr::V6(addr) => {
-                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                        }
-                    };
-                    log::debug!(
-                        "[XUDP SESSION READ] Resolved {} -> {}",
-                        destination,
-                        resolved_destination
-                    );
-
-                    // Get or create session, preserving original destination (may be hostname)
-                    let (session_id, _is_new) =
-                        this.get_or_create_session(&resolved_destination, &destination);
-                    log::debug!(
-                        "[XUDP SESSION READ] Session {} mapped to {}",
-                        session_id,
-                        resolved_destination
-                    );
-
-                    // Successfully decoded a frame
-                    if data.len() > buf.remaining() {
-                        // Buffer it with resolved destination for next read
-                        this.incoming_message =
-                            Some((data, destination, Some(resolved_destination)));
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "buffer too small for incoming message",
-                        )));
-                    }
-
-                    buf.put_slice(&data);
-                    log::debug!(
-                        "[XUDP SESSION READ] Returning {} bytes for session {} to {}",
-                        data.len(),
-                        session_id,
-                        socket_addr
-                    );
-                    return Poll::Ready(Ok((session_id, socket_addr)));
-                }
-                None => {
-                    // Buffer doesn't have a complete frame, need to read more data
-                }
-            }
-
-            // Read more data from the inner stream into reserved but still
-            // uninitialized capacity. Using ReadBuf::uninit avoids zero-filling
-            // 8 KiB on every poll (the old resize(.., 0)), which is pure waste
-            // since poll_read overwrites it and any unwritten tail is dropped.
-            let original_filled = this.read_buffer.len();
-            this.read_buffer.reserve(8192);
-            let mut temp_buf = ReadBuf::uninit(&mut this.read_buffer.spare_capacity_mut()[..8192]);
-
-            log::debug!(
-                "[XUDP SESSION READ] Reading from inner stream, current buffer has {} bytes",
-                original_filled
-            );
-            let poll_result = Pin::new(&mut this.inner_stream).poll_read(cx, &mut temp_buf);
-
-            let n = temp_buf.filled().len();
-            // SAFETY: poll_read reported `n` bytes written through `temp_buf` into
-            // the reserved spare capacity, so bytes [0, original_filled + n) are
-            // now initialized. `reserve(8192)` guaranteed the capacity exists.
-            unsafe {
-                this.read_buffer.set_len(original_filled + n);
-            }
-
-            match ready!(poll_result) {
-                Ok(()) => {
-                    log::debug!(
-                        "[XUDP SESSION READ] Got {} bytes from inner stream (total buffer: {})",
-                        n,
-                        this.read_buffer.len()
-                    );
-
-                    if n == 0 {
-                        this.is_eof = true;
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "EOF reached",
-                        )));
-                    }
-
-                    // Got new data, continue loop to try decoding again
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("[XUDP SESSION READ] Error reading from inner stream: {}", e);
-                    return Poll::Ready(Err(e));
-                }
-            }
-        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -598,104 +396,38 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
-        // This is the reverse direction: UDP response from internet → XUDP client
-        // Use original destination (may be hostname) in response frame, NOT resolved IP
-
-        log::debug!(
-            "[XUDP SESSION WRITE] Writing {} bytes for session {} from source {}",
-            buf.len(),
-            session_id,
-            target
-        );
+        // The reverse direction: a UDP response to the client, under the
+        // client's own session id and labelled with its real source.
 
         // Flush any pending write buffer first
         if !self.write_buffer.is_empty() {
             ready!(self.as_mut().poll_flush_message(cx))?;
         }
 
-        // Check if this is a new session BEFORE looking up or creating entries.
-        // XUDP protocol requires first frame for a session to be StatusNew.
-        let is_new_session = !self
-            .session_to_original_destination
-            .contains_key(&session_id);
-
-        // Use original destination (hostname) instead of resolved IP
-        // Look up the original destination that the client requested.
-        // If not found (e.g., XUDP-to-XUDP forwarding), use the target from the caller
-        // and create a new session entry.
-        let target_location = if let Some(original) = self
-            .session_to_original_destination
-            .get(&session_id)
-            .cloned()
-        {
-            original
-        } else {
-            // Session doesn't exist yet - this happens when forwarding from another XUDP stream.
-            // Create a new session using the target address.
-            let addr = match target.ip() {
-                std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
-                std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
-            };
-            let target_location = NetLocation::new(addr, target.port());
+        if buf.len() > MAX_RESPONSE_LEN {
             log::debug!(
-                "[XUDP SESSION WRITE] Creating new session {} for destination {} (forwarding mode)",
-                session_id,
-                target_location
-            );
-            // Store the mapping for potential future writes with same session_id
-            self.session_to_original_destination
-                .insert(session_id, target_location.clone());
-            let resolved = target_location.clone();
-            self.destination_to_session
-                .insert(resolved.clone(), session_id);
-            self.session_to_destination.insert(session_id, resolved);
-            target_location
-        };
-
-        log::debug!(
-            "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
-            target_location,
-            session_id,
-            target
-        );
-
-        // Build frame with appropriate status (New for first frame, Keep for subsequent)
-        let status = if is_new_session {
-            log::debug!(
-                "[XUDP SESSION WRITE] Sending NEW frame for session {} (first write)",
+                "[XUDP SESSION WRITE] Dropping a {}-byte response for session {}: over {MAX_RESPONSE_LEN}",
+                buf.len(),
                 session_id
             );
-            SessionStatus::New
-        } else {
-            SessionStatus::Keep
-        };
+            return Poll::Ready(Ok(()));
+        }
 
+        let address = match target.ip() {
+            std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
+            std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
+        };
         let metadata = FrameMetadata {
             session_id,
-            status,
+            status: SessionStatus::Keep,
             option: FrameOption::new().with_data(),
-            target: Some(target_location.clone()), // Use ORIGINAL (hostname), not resolved IP!
+            target: Some(NetLocation::new(address, target.port())),
             network: Some(TargetNetwork::Udp),
         };
 
-        log::debug!(
-            "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
-            status,
-            session_id,
-            target_location,
-            buf.len()
-        );
-
-        // Encode metadata
         metadata.encode(&mut self.write_buffer)?;
-
-        // Write data length
         self.write_buffer.put_u16(buf.len() as u16);
-
-        // Write data
         self.write_buffer.extend_from_slice(buf);
-
-        // Flush immediately
 
         self.poll_flush_message(cx)
     }
@@ -707,11 +439,18 @@ impl AsyncSessionMessageStream for XudpMessageStream {}
 mod tests {
     use super::*;
     use crate::async_stream::testing::TestStream;
+    use std::future::poll_fn;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn frame(status: SessionStatus, target: Option<NetLocation>, data: &[u8]) -> BytesMut {
+    fn frame_for(
+        session_id: u16,
+        status: SessionStatus,
+        target: Option<NetLocation>,
+        data: &[u8],
+    ) -> BytesMut {
         let mut buf = BytesMut::new();
         FrameMetadata {
-            session_id: 1,
+            session_id,
             status,
             option: FrameOption::new().with_data(),
             network: target.as_ref().map(|_| TargetNetwork::Udp),
@@ -724,13 +463,31 @@ mod tests {
         buf
     }
 
+    fn frame(status: SessionStatus, target: Option<NetLocation>, data: &[u8]) -> BytesMut {
+        frame_for(1, status, target, data)
+    }
+
+    fn dns_server() -> NetLocation {
+        NetLocation::new(Address::Ipv4("1.1.1.1".parse().unwrap()), 53)
+    }
+
+    async fn read(stream: &mut XudpMessageStream) -> (u16, SocketAddr, Vec<u8>) {
+        let mut storage = vec![0u8; 65535];
+        let mut buf = ReadBuf::new(&mut storage);
+        let (id, addr) =
+            poll_fn(|cx| Pin::new(&mut *stream).poll_read_session_message(cx, &mut buf))
+                .await
+                .unwrap();
+        (id, addr, buf.filled().to_vec())
+    }
+
     /// A KeepAlive carrying OptionData, then a New frame: both are consumed and
     /// the New frame's payload is what comes out.
     #[tokio::test]
     async fn data_on_a_keepalive_is_skipped_with_its_frame() {
         let (near, _far) = tokio::io::duplex(1024);
         let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
-        let target = NetLocation::new(Address::Ipv4("1.1.1.1".parse().unwrap()), 53);
+        let target = dns_server();
 
         stream
             .read_buffer
@@ -741,9 +498,9 @@ mod tests {
             b"hi",
         ));
 
-        let (data, destination) = stream.try_decode_one_frame().unwrap().unwrap();
-        assert_eq!(data, b"hi");
-        assert_eq!(destination, target);
+        let frame = stream.try_decode_one_frame().unwrap().unwrap();
+        assert_eq!(frame.data, b"hi");
+        assert_eq!(frame.target, target);
         assert!(stream.read_buffer.is_empty());
     }
 
@@ -760,5 +517,108 @@ mod tests {
 
         assert!(stream.try_decode_one_frame().unwrap().is_none());
         assert_eq!(stream.read_buffer.len(), whole.len() - 3);
+    }
+
+    /// Two client sessions to one destination stay two sessions, each under
+    /// the client's id, and a response comes back as a Keep under that id.
+    /// Before, ids were invented per destination and mux.cool clients dropped
+    /// every response.
+    #[tokio::test]
+    async fn the_clients_session_ids_are_reported_and_echoed() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+
+        far.write_all(&frame_for(7, SessionStatus::New, Some(dns_server()), b"a"))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(9, SessionStatus::New, Some(dns_server()), b"b"))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(7, SessionStatus::Keep, None, b"c"))
+            .await
+            .unwrap();
+
+        let source: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        assert_eq!(read(&mut stream).await, (7, source, b"a".to_vec()));
+        assert_eq!(read(&mut stream).await, (9, source, b"b".to_vec()));
+        assert_eq!(read(&mut stream).await, (7, source, b"c".to_vec()));
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 9, b"reply", &source))
+            .await
+            .unwrap();
+
+        let mut written = BytesMut::new();
+        written.resize(64, 0);
+        let n = far.read(&mut written).await.unwrap();
+        written.truncate(n);
+        let metadata = FrameMetadata::decode(&mut written).unwrap().unwrap();
+        assert_eq!(metadata.session_id, 9);
+        assert_eq!(metadata.status, SessionStatus::Keep);
+        assert_eq!(metadata.target, Some(dns_server()));
+        assert_eq!(&written[..], b"\x00\x05reply");
+    }
+
+    /// A Keep for a session this side never saw draws an End for that id and
+    /// the connection carries on, as Xray's handleStatusKeep does.
+    #[tokio::test]
+    async fn a_keep_for_an_unknown_session_is_answered_with_end() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+
+        far.write_all(&frame_for(5, SessionStatus::Keep, None, b"lost"))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(6, SessionStatus::New, Some(dns_server()), b"ok"))
+            .await
+            .unwrap();
+
+        let (id, _, data) = read(&mut stream).await;
+        assert_eq!((id, data.as_slice()), (6, &b"ok"[..]));
+
+        let mut written = BytesMut::new();
+        written.resize(64, 0);
+        let n = far.read(&mut written).await.unwrap();
+        written.truncate(n);
+        let metadata = FrameMetadata::decode(&mut written).unwrap().unwrap();
+        assert_eq!(metadata.session_id, 5);
+        assert_eq!(metadata.status, SessionStatus::End);
+        assert!(written.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_over_512_bytes_is_refused() {
+        let (near, _far) = tokio::io::duplex(1024);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        stream.read_buffer.extend_from_slice(&513u16.to_be_bytes());
+        stream.read_buffer.extend_from_slice(&[0u8; 513]);
+
+        let err = stream.try_decode_one_frame().err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A response the client could not read into its 8 KiB frame buffer is
+    /// dropped, as Xray's own XUDP writer drops it; one at the limit is sent.
+    #[tokio::test]
+    async fn a_response_over_the_client_frame_limit_is_dropped() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let source: SocketAddr = "1.1.1.1:53".parse().unwrap();
+
+        let too_big = vec![0u8; MAX_RESPONSE_LEN + 1];
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 1, &too_big, &source))
+            .await
+            .unwrap();
+        let fits = vec![0u8; MAX_RESPONSE_LEN];
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 1, &fits, &source))
+            .await
+            .unwrap();
+        drop(stream);
+
+        let mut written = Vec::new();
+        far.read_to_end(&mut written).await.unwrap();
+        let mut written = BytesMut::from(&written[..]);
+        FrameMetadata::decode(&mut written).unwrap().unwrap();
+        assert_eq!(written.get_u16() as usize, MAX_RESPONSE_LEN);
+        assert_eq!(written.len(), MAX_RESPONSE_LEN);
     }
 }
