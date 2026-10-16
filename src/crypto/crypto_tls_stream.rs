@@ -434,7 +434,8 @@ where
     }
 }
 
-// Implement AsyncStream blanket trait
+// TLS framing: nothing passes through.
+impl<IO> crate::async_stream::SocketPassthrough for CryptoTlsStream<IO> where IO: AsyncStream {}
 impl<IO> crate::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}
 
 #[cfg(test)]
@@ -484,6 +485,8 @@ mod tests {
         }
     }
 
+    impl crate::async_stream::SocketPassthrough for PendingWriteIo {}
+
     impl AsyncStream for PendingWriteIo {}
 
     struct ZeroWriteIo;
@@ -525,6 +528,8 @@ mod tests {
             Poll::Ready(Ok(false))
         }
     }
+
+    impl crate::async_stream::SocketPassthrough for ZeroWriteIo {}
 
     impl AsyncStream for ZeroWriteIo {}
 

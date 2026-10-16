@@ -66,4 +66,6 @@ impl AsyncPing for QuicStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for QuicStream {}
+
 impl AsyncStream for QuicStream {}

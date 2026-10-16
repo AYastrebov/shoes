@@ -380,6 +380,8 @@ impl AsyncPing for MieruStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for MieruStream {}
+
 impl AsyncStream for MieruStream {}
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use tokio::io::ReadBuf;
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
-    AsyncStream, AsyncWriteMessage,
+    AsyncStream, AsyncWriteMessage, SocketPassthrough,
 };
 use crate::outbound_stats::OutboundCounters;
 
@@ -102,13 +102,15 @@ impl<S: AsyncPing + Unpin> AsyncPing for OutboundCountingStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for OutboundCountingStream<S> {
+impl<S: AsyncStream> SocketPassthrough for OutboundCountingStream<S> {
     fn plain_tcp(&self) -> Option<crate::async_stream::PlainTcp<'_>> {
         let mut plain = self.inner.plain_tcp()?;
         plain.counters.push(&*self.counters);
         Some(plain)
     }
 }
+
+impl<S: AsyncStream> AsyncStream for OutboundCountingStream<S> {}
 
 /// The same directions the stream counts in: a read is what the server
 /// sent, which is download.

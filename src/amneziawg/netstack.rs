@@ -915,6 +915,8 @@ impl AsyncPing for VirtualTcpStream {
 
 impl Unpin for VirtualTcpStream {}
 
+impl crate::async_stream::SocketPassthrough for VirtualTcpStream {}
+
 impl AsyncStream for VirtualTcpStream {}
 
 // ---------------------------------------------------------------------------

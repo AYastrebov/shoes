@@ -417,6 +417,8 @@ impl<S: AsyncStream> AsyncPing for H2MuxPaddingStream<S> {
     }
 }
 
+impl<S: AsyncStream> crate::async_stream::SocketPassthrough for H2MuxPaddingStream<S> {}
+
 impl<S: AsyncStream> AsyncStream for H2MuxPaddingStream<S> {}
 
 #[cfg(test)]

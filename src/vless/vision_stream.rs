@@ -1509,4 +1509,6 @@ where
     }
 }
 
+impl<IO> crate::async_stream::SocketPassthrough for VisionStream<IO> where IO: AsyncStream {}
+
 impl<IO> AsyncStream for VisionStream<IO> where IO: AsyncStream {}

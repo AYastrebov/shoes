@@ -956,6 +956,8 @@ impl AsyncShutdownMessage for ShadowsocksStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for ShadowsocksStream {}
+
 impl AsyncStream for ShadowsocksStream {}
 impl AsyncMessageStream for ShadowsocksStream {}
 

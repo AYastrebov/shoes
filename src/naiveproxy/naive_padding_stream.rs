@@ -542,6 +542,8 @@ impl<S: AsyncPing> AsyncPing for NaivePaddingStream<S> {
     }
 }
 
+impl<S: AsyncStream> crate::async_stream::SocketPassthrough for NaivePaddingStream<S> {}
+
 impl<S: AsyncStream> AsyncStream for NaivePaddingStream<S> {}
 
 #[cfg(test)]
@@ -686,6 +688,8 @@ mod tests {
             Poll::Ready(Ok(false))
         }
     }
+
+    impl crate::async_stream::SocketPassthrough for MockStream {}
 
     impl AsyncStream for MockStream {}
 

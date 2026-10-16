@@ -352,6 +352,8 @@ impl AsyncPing for AnyTlsStream {
     }
 }
 
+impl crate::async_stream::SocketPassthrough for AnyTlsStream {}
+
 impl AsyncStream for AnyTlsStream {}
 
 #[cfg(test)]

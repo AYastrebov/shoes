@@ -134,6 +134,8 @@ impl AsyncPing for H2MultiStream {
 
 impl Unpin for H2MultiStream {}
 
+impl crate::async_stream::SocketPassthrough for H2MultiStream {}
+
 impl AsyncStream for H2MultiStream {}
 
 #[cfg(test)]

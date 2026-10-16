@@ -132,6 +132,15 @@ Connection ownership (plan PR 1.5, part 2; A-4):
   once per spawned future type. The arm64 `.so` is 9,548,384 bytes; the size
   baseline is lowered to match.
 
+One trait per concern (plan PR 1.6, part 2; A-7):
+
+- `AsyncStream`'s two socket queries, `plain_tcp` (for `splice`) and
+  `original_destination` (for tproxy and redirect), move to their own
+  `SocketPassthrough` trait, a supertrait of `AsyncStream`. Every stream
+  states whether it hands its socket through, rather than inheriting a
+  default inside the stream trait; the wrappers that encrypt or re-frame say
+  so with an empty impl.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

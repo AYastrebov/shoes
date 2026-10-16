@@ -206,7 +206,16 @@ impl PlainTcp<'_> {
     }
 }
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+/// What a stream lets through of the socket underneath it.
+///
+/// A supertrait of [`AsyncStream`] with no default impl, so every stream type
+/// answers explicitly: an empty `impl SocketPassthrough for X {}` declares a
+/// stream that transforms its bytes and passes nothing through; a wrapper
+/// that only watches -- a counter, a permit -- forwards its inner stream's
+/// answers. It used to be two defaulted methods on `AsyncStream`, so a
+/// wrapper that should have forwarded and did not compiled silently, and
+/// the contract was held by memory.
+pub trait SocketPassthrough {
     /// The socket underneath, if this stream is that socket and nothing
     /// more: every byte read is a byte the socket received, every byte
     /// written goes to it unchanged, and nothing is held in between.
@@ -235,6 +244,11 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync 
     fn original_destination(&self) -> Option<SocketAddr> {
         None
     }
+}
+
+pub trait AsyncStream:
+    AsyncRead + AsyncWrite + AsyncPing + SocketPassthrough + Unpin + Send + Sync
+{
 }
 
 pub trait AsyncMessageStream:
@@ -297,7 +311,7 @@ impl AsyncPing for TcpStream {
     }
 }
 
-impl AsyncStream for TcpStream {
+impl SocketPassthrough for TcpStream {
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
         Some(PlainTcp {
             socket: self,
@@ -322,6 +336,8 @@ impl AsyncStream for TcpStream {
         (!same).then_some(destination)
     }
 }
+
+impl AsyncStream for TcpStream {}
 
 /// A stream that carries its accept-side inflight permit with it.
 ///
@@ -399,7 +415,7 @@ impl<S: AsyncPing + Unpin> AsyncPing for PermitStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for PermitStream<S> {
+impl<S: AsyncStream> SocketPassthrough for PermitStream<S> {
     fn original_destination(&self) -> Option<SocketAddr> {
         self.inner.original_destination()
     }
@@ -408,6 +424,8 @@ impl<S: AsyncStream> AsyncStream for PermitStream<S> {
         self.inner.plain_tcp()
     }
 }
+
+impl<S: AsyncStream> AsyncStream for PermitStream<S> {}
 
 #[cfg(target_family = "unix")]
 impl AsyncPing for UnixStream {
@@ -421,6 +439,7 @@ impl AsyncPing for UnixStream {
 }
 
 #[cfg(target_family = "unix")]
+impl SocketPassthrough for UnixStream {}
 impl AsyncStream for UnixStream {}
 
 impl AsyncPing for UdpSocket {
@@ -622,7 +641,7 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
     }
 }
 
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+impl<T: ?Sized + AsyncStream + Unpin> SocketPassthrough for Box<T> {
     fn original_destination(&self) -> Option<SocketAddr> {
         (**self).original_destination()
     }
@@ -631,7 +650,9 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
         (**self).plain_tcp()
     }
 }
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {}
+impl<T: ?Sized + AsyncStream + Unpin> SocketPassthrough for &mut T {
     fn original_destination(&self) -> Option<SocketAddr> {
         (**self).original_destination()
     }
@@ -640,6 +661,8 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
         (**self).plain_tcp()
     }
 }
+
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {}
 
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {}
@@ -750,6 +773,8 @@ pub mod testing {
         }
     }
 
+    impl super::SocketPassthrough for TestStream {}
+
     impl AsyncStream for TestStream {}
 
     /// A stream the kernel claims to have redirected: `TestStream` with an
@@ -815,11 +840,13 @@ pub mod testing {
         }
     }
 
-    impl AsyncStream for RedirectedStream {
+    impl SocketPassthrough for RedirectedStream {
         fn original_destination(&self) -> Option<SocketAddr> {
             self.destination
         }
     }
+
+    impl AsyncStream for RedirectedStream {}
 }
 
 #[cfg(test)]
@@ -862,7 +889,7 @@ mod tests {
 
         let borrowed: &mut Box<dyn AsyncStream> = &mut boxed;
         assert_eq!(
-            AsyncStream::original_destination(&borrowed),
+            SocketPassthrough::original_destination(&borrowed),
             Some(destination())
         );
     }
@@ -884,7 +911,7 @@ mod tests {
             .unwrap();
         let mut boxed: Box<dyn AsyncStream> = Box::new(PermitStream::new(accepted, permit));
         let borrowed: &mut Box<dyn AsyncStream> = &mut boxed;
-        let plain = AsyncStream::plain_tcp(&borrowed).expect("still a plain socket");
+        let plain = SocketPassthrough::plain_tcp(&borrowed).expect("still a plain socket");
         assert_eq!(plain.socket.local_addr().unwrap(), local);
         assert!(plain.counters.is_empty());
 
