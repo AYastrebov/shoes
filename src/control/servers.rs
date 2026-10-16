@@ -210,12 +210,20 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    // The registry lock is held across the launch's awaits on purpose: the
+    // launch installs this config's outbounds into the process-global
+    // registry, and a registry test running meanwhile would read them. A
+    // `#[tokio::test]` runtime is current-thread, so nothing here is starved.
+    #[allow(clippy::await_holding_lock)]
     async fn launch_socks_on_a_free_port() -> (Launched, std::net::SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
         let yaml = format!("- address: {addr}\n  protocol:\n    type: socks\n");
         let configs = crate::config::load_config_str(&yaml).unwrap();
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prepared = prepare_servers(configs).await.unwrap();
         (launch_servers(prepared).await.unwrap(), addr)
     }

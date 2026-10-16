@@ -1125,6 +1125,8 @@ mod tests {
     /// STOP_TIMEOUT for a flag the task was about to clear.
     #[test]
     fn on_exit_reports_a_failure_after_running_is_false() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let (tx, rx) = mpsc::channel();
         let handle = start_with(
             test_runtime(),
@@ -1146,7 +1148,7 @@ mod tests {
     /// creating. Gated on `running` for the same reason `uptime` is.
     #[test]
     fn the_device_name_is_reported_only_while_running() {
-        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        let _names = crate::tun::device_name_test_lock();
         crate::tun::set_device_name("utun9".to_string());
 
         let running = start_with(
@@ -1198,7 +1200,7 @@ mod tests {
     /// one caller; this makes it untrue for all of them.
     #[test]
     fn a_session_that_ends_forgets_its_interface() {
-        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        let _names = crate::tun::device_name_test_lock();
         crate::tun::set_device_name("utun9".to_string());
 
         let handle = start_with(test_runtime(), |_shutdown| async { Ok(()) }, |_| {});
@@ -1234,7 +1236,7 @@ mod tests {
         // them. Taken before the std lock, which must not be held across the
         // await.
         let _counters = crate::tun::traffic::TEST_LOCK.lock().await;
-        let _names = crate::tun::DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        let _names = crate::tun::device_name_test_lock();
         crate::tun::set_device_name("utun9".to_string());
         assert_eq!(crate::tun::device_name().as_deref(), Some("utun9"));
 
@@ -1252,6 +1254,8 @@ mod tests {
     /// the wait runs out, and no later.
     #[test]
     fn a_service_that_will_not_stop_times_out() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let handle = start_with(
             test_runtime(),
             |_shutdown| async {
@@ -1279,6 +1283,8 @@ mod tests {
     /// is woken by the exit, not by a polling interval.
     #[test]
     fn a_prompt_stop_returns_promptly() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let handle = start_with(
             test_runtime(),
             |shutdown| async move {
@@ -1295,6 +1301,8 @@ mod tests {
     /// A stop the host asked for is a stop the host knows about: no call.
     #[test]
     fn on_exit_is_silent_for_a_requested_stop() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let (tx, rx) = mpsc::channel();
         let handle = start_with(
             test_runtime(),
@@ -1315,6 +1323,8 @@ mod tests {
     /// about.
     #[test]
     fn on_exit_reports_an_unrequested_ok_with_the_recorded_sentence() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let (tx, rx) = mpsc::channel();
         let handle = start_with(
             test_runtime(),
@@ -1338,6 +1348,8 @@ mod tests {
     /// callback that fires in the first instant finds it.
     #[test]
     fn start_and_install_stores_the_handle_before_the_task_runs() {
+        // Its exit guard clears the device name.
+        let _names = crate::tun::device_name_test_lock();
         let slot: Arc<parking_lot::Mutex<Option<ServiceHandle>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let seen = Arc::new(AtomicBool::new(false));
