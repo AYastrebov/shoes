@@ -19,6 +19,33 @@ use crate::sniff::{self, SniffSettings};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::util::write_all;
 
+/// Why the connection to the remote location was not made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// The rules blocked it.
+    Blocked,
+    Refused,
+    NetworkUnreachable,
+    HostUnreachable,
+    /// Anything else, a timeout included.
+    Other,
+}
+
+impl ConnectFailure {
+    fn from_error(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => Self::Refused,
+            std::io::ErrorKind::NetworkUnreachable => Self::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable => Self::HostUnreachable,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The reply an inbound protocol owes its client when the connection fails,
+/// such as SOCKS5's non-zero REP (RFC 1928 section 6).
+pub type ConnectFailureReply = fn(ConnectFailure) -> Box<[u8]>;
+
 /// Everything `TcpServerSetupResult::TcpForward` carries, plus the resolver
 /// and this listener's sniffing settings.
 pub struct ForwardRequest {
@@ -26,6 +53,7 @@ pub struct ForwardRequest {
     pub server_stream: Box<dyn AsyncStream>,
     pub server_need_initial_flush: bool,
     pub connection_success_response: Option<Box<[u8]>>,
+    pub connection_failure_response: Option<ConnectFailureReply>,
     pub initial_remote_data: Option<Box<[u8]>>,
     pub proxy_selector: Arc<ClientProxySelector>,
     pub resolver: Arc<dyn Resolver>,
@@ -38,6 +66,7 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         mut server_stream,
         server_need_initial_flush,
         mut connection_success_response,
+        mut connection_failure_response,
         initial_remote_data,
         proxy_selector,
         resolver,
@@ -60,6 +89,8 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         if let Some(data) = connection_success_response.take() {
             write_all(&mut server_stream, &data).await?;
             server_stream.flush().await?;
+            // Too late to say otherwise.
+            connection_failure_response = None;
         }
 
         let result = peek_stream(
@@ -84,26 +115,34 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
         setup_client_tcp_stream(&mut server_stream, proxy_selector, resolver, judged),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
-        Ok(Ok(None)) => {
-            // Must have been blocked.
-            let _ = server_stream.shutdown().await;
-            return Ok(());
-        }
-        Ok(Err(e)) => {
-            let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
+    let (failure, result) = match setup_client_stream_future.await {
+        Ok(Ok(Some(s))) => (None, Ok(s)),
+        // Must have been blocked.
+        Ok(Ok(None)) => (Some(ConnectFailure::Blocked), Err(None)),
+        Ok(Err(e)) => (
+            Some(ConnectFailure::from_error(&e)),
+            Err(Some(std::io::Error::new(
                 e.kind(),
                 format!("failed to setup client stream to {remote_location}: {e}"),
-            ));
-        }
-        Err(elapsed) => {
-            let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
+            ))),
+        ),
+        Err(elapsed) => (
+            Some(ConnectFailure::Other),
+            Err(Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("client setup to {remote_location} timed out: {elapsed}"),
-            ));
+            ))),
+        ),
+    };
+    let mut client_stream = match result {
+        Ok(s) => s,
+        Err(e) => {
+            if let (Some(reply), Some(failure)) = (connection_failure_response, failure) {
+                let _ = write_all(&mut server_stream, &reply(failure)).await;
+                let _ = server_stream.flush().await;
+            }
+            let _ = server_stream.shutdown().await;
+            return e.map_or(Ok(()), Err);
         }
     };
 
@@ -320,6 +359,7 @@ mod tests {
                 server_stream: Box::new(stream),
                 server_need_initial_flush: false,
                 connection_success_response,
+                connection_failure_response: None,
                 initial_remote_data: None,
                 proxy_selector: selector,
                 resolver: server_resolver,
@@ -448,5 +488,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(upstream_received, hello);
+    }
+
+    fn name_the_failure(failure: ConnectFailure) -> Box<[u8]> {
+        format!("{failure:?}").into_bytes().into_boxed_slice()
+    }
+
+    /// Forward to `port` on loopback and return what the client was told.
+    async fn failure_reply(selector: Arc<ClientProxySelector>, port: u16) -> Vec<u8> {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound_addr = inbound.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = inbound.accept().await.unwrap();
+            forward_tcp(ForwardRequest {
+                remote_location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), port),
+                server_stream: Box::new(stream),
+                server_need_initial_flush: false,
+                connection_success_response: Some(b"OK".to_vec().into_boxed_slice()),
+                connection_failure_response: Some(name_the_failure),
+                initial_remote_data: None,
+                proxy_selector: selector,
+                resolver,
+                sniff: None,
+            })
+            .await
+        });
+        let mut client = TcpStream::connect(inbound_addr).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        let _ = server.await.unwrap();
+        received
+    }
+
+    /// RFC 1928 section 6 has the server reply before closing; the reply is
+    /// the inbound's, chosen by what went wrong.
+    #[tokio::test]
+    async fn a_refused_connection_is_answered_with_the_failure_reply() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let reply = failure_reply(allow_everything(resolver), port).await;
+        assert_eq!(reply, b"Refused");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_connection_is_answered_with_the_failure_reply() {
+        let block_all = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![],
+            ConnectAction::new_block(),
+        )]));
+        let reply = failure_reply(block_all, 9).await;
+        assert_eq!(reply, b"Blocked");
     }
 }

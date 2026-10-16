@@ -13,6 +13,7 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks5_udp_relay::Socks5UdpRelayStream;
 use crate::stream_reader::StreamReader;
+use crate::tcp::tcp_forward::ConnectFailure;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -31,6 +32,7 @@ pub const ADDR_TYPE_DOMAIN_NAME: u8 = 0x03;
 pub const ADDR_TYPE_IPV6: u8 = 0x04;
 
 pub const RESULT_SUCCESS: u8 = 0x0;
+pub const RESULT_FAILURE: u8 = 0x1;
 
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -38,6 +40,10 @@ pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 // SOCKS5 reply codes
 pub const REPLY_SUCCESS: u8 = 0x00;
 pub const REPLY_GENERAL_FAILURE: u8 = 0x01;
+pub const REPLY_NOT_ALLOWED: u8 = 0x02;
+pub const REPLY_NETWORK_UNREACHABLE: u8 = 0x03;
+pub const REPLY_HOST_UNREACHABLE: u8 = 0x04;
+pub const REPLY_CONNECTION_REFUSED: u8 = 0x05;
 pub const REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 
 #[derive(Debug)]
@@ -150,7 +156,8 @@ pub async fn setup_socks_server_stream_inner(
     };
 
     if !methods.contains(&supported_method) {
-        // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
+        // RFC 1928 section 3: the client MUST close on X'FF', so say it.
+        write_all(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",
@@ -201,6 +208,8 @@ pub async fn setup_socks_server_stream_inner(
         let password_match = target_password.as_bytes().ct_eq(password);
 
         if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
+            // RFC 1929: a non-zero STATUS, then the server MUST close.
+            write_all(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SOCKS authentication failed",
@@ -241,6 +250,8 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     if connection_request[1] != CMD_CONNECT {
+        let response = build_error_response(REPLY_COMMAND_NOT_SUPPORTED);
+        write_all(&mut server_stream, &response).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid command code: {}", connection_request[1]),
@@ -261,7 +272,8 @@ pub async fn setup_socks_server_stream_inner(
         let mut location_vec = write_location_to_vec(&NetLocation::new(
             Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
             65535,
-        ));
+        ))
+        .expect("an IPv4 address always encodes");
         response_bytes.append(&mut location_vec);
         response_bytes.into_boxed_slice()
     });
@@ -357,6 +369,7 @@ pub async fn setup_socks_server_stream_inner(
         remote_location: location,
         stream: server_stream,
         need_initial_flush: true,
+        connection_failure_response: Some(socks_connect_failure_reply),
         connection_success_response: Some(connection_success_response.to_vec().into_boxed_slice()),
         initial_remote_data: stream_reader.unparsed_data_owned(),
         proxy_selector: proxy_selector.clone(),
@@ -425,6 +438,19 @@ async fn handle_udp_associate(
     });
 
     Ok(TcpServerSetupResult::AlreadyHandled)
+}
+
+/// The CONNECT reply for a failed connection (RFC 1928 section 6: the
+/// server MUST reply before closing).
+fn socks_connect_failure_reply(failure: ConnectFailure) -> Box<[u8]> {
+    let reply_code = match failure {
+        ConnectFailure::Blocked => REPLY_NOT_ALLOWED,
+        ConnectFailure::Refused => REPLY_CONNECTION_REFUSED,
+        ConnectFailure::NetworkUnreachable => REPLY_NETWORK_UNREACHABLE,
+        ConnectFailure::HostUnreachable => REPLY_HOST_UNREACHABLE,
+        ConnectFailure::Other => REPLY_GENERAL_FAILURE,
+    };
+    build_error_response(reply_code).into_boxed_slice()
 }
 
 /// Build a SOCKS5 error response.
@@ -550,7 +576,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(remote_location.location());
+        let location_bytes = write_location_to_vec(remote_location.location())?;
         write_all(&mut client_stream, &location_bytes).await?;
         client_stream.flush().await?;
 
@@ -757,7 +783,10 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
     }
 }
 
-pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+/// The SOCKS5 address form of `location`, which other protocols here share.
+/// A hostname is length-prefixed with one byte, so one over 255 bytes is an
+/// error rather than a length that wraps and misframes everything after it.
+pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>> {
     let (address, port) = location.components();
     let mut vec = match address {
         Address::Ipv4(v4addr) => {
@@ -774,9 +803,18 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
         }
         Address::Hostname(domain_name) => {
             let domain_name_bytes = domain_name.as_bytes();
+            let Ok(domain_name_len) = u8::try_from(domain_name_bytes.len()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "hostname of {} bytes is over the 255 an address can carry",
+                        domain_name_bytes.len()
+                    ),
+                ));
+            };
             let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
             vec.push(ADDR_TYPE_DOMAIN_NAME);
-            vec.push(domain_name_bytes.len() as u8);
+            vec.push(domain_name_len);
             vec.extend_from_slice(domain_name_bytes);
             vec
         }
@@ -784,5 +822,131 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
 
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
-    vec
+    Ok(vec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::testing::TestStream;
+    use crate::quic_outbound::testing::{direct_selector, test_resolver};
+    use tokio::io::duplex;
+
+    /// Run the server handshake against `client_bytes` and return what it
+    /// wrote back before giving up.
+    async fn server_reply(
+        auth_info: Option<(String, String)>,
+        client_bytes: &[u8],
+    ) -> (Vec<u8>, std::io::Result<TcpServerSetupResult>) {
+        let (near, mut far) = duplex(4096);
+        far.write_all(client_bytes).await.unwrap();
+        let resolver = test_resolver();
+        let selector = direct_selector(resolver.clone());
+        let result = setup_socks_server_stream_inner(
+            auth_info.as_ref(),
+            None,
+            &selector,
+            &resolver,
+            Box::new(TestStream(near)),
+            StreamReader::new(),
+        )
+        .await;
+        let mut written = vec![0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), far.read(&mut written))
+            .await
+            .map(|r| r.unwrap())
+            .unwrap_or(0);
+        written.truncate(n);
+        (written, result)
+    }
+
+    /// RFC 1928 section 3: no acceptable method is answered X'FF'.
+    #[tokio::test]
+    async fn no_acceptable_method_is_answered_ff() {
+        let credentials = Some(("user".to_string(), "pass".to_string()));
+        let (reply, result) = server_reply(credentials, &[0x05, 0x01, METHOD_NONE]).await;
+        assert!(result.is_err());
+        assert_eq!(reply, [0x05, 0xFF]);
+    }
+
+    /// RFC 1929: a failed login is answered with a non-zero status.
+    #[tokio::test]
+    async fn a_wrong_password_is_answered_with_a_failure_status() {
+        let credentials = Some(("user".to_string(), "pass".to_string()));
+        let mut request = vec![0x05, 0x01, METHOD_USERNAME];
+        request.extend_from_slice(&[0x01, 4]);
+        request.extend_from_slice(b"user");
+        request.push(5);
+        request.extend_from_slice(b"wrong");
+        let (reply, result) = server_reply(credentials, &request).await;
+        assert!(result.is_err());
+        assert_eq!(reply, [0x05, METHOD_USERNAME, 0x01, 0x01]);
+    }
+
+    /// BIND is not supported, and says so with REP X'07'.
+    #[tokio::test]
+    async fn bind_is_answered_command_not_supported() {
+        let request = [
+            0x05,
+            0x01,
+            METHOD_NONE, // greeting
+            0x05,
+            0x02,
+            0x00,
+            ADDR_TYPE_IPV4,
+            127,
+            0,
+            0,
+            1,
+            0,
+            80, // BIND
+        ];
+        let (reply, result) = server_reply(None, &request).await;
+        assert!(result.is_err());
+        assert_eq!(
+            reply,
+            [
+                0x05,
+                METHOD_NONE,
+                0x05,
+                0x07,
+                0x00,
+                ADDR_TYPE_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn each_connect_failure_has_its_reply_code() {
+        for (failure, code) in [
+            (ConnectFailure::Blocked, 0x02),
+            (ConnectFailure::NetworkUnreachable, 0x03),
+            (ConnectFailure::HostUnreachable, 0x04),
+            (ConnectFailure::Refused, 0x05),
+            (ConnectFailure::Other, 0x01),
+        ] {
+            assert_eq!(
+                &*socks_connect_failure_reply(failure),
+                [0x05, code, 0x00, ADDR_TYPE_IPV4, 0, 0, 0, 0, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostname_over_255_bytes_is_refused() {
+        let long = NetLocation::new(Address::Hostname("a".repeat(256)), 443);
+        let err = write_location_to_vec(&long).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let longest = NetLocation::new(Address::Hostname("a".repeat(255)), 443);
+        let encoded = write_location_to_vec(&longest).unwrap();
+        assert_eq!(encoded[1], 255);
+        assert_eq!(encoded.len(), 2 + 255 + 2);
+    }
 }

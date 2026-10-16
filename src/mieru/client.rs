@@ -79,14 +79,17 @@ pub fn decapsulate_udp(input: &[u8]) -> std::io::Result<Option<(Vec<u8>, usize)>
 
 /// `[0x05][cmd][0x00][address][u16 port]`, reusing the socks5 address encoder
 /// the rest of this crate already has.
-fn encode_socks5_request(command: u8, location: &crate::address::NetLocation) -> Vec<u8> {
-    let address = crate::socks_handler::write_location_to_vec(location);
+fn encode_socks5_request(
+    command: u8,
+    location: &crate::address::NetLocation,
+) -> std::io::Result<Vec<u8>> {
+    let address = crate::socks_handler::write_location_to_vec(location)?;
     let mut request = Vec::with_capacity(3 + address.len());
     request.push(SOCKS5_VERSION);
     request.push(command);
     request.push(0x00);
     request.extend_from_slice(&address);
-    request
+    Ok(request)
 }
 
 /// Read and check a socks5 reply from inside the session.
@@ -163,7 +166,7 @@ impl TcpClientHandler for MieruTcpHandler {
         use tokio::io::AsyncWriteExt;
 
         let mut session = self.open_session(client_stream).await?;
-        let request = encode_socks5_request(SOCKS5_CONNECT, &remote_location.into_location());
+        let request = encode_socks5_request(SOCKS5_CONNECT, &remote_location.into_location())?;
         session.write_all(&request).await?;
         session.flush().await?;
         read_socks5_reply(&mut session).await?;
@@ -187,7 +190,7 @@ impl TcpClientHandler for MieruTcpHandler {
 
         let mut session = self.open_session(client_stream).await?;
         let target_location = target.into_location();
-        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &target_location);
+        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &target_location)?;
         session.write_all(&request).await?;
         session.flush().await?;
         read_socks5_reply(&mut session).await?;
@@ -491,7 +494,7 @@ mod tests {
     #[test]
     fn test_a_socks5_connect_request_has_the_documented_shape() {
         let location = crate::address::NetLocation::from_str("example.com:443", None).unwrap();
-        let request = encode_socks5_request(SOCKS5_CONNECT, &location);
+        let request = encode_socks5_request(SOCKS5_CONNECT, &location).unwrap();
         assert_eq!(request[0], 0x05, "version");
         assert_eq!(request[1], SOCKS5_CONNECT, "command");
         assert_eq!(request[2], 0x00, "reserved");
@@ -504,7 +507,7 @@ mod tests {
     #[test]
     fn test_a_udp_associate_request_uses_its_own_command() {
         let location = crate::address::NetLocation::from_str("1.2.3.4:53", None).unwrap();
-        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &location);
+        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &location).unwrap();
         assert_eq!(request[1], SOCKS5_UDP_ASSOCIATE);
         assert_eq!(request[3], 0x01, "address type is ipv4");
     }

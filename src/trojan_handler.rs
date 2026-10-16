@@ -193,6 +193,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             remote_location,
             stream: server_stream,
             need_initial_flush: false,
+            connection_failure_response: None,
             connection_success_response: None,
             initial_remote_data: stream_reader.unparsed_data_owned(),
             proxy_selector: self
@@ -230,7 +231,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         write_all(&mut client_stream, &self.password_hash).await?;
         write_all(&mut client_stream, &CRLF_BYTES).await?;
         write_all(&mut client_stream, &[CMD_CONNECT]).await?;
-        let location_bytes = write_location_to_vec(remote_location.location());
+        let location_bytes = write_location_to_vec(remote_location.location())?;
         write_all(&mut client_stream, &location_bytes).await?;
         write_all(&mut client_stream, &CRLF_BYTES).await?;
         client_stream.flush().await?;

@@ -233,6 +233,7 @@ where
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
             connection_success_response,
+            connection_failure_response,
             initial_remote_data,
         } => {
             forward_tcp(ForwardRequest {
@@ -240,6 +241,7 @@ where
                 server_stream,
                 server_need_initial_flush,
                 connection_success_response,
+                connection_failure_response,
                 initial_remote_data,
                 proxy_selector,
                 resolver,

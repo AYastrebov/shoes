@@ -64,6 +64,7 @@ impl TcpServerHandler for RedirectServerHandler {
             remote_location: NetLocation::from(destination),
             stream: server_stream,
             need_initial_flush: true,
+            connection_failure_response: None,
             connection_success_response: None,
             initial_remote_data: None,
             proxy_selector: self.proxy_selector.clone(),
