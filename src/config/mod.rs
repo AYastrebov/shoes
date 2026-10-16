@@ -93,11 +93,6 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 /// what the user typed — has the config as a string and no file to point at.
 /// It was previously gated to the FFI targets, which made the library unable
 /// to parse a config on a desktop build at all.
-///
-/// Still `allow(dead_code)`: the binary declares its modules in main.rs, which
-/// has no `control`, so a binary build compiles this with nothing to use it.
-/// That is a property of the build rather than something a later change fixes.
-#[allow(dead_code)]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
     serde_yaml::from_str::<Vec<Config>>(config_str).map_err(|e| {
         std::io::Error::new(

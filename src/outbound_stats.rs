@@ -69,12 +69,6 @@ pub struct OutboundSet {
     entries: HashMap<String, String>,
 }
 
-/// `allow(dead_code)` for the reason `tun::traffic` gives about its own
-/// accessors: the binary declares its modules in main.rs, and which of these
-/// have a caller depends on the build. `iter` is used by the registry, which
-/// is behind `control-stats`; the rest serve tests. They are the accessors a
-/// set type owes its callers either way.
-#[allow(dead_code)]
 impl OutboundSet {
     pub fn insert(&mut self, key: &str, address: &str) -> std::io::Result<()> {
         match self.entries.get(key) {
@@ -139,11 +133,7 @@ impl OutboundSet {
 /// test that touches it -- directly, or through a path that installs -- takes
 /// this first. Unconditional so that tests of unfeatured code which still
 /// reach an install (`control::prepare_from_config`) can hold it too.
-///
-/// `allow(dead_code)`: with `control-stats` off there is no registry, so the
-/// tests that take it are compiled out and nothing refers to it.
 #[cfg(test)]
-#[allow(dead_code)]
 pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "control-stats")]
@@ -211,7 +201,6 @@ mod registry {
     /// Replace the registry with the outbounds of the config that is about to
     /// run, each at zero. Called where a service starts, never from
     /// validation: a reload replaces the list rather than accumulating.
-    #[allow(dead_code)]
     pub fn install(set: &OutboundSet) {
         let fresh: HashMap<String, Entry> = set
             .iter()
@@ -257,11 +246,6 @@ mod registry {
 
     /// Every registered outbound, sorted by name so a host redrawing on a
     /// timer does not reorder its own rows.
-    ///
-    /// `allow(dead_code)` for the reason `tun::traffic` gives: the only reader
-    /// is `crate::control::stats`, and main.rs has no `control`, so the binary
-    /// compiles this with nothing to call it.
-    #[allow(dead_code)]
     pub fn snapshot_all() -> Vec<OutboundStats> {
         let guard = registry().read().unwrap();
         let mut out: Vec<OutboundStats> = guard

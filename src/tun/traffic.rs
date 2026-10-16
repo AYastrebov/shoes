@@ -45,13 +45,8 @@ pub fn connection_closed() {
     });
 }
 
-/// Live TCP connections right now.
-///
-/// Unlike its two writers, which the stack calls from both targets, the only
-/// reader is `crate::control::stats` -- and main.rs has no `control`, so a
-/// binary build compiles this with nothing to call it.
+/// Live TCP connections right now; read by `crate::control::stats`.
 #[cfg(feature = "control-stats")]
-#[allow(dead_code)]
 pub fn active_connections() -> usize {
     ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
 }
@@ -116,7 +111,6 @@ pub fn add_download_bytes(bytes: u64) {
 
 /// Reset traffic counters (called on service start).
 /// Called from platform FFI modules (ios.rs / android.rs).
-#[allow(dead_code)]
 pub fn reset_traffic_counters() {
     UPLOAD_BYTES.store(0, Ordering::Relaxed);
     DOWNLOAD_BYTES.store(0, Ordering::Relaxed);
@@ -126,7 +120,6 @@ pub fn reset_traffic_counters() {
 
 /// Set the traffic callback function.
 /// Called from platform FFI modules (ios.rs / android.rs).
-#[allow(dead_code)]
 pub fn set_traffic_callback(callback: Arc<dyn Fn(u64, u64) + Send + Sync>) {
     let lock = TRAFFIC_CALLBACK.get_or_init(|| RwLock::new(None));
     *lock.write() = Some(callback);
@@ -134,7 +127,6 @@ pub fn set_traffic_callback(callback: Arc<dyn Fn(u64, u64) + Send + Sync>) {
 
 /// Clear the traffic callback.
 /// Called from platform FFI modules (ios.rs / android.rs).
-#[allow(dead_code)]
 pub fn clear_traffic_callback() {
     if let Some(lock) = TRAFFIC_CALLBACK.get() {
         *lock.write() = None;
@@ -240,11 +232,6 @@ impl<S: tokio::io::AsyncWrite> tokio::io::AsyncWrite for TrafficCountingStream<S
 ///
 /// Process-global rather than per-service, which is an invariant
 /// `crate::control::start` documents: one service per process.
-///
-/// `allow(dead_code)` for the same reason as its neighbours here: the binary
-/// declares its modules in main.rs, which has no `control`, so a binary build
-/// compiles this with nothing to call it.
-#[allow(dead_code)]
 pub fn get_traffic_counters() -> (u64, u64) {
     (
         UPLOAD_BYTES.load(Ordering::Relaxed),

@@ -243,7 +243,12 @@ impl Supervisor {
     pub fn stop(&self) -> StopOutcome {
         let (reply, wait) = oneshot::channel();
         self.send(Command::Stop { reply });
-        wait.blocking_recv().unwrap_or(StopOutcome::Released)
+        // A supervisor that is gone cannot say the device was let go, and
+        // `Released` tells a client it may reuse the device. Nothing was
+        // waited for, so the timeout says zero.
+        wait.blocking_recv().unwrap_or(StopOutcome::TimedOut {
+            waited: std::time::Duration::ZERO,
+        })
     }
 
     pub fn status(&self) -> Status {
@@ -658,6 +663,20 @@ impl<N: HostNetwork> Inner<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A supervisor whose thread is gone cannot vouch for the device; it used
+    /// to answer `Released`, which tells a client the device is free.
+    #[test]
+    fn a_stop_with_the_supervisor_gone_is_not_released() {
+        let (commands, receiver) = mpsc::channel();
+        drop(receiver);
+        let (transitions, _) = broadcast::channel(1);
+        let supervisor = Supervisor {
+            commands,
+            transitions,
+        };
+        assert!(!supervisor.stop().device_released());
+    }
     use crate::host::DnsState;
     use crate::host::double::Recorder;
     use crate::host::{DnsBackup, Route, Via};

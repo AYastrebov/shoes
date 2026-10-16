@@ -1,9 +1,3 @@
-// The binary declares its own copy of the module tree (main.rs), so code only
-// the binary uses reads as dead here. Removed by plan PR 1.2, which makes
-// main.rs a client of this library
-// (docs/plans/2026-10-15-quality-and-correctness.md).
-#![allow(dead_code)]
-
 //! shoes - A high-performance multi-protocol proxy server.
 //!
 //! This library provides the core functionality for shoes, enabling it to be
@@ -125,6 +119,9 @@ pub mod logging;
 
 /// Service lifecycle for embedding hosts.
 pub mod control;
+
+/// The `shoes` binary's own needs: key generators and the worker count.
+pub mod cli;
 
 /// TUN device support for VPN mode.
 #[cfg(any(unix, windows))]

@@ -30,6 +30,22 @@ Lints, dead code and unsafe hygiene (plan PR 1.1; Q-1 to Q-4):
   FFI functions, the unused h2mux items, `outbound_stats::Entry.address`.
   Crate-root and FFI docs describe the real entry points.
 
+One crate, one pipeline (plan PR 1.2; A-1, A-6, A-8):
+
+- **The `shoes` binary links the library** instead of compiling its own copy
+  of every module. The library's crate-wide `allow(dead_code)` is gone with
+  it, and the allows that only existed for the second copy. The binary's test
+  target no longer runs the whole suite a second time.
+- **One server pipeline.** `control::servers` loads certificates, validates,
+  builds the DNS registry and starts servers, for the binary and the TUN
+  hosts alike. A configuration whose second server fails to start no longer
+  leaves the first one running under a TUN host.
+- **The generic QUIC transport uses `quic_transport`'s accept loop**, with
+  quinn's default parameters as before; a failed stream is logged at the
+  level its cause warrants.
+- **`shoesd` reports a stop the supervisor could not confirm as timed out**,
+  not released, so a client does not reuse a device nothing vouched for.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

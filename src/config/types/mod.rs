@@ -29,7 +29,6 @@ pub mod transport;
 pub mod tun;
 
 // Re-export all public types for convenience
-#[allow(unused_imports)]
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
     HttpUpgradeClientConfig, Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig,
@@ -39,14 +38,8 @@ pub use client::{
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
-// Part of the public config surface; the protocol configs that carry it name
-// the module type directly, so the binary does not yet reach for this alias.
-#[allow(unused_imports)]
 pub use obfs::ObfsConfig;
 pub use redacted::Redacted;
-// Part of the public config surface; the binary itself matches on
-// Config::RuleSet rather than naming the type.
-#[allow(unused_imports)]
 pub use rule_set::RuleSetConfig;
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
@@ -56,8 +49,6 @@ pub use server::{
     WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
-// Part of the public config surface; the binary names only SniffConfig.
-#[allow(unused_imports)]
 pub use sniff::{SniffConfig, SniffProtocolConfig};
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::{FakeIpConfig, TunConfig};

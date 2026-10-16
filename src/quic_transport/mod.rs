@@ -170,10 +170,14 @@ pub struct QuicListenerSettings {
 /// Bind a socket and raise one listening endpoint on it.
 fn build_server_endpoint(
     settings: &QuicListenerSettings,
-    params: &QuicTransportParams,
+    params: Option<&QuicTransportParams>,
 ) -> std::io::Result<quinn::Endpoint> {
     let mut server_config = quinn::ServerConfig::with_crypto(settings.quic_server_config.clone());
-    server_config.transport = Arc::new(params.build());
+    // `None` keeps quinn's defaults, which the generic QUIC transport for TCP
+    // protocols has always run on.
+    if let Some(params) = params {
+        server_config.transport = Arc::new(params.build());
+    }
 
     let socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
         settings.bind_address.is_ipv6(),
@@ -247,7 +251,7 @@ pub fn admit_or_retry(
 /// captured there, so nothing protocol-specific reaches this module.
 pub fn start_quic_listeners<F, Fut>(
     settings: QuicListenerSettings,
-    params: QuicTransportParams,
+    params: Option<QuicTransportParams>,
     handle_connection: F,
 ) -> std::io::Result<Vec<JoinHandle<()>>>
 where
@@ -278,7 +282,7 @@ where
         // Nothing ever awaits these join handles - a config reload aborts them
         // - so a panic raised inside the task would be swallowed and the
         // listener would silently accept nothing at all.
-        let endpoint = build_server_endpoint(&settings, &params)?;
+        let endpoint = build_server_endpoint(&settings, params.as_ref())?;
         let handle_connection = handle_connection.clone();
 
         join_handles.push(tokio::spawn(async move {
@@ -399,10 +403,10 @@ mod tests {
             let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
             let handles = start_quic_listeners(
                 listener(bind),
-                QuicTransportParams {
+                Some(QuicTransportParams {
                     congestion,
                     ..params()
-                },
+                }),
                 move |incoming| {
                     let tx = tx.clone();
                     async move {
@@ -515,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn test_an_unbindable_address_is_a_startup_error() {
         let settings = listener(UNBINDABLE.parse().unwrap());
-        let result = start_quic_listeners(settings, params(), |_| async { Ok(()) });
+        let result = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) });
         let err = result
             .map(|handles| handles.len())
             .expect_err("binding TEST-NET-1 must fail");
@@ -539,7 +543,7 @@ mod tests {
         // gets exactly one however many were asked for.
         let expected = if cfg!(windows) { 1 } else { 3 };
 
-        let handles = start_quic_listeners(settings, params(), |_| async { Ok(()) })
+        let handles = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) })
             .expect("loopback must bind");
         assert_eq!(handles.len(), expected);
 
@@ -554,7 +558,7 @@ mod tests {
         let mut settings = listener(reserve_udp_port());
         settings.obfs = Some(Arc::new(obfs::Salamander::new(b"a password").unwrap()));
 
-        let handles = start_quic_listeners(settings, params(), |_| async { Ok(()) })
+        let handles = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) })
             .expect("an obfuscated listener must bind");
         assert_eq!(handles.len(), 1);
         handles.into_iter().for_each(|h| h.abort());
