@@ -9,3 +9,6 @@ pub use shadow_tls_server_handler::{
 };
 
 pub use shadow_tls_client_handler::ShadowTlsClientHandler;
+
+#[cfg(test)]
+mod tests;

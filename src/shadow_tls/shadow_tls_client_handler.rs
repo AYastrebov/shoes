@@ -223,7 +223,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
 
 // TODO: consider reusing server read_client_hello code
 #[inline]
-fn modify_client_hello(
+pub(super) fn modify_client_hello(
     original_frame: &[u8],
     initial_hmac: &ShadowTlsHmac,
 ) -> std::io::Result<Vec<u8>> {
