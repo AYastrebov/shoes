@@ -75,6 +75,11 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
   shipped examples, `socks_through_vmess.yaml`, had exactly that typo and is
   corrected.
 
+- **WireGuard and AmneziaWG keys and prefixes are parsed when the config
+  loads** (`WgKey`, `IpPrefix`), and the tunnel takes the parsed values. The
+  error names the field -- `preshared_key: key must be 32 bytes, got 3` --
+  where it used to say "AmneziaWG" for a plain WireGuard config too.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
