@@ -29,11 +29,6 @@ use super::types::{
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Upstream's floor for the hop interval
-/// (`extras/transport/udphop/conn.go`). Hopping faster is a pattern of its
-/// own, and it costs a fresh socket every time.
-const MIN_HOP_INTERVAL_MS: u64 = 5_000;
-
 /// The longest username or password mieru accepts. `apis/constant/user.go:19`
 /// caps the name at 64 bytes and the Go client applies the same figure to the
 /// password (`pkg/appctl/appctlcommon/client.go:67`).
@@ -1366,79 +1361,21 @@ fn validate_client_config(
         ClientProxyConfig::Hysteria2(hysteria2) => {
             validate_obfs_config(hysteria2.obfs.as_ref())?;
 
-            if let Some(ref hopping) = hysteria2.port_hopping {
-                let invalid =
-                    |detail: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
-
-                // Build the real settings rather than re-checking a subset of
-                // what they require. `chain_builder` expects this to have
-                // happened and `expect`s the result, so anything the
-                // constructor refuses has to be refused here or it becomes a
-                // panic at connect time - port 0 parses as a port but is not a
-                // destination, and that gap was exactly this shape.
-                crate::quic_transport::hop::HopSettings::new(
-                    &hopping.ports,
-                    hopping.interval_ms,
-                    hopping.min_interval_ms,
-                    hopping.max_interval_ms,
-                )
-                .map_err(|e| invalid(format!("Hysteria2 port_hopping is unusable: {e}")))?;
-
-                // The canonical peer address is fixed for the connection's
-                // life - that is what keeps QUIC from seeing a path change on
-                // every hop - so there is nowhere for a re-resolution to go.
-                if client_config.address.address().hostname().is_some() {
-                    return Err(invalid(
-                        "Hysteria2 port_hopping requires a literal IP address. The peer \
-                         address is fixed for the connection's life, so a hostname has \
-                         nowhere to re-resolve to."
-                            .to_string(),
-                    ));
-                }
-
-                let has_range =
-                    hopping.min_interval_ms.is_some() || hopping.max_interval_ms.is_some();
-                if hopping.interval_ms.is_some() && has_range {
-                    return Err(invalid(
-                        "Hysteria2 port_hopping takes either interval_ms or the \
-                         min_interval_ms/max_interval_ms pair, not both."
-                            .to_string(),
-                    ));
-                }
-
-                match (hopping.min_interval_ms, hopping.max_interval_ms) {
-                    (Some(min), Some(max)) => {
-                        if min > max {
-                            return Err(invalid(format!(
-                                "Hysteria2 port_hopping.min_interval_ms ({min}) is greater \
-                                 than max_interval_ms ({max})."
-                            )));
-                        }
-                        if min < MIN_HOP_INTERVAL_MS {
-                            return Err(invalid(format!(
-                                "Hysteria2 port_hopping.min_interval_ms must be at least \
-                                 {MIN_HOP_INTERVAL_MS}."
-                            )));
-                        }
-                    }
-                    (None, None) => {}
-                    _ => {
-                        return Err(invalid(
-                            "Hysteria2 port_hopping needs both min_interval_ms and \
-                             max_interval_ms, or neither."
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                if let Some(interval) = hopping.interval_ms
-                    && interval < MIN_HOP_INTERVAL_MS
-                {
-                    return Err(invalid(format!(
-                        "Hysteria2 port_hopping.interval_ms must be at least \
-                         {MIN_HOP_INTERVAL_MS}."
-                    )));
-                }
+            // Ports and schedule were parsed with the config
+            // (`PortHoppingConfig`); what needs the outbound's address is
+            // checked here. The canonical peer address is fixed for the
+            // connection's life - that is what keeps QUIC from seeing a path
+            // change on every hop - so there is nowhere for a re-resolution
+            // to go.
+            if hysteria2.port_hopping.is_some()
+                && client_config.address.address().hostname().is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Hysteria2 port_hopping requires a literal IP address. The peer \
+                     address is fixed for the connection's life, so a hostname has \
+                     nowhere to re-resolve to.",
+                ));
             }
         }
         ClientProxyConfig::Mieru(mieru) => {
@@ -2661,8 +2598,8 @@ mod tests {
         use super::*;
         use crate::address::NetLocation;
         use crate::config::types::client::{
-            Hysteria2ClientConfig, MieruClientConfig, PortHoppingConfig, TuicClientConfig,
-            TuicUdpRelayMode,
+            Hysteria2ClientConfig, MieruClientConfig, PortHoppingConfig, PortHoppingFields,
+            TuicClientConfig, TuicUdpRelayMode,
         };
         use crate::config::types::transport::{ClientQuicConfig, TcpConfig};
 
@@ -2718,13 +2655,22 @@ mod tests {
             }
         }
 
-        fn hopping(ports: &str) -> PortHoppingConfig {
-            PortHoppingConfig {
+        fn fields(ports: &str) -> PortHoppingFields {
+            PortHoppingFields {
                 ports: ports.to_string(),
                 interval_ms: None,
                 min_interval_ms: None,
                 max_interval_ms: None,
             }
+        }
+
+        fn hopping(ports: &str) -> PortHoppingConfig {
+            PortHoppingConfig::try_from(fields(ports)).unwrap()
+        }
+
+        /// What parsing `fields` says, as the user would read it.
+        fn refusal(fields: PortHoppingFields) -> String {
+            PortHoppingConfig::try_from(fields).unwrap_err()
         }
 
         #[test]
@@ -2736,62 +2682,70 @@ mod tests {
         /// Nothing to hop between is not a configuration, it is a typo.
         #[test]
         fn test_port_hopping_rejects_an_unparsable_range() {
-            let mut config = hysteria2_client_with_hopping(Some(hopping("not-ports")));
-            assert!(validate(&mut config).is_err());
+            assert!(PortHoppingConfig::try_from(fields("not-ports")).is_err());
         }
 
         /// Upstream's floor. Below it the hop rate is itself a signature, and
         /// a silently clamped value would be a setting that does not do what
-        /// it says.
+        /// it says. It used to be checked only here; the parser now refuses
+        /// it wherever the settings come from.
         #[test]
         fn test_port_hopping_rejects_an_interval_under_the_floor() {
-            let mut c = hopping("20000-20010");
-            c.interval_ms = Some(4_999);
-            let mut config = hysteria2_client_with_hopping(Some(c));
-            let err = validate(&mut config).unwrap_err();
-            assert!(err.to_string().contains("5000"), "{err}");
+            let mut f = fields("20000-20010");
+            f.interval_ms = Some(4_999);
+            let err = refusal(f);
+            assert!(err.contains("interval_ms must be at least 5000"), "{err}");
+
+            let mut f = fields("20000-20010");
+            f.min_interval_ms = Some(4_999);
+            f.max_interval_ms = Some(10_000);
+            assert!(refusal(f).contains("min_interval_ms must be at least 5000"));
         }
 
         #[test]
         fn test_port_hopping_rejects_an_inverted_range() {
-            let mut c = hopping("20000-20010");
-            c.min_interval_ms = Some(30_000);
-            c.max_interval_ms = Some(10_000);
-            let mut config = hysteria2_client_with_hopping(Some(c));
-            assert!(validate(&mut config).is_err());
+            let mut f = fields("20000-20010");
+            f.min_interval_ms = Some(30_000);
+            f.max_interval_ms = Some(10_000);
+            assert!(refusal(f).contains("is greater than max_interval_ms"));
         }
 
         /// Two answers to one question. Picking one silently would be a guess
         /// the user never sees.
         #[test]
         fn test_port_hopping_rejects_a_fixed_interval_beside_a_range() {
-            let mut c = hopping("20000-20010");
-            c.interval_ms = Some(30_000);
-            c.min_interval_ms = Some(10_000);
-            c.max_interval_ms = Some(20_000);
-            let mut config = hysteria2_client_with_hopping(Some(c));
-            assert!(validate(&mut config).is_err());
+            let mut f = fields("20000-20010");
+            f.interval_ms = Some(30_000);
+            f.min_interval_ms = Some(10_000);
+            f.max_interval_ms = Some(20_000);
+            assert!(refusal(f).contains("not both"));
         }
 
         #[test]
         fn test_port_hopping_rejects_half_a_range() {
-            let mut c = hopping("20000-20010");
-            c.min_interval_ms = Some(10_000);
-            let mut config = hysteria2_client_with_hopping(Some(c));
-            assert!(validate(&mut config).is_err());
+            let mut f = fields("20000-20010");
+            f.min_interval_ms = Some(10_000);
+            assert!(refusal(f).contains("or neither"));
         }
 
-        /// Validation has to refuse everything `HopSettings::new` refuses:
-        /// `chain_builder` expects the config to have been validated and
-        /// `expect`s the result, so a gap between the two is a panic at
-        /// connect time rather than an error at load.
+        /// Port 0 parses as a port but is not a destination.
         #[test]
         fn test_port_hopping_rejects_port_zero() {
-            let mut config = hysteria2_client_with_hopping(Some(hopping("0-1000")));
-            assert!(validate(&mut config).is_err());
+            assert!(PortHoppingConfig::try_from(fields("0-1000")).is_err());
+            assert!(PortHoppingConfig::try_from(fields("0,20000-20005")).is_err());
+        }
 
-            let mut config = hysteria2_client_with_hopping(Some(hopping("0,20000-20005")));
-            assert!(validate(&mut config).is_err());
+        /// The YAML a user writes reaches the same refusal, with the field.
+        #[test]
+        fn test_a_bad_hopping_block_is_a_parse_error() {
+            let yaml = "ports: 20000-20010\ninterval_ms: 1000\n";
+            let err = serde_yaml::from_str::<PortHoppingConfig>(yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("port_hopping interval_ms must be at least 5000"),
+                "{err}"
+            );
         }
 
         /// A hostname has nowhere to re-resolve to once the connection is up,

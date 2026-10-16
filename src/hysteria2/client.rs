@@ -392,11 +392,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
 
-        // 200ms, far below the 5000ms config floor. That floor is a
-        // validation rule, not a property of the mechanism, and raising it
-        // here would turn the test into a minute of waiting.
-        let hop =
-            crate::quic_transport::hop::HopSettings::new(&range, Some(200), None, None).unwrap();
+        // 200ms, far below the 5000ms config floor. That floor is a rule of
+        // the config, which `HopSettings::new` enforces, not a property of
+        // the mechanism, so the settings are built directly; raising it here
+        // would turn the test into a minute of waiting.
+        let hop = crate::quic_transport::hop::HopSettings {
+            ports: crate::quic_transport::hop::PortSet::parse(&range).unwrap(),
+            schedule: crate::quic_transport::hop::HopSchedule::Fixed(Duration::from_millis(200)),
+        };
 
         let connector = Hysteria2Connector::new(
             NetLocation::from_str(&format!("127.0.0.1:{}", ports[0]), None).unwrap(),
