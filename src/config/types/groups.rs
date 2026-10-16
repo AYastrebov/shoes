@@ -178,6 +178,51 @@ pub enum Config {
     RuleSet(RuleSetConfig),
 }
 
+/// Which [`Config`] variant a document entry is, told by its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    NamedPem,
+    ClientConfigGroup,
+    RuleConfigGroup,
+    DnsConfigGroup,
+    RuleSet,
+    TunServer,
+    Server,
+}
+
+/// In order: the first row with any of its keys present decides.
+///
+/// - `pem`, `client_group`, `rule_group`, `dns_group` each name one variant.
+/// - `rule_set` precedes the server row: a rule-set entry also carries `path`,
+///   which alone means a Unix-socket server.
+/// - A TUN entry has `device_name` (Linux/Windows) or `device_fd`
+///   (iOS/Android/macOS-NE). `netmask` and `destination` cover the one shape
+///   neither does: a macOS host that creates the device and lets the kernel
+///   choose the `utun` unit -- no descriptor, and naming the interface is
+///   exactly what it must not do, since picking a unit races every other utun
+///   user. Both names exist only on `TunConfig`, so without them that entry
+///   would fall through to the server row; a server carrying one is already
+///   an unknown-field error rather than something that used to work.
+const KINDS: &[(&[&str], Kind)] = &[
+    (&["pem"], Kind::NamedPem),
+    (&["client_group"], Kind::ClientConfigGroup),
+    (&["rule_group"], Kind::RuleConfigGroup),
+    (&["dns_group"], Kind::DnsConfigGroup),
+    (&["rule_set"], Kind::RuleSet),
+    (
+        &["device_name", "device_fd", "netmask", "destination"],
+        Kind::TunServer,
+    ),
+    (&["address", "addresses", "path"], Kind::Server),
+];
+
+fn kind_of(map: &serde_yaml::Mapping) -> Option<Kind> {
+    KINDS
+        .iter()
+        .find(|(keys, _)| keys.iter().any(|key| map.contains_key(*key)))
+        .map(|(_, kind)| *kind)
+}
+
 impl<'de> serde::de::Deserialize<'de> for Config {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -186,96 +231,44 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         use serde::de::Error;
         use serde_yaml::Value;
 
-        // First deserialize to a generic Value to inspect the structure
         let value = Value::deserialize(deserializer)?;
-
-        // Check if it's a mapping (as all our configs should be)
         let map = value.as_mapping().ok_or_else(|| {
             Error::custom("Expected a YAML mapping for Config, but found a different type")
         })?;
 
-        // Look for discriminating fields
-        let has_client_group = map.contains_key(Value::String("client_group".to_string()));
-        let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
-        let has_dns_group = map.contains_key(Value::String("dns_group".to_string()));
-        let has_rule_set = map.contains_key(Value::String("rule_set".to_string()));
-        let has_address = map.contains_key(Value::String("address".to_string()));
-        let has_addresses = map.contains_key(Value::String("addresses".to_string()));
-        let has_path_field = map.contains_key(Value::String("path".to_string()));
-        let has_pem = map.contains_key(Value::String("pem".to_string()));
-
-        // Check if this is a TUN config
-        // TUN configs have 'device_name' (Linux/Windows) or 'device_fd'
-        // (iOS/Android/macOS-NE). These fields are unique to TUN and don't
-        // appear in other config types.
-        //
-        // `netmask` and `destination` are in the set for a shape neither of
-        // those two covers: a macOS host that creates the device and lets the
-        // kernel choose the `utun` unit. It has no descriptor, and naming the
-        // interface is exactly what it must not do -- picking a unit races
-        // every other utun user on the machine -- so without these it would
-        // fall through to the `address` branch below and be read as a server
-        // config. Both field names exist only on `TunConfig`, and a server
-        // config carrying one is already an unknown-field error rather than
-        // something that used to work.
-        let has_device_name = map.contains_key(Value::String("device_name".to_string()));
-        let has_device_fd = map.contains_key(Value::String("device_fd".to_string()));
-        let has_netmask = map.contains_key(Value::String("netmask".to_string()));
-        let has_destination = map.contains_key(Value::String("destination".to_string()));
-        let is_tun_config = has_device_name || has_device_fd || has_netmask || has_destination;
-
-        // Try to determine which variant based on fields
-        if has_pem {
-            // NamedPem (pem field is unique to NamedPem)
-            serde_yaml::from_value(value)
-                .map(Config::NamedPem)
-                .map_err(|e| Error::custom(format!("invalid named PEM config: {e}")))
-        } else if has_client_group {
-            // ClientConfigGroup
-            serde_yaml::from_value(value)
-                .map(Config::ClientConfigGroup)
-                .map_err(|e| Error::custom(format!("invalid client config group: {e}")))
-        } else if has_rule_group {
-            // RuleConfigGroup
-            serde_yaml::from_value(value)
-                .map(Config::RuleConfigGroup)
-                .map_err(|e| Error::custom(format!("invalid rule config group: {e}")))
-        } else if has_dns_group {
-            // DnsConfigGroup
-            serde_yaml::from_value(value)
-                .map(Config::DnsConfigGroup)
-                .map_err(|e| Error::custom(format!("invalid DNS config group: {e}")))
-        } else if has_rule_set {
-            // Must precede the address/path branch: a rule-set entry also
-            // carries `path`, which alone means a Unix-socket ServerConfig.
-            serde_yaml::from_value(value)
-                .map(Config::RuleSet)
-                .map_err(|e| Error::custom(format!("invalid rule-set config: {e}")))
-        } else if is_tun_config {
-            // TunConfig - identified by having 'name' or 'raw_fd' without 'protocol' wrapper
-            serde_yaml::from_value(value)
-                .map(Config::TunServer)
-                .map_err(|e| Error::custom(format!("invalid TUN config: {e}")))
-        } else if has_address || has_addresses || has_path_field {
-            // ServerConfig - its custom deserializer validates unknown fields
-            serde_yaml::from_value(value)
-                .map(Config::Server)
-                .map_err(|e| Error::custom(format!("invalid server config: {e}")))
-        } else {
-            // Provide a helpful error message listing what fields we found
+        let Some(kind) = kind_of(map) else {
             let found_fields: Vec<String> = map
                 .keys()
                 .filter_map(|k| k.as_str().map(|s| s.to_string()))
                 .collect();
-
-            Err(Error::custom(format!(
+            return Err(Error::custom(format!(
                 "Unable to determine config type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Server config: must have 'address', 'addresses', or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
                 - DNS config group: must have 'dns_group' field\n\
                 - Rule-set: must have 'rule_set' field"
-            )))
+            )));
+        };
+
+        fn parse<T: serde::de::DeserializeOwned, E: Error>(
+            value: Value,
+            what: &str,
+        ) -> Result<T, E> {
+            serde_yaml::from_value(value).map_err(|e| E::custom(format!("invalid {what}: {e}")))
+        }
+
+        match kind {
+            Kind::NamedPem => parse(value, "named PEM config").map(Config::NamedPem),
+            Kind::ClientConfigGroup => {
+                parse(value, "client config group").map(Config::ClientConfigGroup)
+            }
+            Kind::RuleConfigGroup => parse(value, "rule config group").map(Config::RuleConfigGroup),
+            Kind::DnsConfigGroup => parse(value, "DNS config group").map(Config::DnsConfigGroup),
+            Kind::RuleSet => parse(value, "rule-set config").map(Config::RuleSet),
+            Kind::TunServer => parse(value, "TUN config").map(Config::TunServer),
+            // ServerConfig's own deserializer validates unknown fields.
+            Kind::Server => parse(value, "server config").map(Config::Server),
         }
     }
 }
@@ -300,6 +293,72 @@ impl serde::ser::Serialize for Config {
 #[cfg(test)]
 mod rule_set_discriminator_tests {
     use super::*;
+
+    fn kind_of_config(config: &Config) -> Kind {
+        match config {
+            Config::NamedPem(_) => Kind::NamedPem,
+            Config::ClientConfigGroup(_) => Kind::ClientConfigGroup,
+            Config::RuleConfigGroup(_) => Kind::RuleConfigGroup,
+            Config::DnsConfigGroup(_) => Kind::DnsConfigGroup,
+            Config::RuleSet(_) => Kind::RuleSet,
+            Config::TunServer(_) => Kind::TunServer,
+            Config::Server(_) => Kind::Server,
+        }
+    }
+
+    /// Every variant, written back out, is told apart as itself: a
+    /// serializer that dropped or renamed a discriminating key would turn a
+    /// saved config into a different kind of entry on the next load.
+    #[test]
+    fn every_variant_re_discriminates_to_itself() {
+        let yaml = "
+- pem: cert
+  path: /etc/shoes/cert.pem
+- client_group: out
+  client_proxies:
+    - address: 127.0.0.1:1080
+      protocol:
+        type: socks
+- rule_group: rules
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+- dns_group: dns
+  dns_servers:
+    - udp://1.1.1.1
+- rule_set: geosite-ru
+  path: /etc/shoes/geosite-ru.srs
+- device_fd: 7
+- netmask: 255.255.255.0
+  address: 10.0.0.2
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+- path: /run/shoes.sock
+  protocol:
+    type: socks
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for config in &configs {
+            let value = serde_yaml::to_value(config).unwrap();
+            let map = value
+                .as_mapping()
+                .expect("every variant serializes as a mapping");
+            let kind = kind_of(map);
+            assert_eq!(
+                kind,
+                Some(kind_of_config(config)),
+                "{config:?} wrote {value:?}"
+            );
+            seen.insert(format!("{:?}", kind_of_config(config)));
+        }
+        assert_eq!(
+            seen.len(),
+            KINDS.len(),
+            "the sample covers every variant: {seen:?}"
+        );
+    }
 
     #[test]
     fn a_rule_set_entry_is_not_mistaken_for_a_unix_socket_server() {

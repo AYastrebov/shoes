@@ -226,71 +226,13 @@ impl<'de> Deserialize<'de> for RuleConfig {
             None => return Err(D::Error::missing_field("masks")),
         };
 
-        // Determine action type
-        let action_str = temp.action.as_deref().unwrap_or("allow");
-        let action = match action_str {
-            "block" => RuleActionConfig::Block,
-            "allow" => {
-                // Parse override_address if present
-                let override_address = if let Some(addr_str) = temp.override_address {
-                    Some(NetLocation::from_str(&addr_str, Some(0)).map_err(|_| {
-                        D::Error::custom(format!(
-                            "invalid override_address '{}': expected format like 'host:port' or 'host'",
-                            addr_str
-                        ))
-                    })?)
-                } else {
-                    None
-                };
-
-                // Check for conflicting fields
-                let has_client_proxies = !temp.client_proxies.is_empty();
-                let has_client_chains = !temp.client_chains.is_empty();
-
-                if has_client_proxies && has_client_chains {
-                    return Err(D::Error::custom(
-                        "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
-                         'client_proxies' is deprecated - please use 'client_chains' instead.",
-                    ));
-                }
-
-                // Convert client_proxies to client_chains if present
-                let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
-                    log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
-                    );
-
-                    // Convert to client_chains format:
-                    // All proxies become a single chain with one hop (pool if multiple)
-                    let proxy_list = temp.client_proxies.into_vec();
-                    let hop = if proxy_list.len() == 1 {
-                        ClientChainHop::Single(proxy_list.into_iter().next().unwrap())
-                    } else {
-                        ClientChainHop::Pool(OneOrSome::Some(proxy_list))
-                    };
-                    NoneOrSome::One(ClientChain {
-                        hops: OneOrSome::One(hop),
-                    })
-                } else if has_client_chains {
-                    temp.client_chains
-                } else {
-                    // Default: unspecified means single chain with direct hop
-                    NoneOrSome::Unspecified
-                };
-
-                RuleActionConfig::Allow {
-                    override_address,
-                    client_chains,
-                }
-            }
-            other => {
-                return Err(D::Error::custom(format!(
-                    "invalid action '{}': expected 'allow' or 'block'",
-                    other
-                )));
-            }
-        };
+        let action = action_from_parts(
+            temp.action,
+            temp.override_address,
+            temp.client_proxies,
+            temp.client_chains,
+        )
+        .map_err(D::Error::custom)?;
 
         Ok(RuleConfig {
             masks,
@@ -308,23 +250,7 @@ impl Serialize for RuleConfig {
     {
         use serde::ser::SerializeMap;
 
-        // Count fields: masks + action fields
-        let action_field_count = match &self.action {
-            RuleActionConfig::Block => 1, // action
-            RuleActionConfig::Allow {
-                override_address,
-                client_chains,
-            } => {
-                let mut count = 1; // action
-                if override_address.is_some() {
-                    count += 1;
-                }
-                if !client_chains.is_empty() {
-                    count += 1;
-                }
-                count
-            }
-        };
+        let action_field_count = action_field_count(&self.action);
 
         // OneOrSome::len is test-only, and widening it for one call site is not
         // worth it.
@@ -357,24 +283,7 @@ impl Serialize for RuleConfig {
             map.serialize_entry("rule_sets", &self.rule_sets)?;
         }
 
-        // Serialize action fields (flattened)
-        match &self.action {
-            RuleActionConfig::Block => {
-                map.serialize_entry("action", "block")?;
-            }
-            RuleActionConfig::Allow {
-                override_address,
-                client_chains,
-            } => {
-                map.serialize_entry("action", "allow")?;
-                if let Some(addr) = override_address {
-                    map.serialize_entry("override_address", &addr.to_string())?;
-                }
-                if !client_chains.is_empty() {
-                    map.serialize_entry("client_chains", client_chains)?;
-                }
-            }
-        }
+        serialize_action_fields(&mut map, &self.action)?;
 
         map.end()
     }
@@ -546,69 +455,115 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
 
         let temp = RuleActionTemp::deserialize(deserializer)?;
 
-        // Determine action type
-        let action_str = temp.action.as_deref().unwrap_or("allow");
-        match action_str {
-            "block" => Ok(RuleActionConfig::Block),
-            "allow" => {
-                // Parse override_address if present
-                let override_address = if let Some(addr_str) = temp.override_address {
-                    Some(NetLocation::from_str(&addr_str, Some(0)).map_err(|_| {
-                        D::Error::custom(format!(
-                            "invalid override_address '{}': expected format like 'host:port' or 'host'",
-                            addr_str
-                        ))
-                    })?)
-                } else {
-                    None
-                };
+        action_from_parts(
+            temp.action,
+            temp.override_address,
+            temp.client_proxies,
+            temp.client_chains,
+        )
+        .map_err(D::Error::custom)
+    }
+}
 
-                // Check for conflicting fields
-                let has_client_proxies = !temp.client_proxies.is_empty();
-                let has_client_chains = !temp.client_chains.is_empty();
-
-                if has_client_proxies && has_client_chains {
-                    return Err(D::Error::custom(
-                        "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
-                         'client_proxies' is deprecated - please use 'client_chains' instead.",
-                    ));
-                }
-
-                // Convert client_proxies to client_chains if present
-                let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
-                    log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
-                    );
-
-                    // Convert to client_chains format:
-                    // All proxies become a single chain with one hop (pool if multiple)
-                    let proxy_list = temp.client_proxies.into_vec();
-                    let hop = if proxy_list.len() == 1 {
-                        ClientChainHop::Single(proxy_list.into_iter().next().unwrap())
-                    } else {
-                        ClientChainHop::Pool(OneOrSome::Some(proxy_list))
-                    };
-                    NoneOrSome::One(ClientChain {
-                        hops: OneOrSome::One(hop),
+/// The action a rule's fields describe. Shared by [`RuleConfig`], which
+/// carries the action fields beside its masks, and [`RuleActionConfig`] on
+/// its own, so the default, the deprecated `client_proxies` and the conflict
+/// between the two chain fields are read one way.
+fn action_from_parts(
+    action: Option<String>,
+    override_address: Option<String>,
+    client_proxies: NoneOrSome<ConfigSelection<ClientConfig>>,
+    client_chains: NoneOrSome<ClientChain>,
+) -> Result<RuleActionConfig, String> {
+    match action.as_deref().unwrap_or("allow") {
+        "block" => Ok(RuleActionConfig::Block),
+        "allow" => {
+            let override_address = override_address
+                .map(|addr_str| {
+                    NetLocation::from_str(&addr_str, Some(0)).map_err(|_| {
+                        format!(
+                            "invalid override_address '{addr_str}': expected format like \
+                             'host:port' or 'host'"
+                        )
                     })
-                } else if has_client_chains {
-                    temp.client_chains
-                } else {
-                    // Default: unspecified means single chain with direct hop
-                    NoneOrSome::Unspecified
-                };
-
-                Ok(RuleActionConfig::Allow {
-                    override_address,
-                    client_chains,
                 })
+                .transpose()?;
+
+            let has_client_proxies = !client_proxies.is_empty();
+            let has_client_chains = !client_chains.is_empty();
+            if has_client_proxies && has_client_chains {
+                return Err(
+                    "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
+                     'client_proxies' is deprecated - please use 'client_chains' instead."
+                        .to_string(),
+                );
             }
-            other => Err(D::Error::custom(format!(
-                "invalid action '{}': expected 'allow' or 'block'",
-                other
-            ))),
+
+            let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
+                log::warn!(
+                    "The 'client_proxies' field is deprecated and will be removed in a future version. \
+                     Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
+                );
+                // All proxies become a single chain with one hop (a pool if
+                // there are several).
+                let mut proxy_list = client_proxies.into_vec();
+                let hop = if proxy_list.len() == 1 {
+                    ClientChainHop::Single(proxy_list.remove(0))
+                } else {
+                    ClientChainHop::Pool(OneOrSome::Some(proxy_list))
+                };
+                NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(hop),
+                })
+            } else if has_client_chains {
+                client_chains
+            } else {
+                // Unspecified means a single chain with a direct hop.
+                NoneOrSome::Unspecified
+            };
+
+            Ok(RuleActionConfig::Allow {
+                override_address,
+                client_chains,
+            })
         }
+        other => Err(format!(
+            "invalid action '{other}': expected 'allow' or 'block'"
+        )),
+    }
+}
+
+/// Write an action's fields into a map: `action`, then whatever it carries.
+fn serialize_action_fields<M: serde::ser::SerializeMap>(
+    map: &mut M,
+    action: &RuleActionConfig,
+) -> Result<(), M::Error> {
+    match action {
+        RuleActionConfig::Block => map.serialize_entry("action", "block"),
+        RuleActionConfig::Allow {
+            override_address,
+            client_chains,
+        } => {
+            map.serialize_entry("action", "allow")?;
+            if let Some(addr) = override_address {
+                map.serialize_entry("override_address", &addr.to_string())?;
+            }
+            if !client_chains.is_empty() {
+                map.serialize_entry("client_chains", client_chains)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// How many map entries [`serialize_action_fields`] writes.
+fn action_field_count(action: &RuleActionConfig) -> usize {
+    match action {
+        RuleActionConfig::Block => 1,
+        RuleActionConfig::Allow {
+            override_address,
+            client_chains,
+        } => 1 + usize::from(override_address.is_some()) + usize::from(!client_chains.is_empty()),
     }
 }
 
@@ -619,35 +574,9 @@ impl Serialize for RuleActionConfig {
     {
         use serde::ser::SerializeMap;
 
-        match self {
-            RuleActionConfig::Block => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("action", "block")?;
-                map.end()
-            }
-            RuleActionConfig::Allow {
-                override_address,
-                client_chains,
-            } => {
-                let mut count = 1; // action
-                if override_address.is_some() {
-                    count += 1;
-                }
-                if !client_chains.is_empty() {
-                    count += 1;
-                }
-
-                let mut map = serializer.serialize_map(Some(count))?;
-                map.serialize_entry("action", "allow")?;
-                if let Some(addr) = override_address {
-                    map.serialize_entry("override_address", &addr.to_string())?;
-                }
-                if !client_chains.is_empty() {
-                    map.serialize_entry("client_chains", client_chains)?;
-                }
-                map.end()
-            }
-        }
+        let mut map = serializer.serialize_map(Some(action_field_count(self)))?;
+        serialize_action_fields(&mut map, self)?;
+        map.end()
     }
 }
 
