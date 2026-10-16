@@ -80,6 +80,11 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
   error names the field -- `preshared_key: key must be 32 bytes, got 3` --
   where it used to say "AmneziaWG" for a plain WireGuard config too.
 
+- **Hysteria2 `port_hopping` is parsed into its hop settings when the config
+  loads.** Every rule -- the port set, port 0, interval exclusivity, the
+  5000 ms floor -- is checked in one place, and the runtime no longer
+  re-parses and `expect`s it.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

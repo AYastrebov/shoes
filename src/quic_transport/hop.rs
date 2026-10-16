@@ -84,6 +84,11 @@ impl HopSchedule {
 /// Upstream's default interval (`extras/transport/udphop/conn.go`).
 pub const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Upstream's floor (`extras/transport/udphop/conn.go`). Below it the hop
+/// rate is itself a signature, it costs a fresh socket every time, and a
+/// silently clamped value would be a setting that does not do what it says.
+pub const MIN_HOP_INTERVAL_MS: u64 = 5_000;
+
 /// Everything the outbound needs in order to hop, resolved from config.
 #[derive(Debug, Clone)]
 pub struct HopSettings {
@@ -92,44 +97,56 @@ pub struct HopSettings {
 }
 
 impl HopSettings {
-    /// Build from the config's raw fields.
-    ///
-    /// Validation has already refused the impossible combinations, so this is
-    /// the translation rather than a second check: a fixed interval and a
-    /// range cannot both be present here.
+    /// Build from the config's raw fields, refusing every combination that
+    /// does not describe one schedule. This is the only parser: the config
+    /// type builds its settings here when it is deserialized.
     pub fn new(
         ports: &str,
         interval_ms: Option<u64>,
         min_interval_ms: Option<u64>,
         max_interval_ms: Option<u64>,
     ) -> std::io::Result<Self> {
-        let invalid = |detail: &str| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, detail.to_string())
+        let invalid =
+            |detail: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
+        let at_least_the_floor = |field: &str, value: u64| {
+            if value < MIN_HOP_INTERVAL_MS {
+                Err(invalid(format!(
+                    "{field} must be at least {MIN_HOP_INTERVAL_MS}."
+                )))
+            } else {
+                Ok(())
+            }
         };
 
-        // Spelled out rather than left to match precedence. The contradictory
-        // shapes are refused here too, not only in config validation: this
-        // constructor is reachable from tests and from any future programmatic
-        // config, and a silent guess in either would be worse than an error.
         let schedule = match (interval_ms, min_interval_ms, max_interval_ms) {
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                 return Err(invalid(
-                    "port hopping takes either a fixed interval or a min/max range, not both",
+                    "takes either interval_ms or the min_interval_ms/max_interval_ms pair, \
+                     not both."
+                        .to_string(),
                 ));
             }
             (None, Some(min), Some(max)) if min > max => {
-                return Err(invalid("port hopping's min interval is above its max"));
+                return Err(invalid(format!(
+                    "min_interval_ms ({min}) is greater than max_interval_ms ({max})."
+                )));
             }
-            (None, Some(min), Some(max)) => HopSchedule::Range {
-                min: Duration::from_millis(min),
-                max: Duration::from_millis(max),
-            },
+            (None, Some(min), Some(max)) => {
+                at_least_the_floor("min_interval_ms", min)?;
+                HopSchedule::Range {
+                    min: Duration::from_millis(min),
+                    max: Duration::from_millis(max),
+                }
+            }
             (None, Some(_), None) | (None, None, Some(_)) => {
                 return Err(invalid(
-                    "port hopping needs both a min and a max interval, or neither",
+                    "needs both min_interval_ms and max_interval_ms, or neither.".to_string(),
                 ));
             }
-            (Some(interval), None, None) => HopSchedule::Fixed(Duration::from_millis(interval)),
+            (Some(interval), None, None) => {
+                at_least_the_floor("interval_ms", interval)?;
+                HopSchedule::Fixed(Duration::from_millis(interval))
+            }
             (None, None, None) => HopSchedule::Fixed(DEFAULT_HOP_INTERVAL),
         };
         Ok(Self {

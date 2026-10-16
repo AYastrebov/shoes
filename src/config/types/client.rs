@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::redacted::Redacted;
 use super::uuid::Uuid;
 use super::wg::{IpPrefix, WgKey, named};
+use crate::quic_transport::hop::HopSettings;
 
 use crate::address::NetLocation;
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
@@ -253,10 +254,49 @@ pub struct Hysteria2ClientConfig {
 /// Rotate the client's UDP port on a timer, for a server published as a port
 /// range.
 ///
+/// Parsed into its [`HopSettings`] when the config is read, so every setting
+/// the hopper cannot use is a load error; the fields are kept as written,
+/// which is what it serializes back to.
+///
 /// <https://v2.hysteria.network/docs/advanced/Port-Hopping/>
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PortHoppingFields", into = "PortHoppingFields")]
 pub struct PortHoppingConfig {
+    fields: PortHoppingFields,
+    settings: HopSettings,
+}
+
+impl PortHoppingConfig {
+    pub fn settings(&self) -> &HopSettings {
+        &self.settings
+    }
+}
+
+impl TryFrom<PortHoppingFields> for PortHoppingConfig {
+    type Error = String;
+
+    fn try_from(fields: PortHoppingFields) -> Result<Self, Self::Error> {
+        let settings = HopSettings::new(
+            &fields.ports,
+            fields.interval_ms,
+            fields.min_interval_ms,
+            fields.max_interval_ms,
+        )
+        .map_err(|e| format!("port_hopping {e}"))?;
+        Ok(Self { fields, settings })
+    }
+}
+
+impl From<PortHoppingConfig> for PortHoppingFields {
+    fn from(config: PortHoppingConfig) -> Self {
+        config.fields
+    }
+}
+
+/// [`PortHoppingConfig`] as written.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortHoppingFields {
     /// Ports to hop between: `20000-50000`, `1234,5000-6000,7044`.
     ///
     /// This *replaces* the port in the outbound's `address`, which is then
