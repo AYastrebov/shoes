@@ -440,6 +440,7 @@ impl AsyncPing for UnixStream {
 
 #[cfg(target_family = "unix")]
 impl SocketPassthrough for UnixStream {}
+#[cfg(target_family = "unix")]
 impl AsyncStream for UnixStream {}
 
 impl AsyncPing for UdpSocket {
