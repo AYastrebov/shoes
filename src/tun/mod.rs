@@ -129,6 +129,40 @@ pub fn device_name() -> Option<String> {
 /// never published one would time out every start.
 pub(crate) fn set_device_name(name: String) {
     *DEVICE_NAME.lock() = Some(name);
+    DEVICE_NAME_CHANGED.notify_all();
+}
+
+/// Raised whenever [`DEVICE_NAME`] changes, and by
+/// [`notify_device_name_waiters`].
+static DEVICE_NAME_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// Wake whoever waits in [`wait_for_device_name`] to look again -- for a
+/// change their `keep_waiting` reads, such as the session ending.
+pub fn notify_device_name_waiters() {
+    let _name = DEVICE_NAME.lock();
+    DEVICE_NAME_CHANGED.notify_all();
+}
+
+/// Block until a device name is published, `keep_waiting` turns false, or
+/// `deadline` passes, and return the name if there is one. `keep_waiting` is
+/// read under the same lock the wait releases, so a change announced through
+/// [`notify_device_name_waiters`] cannot slip between the check and the wait.
+pub fn wait_for_device_name(
+    deadline: std::time::Instant,
+    keep_waiting: impl Fn() -> bool,
+) -> Option<String> {
+    let mut name = DEVICE_NAME.lock();
+    loop {
+        if name.is_some() || !keep_waiting() {
+            return name.clone();
+        }
+        if DEVICE_NAME_CHANGED
+            .wait_until(&mut name, deadline)
+            .timed_out()
+        {
+            return name.clone();
+        }
+    }
 }
 
 /// Forget it.
@@ -139,6 +173,7 @@ pub(crate) fn set_device_name(name: String) {
 /// thing `control`'s exit guard does -- see the ordering note there.
 pub fn clear_device_name() {
     *DEVICE_NAME.lock() = None;
+    DEVICE_NAME_CHANGED.notify_all();
 }
 
 /// Run the TUN server with the given configuration.
@@ -740,6 +775,43 @@ mod tests {
     use crate::tcp::chain_builder::build_client_chain_group;
 
     use super::*;
+
+    /// A waiter is woken by the name being published, and by a notify once
+    /// what it waits on has changed -- not by a polling interval.
+    #[test]
+    fn a_device_name_wait_is_woken_by_the_event() {
+        let _lock = DEVICE_NAME_TEST_LOCK.lock().unwrap();
+        clear_device_name();
+        let long = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let publisher = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            set_device_name("utun9".to_string());
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            wait_for_device_name(long, || true).as_deref(),
+            Some("utun9")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        publisher.join().unwrap();
+        clear_device_name();
+
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopper = {
+            let running = running.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                running.store(false, std::sync::atomic::Ordering::SeqCst);
+                notify_device_name_waiters();
+            })
+        };
+        let started = std::time::Instant::now();
+        let name = wait_for_device_name(long, || running.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(name, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        stopper.join().unwrap();
+    }
 
     /// A local stream that reports EOF on read and records everything written.
     /// Stands in for the smoltcp-backed TUN connection.

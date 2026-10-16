@@ -64,8 +64,9 @@ pub struct ServiceHandle {
     runtime: tokio::runtime::Runtime,
     /// Channel to signal shutdown.
     shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Flag indicating if service is running.
-    running: Arc<AtomicBool>,
+    /// Whether the service task is still running, and the signal its end
+    /// raises.
+    running: Arc<Running>,
     /// Set by `stop_handle` before the shutdown signal, so the exit guard
     /// can tell a stop the host asked for from one it must be told about.
     stop_requested: Arc<AtomicBool>,
@@ -84,8 +85,45 @@ pub struct ServiceHandle {
 /// How long `stop_handle` waits for the service task to finish.
 pub const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often it looks while waiting.
-const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+/// Whether a service task is still running, with a condvar its end raises, so
+/// a stop waits on the event rather than polling for it.
+struct Running {
+    flag: AtomicBool,
+    ended: parking_lot::Mutex<bool>,
+    changed: parking_lot::Condvar,
+}
+
+impl Running {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(true),
+            ended: parking_lot::Mutex::new(false),
+            changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn mark_stopped(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+        *self.ended.lock() = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait up to `timeout` for the task to end. True if it did.
+    fn wait_stopped(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut ended = self.ended.lock();
+        while !*ended {
+            if self.changed.wait_until(&mut ended, deadline).timed_out() {
+                return *ended;
+            }
+        }
+        true
+    }
+}
 
 /// Stop a running service and wait for it to release the TUN descriptor.
 ///
@@ -103,21 +141,22 @@ const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// Dropping the runtime, on the other hand, waits on tasks that no longer hold
 /// anything the app needs back, so it happens on a thread of its own and the
 /// caller does not pay for it.
-pub fn stop_handle(mut handle: ServiceHandle) -> StopOutcome {
+pub fn stop_handle(handle: ServiceHandle) -> StopOutcome {
+    stop_handle_within(handle, STOP_TIMEOUT)
+}
+
+/// [`stop_handle`] with the wait bounded by `timeout` instead of
+/// [`STOP_TIMEOUT`], so a test can see a real timeout without waiting it out.
+fn stop_handle_within(mut handle: ServiceHandle, timeout: std::time::Duration) -> StopOutcome {
     handle.stop_requested.store(true, Ordering::SeqCst);
     if let Some(tx) = handle.shutdown_tx.take() {
         let _ = tx.send(());
     }
 
+    // Woken by the exit guard the moment the task ends, rather than looking
+    // every 5 ms; the timeout is the only reason to wake otherwise.
     let started = std::time::Instant::now();
-    let mut stopped = false;
-    while started.elapsed() < STOP_TIMEOUT {
-        if !handle.running.load(Ordering::SeqCst) {
-            stopped = true;
-            break;
-        }
-        std::thread::sleep(STOP_POLL_INTERVAL);
-    }
+    let stopped = handle.running.wait_stopped(timeout);
 
     let waited = started.elapsed();
     let outcome = if stopped {
@@ -125,8 +164,8 @@ pub fn stop_handle(mut handle: ServiceHandle) -> StopOutcome {
         StopOutcome::Released
     } else {
         error!(
-            "TUN service did not stop within {}s; the TUN descriptor may still be in use",
-            STOP_TIMEOUT.as_secs()
+            "TUN service did not stop within {}ms; the TUN descriptor may still be in use",
+            timeout.as_millis()
         );
         StopOutcome::TimedOut { waited }
     };
@@ -169,7 +208,7 @@ impl ServiceHandle {
 
     /// Whether the service task is still running.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.is_running()
     }
 
     /// Stop this service and wait for it to release the device.
@@ -331,7 +370,7 @@ where
     Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let running = Arc::new(AtomicBool::new(true));
+    let running = Arc::new(Running::new());
     let stop_requested = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(parking_lot::Mutex::new(None));
 
@@ -409,7 +448,7 @@ impl std::fmt::Display for ExitReason {
 /// `shoes_is_running()` is already false inside the callback and a host that
 /// calls `shoes_stop` from it returns at once.
 struct ExitGuard {
-    running: Arc<AtomicBool>,
+    running: Arc<Running>,
     stop_requested: Arc<AtomicBool>,
     failure: Arc<parking_lot::Mutex<Option<String>>>,
     on_exit: Option<Box<dyn FnOnce(ExitReason) + Send>>,
@@ -426,7 +465,11 @@ impl Drop for ExitGuard {
         #[cfg(any(unix, windows))]
         crate::tun::clear_device_name();
 
-        self.running.store(false, Ordering::SeqCst);
+        self.running.mark_stopped();
+        // A host waiting for the device (`shoesd`) reads `running` as part
+        // of its wait; this is what tells it to look again.
+        #[cfg(any(unix, windows))]
+        crate::tun::notify_device_name_waiters();
         if self.stop_requested.load(Ordering::SeqCst) {
             return;
         }
@@ -1085,7 +1128,7 @@ mod tests {
         );
         let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(reason, ExitReason::Failed("boom".to_string()));
-        assert!(!handle.running.load(Ordering::SeqCst));
+        assert!(!handle.running.is_running());
         let _ = stop_handle(handle);
     }
 
@@ -1197,6 +1240,51 @@ mod tests {
             None,
             "a start must clear the static before anything can read it"
         );
+    }
+
+    /// A service that ignores its shutdown signal is reported as timed out
+    /// -- the outcome that tells a host not to close the descriptor -- once
+    /// the wait runs out, and no later.
+    #[test]
+    fn a_service_that_will_not_stop_times_out() {
+        let handle = start_with(
+            test_runtime(),
+            |_shutdown| async {
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+            |_| {},
+        );
+        let started = std::time::Instant::now();
+        let outcome = stop_handle_within(handle, std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, StopOutcome::TimedOut { .. }),
+            "{outcome:?}"
+        );
+        assert!(!outcome.device_released());
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100)
+                && elapsed < std::time::Duration::from_secs(2),
+            "waited {elapsed:?}"
+        );
+    }
+
+    /// A stop that the service honours returns as soon as it ends: the wait
+    /// is woken by the exit, not by a polling interval.
+    #[test]
+    fn a_prompt_stop_returns_promptly() {
+        let handle = start_with(
+            test_runtime(),
+            |shutdown| async move {
+                let _ = shutdown.await;
+                Ok(())
+            },
+            |_| {},
+        );
+        let started = std::time::Instant::now();
+        assert!(matches!(stop_handle(handle), StopOutcome::Released));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     /// A stop the host asked for is a stop the host knows about: no call.

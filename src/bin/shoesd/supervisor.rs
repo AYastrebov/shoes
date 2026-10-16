@@ -82,9 +82,6 @@ const DAEMON_DEVICE_NAME: &str = "shoesd";
 /// is not there yet.
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often to look while waiting for it.
-const DEVICE_POLL: Duration = Duration::from_millis(20);
-
 /// What a client sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -507,22 +504,19 @@ impl<N: HostNetwork> Inner<N> {
     /// code four other hosts share. The wait is bounded, and a device that
     /// never appears fails the start rather than leaving a session that looks
     /// running with no routes.
+    /// Woken when the engine publishes its device or ends, rather than
+    /// looking every 20 ms.
     fn await_interface(&self, handle: &ServiceHandle) -> Result<String, String> {
         let deadline = Instant::now() + DEVICE_TIMEOUT;
-        loop {
-            if let Some(interface) = shoes::tun::device_name() {
-                return Ok(interface);
+        match shoes::tun::wait_for_device_name(deadline, || handle.is_running()) {
+            Some(interface) => Ok(interface),
+            None if !handle.is_running() => {
+                Err("the engine stopped before it created a device".to_string())
             }
-            if !handle.is_running() {
-                return Err("the engine stopped before it created a device".to_string());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "no TUN device appeared within {}s",
-                    DEVICE_TIMEOUT.as_secs()
-                ));
-            }
-            std::thread::sleep(DEVICE_POLL);
+            None => Err(format!(
+                "no TUN device appeared within {}s",
+                DEVICE_TIMEOUT.as_secs()
+            )),
         }
     }
 
