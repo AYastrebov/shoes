@@ -29,7 +29,6 @@ use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
-use crate::uuid_util::parse_uuid;
 
 fn start_quic_server(
     bind_address: SocketAddr,
@@ -328,7 +327,7 @@ pub async fn start_quic_servers(
             zero_rtt_handshake,
             congestion_control,
         } => {
-            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
+            let uuid: &'static [u8] = Box::leak(Box::new(*uuid.as_bytes()));
             let password: &'static str = Box::leak(password.into_inner().into_boxed_str());
             for bind_address in bind_addresses.into_iter() {
                 let tuic_handles = crate::tuic::start_tuic_server(

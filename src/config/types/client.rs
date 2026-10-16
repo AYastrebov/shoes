@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::redacted::Redacted;
+use super::uuid::Uuid;
 
 use crate::address::NetLocation;
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
@@ -340,7 +341,7 @@ pub struct MieruClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuicClientConfig {
-    pub uuid: String,
+    pub uuid: Uuid,
     pub password: Redacted<String>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub udp_enabled: bool,
@@ -449,7 +450,7 @@ where
 }
 
 /// What `deserialize_vmess_client` hands back: cipher, user id, udp flag, h2mux.
-type VmessClientFields = (String, Redacted<String>, bool, Option<H2MuxConfig>);
+type VmessClientFields = (String, Redacted<Uuid>, bool, Option<H2MuxConfig>);
 
 /// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
 fn deserialize_vmess_client<'de, D>(deserializer: D) -> Result<VmessClientFields, D::Error>
@@ -462,7 +463,7 @@ where
     #[serde(deny_unknown_fields)]
     struct VmessClientTemp {
         cipher: String,
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default, alias = "force_aead")]
         aead: Option<bool>,
         #[serde(default = "default_true")]
@@ -684,7 +685,7 @@ pub enum ClientProxyConfig {
         udp_enabled: bool,
     },
     Vless {
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration
@@ -741,7 +742,7 @@ pub enum ClientProxyConfig {
     #[serde(deserialize_with = "deserialize_vmess_client")]
     Vmess {
         cipher: String,
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration
@@ -1082,7 +1083,7 @@ obfs:
     fn test_client_proxy_config_tuic_defaults() {
         let yaml = r#"
 type: tuic
-uuid: "00000000-0000-0000-0000-000000000000"
+uuid: "00000000-0000-4000-8000-000000000000"
 password: secret
 "#;
         let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1111,7 +1112,7 @@ password: secret
             ("bbr", TuicCongestionControl::Bbr),
         ] {
             let yaml = format!(
-                "type: tuic\nuuid: \"00000000-0000-0000-0000-000000000000\"\npassword: secret\ncongestion_control: {name}\n"
+                "type: tuic\nuuid: \"00000000-0000-4000-8000-000000000000\"\npassword: secret\ncongestion_control: {name}\n"
             );
             match serde_yaml::from_str::<ClientProxyConfig>(&yaml).unwrap() {
                 ClientProxyConfig::Tuic(t) => assert_eq!(t.congestion_control, expected, "{name}"),
@@ -1124,7 +1125,7 @@ password: secret
     fn test_tuic_rejects_unknown_congestion_control() {
         let yaml = r#"
 type: tuic
-uuid: "00000000-0000-0000-0000-000000000000"
+uuid: "00000000-0000-4000-8000-000000000000"
 password: secret
 congestion_control: vegas
 "#;
@@ -1140,7 +1141,7 @@ congestion_control: vegas
     fn test_tuic_congestion_control_serialises_only_when_chosen() {
         let yaml = r#"
 type: tuic
-uuid: "00000000-0000-0000-0000-000000000000"
+uuid: "00000000-0000-4000-8000-000000000000"
 password: secret
 "#;
         let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1157,7 +1158,7 @@ password: secret
     fn test_tuic_rejects_unknown_relay_mode() {
         let yaml = r#"
 type: tuic
-uuid: "00000000-0000-0000-0000-000000000000"
+uuid: "00000000-0000-4000-8000-000000000000"
 password: secret
 udp_relay_mode: sideways
 "#;

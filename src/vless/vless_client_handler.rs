@@ -13,7 +13,6 @@ use crate::async_stream::AsyncStream;
 use crate::crypto::CryptoTlsStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
-use crate::uuid_util::parse_uuid;
 
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
@@ -35,9 +34,9 @@ impl std::fmt::Debug for VlessTcpClientHandler {
 }
 
 impl VlessTcpClientHandler {
-    pub fn new(user_id: &str, udp_enabled: bool) -> Self {
+    pub fn new(user_id: &[u8; 16], udp_enabled: bool) -> Self {
         Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            user_id: Box::new(*user_id),
             udp_enabled,
         }
     }

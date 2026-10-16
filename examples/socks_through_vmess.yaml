@@ -12,4 +12,4 @@
       protocol:
         type: vmess
         cipher: aes-128-gcm
-        user_id: bb0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+        user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4

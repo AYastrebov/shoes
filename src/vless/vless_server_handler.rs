@@ -21,7 +21,6 @@ use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::write_all;
-use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 use super::vision_stream::VisionStream;
@@ -51,14 +50,14 @@ impl std::fmt::Debug for VlessTcpServerHandler {
 
 impl VlessTcpServerHandler {
     pub fn new(
-        user_id: &str,
+        user_id: &[u8; 16],
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         fallback: Option<NetLocation>,
     ) -> Self {
         Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            user_id: Box::new(*user_id),
             udp_enabled,
             proxy_selector,
             resolver,
