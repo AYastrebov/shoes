@@ -30,12 +30,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use log::{error, info};
-use parking_lot::Mutex;
-use std::sync::OnceLock;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 
-use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
+use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, setup_log_file};
 
 /// Whether `shoes_init` has run.
 static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -84,65 +82,27 @@ pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes:
 /// May be NULL, in which case nothing is called.
 pub type ShoesStoppedCallback = Option<extern "C" fn(reason: *const c_char)>;
 
-/// The stopped callback for the running session. One slot, like the traffic
-/// callback: shoes runs one engine per process. Taken, not read, when it
-/// fires, so it can call at most once per session.
-static STOPPED_CALLBACK: OnceLock<Mutex<ShoesStoppedCallback>> = OnceLock::new();
-
-fn install_stopped_callback(callback: ShoesStoppedCallback) {
-    *STOPPED_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = callback;
+/// The host's stopped callback, as the session's one-shot `on_stop`. Every
+/// exit has a sentence, so the callback is never handed NULL -- which the
+/// contract reserves for "no reason".
+fn on_stop(callback: ShoesStoppedCallback) -> Option<common::StoppedCallback> {
+    let callback = callback?;
+    Some(Box::new(move |reason: &crate::control::ExitReason| {
+        let reason = common::c_string_lossy(reason.message());
+        callback(reason.as_ptr());
+    }))
 }
 
-fn clear_stopped_callback() {
-    install_stopped_callback(None);
-}
-
-#[cfg(test)]
-fn stopped_slot_is_empty() -> bool {
-    STOPPED_CALLBACK
-        .get()
-        .is_none_or(|slot| slot.lock().is_none())
-}
-
-/// Deliver an exit to the host. The reason is stored for
-/// `shoes_get_last_error` first, and the lock is released before the call
-/// so a callback that calls `shoes_stop` cannot deadlock on this slot.
-fn fire_stopped(reason: crate::control::ExitReason) {
-    common::set_last_exit(&reason);
-    let callback = STOPPED_CALLBACK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .take();
-    let Some(callback) = callback else { return };
-    // Every exit has a sentence, so the callback is never handed NULL --
-    // which the contract reserves for "no reason".
-    let reason = common::c_string_lossy(reason.message());
-    callback(reason.as_ptr());
-}
-
-/// Global socket protector callback.
-static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLock::new();
-
-/// Socket protector implementation for iOS.
-struct IosSocketProtector;
+/// Socket protector for iOS: the host's callback, held by the protector
+/// itself rather than in a slot of its own, so the two cannot disagree.
+struct IosSocketProtector(ProtectSocketCallback);
 
 impl crate::socket_protector::SocketProtector for IosSocketProtector {
     fn protect(&self, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-        // Copied out under the lock, called with it released -- the same
-        // discipline as fire_stopped. Holding the slot across the Swift
-        // call let a slow protect() block shoes_stop's final clear for
-        // as long as Swift took, unbounded, against shoes_stop's
-        // documented five-second ceiling.
-        let callback = *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
-
-        if let Some(callback) = callback {
-            if callback(fd as c_int) {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("Socket protection failed"))
-            }
-        } else {
+        if (self.0)(fd as c_int) {
             Ok(())
+        } else {
+            Err(std::io::Error::other("Socket protection failed"))
         }
     }
 }
@@ -188,9 +148,6 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
         crate::logging::init_multi_logger(writers, directives);
         crate::logging::install_panic_hook();
     }
-
-    TUN_SERVICE.get_or_init(|| Mutex::new(None));
-    PROTECT_CALLBACK.get_or_init(|| Mutex::new(None));
 
     info!("shoes iOS initialized with log level: {}", level_str);
     0
@@ -315,7 +272,7 @@ unsafe fn start_service(
     // flight empties the service slot before its five-second wait, and a
     // start that slipped into that window used to pass the guard below
     // and run a second engine on the same descriptor.
-    let _transition = common::transition_guard();
+    let transition = common::transition_guard();
 
     // Every -1 below leaves a reason in shoes_get_last_error, so a caller
     // that reads it never sees the previous failure's message instead.
@@ -345,35 +302,22 @@ unsafe fn start_service(
     };
 
     // Everything installed from here on is undone by this on any failure
-    // below, so no arm can forget one of the four.
+    // below. The stopped callback is not installed until the session is, so
+    // a failed start has none to clear.
     let fail = |msg: String| -> c_long {
         error!("{who}: {msg}");
         common::set_last_error(msg);
-        crate::tun::traffic::clear_traffic_callback();
-        clear_stopped_callback();
-        crate::socket_protector::clear_global_socket_protector();
-        *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = None;
+        common::clear_callbacks(&transition);
         -1
     };
 
     info!("{who}: config length = {} bytes", config_str.len());
 
-    {
-        let mut callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
-        *callback_guard = Some(protect_callback);
-    }
-
-    // Store traffic callback and reset counters
-    crate::tun::traffic::reset_traffic_counters();
-    crate::tun::traffic::set_traffic_callback(Arc::new(move |upload, download| {
-        traffic_callback(upload, download);
-    }));
-    // Installed before control::start so an exit in the first instant is
-    // not lost, and always (re)installed -- an empty slot for shoes_start --
-    // so a callback from an earlier session can never fire for this one.
-    install_stopped_callback(stopped_callback);
-
-    crate::socket_protector::set_global_socket_protector(Arc::new(IosSocketProtector));
+    common::install_callbacks(
+        &transition,
+        Arc::new(IosSocketProtector(protect_callback)),
+        Arc::new(move |upload, download| traffic_callback(upload, download)),
+    );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -413,23 +357,7 @@ unsafe fn start_service(
     // The runtime is built here, with two worker threads, rather than inside
     // control::start: a Network Extension's memory limit is what sets that
     // number, and Android wants all the cores instead.
-    //
-    // The handle is stored before the task is spawned, so a stopped callback
-    // that fires in the first instant and calls shoes_stop finds it. The
-    // previous session's handle, if any, is taken out under the lock and
-    // released after it, in the background: dropping its runtime in place
-    // would wait for its workers, one of which may be inside that session's
-    // stopped callback and about to take this very lock.
-    let mut previous = None;
-    crate::control::start_and_install(runtime, prepared, fire_stopped, |handle| {
-        // get_or_init, not get().unwrap(): a caller that reaches shoes_start
-        // without shoes_init would otherwise panic across the FFI boundary.
-        let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
-        previous = guard.replace(handle);
-    });
-    if let Some(previous) = previous {
-        previous.discard();
-    }
+    common::start_session(&transition, runtime, prepared, on_stop(stopped_callback));
 
     1
 }
@@ -478,22 +406,15 @@ pub extern "C" fn shoes_stop(_handle: c_long) -> c_int {
     // The whole teardown under one transition guard: a start queued
     // behind it installs its own callbacks the moment the lock frees, so
     // a clear outside the lock wiped the slots that start had just
-    // filled -- its engine then ran with no socket protector.
+    // filled -- its engine then ran with no socket protector. The stopped
+    // callback goes with the session, before the wait: the exit during the
+    // stop is one the host asked for, and a stop event for it would be a lie.
     let transition = common::transition_guard();
-
-    // Before stop_service, not after like the traffic callback: the service
-    // task exits during the stop, and that exit is one the host asked for.
-    // A late traffic tick is harmless; a stop event here is a lie.
-    clear_stopped_callback();
-    let released = common::stop_service_locked(&transition);
-    crate::tun::traffic::clear_traffic_callback();
-
-    if let Some(callback) = PROTECT_CALLBACK.get() {
-        let mut guard = callback.lock();
-        *guard = None;
+    if common::stop_service_locked(&transition) {
+        1
+    } else {
+        0
     }
-
-    if released { 1 } else { 0 }
 }
 
 /// Check if the shoes service is running.
@@ -796,36 +717,7 @@ mod tests {
         let handle =
             unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, Some(count_stopped)) };
         assert_eq!(handle, -1);
-        assert!(stopped_slot_is_empty());
+        assert!(!shoes_is_running());
         assert_eq!(STOPPED_CALLS.load(Ordering::SeqCst), 0);
-    }
-
-    /// shoes_stop empties the slot before it stops anything, so nothing
-    /// that happens during the stop can reach the host.
-    #[test]
-    fn stop_clears_the_stopped_slot_first() {
-        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
-        install_stopped_callback(Some(count_stopped));
-        assert!(!stopped_slot_is_empty());
-        shoes_stop(1);
-        assert!(stopped_slot_is_empty());
-    }
-
-    /// fire_stopped records the reason for shoes_get_last_error before it
-    /// calls out, and calls exactly once.
-    #[test]
-    fn fire_stopped_records_then_calls() {
-        let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
-        STOPPED_CALLS.store(0, Ordering::SeqCst);
-        install_stopped_callback(Some(count_stopped));
-        fire_stopped(crate::control::ExitReason::Failed(
-            "engine fell over".to_string(),
-        ));
-        assert_eq!(STOPPED_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            common::get_last_error().as_deref(),
-            Some("engine fell over")
-        );
-        assert!(stopped_slot_is_empty(), "the slot is one-shot");
     }
 }

@@ -35,9 +35,9 @@ use log::{Record, error, info};
 use tokio::runtime::Runtime;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
-use crate::socket_protector::{FnSocketProtector, set_global_socket_protector};
+use crate::socket_protector::FnSocketProtector;
 
-use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
+use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, setup_log_file};
 
 /// Writes to Android logcat. Uses the `record` arg for level mapping;
 /// logcat has its own formatting so the pre-formatted string is ignored.
@@ -228,7 +228,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // flight empties the service slot before its five-second wait, and a
     // start that slipped into that window used to pass the guard below
     // and run a second engine on the same descriptor.
-    let _transition = common::transition_guard();
+    let transition = common::transition_guard();
 
     info!("Starting shoes service");
 
@@ -299,13 +299,10 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
         }
     });
 
-    set_global_socket_protector(Arc::new(protector));
-
     // Traffic callback calls TrafficListener.onTrafficUpdate(long, long)
     let traffic_ref: Arc<Global<JObject<'static>>> = Arc::new(traffic_ref);
     let jvm_traffic = jvm.clone();
-    crate::tun::traffic::reset_traffic_counters();
-    crate::tun::traffic::set_traffic_callback(Arc::new(move |upload: u64, download: u64| {
+    let traffic = move |upload: u64, download: u64| {
         let _ =
             jvm_traffic.attach_current_thread(|env: &mut jni::Env| -> jni::errors::Result<()> {
                 env.call_method(
@@ -316,7 +313,8 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
                 )?;
                 Ok(())
             });
-    }));
+    };
+    common::install_callbacks(&transition, Arc::new(protector), Arc::new(traffic));
 
     // Everything installed above -- the protector and the traffic
     // callback, both holding JNI global refs to the host's objects -- is
@@ -325,8 +323,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     let fail = |msg: String| -> jlong {
         error!("start: {msg}");
         common::set_last_error(msg);
-        crate::tun::traffic::clear_traffic_callback();
-        crate::socket_protector::clear_global_socket_protector();
+        common::clear_callbacks(&transition);
         -1
     };
 
@@ -364,21 +361,9 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // Runtime::new() above, not a pinned worker count: Android has no Network
     // Extension memory limit to stay under, so it takes the cores it can get.
     // That is why control::start receives a runtime rather than building one.
-    // Stored before the task is spawned and the previous handle released
-    // outside the lock, for the reasons given in ios.rs.
-    let mut previous = None;
-    crate::control::start_and_install(
-        runtime,
-        prepared,
-        |reason| common::set_last_exit(&reason),
-        |handle| {
-            let service = TUN_SERVICE.get_or_init(|| parking_lot::Mutex::new(None));
-            previous = service.lock().replace(handle);
-        },
-    );
-    if let Some(previous) = previous {
-        previous.discard();
-    }
+    // No stopped callback: the host polls getLastError, which the session's
+    // exit fills either way.
+    common::start_session(&transition, runtime, prepared, None);
 
     info!("TUN service started successfully");
     1
@@ -401,7 +386,6 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     // traffic callback wiped by this stop's tail.
     let transition = common::transition_guard();
     let released = common::stop_service_locked(&transition);
-    crate::tun::traffic::clear_traffic_callback();
 
     // JNI_TRUE: the engine confirmed the stop and the TUN descriptor is
     // released -- closing the ParcelFileDescriptor is safe. JNI_FALSE:
