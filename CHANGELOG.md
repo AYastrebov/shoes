@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## v0.6.0
+
+Phase 0 of the 2026-10-15 quality plan
+(`docs/plans/2026-10-15-quality-and-correctness.md`): every reachable abort
+becomes an error, and the correctness bugs with a known consumer are fixed.
+The audit IDs closed are SS-D1, SS-D2, ST-S3, RE-R6, VL-V4 (#55); RS-1,
+WG-A1, TN-T1, TN-T2, TN-T3, TR-2, XU-X1 (#56); VM-D2, XU-X2, XU-X3, HY-D2,
+TU-D4, H2-4 (#57); TR-5, TR-6, TR-7, TR-8, TR-11 (#58).
+
+Behaviour changes to know before upgrading:
+
+- The `clash_api` block is refused at validation (#54).
+- A WebSocket client with no `Host` in `matching_headers` now sends the
+  proxy address as `Host`, where it sent none (#56).
+- Hysteria2 and TUIC replies carry their real source address, not the
+  hostname the client asked for (#57).
+- After a WebSocket peer sends Close, writing to the stream is an error
+  (#58).
 
 The project narrows its focus to the mobile clients, the desktop clients
 over `shoesd`, and performance and stability. The awg-manager engine and
