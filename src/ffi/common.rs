@@ -58,9 +58,6 @@ pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Global state for the TUN service.
 pub static TUN_SERVICE: OnceLock<parking_lot::Mutex<Option<TunServiceHandle>>> = OnceLock::new();
 
-/// Global flag to track initialization.
-pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
 /// Last error message from the service. Set when `start_from_config` fails
 /// or the service stops with an error. Read via `shoes_get_last_error()`.
 static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<LastError>>> = OnceLock::new();

@@ -35,7 +35,10 @@ use std::sync::OnceLock;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 
-use super::common::{self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
+use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
+
+/// Whether `shoes_init` has run.
+static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Socket protector callback type.
 /// Called from Rust to protect sockets from VPN routing.
