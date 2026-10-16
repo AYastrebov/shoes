@@ -101,10 +101,7 @@ pub async fn prepare_servers(configs: Vec<Config>) -> Result<PreparedServers, Pr
 /// Publish the outbounds a configuration runs, replacing the previous
 /// configuration's: a reload must not carry its servers into the new list.
 pub(super) fn install_outbounds(outbounds: &OutboundSet) {
-    #[cfg(feature = "control-stats")]
     crate::outbound_stats::install(outbounds);
-    #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
 }
 
 /// Start every server in `configs`, each with the resolver its `dns:` block

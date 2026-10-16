@@ -38,8 +38,7 @@ use log::debug;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
-#[cfg(feature = "control-stats")]
-use crate::outbound_stats::OutboundCounters;
+use crate::outbound_stats::Counters;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
@@ -95,11 +94,9 @@ enum ClientProxyChainKind {
         subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>>,
         subsequent_next_indices: Vec<AtomicU32>,
         /// One handle per member of `initial_hop`, same order.
-        #[cfg(feature = "control-stats")]
-        initial_hop_counters: Vec<Arc<OutboundCounters>>,
+        initial_hop_counters: Vec<Counters>,
         /// One handle per member of each pool in `subsequent_hops`, same order.
-        #[cfg(feature = "control-stats")]
-        subsequent_hop_counters: Vec<Vec<Arc<OutboundCounters>>>,
+        subsequent_hop_counters: Vec<Vec<Counters>>,
         udp_final_hop_indices: Vec<usize>,
         udp_final_hop_next_index: AtomicU32,
         udp_uses_initial_hop: bool,
@@ -110,8 +107,7 @@ enum ClientProxyChainKind {
     Terminal {
         connectors: Vec<Arc<dyn TerminalConnector>>,
         next_index: AtomicU32,
-        #[cfg(feature = "control-stats")]
-        connector_counters: Vec<Arc<OutboundCounters>>,
+        connector_counters: Vec<Counters>,
     },
 }
 
@@ -204,10 +200,8 @@ impl ClientProxyChain {
         // always in bounds. `unattributed` until chain_builder replaces them:
         // a chain built with no config behind it counts into a void rather
         // than crediting an arbitrary server.
-        #[cfg(feature = "control-stats")]
         let initial_hop_counters = vec![crate::outbound_stats::unattributed(); initial_hop.len()];
-        #[cfg(feature = "control-stats")]
-        let subsequent_hop_counters: Vec<Vec<Arc<OutboundCounters>>> = subsequent_hops
+        let subsequent_hop_counters: Vec<Vec<Counters>> = subsequent_hops
             .iter()
             .map(|hop| vec![crate::outbound_stats::unattributed(); hop.len()])
             .collect();
@@ -218,9 +212,7 @@ impl ClientProxyChain {
                 initial_hop_next_index: AtomicU32::new(0),
                 subsequent_hops,
                 subsequent_next_indices,
-                #[cfg(feature = "control-stats")]
                 initial_hop_counters,
-                #[cfg(feature = "control-stats")]
                 subsequent_hop_counters,
                 udp_final_hop_indices,
                 udp_final_hop_next_index: AtomicU32::new(0),
@@ -239,14 +231,12 @@ impl ClientProxyChain {
             !connectors.is_empty(),
             "ClientProxyChain must have at least one terminal connector"
         );
-        #[cfg(feature = "control-stats")]
         let connector_counters = vec![crate::outbound_stats::unattributed(); connectors.len()];
 
         Self {
             kind: ClientProxyChainKind::Terminal {
                 connectors,
                 next_index: AtomicU32::new(0),
-                #[cfg(feature = "control-stats")]
                 connector_counters,
             },
         }
@@ -256,12 +246,7 @@ impl ClientProxyChain {
     /// built. Panics on a length mismatch: that is a construction bug in
     /// `chain_builder`, and silently mis-attributing traffic would be worse
     /// than a loud failure at startup.
-    #[cfg(feature = "control-stats")]
-    pub fn with_counters(
-        mut self,
-        initial: Vec<Arc<OutboundCounters>>,
-        subsequent: Vec<Vec<Arc<OutboundCounters>>>,
-    ) -> Self {
+    pub fn with_counters(mut self, initial: Vec<Counters>, subsequent: Vec<Vec<Counters>>) -> Self {
         match &mut self.kind {
             ClientProxyChainKind::StreamChain {
                 initial_hop,
@@ -285,8 +270,7 @@ impl ClientProxyChain {
         self
     }
 
-    #[cfg(feature = "control-stats")]
-    pub fn with_terminal_counters(mut self, counters: Vec<Arc<OutboundCounters>>) -> Self {
+    pub fn with_terminal_counters(mut self, counters: Vec<Counters>) -> Self {
         match &mut self.kind {
             ClientProxyChainKind::Terminal {
                 connectors,
@@ -306,23 +290,22 @@ impl ClientProxyChain {
     /// The counters this connection's bytes belong to: the exit hop's, which
     /// is the last subsequent hop when there is one and the initial hop
     /// otherwise.
-    #[cfg(feature = "control-stats")]
     ///
     /// Takes only the exit hop's index rather than every hop's, so the caller
     /// has nothing to collect: the selection it already holds answers this.
     fn exit_counters(
-        initial_hop_counters: &[Arc<OutboundCounters>],
-        subsequent_hop_counters: &[Vec<Arc<OutboundCounters>>],
+        initial_hop_counters: &[Counters],
+        subsequent_hop_counters: &[Vec<Counters>],
         initial_idx: usize,
         subsequent_exit_idx: Option<usize>,
-    ) -> Arc<OutboundCounters> {
+    ) -> Counters {
         match (subsequent_hop_counters.last(), subsequent_exit_idx) {
             (Some(pool), Some(idx)) => pool[idx].clone(),
             _ => initial_hop_counters[initial_idx].clone(),
         }
     }
 
-    #[cfg(all(test, feature = "control-stats"))]
+    #[cfg(test)]
     fn initial_counter_len(&self) -> usize {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
@@ -334,7 +317,7 @@ impl ClientProxyChain {
     }
 
     #[cfg(all(test, feature = "control-stats"))]
-    fn initial_counter(&self, i: usize) -> Arc<OutboundCounters> {
+    fn initial_counter(&self, i: usize) -> Counters {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
                 initial_hop_counters,
@@ -416,19 +399,16 @@ impl ClientProxyChain {
                 initial_hop_next_index,
                 subsequent_hops,
                 subsequent_next_indices,
-                #[cfg(feature = "control-stats")]
                 initial_hop_counters,
-                #[cfg(feature = "control-stats")]
                 subsequent_hop_counters,
                 ..
             } => {
-                let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
+                let (entry, initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
                 // One allocation per connection, the same one this path always
                 // made. The indices ride along in it rather than in a second
                 // vector, so a build without counters carries them without
                 // paying for them.
                 let selected = select_subsequent(subsequent_hops, subsequent_next_indices);
-                #[cfg(feature = "control-stats")]
                 let subsequent_exit_idx = selected.last().map(|(_, i)| *i);
 
                 debug!(
@@ -506,57 +486,27 @@ impl ClientProxyChain {
                     remote_location.location()
                 );
 
-                #[cfg(feature = "control-stats")]
-                let result = {
-                    let counters = Self::exit_counters(
-                        initial_hop_counters,
-                        subsequent_hop_counters,
-                        _initial_idx,
-                        subsequent_exit_idx,
-                    );
-                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
-                        result.client_stream,
-                        counters,
-                    );
-                    // early_data never travels through the stream and would
-                    // otherwise be lost from the count entirely.
-                    if let Some(data) = &result.early_data {
-                        counting.count_early_data(data.len());
-                    }
-                    TcpClientSetupResult {
-                        client_stream: Box::new(counting),
-                        early_data: result.early_data,
-                    }
-                };
-
-                Ok(result)
+                let counters = Self::exit_counters(
+                    initial_hop_counters,
+                    subsequent_hop_counters,
+                    initial_idx,
+                    subsequent_exit_idx,
+                );
+                Ok(crate::outbound_stats::count_tcp(result, counters))
             }
             ClientProxyChainKind::Terminal {
                 connectors,
                 next_index,
-                #[cfg(feature = "control-stats")]
                 connector_counters,
             } => {
-                let (connector, _idx) = select_terminal(connectors, next_index);
+                let (connector, idx) = select_terminal(connectors, next_index);
                 debug!("Terminal TCP connect -> {}", remote_location.location());
                 let result = connector.connect_tcp(resolver, remote_location).await?;
 
-                #[cfg(feature = "control-stats")]
-                let result = {
-                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
-                        result.client_stream,
-                        connector_counters[_idx].clone(),
-                    );
-                    if let Some(data) = &result.early_data {
-                        counting.count_early_data(data.len());
-                    }
-                    TcpClientSetupResult {
-                        client_stream: Box::new(counting),
-                        early_data: result.early_data,
-                    }
-                };
-
-                Ok(result)
+                Ok(crate::outbound_stats::count_tcp(
+                    result,
+                    connector_counters[idx].clone(),
+                ))
             }
         }
     }
@@ -576,9 +526,7 @@ impl ClientProxyChain {
                 udp_final_hop_indices,
                 udp_final_hop_next_index,
                 udp_uses_initial_hop,
-                #[cfg(feature = "control-stats")]
                 initial_hop_counters,
-                #[cfg(feature = "control-stats")]
                 subsequent_hop_counters,
             } => {
                 if udp_final_hop_indices.is_empty() {
@@ -616,15 +564,10 @@ impl ClientProxyChain {
 
                     // pool_idx indexes initial_hop here: this branch is the
                     // one where the initial hop IS the final hop.
-                    #[cfg(feature = "control-stats")]
-                    let stream: Box<dyn AsyncMessageStream> = Box::new(
-                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
-                            stream,
-                            initial_hop_counters[pool_idx].clone(),
-                        ),
-                    );
-
-                    Ok(stream)
+                    Ok(crate::outbound_stats::count_messages(
+                        stream,
+                        initial_hop_counters[pool_idx].clone(),
+                    ))
                 } else {
                     let (entry, _initial_idx) =
                         select_from_pool(initial_hop, initial_hop_next_index);
@@ -708,41 +651,30 @@ impl ClientProxyChain {
                     let stream = final_proxy.setup_udp_bidirectional(stream, target).await?;
 
                     // pool_idx indexes the final hop pool in this branch.
-                    #[cfg(feature = "control-stats")]
-                    let stream: Box<dyn AsyncMessageStream> = Box::new(
-                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
-                            stream,
-                            subsequent_hop_counters
-                                .last()
-                                .expect("multi-hop branch has a final pool")[pool_idx]
-                                .clone(),
-                        ),
-                    );
-
-                    Ok(stream)
+                    Ok(crate::outbound_stats::count_messages(
+                        stream,
+                        subsequent_hop_counters
+                            .last()
+                            .expect("multi-hop branch has a final pool")[pool_idx]
+                            .clone(),
+                    ))
                 }
             }
             ClientProxyChainKind::Terminal {
                 connectors,
                 next_index,
-                #[cfg(feature = "control-stats")]
                 connector_counters,
             } => {
-                let (connector, _idx) = select_terminal(connectors, next_index);
+                let (connector, idx) = select_terminal(connectors, next_index);
                 debug!("Terminal UDP connect -> {}", target.location());
                 let stream = connector
                     .connect_udp_bidirectional(resolver, target)
                     .await?;
 
-                #[cfg(feature = "control-stats")]
-                let stream: Box<dyn AsyncMessageStream> = Box::new(
-                    crate::outbound_counting_stream::OutboundCountingMessageStream::new(
-                        stream,
-                        connector_counters[_idx].clone(),
-                    ),
-                );
-
-                Ok(stream)
+                Ok(crate::outbound_stats::count_messages(
+                    stream,
+                    connector_counters[idx].clone(),
+                ))
             }
         }
     }

@@ -141,6 +141,17 @@ One trait per concern (plan PR 1.6, part 2; A-7):
   default inside the stream trait; the wrappers that encrypt or re-frame say
   so with an empty impl.
 
+One attribution path (plan PR 1.6, part 3; A-9 in part):
+
+- Outbound traffic attribution is written once instead of once per feature
+  setting. Without `control-stats` the counter handle is a zero-sized type
+  and `count_tcp`/`count_messages` hand the stream back unwrapped, so the
+  chain, the chain builder and the TUN stack carry no `cfg` of their own:
+  the crate goes from 97 `control-stats` gates to 31, most of what remains
+  being the feature's own implementation and the tests that read counters.
+  The shipped (with-stats) arm64 library is 664 bytes smaller; a build
+  without the feature is 5,632 bytes larger.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

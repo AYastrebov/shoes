@@ -144,6 +144,10 @@ mod registry {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, RwLock};
 
+    /// What a chain holds for each pool member: shared, so the clones group
+    /// expansion makes of one server add up to one total.
+    pub type Counters = Arc<OutboundCounters>;
+
     /// The counters for one outbound.
     #[derive(Debug, Default)]
     pub struct OutboundCounters {
@@ -224,7 +228,7 @@ mod registry {
     /// must not be able to add a server to that list -- which it could, before
     /// this was a lookup, from any code path that built a chain without a
     /// config behind it.
-    pub fn lookup(key: &str) -> Arc<OutboundCounters> {
+    pub fn lookup(key: &str) -> Counters {
         registry()
             .read()
             .unwrap()
@@ -237,8 +241,8 @@ mod registry {
     /// -- tests, and any construction path with no config behind it. Traffic
     /// through such a chain is counted into a void rather than credited to
     /// some arbitrary server.
-    pub fn unattributed() -> Arc<OutboundCounters> {
-        static UNATTRIBUTED: OnceLock<Arc<OutboundCounters>> = OnceLock::new();
+    pub fn unattributed() -> Counters {
+        static UNATTRIBUTED: OnceLock<Counters> = OnceLock::new();
         UNATTRIBUTED
             .get_or_init(|| Arc::new(OutboundCounters::default()))
             .clone()
@@ -267,8 +271,80 @@ mod registry {
     }
 }
 
-#[cfg(feature = "control-stats")]
+/// The same surface with nothing behind it, so the code that attributes
+/// traffic is written once and compiles to nothing here: [`Counters`] is a
+/// zero-sized type, a `Vec` of it never allocates, and
+/// `outbound_counting_stream` hands streams back unwrapped.
+#[cfg(not(feature = "control-stats"))]
+mod registry {
+    use super::OutboundSet;
+
+    #[derive(Debug, Default, Clone)]
+    pub struct Counters;
+
+    #[inline(always)]
+    pub fn install(_set: &OutboundSet) {}
+
+    #[inline(always)]
+    pub fn lookup(_key: &str) -> Counters {
+        Counters
+    }
+
+    #[inline(always)]
+    pub fn unattributed() -> Counters {
+        Counters
+    }
+}
+
 pub use registry::*;
+
+/// Credit a TCP connection's bytes to `counters`, the `early_data` its final
+/// hop read during the handshake included. Without `control-stats`, the
+/// result unchanged: no adapter, no box.
+pub fn count_tcp(
+    result: crate::tcp::tcp_handler::TcpClientSetupResult,
+    counters: Counters,
+) -> crate::tcp::tcp_handler::TcpClientSetupResult {
+    #[cfg(feature = "control-stats")]
+    {
+        let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
+            result.client_stream,
+            counters,
+        );
+        // early_data never travels through the stream and would otherwise be
+        // lost from the count entirely.
+        if let Some(data) = &result.early_data {
+            counting.count_early_data(data.len());
+        }
+        crate::tcp::tcp_handler::TcpClientSetupResult {
+            client_stream: Box::new(counting),
+            early_data: result.early_data,
+        }
+    }
+    #[cfg(not(feature = "control-stats"))]
+    {
+        let _ = counters;
+        result
+    }
+}
+
+/// The datagram equivalent of [`count_tcp`].
+pub fn count_messages(
+    stream: Box<dyn crate::async_stream::AsyncMessageStream>,
+    counters: Counters,
+) -> Box<dyn crate::async_stream::AsyncMessageStream> {
+    #[cfg(feature = "control-stats")]
+    {
+        Box::new(
+            crate::outbound_counting_stream::OutboundCountingMessageStream::new(stream, counters),
+        )
+    }
+    #[cfg(not(feature = "control-stats"))]
+    {
+        let _ = counters;
+        stream
+    }
+}
 
 #[cfg(test)]
 mod set_tests {

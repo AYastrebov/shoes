@@ -23,23 +23,25 @@ static DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// compiled into the binary too, and main.rs has no `control` module. Same
 /// reason the byte counters are here.
 ///
-/// Behind the feature, like its call sites: these are `pub` in a `pub mod`, so
-/// unconditionally they are exported API that nothing can drop, and a mobile
-/// build with the feature off would still carry them. Measured at 720 bytes.
+/// Behind the feature; the functions that move it are not, and are empty
+/// without it, so the stack calls them unconditionally and a build with the
+/// feature off carries neither the static nor the calls.
 #[cfg(feature = "control-stats")]
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Called when the stack accepts a connection.
-#[cfg(feature = "control-stats")]
+#[inline(always)]
 pub fn connection_opened() {
+    #[cfg(feature = "control-stats")]
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Called when the stack cleans one up.
-#[cfg(feature = "control-stats")]
+#[inline(always)]
 pub fn connection_closed() {
     // Saturating rather than wrapping: a close without a matching open would
     // otherwise show a host 18 quintillion live connections.
+    #[cfg(feature = "control-stats")]
     let _ = ACTIVE_CONNECTIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_sub(1))
     });
@@ -57,7 +59,7 @@ pub fn active_connections() -> usize {
 /// in `control::stats` and one in `tun::tcp_stack_direct` can otherwise
 /// interleave and read each other's increments. The lock lives here, next to
 /// the state it guards, rather than in either caller.
-#[cfg(all(test, feature = "control-stats"))]
+#[cfg(test)]
 pub static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serialises every test that mutates the process-wide traffic counters.
@@ -81,8 +83,9 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 /// with it, so the count is zero by definition. Decrementing per surviving
 /// socket would reach the same number by a longer route and drift if any path
 /// missed one.
-#[cfg(feature = "control-stats")]
+#[inline(always)]
 pub fn reset_active_connections() {
+    #[cfg(feature = "control-stats")]
     ACTIVE_CONNECTIONS.store(0, Ordering::Relaxed);
 }
 

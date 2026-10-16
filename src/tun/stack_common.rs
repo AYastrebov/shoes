@@ -964,7 +964,6 @@ pub fn run_stack_loop<D: StackDevice>(
                                         // On a SYN, not per packet, so a
                                         // relaxed atomic here is not
                                         // measurable.
-                                        #[cfg(feature = "control-stats")]
                                         super::traffic::connection_opened();
 
                                         // `lock`, not `try_lock`: the other
@@ -1248,7 +1247,6 @@ pub fn run_stack_loop<D: StackDevice>(
                 sockets
                     .connections
                     .remove(&(socket_info.src_addr, socket_info.dst_addr));
-                #[cfg(feature = "control-stats")]
                 super::traffic::connection_closed();
                 trace!(
                     "Cleaned up connection: {} -> {}",
@@ -1375,7 +1373,6 @@ pub fn run_stack_loop<D: StackDevice>(
     // decrements, so without this the count keeps whatever was open at the
     // moment the tunnel stopped. Being process-global, that error then
     // compounds across every start/stop for the life of the process.
-    #[cfg(feature = "control-stats")]
     super::traffic::reset_active_connections();
 
     info!("smoltcp stack thread stopped");
@@ -2066,7 +2063,6 @@ mod tests {
     /// is turning one test's failure into a `PoisonError` cascade across
     /// every other test that uses the counter -- which is exactly what a
     /// Windows CI run produced (one real assertion failure, four phantoms).
-    #[cfg(feature = "control-stats")]
     fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
         super::super::traffic::COUNTER_TEST_LOCK
             .lock()
@@ -2179,7 +2175,6 @@ mod tests {
     /// client would retry against for a minute.
     #[test]
     fn a_syn_over_the_cap_draws_a_reset() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn_with_options(
             TcpStackOptions {
@@ -2237,7 +2232,6 @@ mod tests {
 
     #[test]
     fn a_syn_becomes_a_connection_and_a_syn_ack() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
 
@@ -2308,7 +2302,6 @@ mod tests {
     /// buffers until the peer gives up.
     #[test]
     fn dropping_a_connection_with_unread_data_resets_it() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
         let (conn, server_isn) = harness.establish(20020);
@@ -2357,7 +2350,6 @@ mod tests {
     /// socket must be reset and its 4-tuple free again.
     #[test]
     fn an_orphaned_connection_the_peer_never_closes_is_reset_after_the_timeout() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         // Short enough to wait out; long against the tests' 10 ms polling.
         let mut harness = Harness::spawn_with(StdDuration::from_millis(300));
@@ -2436,7 +2428,6 @@ mod tests {
     fn a_segment_for_a_parked_connection_is_delivered_not_reset() {
         use tokio::io::AsyncRead;
 
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
         let (mut conn, server_isn) = harness.establish(20100);
@@ -2481,7 +2472,6 @@ mod tests {
     fn a_write_to_a_parked_connection_goes_out() {
         use tokio::io::AsyncWrite;
 
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
         let (mut conn, _server_isn) = harness.establish(20110);
@@ -2510,7 +2500,6 @@ mod tests {
     /// the socket back, and the sweep sends the FIN it owes.
     #[test]
     fn dropping_a_parked_connection_closes_it() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
         let (conn, _server_isn) = harness.establish(20120);
@@ -2535,7 +2524,6 @@ mod tests {
     /// its connection is never released.
     #[test]
     fn a_timer_that_ends_a_parked_connection_brings_it_back() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         // Long enough to park first (`PARK_IDLE_AFTER` is 100 ms under
         // test), short enough to keep the test quick. The peer then says
@@ -2633,7 +2621,6 @@ mod tests {
 
     #[test]
     fn udp_is_forwarded_to_tokio_not_smoltcp() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
 
@@ -2660,7 +2647,6 @@ mod tests {
     /// is still delivered when the consumer returns.
     #[test]
     fn udp_past_the_ingress_queue_is_dropped_and_counted_not_queued() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
         let dropped_before = udp_ingress_dropped();
@@ -2698,7 +2684,6 @@ mod tests {
 
     #[test]
     fn udp_responses_are_written_back_to_the_device() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let harness = Harness::spawn();
 
@@ -2725,7 +2710,6 @@ mod tests {
 
     #[test]
     fn the_loop_stops_when_its_device_dies() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let harness = Harness::spawn();
 
@@ -2746,7 +2730,6 @@ mod tests {
 
     #[test]
     fn the_shutdown_flag_stops_the_loop() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
 
@@ -2849,7 +2832,6 @@ mod tests {
     /// become a connection. None may be dropped on the way through the loop.
     #[test]
     fn every_syn_in_a_burst_becomes_a_connection() {
-        #[cfg(feature = "control-stats")]
         let _guard = counter_guard();
         let mut harness = Harness::spawn();
 

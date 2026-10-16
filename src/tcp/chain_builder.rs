@@ -69,8 +69,7 @@ pub fn build_client_proxy_chain(
     //
     // stats_key fails only on a blank name, which validation already rejected
     // by the time a chain is built, so a failure here is a bug.
-    #[cfg(feature = "control-stats")]
-    let hop_counters: Vec<Vec<Arc<crate::outbound_stats::OutboundCounters>>> = hops
+    let hop_counters: Vec<Vec<crate::outbound_stats::Counters>> = hops
         .iter()
         .map(|pool| {
             pool.iter()
@@ -92,10 +91,8 @@ pub fn build_client_proxy_chain(
             .into_iter()
             .map(build_terminal_connector)
             .collect();
-        let chain = ClientProxyChain::new_terminal(connectors);
-        #[cfg(feature = "control-stats")]
-        let chain = chain.with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
-        return chain;
+        return ClientProxyChain::new_terminal(connectors)
+            .with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
     }
 
     // Build initial hop entries from hop 0.
@@ -150,14 +147,9 @@ pub fn build_client_proxy_chain(
         })
         .collect();
 
-    let chain = ClientProxyChain::new(initial_hop, subsequent_hops);
-    #[cfg(feature = "control-stats")]
-    let chain = {
-        let mut counters = hop_counters.into_iter();
-        let initial = counters.next().expect("at least one hop");
-        chain.with_counters(initial, counters.collect())
-    };
-    chain
+    let mut counters = hop_counters.into_iter();
+    let initial = counters.next().expect("at least one hop");
+    ClientProxyChain::new(initial_hop, subsequent_hops).with_counters(initial, counters.collect())
 }
 
 /// Build a connector for a protocol that owns its transport.
