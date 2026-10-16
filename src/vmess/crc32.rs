@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 // Copied and modified from rust-snappy
 use std::sync::OnceLock;
 

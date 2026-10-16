@@ -750,14 +750,7 @@ client_proxies:
 
     #[test]
     fn test_example_files_load_and_validate() {
-        use crate::thread_util;
         use std::path::{Path, PathBuf};
-
-        // Initialize thread count for the test environment if not already set
-        // set_num_threads will panic if NUM_THREADS is already set by another test
-        let _ = std::panic::catch_unwind(|| {
-            thread_util::set_num_threads(4);
-        });
 
         // Get the examples directory relative to the project root
         let examples_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");

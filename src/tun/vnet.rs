@@ -20,6 +20,12 @@
 //! The header is in native byte order: that is what the kernel reads unless
 //! `TUNSETVNETLE` says otherwise, and a big-endian router is a target here.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io;
 
 /// `sizeof(struct virtio_net_hdr)`, which is what a TUN prepends unless

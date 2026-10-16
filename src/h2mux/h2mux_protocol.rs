@@ -4,7 +4,7 @@
 
 use std::io;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -178,16 +178,16 @@ impl StreamRequest {
 }
 
 /// Stream response (status).
-/// Reserved for future client-side response parsing.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct StreamResponse {
     pub status: u8,
     pub message: Option<String>,
 }
 
-#[allow(dead_code)]
 impl StreamResponse {
+    /// The client reads the status itself (`h2mux_client_stream.rs`), so the
+    /// decoding half exists for the round-trip tests.
+    #[cfg(test)]
     pub fn success() -> Self {
         Self {
             status: STATUS_SUCCESS,
@@ -200,10 +200,6 @@ impl StreamResponse {
             status: STATUS_ERROR,
             message: Some(message.into()),
         }
-    }
-
-    pub fn is_success(&self) -> bool {
-        self.status == STATUS_SUCCESS
     }
 
     /// Encode stream response to bytes
@@ -229,6 +225,7 @@ impl StreamResponse {
     }
 
     /// Decode stream response from reader
+    #[cfg(test)]
     pub async fn decode<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
         let status = reader.read_u8().await?;
 
@@ -285,10 +282,12 @@ pub fn encode_socks_address(buf: &mut BytesMut, location: &NetLocation) -> io::R
     Ok(())
 }
 
-/// Decode a SOCKS5 address from bytes.
-/// Reserved for synchronous parsing paths.
-#[allow(dead_code)]
+/// Decode a SOCKS5 address from bytes; the server reads it with
+/// [`decode_socks_address_async`], and this is the tests' oracle.
+#[cfg(test)]
 pub fn decode_socks_address(data: &mut &[u8]) -> io::Result<NetLocation> {
+    use bytes::Buf;
+
     if data.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -398,7 +397,7 @@ pub async fn decode_socks_address_async<R: AsyncRead + Unpin>(
 
 /// Read a varint from reader.
 /// Used by StreamResponse::decode.
-#[allow(dead_code)]
+#[cfg(test)]
 async fn read_varint<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<usize> {
     let mut result: usize = 0;
     let mut shift = 0;

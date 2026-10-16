@@ -32,6 +32,12 @@
 //!   (`TcpStackOptions::utun_header`). The `readPackets`/`writePackets` API
 //!   is not supported: there is no descriptor to read.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 mod stack_common;
 mod tcp_conn;
 #[cfg(unix)]

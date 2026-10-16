@@ -1,5 +1,11 @@
 //! Builder functions for creating ClientProxyChain from config.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};

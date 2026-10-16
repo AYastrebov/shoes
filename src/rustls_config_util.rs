@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -6,8 +12,8 @@ use rustls::pki_types::pem::PemObject;
 
 pub fn create_client_config(
     verify_webpki: bool,
-    server_fingerprints: Vec<String>,
-    alpn_protocols: Vec<String>,
+    server_fingerprints: &[String],
+    alpn_protocols: &[String],
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
     tls13_only: bool,
@@ -33,7 +39,7 @@ pub fn create_client_config(
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                     supported_algs: get_supported_algorithms(),
-                    server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                    server_fingerprints: process_fingerprints(server_fingerprints).unwrap(),
                     webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
                 }))
         } else {
@@ -44,7 +50,7 @@ pub fn create_client_config(
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                 supported_algs: get_supported_algorithms(),
-                server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                server_fingerprints: process_fingerprints(server_fingerprints).unwrap(),
                 webpki_verifier: None,
             }))
     } else {

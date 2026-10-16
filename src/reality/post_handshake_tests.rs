@@ -1,6 +1,12 @@
 //! A shoes client and server complete a REALITY handshake in memory, then each is fed the
 //! post-handshake handshake messages a peer may send (RFC 8446 §4.6).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io;
 
 use aws_lc_rs::agreement;
@@ -38,7 +44,7 @@ fn handshaken_pair() -> (RealityClientConnection, RealityServerConnection) {
     let mut client_hello = Vec::new();
     client.write_tls(&mut client_hello).unwrap();
     server.validate_client_hello(&client_hello).unwrap();
-    server.build_server_response(vec![]).unwrap();
+    server.build_server_response(&[]).unwrap();
 
     server_to_client(&mut server, &mut client).unwrap();
     client_to_server(&mut client, &mut server).unwrap();

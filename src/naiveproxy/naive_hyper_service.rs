@@ -3,6 +3,12 @@
 //! This module provides a hyper-based HTTP/2 server for NaiveProxy connections.
 //! It handles CONNECT requests with padding support and built-in static file fallback.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::convert::Infallible;
 use std::io;
 use std::path::PathBuf;

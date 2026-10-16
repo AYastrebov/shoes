@@ -12,6 +12,12 @@
 //! It lives beside the other QUIC-protocol machinery because those two are its
 //! only users; nothing about the table itself is QUIC-specific.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use lru::LruCache;
 use std::num::NonZeroUsize;
 

@@ -14,6 +14,12 @@
 //!
 //! [`AsyncStream::plain_tcp`]: crate::async_stream::AsyncStream::plain_tcp
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;

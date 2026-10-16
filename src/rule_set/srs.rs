@@ -9,6 +9,12 @@
 //!
 //! This module knows the wire format and nothing about matching.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::io::{Error, Result};
 use std::net::Ipv4Addr;
 

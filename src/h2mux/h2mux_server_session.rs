@@ -5,7 +5,6 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use http::Response;
@@ -51,9 +50,6 @@ pub struct InboundStream {
 pub struct H2MuxServerSession {
     /// Receiver for incoming streams
     inbound_rx: mpsc::Receiver<InboundStream>,
-    /// Session closed flag (shared with accept loop)
-    #[allow(dead_code)]
-    is_closed: Arc<AtomicBool>,
     /// Session protocol
     protocol: MuxProtocol,
     /// Padding enabled
@@ -107,7 +103,6 @@ impl H2MuxServerSession {
     {
         // Create channel for inbound streams
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_BUFFER);
-        let is_closed = Arc::new(AtomicBool::new(false));
 
         // Create activity tracker for idle timeout.
         // Wrap the connection with ActivityTrackedStream so that ALL HTTP/2 frames
@@ -129,14 +124,12 @@ impl H2MuxServerSession {
         debug!("H2MuxServerSession: H2 handshake complete");
 
         // Spawn acceptor task with idle timeout monitoring
-        let is_closed_clone = Arc::clone(&is_closed);
         tokio::spawn(async move {
-            Self::accept_loop(connection, inbound_tx, is_closed_clone, activity).await;
+            Self::accept_loop(connection, inbound_tx, activity).await;
         });
 
         Ok(Self {
             inbound_rx,
-            is_closed,
             protocol,
             padding_enabled,
         })
@@ -149,7 +142,6 @@ impl H2MuxServerSession {
     async fn accept_loop(
         mut connection: h2::server::Connection<impl AsyncRead + AsyncWrite + Unpin, Bytes>,
         inbound_tx: mpsc::Sender<InboundStream>,
-        is_closed: Arc<AtomicBool>,
         activity: ActivityTracker,
     ) {
         // Check idle timeout periodically (6 times per timeout period)
@@ -182,10 +174,6 @@ impl H2MuxServerSession {
 
                 // Check for idle timeout
                 _ = idle_timer.tick() => {
-                    if is_closed.load(Ordering::Relaxed) {
-                        break;
-                    }
-
                     if activity.is_idle(IDLE_TIMEOUT) {
                         debug!("H2MuxServerSession: idle timeout, initiating graceful shutdown");
                         // Send GOAWAY and allow existing streams to complete
@@ -222,7 +210,6 @@ impl H2MuxServerSession {
             }
         }
 
-        is_closed.store(true, Ordering::Relaxed);
         debug!("H2MuxServerSession: accept loop ended");
     }
 
@@ -279,18 +266,6 @@ impl H2MuxServerSession {
         self.inbound_rx.recv().await
     }
 
-    /// Check if the session is closed.
-    #[allow(dead_code)]
-    pub fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Relaxed)
-    }
-
-    /// Close the session.
-    #[allow(dead_code)]
-    pub fn close(&self) {
-        self.is_closed.store(true, Ordering::Relaxed);
-    }
-
     /// Get the protocol being used
     pub fn protocol(&self) -> MuxProtocol {
         self.protocol
@@ -300,28 +275,6 @@ impl H2MuxServerSession {
     pub fn padding_enabled(&self) -> bool {
         self.padding_enabled
     }
-}
-
-/// Run an H2MUX server session, forwarding each stream to a handler.
-#[allow(dead_code)]
-pub async fn run_h2mux_server<IO, F, Fut>(conn: IO, handler: F) -> io::Result<()>
-where
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: Fn(InboundStream) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
-{
-    let mut session = H2MuxServerSession::new(conn).await?;
-
-    while let Some(inbound) = session.accept().await {
-        let fut = handler(inbound);
-        tokio::spawn(async move {
-            if let Err(e) = fut.await {
-                debug!("H2MUX stream handler error: {}", e);
-            }
-        });
-    }
-
-    Ok(())
 }
 
 /// Handle an H2MUX session on a stream.

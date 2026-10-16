@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use md5::{Digest, Md5};
 
 use super::shadowsocks_key::ShadowsocksKey;

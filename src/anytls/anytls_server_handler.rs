@@ -6,6 +6,12 @@
 //! 2. Creates an AnyTlsSession with all routing dependencies
 //! 3. Runs the session which handles streams internally
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

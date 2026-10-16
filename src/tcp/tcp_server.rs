@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 // Only the unix-socket server takes a filesystem path.

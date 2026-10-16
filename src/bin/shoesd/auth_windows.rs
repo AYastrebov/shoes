@@ -114,6 +114,7 @@ fn wall_clock() -> u64 {
 
     // SAFETY: writes the struct it is given.
     let mut time = unsafe { std::mem::zeroed() };
+    // SAFETY: `time` is a live FILETIME on the stack.
     unsafe { GetSystemTimePreciseAsFileTime(&mut time) };
     filetime(time)
 }
@@ -265,6 +266,7 @@ impl Handle {
                 std::mem::zeroed(),
             )
         };
+        // SAFETY: as above: a live handle and four out-parameters on the stack.
         if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
             == 0
         {

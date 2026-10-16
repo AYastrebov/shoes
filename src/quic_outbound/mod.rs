@@ -89,8 +89,8 @@ impl QuicOutboundSettings {
 
         let rustls_client_config = create_client_config(
             self.quic.verify,
-            self.quic.server_fingerprints.clone().into_vec(),
-            self.alpn_protocols(),
+            &self.quic.server_fingerprints.clone().into_vec(),
+            &self.alpn_protocols(),
             sni.is_some(),
             key_and_cert,
             // QUIC enforces TLS 1.3 anyway.
@@ -104,7 +104,9 @@ impl QuicOutboundSettings {
 
         let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
             Arc::new(rustls_client_config),
-            tls13_suite.quic_suite().unwrap(),
+            tls13_suite.quic_suite().ok_or_else(|| {
+                std::io::Error::other("TLS13_AES_128_GCM_SHA256 has no QUIC suite")
+            })?,
         )
         .map_err(|e| std::io::Error::other(format!("failed to build QUIC client config: {e}")))?;
 
@@ -130,7 +132,7 @@ impl QuicOutboundSettings {
         let Some(hop) = self.port_hopping.clone() else {
             // Unchanged path: without hopping, nothing about how the socket is
             // built or handed to quinn changes.
-            let udp_socket = new_udp_socket(server_is_ipv6, self.bind_interface.clone())?;
+            let udp_socket = new_udp_socket(server_is_ipv6, self.bind_interface.as_deref())?;
             let udp_socket = udp_socket.into_std()?;
 
             let mut endpoint = match self.obfs.clone() {
@@ -158,7 +160,7 @@ impl QuicOutboundSettings {
         let bind_interface = self.bind_interface.clone();
         let obfs = self.obfs.clone();
         let factory: SocketFactory = Arc::new(move || {
-            let socket = new_udp_socket(server_is_ipv6, bind_interface.clone())?.into_std()?;
+            let socket = new_udp_socket(server_is_ipv6, bind_interface.as_deref())?.into_std()?;
             match obfs.clone() {
                 Some(obfs) => Ok(Arc::new(ObfuscatedUdpSocket::new(socket, obfs)?)),
                 None => quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket),

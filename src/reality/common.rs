@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 // TLS constants and utilities for REALITY client/server implementations
 
 use std::io::{self, Error, ErrorKind};

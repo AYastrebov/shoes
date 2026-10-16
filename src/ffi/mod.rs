@@ -3,40 +3,36 @@
 //! This module provides C-compatible functions that can be called from
 //! Android (via JNI) and iOS (via Swift/ObjC).
 //!
-//! # Android Usage
+//! # Android
+//!
+//! `android.rs` exports the JNI functions behind `com.shoesproxy.ShoesNative`
+//! (`android/src/main/java/com/shoesproxy/ShoesNative.kt`):
 //!
 //! ```kotlin
-//! // Load native library
-//! System.loadLibrary("shoes")
-//!
-//! // Declare native methods
-//! external fun shoesInit(logLevel: String): Int
-//! external fun shoesStartTun(
-//!     fd: Int,
-//!     configYaml: String,
-//!     protectCallback: (Int) -> Boolean
-//! ): Long
-//! external fun shoesStop(handle: Long)
+//! ShoesNative.init("info")
+//! val handle = ShoesNative.start(configYaml, protectCallback, trafficCallback)
+//! ShoesNative.stop(handle)
 //! ```
 //!
-//! # iOS Usage
+//! # iOS and macOS
+//!
+//! `ios.rs` exports the C functions declared in `include/shoes.h`:
 //!
 //! ```swift
-//! // Initialize
 //! shoes_init("info")
-//!
-//! // Start VPN
-//! let handle = shoes_start(configYaml, protectCallback)
-//!
-//! // Stop VPN
+//! let handle = shoes_start(configYaml, protectCallback, trafficCallback)
 //! shoes_stop(handle)
 //! ```
 //!
-//! # Thread Safety
+//! `shoes_start_with_fd` takes the packet tunnel's descriptor and a stopped
+//! callback as well.
 //!
-//! - `shoes_init` must be called once before any other function
-//! - `shoes_start` / `shoes_start_tun` starts a background thread for the TUN service
-//! - `shoes_stop` signals shutdown and waits for cleanup
+//! # Thread safety
+//!
+//! - `init` / `shoes_init` must be called once before any other function.
+//! - A start runs the engine on its own threads and returns a handle.
+//! - A stop signals shutdown and waits, up to five seconds, for the engine to
+//!   release the TUN descriptor. Starts and stops are serialised.
 
 // The whole surface is written against panic = "abort": ExitGuard's Drop
 // never runs on a panic (a claim control/mod.rs states outright), the

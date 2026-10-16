@@ -22,16 +22,16 @@
 //! # Example (Android via JNI)
 //!
 //! ```ignore
-//! // In Kotlin, implement a callback that calls VpnService.protect()
-//! class SocketProtectorImpl(private val vpnService: VpnService) {
-//!     fun protect(fd: Int): Boolean {
-//!         return vpnService.protect(fd)
-//!     }
-//! }
-//!
-//! // Pass to Rust via FFI
-//! shoesStartTun(config, tunFd, socketProtector)
+//! // In a VpnService: `SocketProtector` is a fun interface, so `this::protect`
+//! // passes VpnService.protect(fd) straight through.
+//! val handle = ShoesNative.start(configYaml, this::protect, trafficListener)
 //! ```
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
 
 use std::io;
 #[cfg(unix)]

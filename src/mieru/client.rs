@@ -1,5 +1,11 @@
 //! The mieru client handler: a session, with socks5 inside it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

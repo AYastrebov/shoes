@@ -53,7 +53,7 @@ impl VisionFilter {
         self.record_filter_count = self.record_filter_count.saturating_sub(1);
     }
 
-    pub fn stop_filtering(&mut self, reason: String) {
+    pub fn stop_filtering(&mut self, reason: &str) {
         log::debug!("VISION: Stopping filtering - {}", reason);
         self.record_filter_count = 0;
     }
@@ -89,7 +89,7 @@ impl VisionFilter {
 
         if data.len() < 5 {
             // invalid record length
-            self.stop_filtering(format!("invalid record length: {}", data.len()));
+            self.stop_filtering(&format!("invalid record length: {}", data.len()));
             return;
         }
 
@@ -143,11 +143,11 @@ impl VisionFilter {
                         }
 
                         // Stop filtering early
-                        self.stop_filtering("TLS 1.3 handshake detected".to_string());
+                        self.stop_filtering("TLS 1.3 handshake detected");
                     }
                 }
                 Err(e) => {
-                    self.stop_filtering(format!("invalid ServerHello: {}", e));
+                    self.stop_filtering(&format!("invalid ServerHello: {}", e));
                 }
             }
         }
@@ -183,7 +183,7 @@ mod tests {
 
         assert!(filter.is_filtering());
 
-        filter.stop_filtering("test".to_string());
+        filter.stop_filtering("test");
 
         assert!(!filter.is_filtering());
     }
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn test_filter_record_no_processing_when_complete() {
         let mut filter = VisionFilter::new();
-        filter.stop_filtering("test".to_string());
+        filter.stop_filtering("test");
 
         let data = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00];
 

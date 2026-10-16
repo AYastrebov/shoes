@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use crate::util::atomic::AtomicU64;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
@@ -183,7 +189,7 @@ fn auth_response(udp_enabled: bool) -> http::Response<()> {
         .expect("every part of this response is a constant or a generated string")
 }
 
-fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
+fn validate_auth_request<T>(req: &http::Request<T>, password: &str) -> std::io::Result<()> {
     if req.uri() != "https://hysteria/auth" {
         return Err(std::io::Error::other(format!(
             "unexpected uri: {}",
@@ -245,7 +251,7 @@ async fn auth_connection(
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
                 })?;
-                match validate_auth_request(req, password) {
+                match validate_auth_request(&req, password) {
                     Ok(()) => {
                         let resp = auth_response(udp_enabled);
 
@@ -1145,12 +1151,12 @@ mod tests {
 
     #[test]
     fn test_auth_accepts_the_configured_password() {
-        assert!(validate_auth_request(auth_request("hunter2"), "hunter2").is_ok());
+        assert!(validate_auth_request(&auth_request("hunter2"), "hunter2").is_ok());
     }
 
     #[test]
     fn test_auth_rejects_a_wrong_password() {
-        assert!(validate_auth_request(auth_request("wrong"), "hunter2").is_err());
+        assert!(validate_auth_request(&auth_request("wrong"), "hunter2").is_err());
     }
 
     #[test]
@@ -1158,8 +1164,8 @@ mod tests {
         // A comparison that stopped at the first difference would take longer
         // for this than for a password differing in byte one; the rejection
         // itself is what this pins.
-        assert!(validate_auth_request(auth_request("hunter"), "hunter2").is_err());
-        assert!(validate_auth_request(auth_request("hunter23"), "hunter2").is_err());
+        assert!(validate_auth_request(&auth_request("hunter"), "hunter2").is_err());
+        assert!(validate_auth_request(&auth_request("hunter23"), "hunter2").is_err());
     }
 
     /// A rejection must not repeat what was sent. The attempt may well be a
@@ -1167,7 +1173,7 @@ mod tests {
     /// way.
     #[test]
     fn test_auth_rejection_does_not_echo_the_credential() {
-        let err = validate_auth_request(auth_request("s3cret-elsewhere"), "hunter2")
+        let err = validate_auth_request(&auth_request("s3cret-elsewhere"), "hunter2")
             .unwrap_err()
             .to_string();
         assert!(
@@ -1181,7 +1187,7 @@ mod tests {
         let request = http::Request::post("https://hysteria/auth")
             .body(())
             .unwrap();
-        assert!(validate_auth_request(request, "hunter2").is_err());
+        assert!(validate_auth_request(&request, "hunter2").is_err());
     }
 
     #[test]
@@ -1190,13 +1196,13 @@ mod tests {
             .header("Hysteria-Auth", "hunter2")
             .body(())
             .unwrap();
-        assert!(validate_auth_request(wrong_uri, "hunter2").is_err());
+        assert!(validate_auth_request(&wrong_uri, "hunter2").is_err());
 
         let wrong_method = http::Request::get("https://hysteria/auth")
             .header("Hysteria-Auth", "hunter2")
             .body(())
             .unwrap();
-        assert!(validate_auth_request(wrong_method, "hunter2").is_err());
+        assert!(validate_auth_request(&wrong_method, "hunter2").is_err());
     }
 
     /// Build a session with no connection behind it. `UdpSession::start` needs

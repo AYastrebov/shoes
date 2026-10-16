@@ -19,6 +19,12 @@
 //! shoes_stop(handle)
 //! ```
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -107,7 +113,7 @@ fn fire_stopped(reason: Option<String>) {
         .lock()
         .take();
     let Some(callback) = callback else { return };
-    match reason.map(common::c_string_lossy) {
+    match reason.as_deref().map(common::c_string_lossy) {
         Some(c) => callback(c.as_ptr()),
         None => callback(std::ptr::null()),
     }
@@ -630,7 +636,7 @@ pub extern "C" fn shoes_get_last_error() -> *mut c_char {
         // Lossy rather than NULL on an interior NUL: NULL means "no
         // error", and a message that cannot cross the boundary must not
         // read as one.
-        Some(msg) => common::c_string_lossy(msg).into_raw(),
+        Some(msg) => common::c_string_lossy(&msg).into_raw(),
         None => std::ptr::null_mut(),
     }
 }
@@ -728,6 +734,7 @@ mod tests {
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         let yaml = CString::new("---\n[]\n").unwrap();
+        // SAFETY: `yaml` is a CString alive across the call.
         let handle = unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, None) };
         assert_eq!(handle, -1);
         let err = common::get_last_error().unwrap_or_default();
@@ -747,6 +754,7 @@ mod tests {
             .unwrap();
         let handle = rt.block_on(async {
             let yaml = CString::new("tun:\n  device_fd: 7\n").unwrap();
+            // SAFETY: `yaml` is a CString alive across the call.
             unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, None) }
         });
         assert_eq!(handle, -1);
@@ -758,6 +766,8 @@ mod tests {
     #[test]
     fn start_with_fd_rejects_a_null_config_and_says_so() {
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
+        // SAFETY: a null config is the case under test, which the function
+        // checks before reading it.
         let handle = unsafe { shoes_start_with_fd(std::ptr::null(), 7, protect, traffic, None) };
         assert_eq!(handle, -1);
         assert_eq!(
@@ -781,6 +791,7 @@ mod tests {
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         STOPPED_CALLS.store(0, Ordering::SeqCst);
         let yaml = CString::new("---\n[]\n").unwrap();
+        // SAFETY: `yaml` is a CString alive across the call.
         let handle =
             unsafe { shoes_start_with_fd(yaml.as_ptr(), 7, protect, traffic, Some(count_stopped)) };
         assert_eq!(handle, -1);

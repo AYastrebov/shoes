@@ -25,6 +25,11 @@
 //!
 //! See docs/specs/2026-09-11-awg-manager-engine.md, "Slice 2".
 #![cfg(target_os = "linux")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -536,8 +541,8 @@ async fn tproxy_relays_a_client_on_another_interface() {
     let client = std::thread::spawn(move || {
         use std::os::fd::AsRawFd;
         let ns = std::fs::File::open(format!("/proc/{lan_pid}/ns/net")).unwrap();
-        // SAFETY: a valid namespace descriptor; only this thread moves.
         assert_eq!(
+            // SAFETY: a valid namespace descriptor; only this thread moves.
             unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) },
             0,
             "setns: {}",

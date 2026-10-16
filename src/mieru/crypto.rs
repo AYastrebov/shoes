@@ -1,5 +1,11 @@
 //! mieru key derivation and the direction-scoped cipher.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::num::NonZeroU32;
 
 use aws_lc_rs::{digest, pbkdf2};

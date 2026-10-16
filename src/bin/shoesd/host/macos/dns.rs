@@ -66,6 +66,8 @@ impl DnsStore {
             .ok_or_else(|| {
                 std::io::Error::other("the global IPv4 state names no PrimaryService")
             })?;
+        // SAFETY: `value` points into `global`, which is alive; the get rule
+        // retains a reference for the CFString it returns.
         let service = unsafe { CFString::wrap_under_get_rule(*value as CFStringRef) };
 
         Ok(service.to_string())
@@ -90,6 +92,8 @@ impl DnsStore {
         let Some(value) = dictionary.find(unsafe { kSCPropNetDNSServerAddresses }.to_void()) else {
             return Ok(Vec::new());
         };
+        // SAFETY: `value` points into `dictionary`, alive here; the get rule
+        // retains the array it returns.
         let addresses = unsafe {
             CFArray::<CFString>::wrap_under_get_rule(*value as core_foundation::array::CFArrayRef)
         };

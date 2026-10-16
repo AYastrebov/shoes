@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -539,7 +545,7 @@ pub struct SocksTcpClientHandler {
 }
 
 impl SocksTcpClientHandler {
-    pub fn new(auth_info: Option<(String, String)>) -> Self {
+    pub fn new(auth_info: Option<&(String, String)>) -> Self {
         let mut data = vec![
             VER_SOCKS5,
             1, // number of methods,
@@ -549,7 +555,7 @@ impl SocksTcpClientHandler {
                 METHOD_NONE
             },
         ];
-        if let Some((username, password)) = auth_info.as_ref() {
+        if let Some((username, password)) = auth_info {
             data.extend(&[VER_AUTH, username.len() as u8]);
             data.extend_from_slice(username.as_bytes());
             data.push(password.len() as u8);

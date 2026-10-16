@@ -72,7 +72,6 @@ mod trojan_handler;
 mod tuic;
 #[cfg(any(unix, windows))]
 mod tun;
-mod udp_message_stream;
 mod udp_route_cache;
 mod uot;
 mod util;
@@ -118,28 +117,29 @@ use tcp::*;
 #[derive(Debug)]
 struct ConfigChanged;
 
-fn start_notify_thread(
-    config_paths: Vec<String>,
-) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
+/// Watch `paths` for edits. Built after the first configuration has loaded,
+/// so every path is one that was just read: a missing file is reported by
+/// the load, with the usage text, rather than here.
+fn start_notify_thread<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> notify::Result<(RecommendedWatcher, UnboundedReceiver<ConfigChanged>)> {
     let (tx, rx) = unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) => {
+            // The receiver goes only with the serve loop, at exit.
             if matches!(event.kind, EventKind::Modify(..)) {
-                tx.send(ConfigChanged {}).unwrap();
+                let _ = tx.send(ConfigChanged {});
             }
         }
         Err(e) => println!("watch error: {e:?}"),
-    })
-    .unwrap();
+    })?;
 
-    for config_path in config_paths {
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
+    for path in paths {
+        watcher.watch(Path::new(path), RecursiveMode::NonRecursive)?;
     }
 
-    (watcher, rx)
+    Ok((watcher, rx))
 }
 
 /// Add the rule-set files referenced by these configs to the watch set.
@@ -156,7 +156,7 @@ fn watch_rule_set_paths(watcher: &mut RecommendedWatcher, configs: &[config::Con
     }
 }
 
-fn print_usage_and_exit(arg0: String) {
+fn print_usage_and_exit(arg0: &str) {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
     eprintln!("OPTIONS:");
@@ -210,14 +210,14 @@ fn main() {
             args.remove(0);
             if args.is_empty() {
                 eprintln!("Missing threads argument.");
-                print_usage_and_exit(arg0);
+                print_usage_and_exit(&arg0);
                 return;
             }
             num_threads = match args.remove(0).parse::<usize>() {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Invalid thread count: {e}");
-                    print_usage_and_exit(arg0);
+                    print_usage_and_exit(&arg0);
                     return;
                 }
             };
@@ -225,7 +225,7 @@ fn main() {
             args.remove(0);
             if args.is_empty() {
                 eprintln!("Missing log-file argument.");
-                print_usage_and_exit(arg0);
+                print_usage_and_exit(&arg0);
                 return;
             }
             log_files.push(args.remove(0));
@@ -240,7 +240,7 @@ fn main() {
             return;
         } else {
             eprintln!("Invalid argument: {}", args[0]);
-            print_usage_and_exit(arg0);
+            print_usage_and_exit(&arg0);
             return;
         }
     }
@@ -280,7 +280,10 @@ fn main() {
     logging::install_panic_hook();
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
-        let (private_key, public_key) = generate_keypair().unwrap();
+        let (private_key, public_key) = generate_keypair().unwrap_or_else(|e| {
+            eprintln!("Could not generate a keypair: {e}");
+            std::process::exit(1);
+        });
         println!(
             "--------------------------------------------------------------------------------"
         );
@@ -313,7 +316,10 @@ fn main() {
                     Ok(cipher) => {
                         let rng = SystemRandom::new();
                         let mut key_bytes = vec![0u8; cipher.key_len()];
-                        rng.fill(&mut key_bytes).expect("RNG failed");
+                        if rng.fill(&mut key_bytes).is_err() {
+                            eprintln!("The system random number generator failed.");
+                            std::process::exit(1);
+                        }
                         let password = STANDARD.encode(&key_bytes);
                         println!(
                             "--------------------------------------------------------------------------------"
@@ -371,12 +377,7 @@ fn main() {
     }
 
     if num_threads == 0 {
-        num_threads = std::cmp::max(
-            2,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-        );
+        num_threads = thread_util::get_num_threads();
         debug!("Runtime threads: {num_threads}");
     } else {
         println!("Using custom thread count ({num_threads})");
@@ -394,22 +395,19 @@ fn main() {
         mt
     };
 
-    let runtime = builder
-        .enable_io()
-        .enable_time()
-        .build()
-        .expect("Could not build tokio runtime");
+    let runtime = match builder.enable_io().enable_time().build() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Could not build the tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
 
     runtime.block_on(async move {
-        // No watcher for a validation-only run: `check` has nothing to
-        // reload, and the watcher unwraps a missing path, which turned
-        // `check missing.yaml` into a panic where an exit code was promised.
-        let mut reload_state = if no_reload || dry_run {
-            None
-        } else {
-            let (watcher, rx) = start_notify_thread(args.clone());
-            Some((watcher, rx))
-        };
+        // No watcher yet: it is built once the first configuration has
+        // loaded, below, and never for a validation-only run, which has
+        // nothing to reload.
+        let mut reload_state: Option<(RecommendedWatcher, UnboundedReceiver<ConfigChanged>)> = None;
 
         if dry_run {
             // Validation only -- no DNS registry, whose bootstrap resolution
@@ -448,15 +446,24 @@ fn main() {
         // avoid, and there is nothing to clean up before the first launch.
         let mut reload = ReloadSignal::install();
 
-        let mut prepared = match prepare_servers(&args, reload_state.as_mut().map(|(w, _)| w)).await
-        {
+        let mut prepared = match prepare_servers(&args, None).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{e}\n");
-                print_usage_and_exit(arg0);
+                print_usage_and_exit(&arg0);
                 return;
             }
         };
+
+        // The configs and the rule-sets they name, as just read. A watcher
+        // that cannot start costs the reload-on-edit, not the servers: SIGHUP
+        // still reloads.
+        if !no_reload {
+            match start_notify_thread(prepared.sources.paths()) {
+                Ok(state) => reload_state = Some(state),
+                Err(e) => eprintln!("Not watching the config files ({e}); send SIGHUP to reload."),
+            }
+        }
 
         // Registered once, before the serve loop: tokio replaces the OS
         // default disposition for the process's lifetime, so the streams
@@ -516,7 +523,12 @@ fn main() {
                     () = async {
                         match reload_state.as_mut() {
                             Some((_, rx)) => {
-                                rx.recv().await.expect("the watcher thread is co-owned");
+                                // The watcher is held beside its receiver,
+                                // so the sender cannot be gone while this
+                                // waits; if it ever were, stop listening.
+                                if rx.recv().await.is_none() {
+                                    futures::future::pending::<()>().await;
+                                }
                             }
                             // No watcher: only a signal can end this wait.
                             None => futures::future::pending::<()>().await,
@@ -816,6 +828,10 @@ impl Sources {
             sources.push((path, hash));
         }
         Self(sources)
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(path, _)| path.as_str())
     }
 
     /// The same files, read again now.

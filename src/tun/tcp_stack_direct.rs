@@ -66,18 +66,24 @@ impl Drop for TcpStackDirect {
         // something happened to arrive. The join below is what guarantees the
         // TUN descriptor has been let go, so it cannot simply be skipped.
         let wake = [0u8; 1];
+        // SAFETY: `wake_tx` is the pipe's write end, open until the close below;
+        // the pointer and length describe `wake`, a live one-byte array.
         unsafe {
             libc::write(self.wake_tx, wake.as_ptr() as *const libc::c_void, 1);
         }
 
         self.handle.join();
 
+        // SAFETY: `wake_tx` is ours and still open; it is closed once, here, after
+        // the thread that could write to it has joined.
         unsafe {
             libc::close(self.wake_tx);
             libc::close(self.wake_rx);
         }
 
         if self.close_fd_on_drop {
+            // SAFETY: `close_fd_on_drop` means the descriptor was handed to us to own, and
+            // the stack thread that used it has joined, so nothing else closes it.
             unsafe {
                 libc::close(self.tun_fd);
             }
@@ -151,6 +157,8 @@ impl TcpStackDirect {
                 // pipe every attempt, plus the TUN device itself on the
                 // desktop path, where the interface then stays up and the
                 // named device can refuse the retry with EBUSY.
+                // SAFETY: each descriptor is closed only if it was opened above and was not
+                // handed to a thread, so none is closed twice or while still in use.
                 unsafe {
                     if wake_rx >= 0 {
                         libc::close(wake_rx);
@@ -760,6 +768,8 @@ fn wait_readable(fd: RawFd, wake_fd: RawFd, duration: Option<SmolDuration>) -> i
         let mut sink = [0u8; 64];
         // Non-blocking by construction (new_wake_pipe sets O_NONBLOCK), so
         // this ends with EAGAIN rather than blocking.
+        // SAFETY: `wake_fd` is the open, non-blocking read end of the wake pipe, and
+        // the pointer and length describe `sink`, a live local buffer.
         while unsafe { libc::read(wake_fd, sink.as_mut_ptr() as *mut libc::c_void, sink.len()) } > 0
         {
         }
@@ -770,11 +780,13 @@ fn wait_readable(fd: RawFd, wake_fd: RawFd, duration: Option<SmolDuration>) -> i
 
 /// Set a file descriptor to non-blocking mode (call once at startup).
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFL reads flags and touches no memory; a bad `fd` is an error.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
     if (flags & libc::O_NONBLOCK) == 0
+        // SAFETY: F_SETFL with an int argument touches no memory; a bad `fd` is an error.
         && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
         return Err(io::Error::last_os_error());
@@ -786,6 +798,8 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 /// Returns Err(WouldBlock) when no data is available, so callers can
 /// distinguish it from Ok(0) which indicates EOF.
 fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the pointer and length describe `buf`, a live exclusive borrow;
+    // `read` writes at most `buf.len()` bytes into it.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if n < 0 {
         Err(io::Error::last_os_error())
@@ -904,8 +918,8 @@ mod tests {
         assert!(header);
 
         let longer: libc::c_int = 12;
-        // SAFETY: TUNSETVNETHDRSZ reads one int through the pointer.
         assert_eq!(
+            // SAFETY: TUNSETVNETHDRSZ reads one int through the pointer.
             unsafe { libc::ioctl(fd, libc::TUNSETVNETHDRSZ as _, &longer) },
             0
         );
@@ -986,6 +1000,7 @@ mod tests {
         assert!(stack.is_running(), "Stack thread should be running");
 
         // Externally close the fd to produce EBADF on both read and select.
+        // SAFETY: the test owns `client_fd` and closes it once, to cause EBADF.
         unsafe { libc::close(client_fd) };
         // Also drop the writer so there's no other holder.
         drop(server);
@@ -1120,8 +1135,11 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         drop(stack);
 
+        // SAFETY: F_GETFD only inspects the descriptor table.
         let still_open = unsafe { libc::fcntl(client_fd, libc::F_GETFD) } != -1;
         // Closed here, not by the stack, which is the whole point.
+        // SAFETY: the test owns `client_fd`, and the stack is dropped, so this is the
+        // one close.
         unsafe { libc::close(client_fd) };
         drop(server);
 
@@ -1412,6 +1430,7 @@ mod tests {
         // Fill the write buffer until WouldBlock
         let big_buf = vec![0u8; 65536];
         loop {
+            // SAFETY: the pointer and length describe `big_buf`, alive across the call.
             let n = unsafe {
                 libc::write(
                     writer_fd,
@@ -1439,6 +1458,7 @@ mod tests {
             result
         );
 
+        // SAFETY: the test owns `writer_fd` and closes it once.
         unsafe { libc::close(writer_fd) };
         drop(reader);
     }

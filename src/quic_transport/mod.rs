@@ -12,6 +12,12 @@
 //! between two protocols is then a visible choice rather than a copy that
 //! drifted.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 pub mod fragments;
 pub mod hop;
 pub mod obfs;

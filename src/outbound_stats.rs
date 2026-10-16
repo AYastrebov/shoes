@@ -14,6 +14,12 @@
 //! `crate::control::stats::snapshot` is a free function with no handle to
 //! thread a registry through.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::collections::HashMap;
 
 /// The key a direct outbound always takes, and therefore the one name a
@@ -193,11 +199,6 @@ mod registry {
 
     struct Entry {
         counters: Arc<OutboundCounters>,
-        /// The address this key was installed with. Carried for a Debug dump
-        /// and for the conflict message an `OutboundSet` produces; nothing
-        /// reads it at runtime, because conflicts are settled at config load.
-        #[allow(dead_code)]
-        address: String,
     }
 
     type Registry = RwLock<HashMap<String, Entry>>;
@@ -214,12 +215,11 @@ mod registry {
     pub fn install(set: &OutboundSet) {
         let fresh: HashMap<String, Entry> = set
             .iter()
-            .map(|(key, address)| {
+            .map(|(key, _address)| {
                 (
                     key.to_string(),
                     Entry {
                         counters: Arc::new(OutboundCounters::default()),
-                        address: address.to_string(),
                     },
                 )
             })

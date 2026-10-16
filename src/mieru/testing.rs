@@ -6,6 +6,12 @@
 //! — encode a field wrongly, decode it wrongly to match, and every test here
 //! passes. See "What stays unverified" in the design document.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::mieru::crypto::{DirectionCipher, derive_key, round_to_interval};

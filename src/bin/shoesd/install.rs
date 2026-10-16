@@ -11,6 +11,12 @@
 //! and the root check are where a mistake is a privilege escalation rather
 //! than a broken install, so they are written once.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
@@ -1612,6 +1618,7 @@ mod tests {
     /// rather than whichever step's permission error came first.
     #[test]
     fn installing_without_root_is_refused_early() {
+        // SAFETY: geteuid takes nothing and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }

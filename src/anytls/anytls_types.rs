@@ -2,6 +2,12 @@
 //!
 //! Based on the AnyTLS protocol specification.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 

@@ -25,15 +25,17 @@ use super::transport::{ClientQuicConfig, TcpConfig, Transport};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct H2MuxConfig {
-    /// Maximum number of connections to maintain
+    /// Accepted and ignored, with a warning: each connection opens its own
+    /// h2mux session, so there is no pool for these to size. Kept so a
+    /// config written for sing-box still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
 
-    /// Minimum number of streams before opening a new connection
+    /// Accepted and ignored; see `max_connections`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_streams: Option<u32>,
 
-    /// Maximum number of streams per connection (0 = unlimited)
+    /// Accepted and ignored; see `max_connections`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_streams: Option<u32>,
 
@@ -45,11 +47,17 @@ pub struct H2MuxConfig {
 impl H2MuxConfig {
     /// Converts this config to H2MuxOptions for the client handler.
     pub fn to_options(&self) -> H2MuxOptions {
+        if self.max_connections.is_some()
+            || self.min_streams.is_some()
+            || self.max_streams.is_some()
+        {
+            log::warn!(
+                "h2mux max_connections, min_streams and max_streams have no effect: \
+                 each connection opens its own h2mux session"
+            );
+        }
         H2MuxOptions {
             protocol: MuxProtocol::H2Mux,
-            max_connections: self.max_connections.unwrap_or(4),
-            min_streams: self.min_streams.unwrap_or(4),
-            max_streams: self.max_streams.unwrap_or(0),
             padding: self.padding,
         }
     }

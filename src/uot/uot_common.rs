@@ -9,6 +9,12 @@
 //! - 0x01: IPv6 (16 bytes)
 //! - 0x02: Domain (1 byte length + domain string)
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};

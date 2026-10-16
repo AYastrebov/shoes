@@ -3,6 +3,12 @@
 //! Provides AnyTLS client support for outbound connections.
 //! Creates multiplexed streams over a single TLS connection.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use aws_lc_rs::digest::{SHA256, digest};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;

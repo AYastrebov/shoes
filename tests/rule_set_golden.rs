@@ -4,6 +4,12 @@
 //! reverse-engineered binary format without real inputs is not meaningfully
 //! tested, so about 255 KB of fixtures is a deliberate trade.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 

@@ -3,6 +3,12 @@
 //! Provides configurable packet padding to obfuscate TLS-in-TLS fingerprints.
 //! Based on the AnyTLS protocol specification.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "predates the lint; see the [lints] note in Cargo.toml"
+)]
+
 use crate::anytls::anytls_types::StringMap;
 use md5::{Digest, Md5};
 use rand::RngExt;

@@ -63,7 +63,7 @@ impl AeadKey {
     ///
     /// Use this for small buffers where allocation overhead doesn't matter.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))] // Used by test helpers
+    #[cfg(test)]
     pub fn seal(&self, plaintext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> io::Result<Vec<u8>> {
         let mut buf = plaintext.to_vec();
         self.seal_in_place(&mut buf, iv, seq, aad)?;
