@@ -17,6 +17,9 @@ mod pem;
 mod types;
 mod validate;
 
+#[cfg(test)]
+mod roundtrip_tests;
+
 pub use pem::convert_cert_paths;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
