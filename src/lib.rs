@@ -115,6 +115,7 @@ mod tls_server_handler;
 mod tproxy;
 mod trojan_handler;
 pub mod tuic;
+mod udp_route_cache;
 mod uot;
 mod util;
 mod uuid_util;

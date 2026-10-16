@@ -502,6 +502,89 @@ mod tests {
         assert_eq!(reply, payload);
     }
 
+    /// Sends a `quic`-mode Packet to `target` before Authenticate, the order
+    /// a client may use when its first packet races the auth stream.
+    #[derive(Debug)]
+    struct PacketBeforeAuth {
+        inner: TuicAuthenticator,
+        target: NetLocation,
+        payload: &'static [u8],
+    }
+
+    #[async_trait]
+    impl ConnectionAuthenticator for PacketBeforeAuth {
+        async fn authenticate(&self, connection: &quinn::Connection) -> std::io::Result<()> {
+            let mut stream = connection.open_uni().await.map_err(std::io::Error::other)?;
+            let mut packet = super::super::frame::encode_packet_header(
+                7,
+                0,
+                1,
+                0,
+                self.payload.len() as u16,
+                Some(&self.target),
+            );
+            packet.extend_from_slice(self.payload);
+            stream
+                .write_all(&packet)
+                .await
+                .map_err(std::io::Error::other)?;
+            stream.finish().map_err(std::io::Error::other)?;
+            // Let the Packet stream reach the server ahead of the auth stream.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.inner.authenticate(connection).await
+        }
+    }
+
+    /// A Packet stream sent before Authenticate is held and relayed once the
+    /// client authenticates. It used to be read and thrown away, which lost
+    /// the first packet of a `quic`-mode association - often a DNS query.
+    #[tokio::test]
+    async fn test_a_packet_sent_before_auth_is_relayed_after_it() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+
+        let authenticator = Arc::new(PacketBeforeAuth {
+            inner: TuicAuthenticator {
+                uuid: crate::uuid_util::parse_uuid(TEST_UUID)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                password: SERVER_PASSWORD.to_string(),
+            },
+            target: NetLocation::from_str(&echo.to_string(), None).unwrap(),
+            payload: b"before auth",
+        });
+        let connection = LiveConnection::new(
+            QuicOutboundSettings {
+                server: NetLocation::from_str(&server.to_string(), None).unwrap(),
+                quic: client_quic_config(),
+                bind_interface: None,
+                obfs: None,
+                port_hopping: None,
+                default_alpn: "h3",
+                congestion: CongestionControl::Cubic,
+            },
+            authenticator,
+            None,
+        );
+        let connection = connection.get(&resolver).await.unwrap();
+
+        // The echo comes back as a Packet on a server uni stream; its payload
+        // is the tail.
+        let mut reply = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = connection.accept_uni().await.unwrap();
+            stream.read_to_end(65535).await.unwrap()
+        })
+        .await
+        .expect("the packet sent before auth was never relayed");
+        let payload = reply.split_off(reply.len() - b"before auth".len());
+        assert_eq!(payload, b"before auth");
+        let header = &reply[..4];
+        assert_eq!(header[1], super::super::frame::COMMAND_TYPE_PACKET);
+        assert_eq!(u16::from_be_bytes([header[2], header[3]]), 7);
+    }
+
     #[tokio::test]
     async fn test_udp_round_trip_in_quic_mode() {
         let server = spawn_server().await;

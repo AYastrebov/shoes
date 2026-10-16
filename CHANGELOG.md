@@ -55,6 +55,31 @@ TN-T2, TN-T3, TR-2, XU-X1):
 - **XUDP consumes data attached to a KeepAlive or End frame**; it used to
   read the next frame from the middle of it.
 
+Mux and session correctness against the reference clients (VM-D2, XU-X2,
+XU-X3, HY-D2, TU-D4, H2-4):
+
+- **VMess UDP writes the padding its chunk length declares.** With global
+  padding, on by default for AES and ChaCha in Xray, the reader lost the
+  chunk boundary at the first non-zero padding.
+- **The XUDP server keeps the client's session ids.** Each packet is
+  reported under the id it arrived with, and each response is a Keep frame
+  echoing it, as Xray's mux server answers. Ids used to be invented per
+  destination and sent with New, so mux.cool clients (Xray `xudpConcurrency`,
+  sing-box mux with XUDP) dropped every response. A Keep for an unknown
+  session is answered with End instead of failing the connection; frame
+  metadata over 512 bytes is refused; a response over 7526 bytes is dropped,
+  as Xray's own writer drops it.
+- **Hysteria2 and TUIC send each UDP datagram to the target it names.** A
+  session opened with a hostname used to be pinned to that hostname's
+  address for its whole life, with replies relabelled as the hostname.
+  Replies now carry their real source, IPv4 sources as IPv4.
+- **TUIC holds uni streams that arrive before Authenticate** and runs them
+  once the client authenticates. They were read and discarded, which lost
+  the first packet of a `quic`-mode association, often a DNS query.
+- **h2mux declines the sing-mux TCP Brutal exchange** the way a sing-box
+  server without brutal does. It used to dial `_BrutalBwExchange` as a
+  hostname, fail, and make a brutal-enabled client tear the session down.
+
 ## v0.4.1
 
 `awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no

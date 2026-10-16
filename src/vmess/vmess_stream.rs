@@ -1085,6 +1085,13 @@ impl AsyncWriteMessage for VmessStream {
             end_index += this.tag_len;
         }
 
+        // The length above counts the padding, so the padding has to follow,
+        // as on the stream path.
+        if padding_len > 0 {
+            rand::rng().fill_bytes(&mut this.write_packet[end_index..end_index + padding_len]);
+            end_index += padding_len;
+        }
+
         this.write_packet_end_offset = end_index;
 
         Poll::Ready(Ok(()))
@@ -1354,6 +1361,71 @@ mod tests {
 
         // Read allows larger chunks to be compatible with other implementations
         assert_eq!(MAX_ENCRYPTED_READ_DATA_SIZE, 65535);
+    }
+
+    /// A UDP stream (message mode) with GlobalPadding: shared keys and shake
+    /// seeds, so one side's writes are the other side's reads.
+    fn padded_udp_stream(stream: Box<dyn AsyncStream>) -> VmessStream {
+        let key = [0x42u8; 16];
+        let iv = [0x11u8; 16];
+        let opening = OpeningKey::new(
+            UnboundKey::new(&AES_128_GCM, &key).unwrap(),
+            VmessNonceSequence::new(&iv),
+        );
+        let sealing = SealingKey::new(
+            UnboundKey::new(&AES_128_GCM, &key).unwrap(),
+            VmessNonceSequence::new(&iv),
+        );
+        VmessStream::new(
+            stream,
+            true,
+            Some((opening, sealing)),
+            Some(create_shake128_reader(&iv)),
+            Some(create_shake128_reader(&iv)),
+            true,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn padded_udp_messages_round_trip() {
+        use crate::async_stream::testing::TestStream;
+        use std::future::poll_fn;
+
+        // The seed's padding sequence must include non-zero lengths, or the
+        // test proves nothing.
+        let mut mask = LengthMask::new(create_shake128_reader(&[0x11u8; 16]), true);
+        let paddings: Vec<usize> = (0..8).map(|_| mask.next_values().0).collect();
+        assert!(paddings.iter().any(|&p| p > 0), "{paddings:?}");
+
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let mut writer = padded_udp_stream(Box::new(TestStream(near)));
+        let mut reader = padded_udp_stream(Box::new(TestStream(far)));
+
+        let messages: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 100 + i as usize]).collect();
+        for message in &messages {
+            poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, message))
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut writer).poll_flush_message(cx))
+                .await
+                .unwrap();
+        }
+
+        for message in &messages {
+            let mut storage = vec![0u8; 65535];
+            let mut buf = ReadBuf::new(&mut storage);
+            // A desynced reader waits for bytes that never come.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                poll_fn(|cx| Pin::new(&mut reader).poll_read_message(cx, &mut buf)),
+            )
+            .await
+            .expect("the reader lost the chunk boundary")
+            .unwrap();
+            assert_eq!(buf.filled(), &message[..]);
+        }
     }
 
     #[test]

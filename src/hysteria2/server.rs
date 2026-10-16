@@ -51,6 +51,7 @@ use crate::quic_transport::{
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::connect_client_tcp_stream;
+use crate::udp_route_cache::UdpRouteCache;
 use crate::util::allocate_vec;
 
 use super::frame::{
@@ -303,11 +304,9 @@ struct UdpSession {
     /// one fixed address per session and would carry this for nothing.
     pending_location: Option<NetLocation>,
     send_socket: Arc<UdpSocket>,
-    // we cache the last location in case of mid-session address changes, and
-    // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
-    override_remote_write_address: Option<SocketAddr>,
+    /// Each datagram goes to the target it names; this keeps the last one's
+    /// routing decision so a single-peer session is judged once.
+    route: UdpRouteCache,
     // Shared with the spawned remote-to-local task so that reply traffic counts as
     // activity too; otherwise a download-only session would be reaped mid-transfer.
     last_activity: Arc<AtomicU64>,
@@ -326,16 +325,11 @@ impl Drop for UdpSession {
 }
 
 impl UdpSession {
-    // TODO: remove this function completely and inline?
-    #[allow(clippy::too_many_arguments)]
     fn start(
         session_id: u32,
         connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
-        override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        route: UdpRouteCache,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -347,9 +341,7 @@ impl UdpSession {
             fragments: Defragmenter::new(),
             pending_location: None,
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
+            route,
             last_activity: last_activity.clone(),
             cancel_token: session_cancel_token.clone(),
         };
@@ -359,7 +351,6 @@ impl UdpSession {
                 session_id,
                 connection,
                 client_socket,
-                override_local_write_location,
                 last_activity,
                 session_cancel_token,
             )
@@ -468,7 +459,6 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
-    override_local_write_address: Option<NetLocation>,
     last_activity: Arc<AtomicU64>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
@@ -476,25 +466,13 @@ async fn run_udp_remote_to_local_loop(
         .max_datagram_size()
         .ok_or_else(|| no_datagram_support(session_id))?;
 
-    let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
-        Some(a) => {
-            // The wire form, not Display: an IPv6 literal needs its brackets
-            // or the peer's SplitHostPort refuses the whole datagram.
-            let address_bytes: Bytes = a.to_wire_string().into_bytes().into();
-            let address_len = address_bytes.len();
-            let address_len_bytes = encode_varint(address_len as u64)?;
-            Some((address_bytes, address_len_bytes.into()))
-        }
-        None => None,
-    };
-
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
     // The reply source address is serialized into every datagram header, but for
     // the common single-peer flow it never changes. Cache the encoded address and
     // its length varint so the steady state is a refcount bump, not a to_string()
-    // plus a varint allocation per packet. Only used when there is no override.
+    // plus a varint allocation per packet.
     let mut cached_src: Option<(SocketAddr, Bytes, Bytes)> = None;
 
     loop {
@@ -532,20 +510,19 @@ async fn run_udp_remote_to_local_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let (address_bytes, address_len_bytes) = match original_address_bytes {
-            Some((ref a, ref b)) => (a.clone(), b.clone()),
-            None => {
-                if cached_src.as_ref().is_none_or(|(a, _, _)| *a != src_addr) {
-                    let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
-                    // no need to do a length check since this is a socket address and an IP.
-                    let address_len_bytes: Bytes =
-                        encode_varint(address_bytes.len() as u64)?.into();
-                    cached_src = Some((src_addr, address_bytes, address_len_bytes));
-                }
-                let (_, a, b) = cached_src.as_ref().unwrap();
-                (a.clone(), b.clone())
-            }
-        };
+        // Every reply is labelled with its real source, as upstream's
+        // receiveLoop does when no hook rewrote the address. The socket is
+        // dual-stack, so an IPv4 source arrives mapped; Go prints that as plain
+        // IPv4, and so do we.
+        if cached_src.as_ref().is_none_or(|(a, _, _)| *a != src_addr) {
+            let source = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
+            let address_bytes: Bytes = source.to_string().into_bytes().into();
+            // no need to do a length check since this is a socket address and an IP.
+            let address_len_bytes: Bytes = encode_varint(address_bytes.len() as u64)?.into();
+            cached_src = Some((src_addr, address_bytes, address_len_bytes));
+        }
+        let (_, address_bytes, address_len_bytes) = cached_src.as_ref().unwrap();
+        let (address_bytes, address_len_bytes) = (address_bytes.clone(), address_len_bytes.clone());
 
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
@@ -731,22 +708,6 @@ async fn run_udp_local_to_remote_loop(
                     }
                 };
 
-                // the remote location specified at the beginning of a session is assumed
-                // to be the remote location for the entire session iif it does not match
-                // the resolved address, as per the official client - which is only if
-                // it's a hostname. in our case, we also have to handle when the remote
-                // location is replaced by a different location in the rules.
-                //
-                // it's possible that when we receive packets on the client socket,
-                // it could be the resolved hostname versus what was initially provided,
-                // and we need to write datagrams back to the user using their provided
-                // address so that they know where it's from.
-                //
-                // it would be much simpler to always replace, or never, but we stick to
-                // the official client behavior for now.
-                //
-                // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
-
                 let resolved_address = match resolver_cache
                     .resolve_location(updated_location.location())
                     .await
@@ -757,13 +718,6 @@ async fn run_udp_local_to_remote_loop(
                         continue;
                     }
                 };
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        (None, None)
-                    };
 
                 // even if the remote location is ipv4, a future location could be ipv6.
                 // TODO: the configured client socket is for the current remote_location, but
@@ -776,10 +730,7 @@ async fn run_udp_local_to_remote_loop(
                     session_id,
                     connection.clone(),
                     Arc::new(client_socket),
-                    remote_location.clone(),
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
+                    UdpRouteCache::new(remote_location.clone(), resolved_address),
                     &cancel_token,
                 );
                 entry.insert(session)
@@ -831,50 +782,15 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
-        let socket_addr = match session.override_remote_write_address {
-            Some(addr) => addr,
-            None => {
-                if remote_location == session.last_location {
-                    session.last_socket_addr
-                } else {
-                    warn!(
-                        "Location changed during ongoing UDP session: {}",
-                        remote_location.clone()
-                    );
-                    let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), &resolver)
-                        .await;
-                    let updated_location = match action {
-                        Ok(ConnectDecision::Allow {
-                            chain_group: _,
-                            remote_location,
-                        }) => remote_location,
-                        Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
-                            continue;
-                        }
-                    };
-                    let updated_socket_addr = match resolver_cache
-                        .resolve_location(updated_location.location())
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve updated remote location {}: {e}",
-                                updated_location.location()
-                            );
-                            continue;
-                        }
-                    };
-                    session.last_location = updated_location.into_location();
-                    session.last_socket_addr = updated_socket_addr;
-                    updated_socket_addr
-                }
+        let socket_addr = match session
+            .route
+            .route(&remote_location, &client_proxy_selector, &resolver)
+            .await
+        {
+            Ok(socket_addr) => socket_addr,
+            Err(e) => {
+                warn!("Dropping UDP datagram to {remote_location}: {e}");
+                continue;
             }
         };
 
@@ -1292,9 +1208,7 @@ mod tests {
             fragments: Defragmenter::new(),
             pending_location: None,
             send_socket: Arc::new(socket),
-            last_location: location,
-            last_socket_addr: "127.0.0.1:9".parse().unwrap(),
-            override_remote_write_address: None,
+            route: UdpRouteCache::new(location, "127.0.0.1:9".parse().unwrap()),
             last_activity: Arc::new(AtomicU64::new(idle_since_secs)),
             cancel_token: parent.child_token(),
         }
