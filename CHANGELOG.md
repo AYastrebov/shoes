@@ -126,6 +126,11 @@ Connection ownership (plan PR 1.5, part 2; A-4):
 - Connections are owned by the launch that accepted them -- TCP, Unix-socket,
   QUIC (generic, Hysteria2, TUIC) and tproxy listeners, and the work a
   connection detaches (mux sessions, UDP associations, per-stream tasks).
+- **The mobile library is 377 KB smaller than before connection ownership,
+  instead of 620 KB larger.** `connections::spawn` boxes the future it is
+  handed, so the set's wrappers and tokio's task harness compile once, not
+  once per spawned future type. The arm64 `.so` is 9,548,384 bytes; the size
+  baseline is lowered to match.
 
 ## v0.6.0
 

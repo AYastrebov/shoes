@@ -38,6 +38,15 @@
 #                     library, against an RSS cost of 2 KiB at the
 #                     256-connection ceiling -- MOBILE.md section 10 has the
 #                     measurement and the method.
+#   9548384 -288784  connections::spawn boxes the future it is handed. The
+#                     generic ConnectionSet of #71 had cost +620008 (9925000
+#                     -> 10545008, measured here on 1.97 and NDK 30.0) by
+#                     compiling the tracker, token, task-local and tokio's
+#                     task harness per future type and per branch; boxing
+#                     compiles them once, which also drops the per-type
+#                     harnesses the plain tokio::spawn calls had before.
+#                     Measured on the same toolchain as the two numbers it
+#                     is compared with.
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -50,4 +59,4 @@
 # Judged worth paying: the net 4376 bytes is 0.03% of the library, against a
 # MOBILE.md precedent that declined a 1.0 MiB saving because the build
 # complexity cost more than the megabyte was worth.
-9837168
+9548384

@@ -8,6 +8,7 @@
 //! (<https://tokio.rs/tokio/topics/shutdown>).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -28,8 +29,19 @@ pub fn spawn<F>(work: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    spawn_boxed(Box::pin(work))
+}
+
+/// A connection's future, boxed where it enters this module. Everything past
+/// that point -- the tracker, the token, the task-local and tokio's task
+/// harness -- is then compiled once rather than once per spawned future type
+/// and per branch below. Generic, that cost 620 KB of the arm64 mobile
+/// library; boxed, the library is 377 KB smaller than before the set existed.
+type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+fn spawn_boxed(work: Work) -> JoinHandle<()> {
     match CURRENT.try_with(|set| set.clone()) {
-        Ok(set) => set.spawn(work),
+        Ok(set) => set.spawn_boxed(work),
         Err(_) => tokio::spawn(work),
     }
 }
@@ -53,6 +65,10 @@ impl ConnectionSet {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_boxed(Box::pin(connection))
+    }
+
+    fn spawn_boxed(&self, connection: Work) -> JoinHandle<()> {
         let token = self.token.clone();
         let set = self.clone();
         self.tracker.spawn(CURRENT.scope(set, async move {
