@@ -148,7 +148,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
 
     if use_h2 {
         // HTTP/2 for NaiveProxy clients
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
@@ -175,7 +175,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     } else {
         // HTTP/1.1 for browsers and censors - serve static files only, no proxy
         let fallback_path = naive_cfg.fallback_path.clone();
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let path = fallback_path.clone();
                 async move { http1_fallback_service(req, path).await }
@@ -312,7 +312,7 @@ async fn naive_service(
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
 
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = HyperUpgradedStream(TokioIo::new(upgraded));

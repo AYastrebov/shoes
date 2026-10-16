@@ -113,6 +113,20 @@ Cancellation and waiting (plan PR 1.5, part 1; A-4 in part, A-8):
 - **Stopping a service waits on its exit instead of polling** every 5 ms, and
   `shoesd` waits on the TUN device being published instead of every 20 ms.
 
+Connection ownership (plan PR 1.5, part 2; A-4):
+
+- **A reload drains the previous configuration's connections instead of
+  orphaning them.** The accept loops stopped on a reload, and every live
+  connection ran on, on the old rules and outbounds, with nothing that could
+  end it. The binary now closes the old listeners, starts the new
+  configuration at once, and lets the old connections finish for up to 30
+  seconds before cancelling the rest; it logs how many did which. A stop
+  (SIGTERM, SIGINT) cancels them outright. TUN hosts end their listeners'
+  connections with the service.
+- Connections are owned by the launch that accepted them -- TCP, Unix-socket,
+  QUIC (generic, Hysteria2, TUIC) and tproxy listeners, and the work a
+  connection detaches (mux sessions, UDP associations, per-stream tasks).
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

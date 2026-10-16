@@ -37,6 +37,7 @@ fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
     sniff: Option<SniffSettings>,
+    connections: crate::connections::ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // The accept loop, the per-listener cap, Retry under pressure and the
     // end-of-connection triage are quic_transport's, shared with Hysteria2
@@ -49,6 +50,7 @@ fn start_quic_server(
             obfs: None,
         },
         None,
+        connections,
         move |conn| {
             process_connection(
                 resolver.clone(),
@@ -82,7 +84,7 @@ async fn process_connection(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) =
                 process_streams(cloned_resolver, cloned_handler, stream, cloned_sniff).await
             {
@@ -218,6 +220,7 @@ async fn process_streams(
 pub async fn start_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    connections: &crate::connections::ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -316,6 +319,7 @@ pub async fn start_quic_servers(
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     udp_enabled,
+                    connections.clone(),
                 )
                 .await?;
                 handles.extend(hysteria2_handles);
@@ -344,6 +348,7 @@ pub async fn start_quic_servers(
                     resolver.clone(),
                     zero_rtt_handshake,
                     congestion_control.into(),
+                    connections.clone(),
                 )
                 .await?;
                 handles.extend(tuic_handles);
@@ -375,6 +380,7 @@ pub async fn start_quic_servers(
                     tcp_handler,
                     num_endpoints,
                     sniff.clone(),
+                    connections.clone(),
                 )?;
 
                 handles.extend(quic_handles);

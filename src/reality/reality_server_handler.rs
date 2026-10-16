@@ -315,7 +315,7 @@ fn start_forward_to_dest(
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
 ) {
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);

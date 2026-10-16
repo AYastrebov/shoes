@@ -233,7 +233,7 @@ async fn shadowtls_fallback_to_handshake_server(
     // Spawn the long-running bidirectional copy as a background task.
     // This allows the setup to complete within the timeout while the actual
     // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut *client_stream,
             &mut *handshake_stream,

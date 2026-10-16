@@ -352,7 +352,7 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_loop(
                 session_id,
                 connection,
@@ -838,7 +838,7 @@ async fn run_tcp_loop(
 
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) =
                 process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {
@@ -1048,10 +1048,11 @@ pub async fn start_hysteria2_server(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     udp_enabled: bool,
+    connections: crate::connections::ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let params = transport_params(listener.obfs.as_ref());
 
-    start_quic_listeners(listener, Some(params), move |conn| {
+    start_quic_listeners(listener, Some(params), connections, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         async move {

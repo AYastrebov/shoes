@@ -435,7 +435,7 @@ async fn handle_udp_associate(
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         if let Err(e) =
             run_udp_associate(server_stream, relay_stream, proxy_selector, resolver).await
         {

@@ -7,6 +7,7 @@ use log::{debug, info};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, ValidatedConfigs, convert_cert_paths, create_server_configs};
+use crate::connections::ConnectionSet;
 use crate::dns::{DnsRegistry, build_dns_registry};
 use crate::outbound_stats::OutboundSet;
 use crate::tcp::tcp_server::start_servers;
@@ -112,6 +113,7 @@ pub(super) fn install_outbounds(outbounds: &OutboundSet) {
 pub(super) async fn start_configs(
     configs: Vec<Config>,
     dns_registry: &mut DnsRegistry,
+    connections: &ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles: Vec<JoinHandle<()>> = vec![];
     for config in configs {
@@ -120,7 +122,7 @@ pub(super) async fn start_configs(
             Config::TunServer(t) => dns_registry.get_for_tun(t.dns.as_ref()),
             _ => dns_registry.get_for_server(None),
         };
-        match start_servers(config, resolver).await {
+        match start_servers(config, resolver, connections).await {
             Ok(handles) => join_handles.extend(handles),
             Err(e) => {
                 for handle in &join_handles {
@@ -129,6 +131,7 @@ pub(super) async fn start_configs(
                 for handle in join_handles {
                     let _ = handle.await;
                 }
+                connections.abort().await;
                 return Err(e);
             }
         }
@@ -136,13 +139,139 @@ pub(super) async fn start_configs(
     Ok(join_handles)
 }
 
-/// Publish the outbounds and start every server, TUN entries included.
-pub async fn launch_servers(prepared: PreparedServers) -> std::io::Result<Vec<JoinHandle<()>>> {
+/// How a running configuration's live connections end when it is replaced
+/// or stopped.
+#[derive(Debug, Clone, Copy)]
+pub enum Ending {
+    /// Let them finish for up to this long, then cancel the rest.
+    Drain(std::time::Duration),
+    /// Cancel them now.
+    Abort,
+}
+
+/// A launched configuration: its accept loops, and the connections they
+/// accepted.
+pub struct Launched {
+    accept_loops: Vec<JoinHandle<()>>,
+    connections: ConnectionSet,
+}
+
+impl Launched {
+    /// The connections this launch accepted.
+    pub fn connections(&self) -> &ConnectionSet {
+        &self.connections
+    }
+
+    /// Stop accepting, and wait until the listening sockets are released --
+    /// a replacement binds the same addresses next. Live connections are not
+    /// touched.
+    pub async fn stop_accepting(&mut self) {
+        for handle in &self.accept_loops {
+            handle.abort();
+        }
+        for handle in self.accept_loops.drain(..) {
+            let _ = handle.await;
+        }
+    }
+
+    /// Stop accepting, then end the live connections as `ending` says.
+    /// Returns how many were cancelled.
+    pub async fn end(mut self, ending: Ending) -> usize {
+        self.stop_accepting().await;
+        match ending {
+            Ending::Drain(grace) => self.connections.drain(grace).await,
+            Ending::Abort => {
+                let live = self.connections.len();
+                self.connections.abort().await;
+                live
+            }
+        }
+    }
+}
+
+/// Publish the outbounds and start every server, TUN entries included./// Publish the outbounds and start every server, TUN entries included.
+pub async fn launch_servers(prepared: PreparedServers) -> std::io::Result<Launched> {
     let PreparedServers {
         configs,
         mut dns_registry,
         outbounds,
     } = prepared;
     install_outbounds(&outbounds);
-    start_configs(configs, &mut dns_registry).await
+    let connections = ConnectionSet::new();
+    let accept_loops = start_configs(configs, &mut dns_registry, &connections).await?;
+    Ok(Launched {
+        accept_loops,
+        connections,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn launch_socks_on_a_free_port() -> (Launched, std::net::SocketAddr) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let yaml = format!("- address: {addr}\n  protocol:\n    type: socks\n");
+        let configs = crate::config::load_config_str(&yaml).unwrap();
+        let prepared = prepare_servers(configs).await.unwrap();
+        (launch_servers(prepared).await.unwrap(), addr)
+    }
+
+    async fn wait_for(launched: &Launched, live: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while launched.connections().len() != live {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never reached {live} live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A reload used to stop the accept loops and leave live connections
+    /// running on the old configuration with nothing owning them. They are
+    /// in the launch's set now: they survive the listener closing, and a
+    /// drain past its grace cancels them.
+    #[tokio::test]
+    async fn a_launchs_connections_outlive_its_listener_until_drained() {
+        let (mut launched, addr) = launch_socks_on_a_free_port().await;
+        // Silent after connecting: the SOCKS handshake waits for the
+        // greeting, so the connection stays live until it is cancelled.
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        wait_for(&launched, 1).await;
+
+        launched.stop_accepting().await;
+        assert_eq!(
+            launched.connections().len(),
+            1,
+            "closing the listener kept it"
+        );
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the port no longer accepts"
+        );
+
+        let cancelled = launched
+            .end(Ending::Drain(std::time::Duration::from_millis(50)))
+            .await;
+        assert_eq!(cancelled, 1);
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("the cancelled connection is closed, not left hanging");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn an_abort_ends_live_connections_at_once() {
+        let (launched, addr) = launch_socks_on_a_free_port().await;
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        wait_for(&launched, 1).await;
+        let started = tokio::time::Instant::now();
+        assert_eq!(launched.end(Ending::Abort).await, 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

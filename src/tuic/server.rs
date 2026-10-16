@@ -335,7 +335,7 @@ async fn run_bidirectional_loop(
         let conn = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
                 .await
             {
@@ -616,7 +616,7 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 connection,
@@ -649,7 +649,7 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
@@ -901,7 +901,7 @@ async fn run_unidirectional_loop(
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
             tokio::select! {
@@ -951,7 +951,7 @@ async fn run_unidirectional_loop(
         let udp_session_map = udp_session_map.clone();
         let fragments = fragments.clone();
         let cancel_token = cancel_token.clone();
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
             match process_uni_stream(
@@ -1423,6 +1423,7 @@ fn transport_params(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_tuic_server(
     listener: QuicListenerSettings,
     uuid: &'static [u8],
@@ -1431,10 +1432,11 @@ pub async fn start_tuic_server(
     resolver: Arc<dyn Resolver>,
     zero_rtt_handshake: bool,
     congestion: CongestionControl,
+    connections: crate::connections::ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let params = transport_params(listener.obfs.as_ref(), congestion);
 
-    start_quic_listeners(listener, Some(params), move |conn| {
+    start_quic_listeners(listener, Some(params), connections, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         async move {

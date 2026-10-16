@@ -245,7 +245,7 @@ impl AnyTlsSession {
 
         // Start the outgoing data processor
         let session_clone = Arc::clone(&session);
-        let outgoing_task = tokio::spawn(async move {
+        let outgoing_task = crate::connections::spawn(async move {
             session_clone.process_outgoing().await;
         });
 
@@ -408,7 +408,7 @@ impl AnyTlsSession {
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
-                    let handle = tokio::spawn(async move {
+                    let handle = crate::connections::spawn(async move {
                         // The setup phase is bounded inside handle_new_stream (see
                         // STREAM_SETUP_TIMEOUT); the copy that follows must NOT be
                         // time-limited, or every long-lived connection (a download, SSH,

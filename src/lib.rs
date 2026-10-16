@@ -50,6 +50,7 @@ mod buf_reader;
 mod buffer_sizing;
 mod client_proxy_chain;
 mod client_proxy_selector;
+pub mod connections;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
