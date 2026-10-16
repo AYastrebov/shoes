@@ -403,6 +403,7 @@ mod tests {
             direct_selector(test_resolver()),
             test_resolver(),
             true,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -473,6 +474,7 @@ mod tests {
             direct_selector(test_resolver()),
             test_resolver(),
             true,
+            Default::default(),
         )
         .await
         .unwrap();

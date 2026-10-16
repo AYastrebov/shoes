@@ -124,7 +124,7 @@ impl H2MuxServerSession {
         debug!("H2MuxServerSession: H2 handshake complete");
 
         // Spawn acceptor task with idle timeout monitoring
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             Self::accept_loop(connection, inbound_tx, activity).await;
         });
 
@@ -158,7 +158,7 @@ impl H2MuxServerSession {
                     match result {
                         Some(Ok((request, respond))) => {
                             let inbound_tx = inbound_tx.clone();
-                            tokio::spawn(async move {
+                            crate::connections::spawn(async move {
                                 if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
                                     debug!("H2MuxServerSession: stream error: {}", e);
                                 }
@@ -187,7 +187,7 @@ impl H2MuxServerSession {
                                 match result {
                                     Ok((request, respond)) => {
                                         let inbound_tx = inbound_tx.clone();
-                                        tokio::spawn(async move {
+                                        crate::connections::spawn(async move {
                                             if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
                                                 debug!("H2MuxServerSession: stream error during drain: {}", e);
                                             }
@@ -307,7 +307,7 @@ where
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) =
                 handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
             {

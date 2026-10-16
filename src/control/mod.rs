@@ -770,12 +770,16 @@ pub async fn run_prepared(
     crate::fatal::reset();
 
     // Start TCP servers (like mixed)
+    // The listeners' connections, ended with the service rather than left
+    // to the runtime's teardown.
+    let connections = crate::connections::ConnectionSet::new();
     let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
 
     join_handles.extend(
         servers::start_configs(
             server_configs.into_iter().map(Config::Server).collect(),
             &mut dns_registry,
+            &connections,
         )
         .await?,
     );
@@ -825,6 +829,7 @@ pub async fn run_prepared(
     for handle in join_handles {
         handle.abort();
     }
+    connections.abort().await;
 
     // The watcher either fired (and is finished -- a finished task
     // survives the abort and still yields its value) or the TUN ended on

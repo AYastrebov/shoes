@@ -252,6 +252,7 @@ pub fn admit_or_retry(
 pub fn start_quic_listeners<F, Fut>(
     settings: QuicListenerSettings,
     params: Option<QuicTransportParams>,
+    connections: crate::connections::ConnectionSet,
     handle_connection: F,
 ) -> std::io::Result<Vec<JoinHandle<()>>>
 where
@@ -284,6 +285,7 @@ where
         // listener would silently accept nothing at all.
         let endpoint = build_server_endpoint(&settings, params.as_ref())?;
         let handle_connection = handle_connection.clone();
+        let connections = connections.clone();
 
         join_handles.push(tokio::spawn(async move {
             // The same per-listener cap and end-of-connection triage as
@@ -307,7 +309,7 @@ where
                     continue;
                 };
                 let handle_connection = handle_connection.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
                     if let Err(e) = handle_connection(conn).await {
                         log::log!(
@@ -407,6 +409,7 @@ mod tests {
                     congestion,
                     ..params()
                 }),
+                Default::default(),
                 move |incoming| {
                     let tx = tx.clone();
                     async move {
@@ -519,7 +522,10 @@ mod tests {
     #[tokio::test]
     async fn test_an_unbindable_address_is_a_startup_error() {
         let settings = listener(UNBINDABLE.parse().unwrap());
-        let result = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) });
+        let result =
+            start_quic_listeners(settings, Some(params()), Default::default(), |_| async {
+                Ok(())
+            });
         let err = result
             .map(|handles| handles.len())
             .expect_err("binding TEST-NET-1 must fail");
@@ -543,7 +549,10 @@ mod tests {
         // gets exactly one however many were asked for.
         let expected = if cfg!(windows) { 1 } else { 3 };
 
-        let handles = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) })
+        let handles =
+            start_quic_listeners(settings, Some(params()), Default::default(), |_| async {
+                Ok(())
+            })
             .expect("loopback must bind");
         assert_eq!(handles.len(), expected);
 
@@ -558,7 +567,10 @@ mod tests {
         let mut settings = listener(reserve_udp_port());
         settings.obfs = Some(Arc::new(obfs::Salamander::new(b"a password").unwrap()));
 
-        let handles = start_quic_listeners(settings, Some(params()), |_| async { Ok(()) })
+        let handles =
+            start_quic_listeners(settings, Some(params()), Default::default(), |_| async {
+                Ok(())
+            })
             .expect("an obfuscated listener must bind");
         assert_eq!(handles.len(), 1);
         handles.into_iter().for_each(|h| h.abort());

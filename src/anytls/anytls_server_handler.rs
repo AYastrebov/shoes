@@ -178,7 +178,7 @@ impl TcpServerHandler for AnyTlsServerHandler {
         );
 
         // Run the session in a background task
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             if let Err(e) = session.run().await {
                 log::debug!("AnyTLS session ended: {}", e);
             }
@@ -227,7 +227,7 @@ impl AnyTlsServerHandler {
         // Spawn the long-running bidirectional copy as a background task.
         // This allows the setup to complete within the timeout while the actual
         // data transfer runs indefinitely.
-        tokio::spawn(async move {
+        crate::connections::spawn(async move {
             let result = copy_bidirectional(
                 &mut *client_stream,
                 &mut *dest_stream,

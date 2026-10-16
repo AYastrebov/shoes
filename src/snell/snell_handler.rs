@@ -206,7 +206,7 @@ impl TcpServerHandler for SnellServerHandler {
 
                 let initial_data = stream_reader.unparsed_data_owned();
 
-                tokio::spawn(async move {
+                crate::connections::spawn(async move {
                     if let Err(e) = handle_h2mux_session(
                         server_stream,
                         initial_data,

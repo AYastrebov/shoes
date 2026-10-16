@@ -618,7 +618,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     let resolver = self.resolver.clone();
                     let udp_enabled = self.udp_enabled;
 
-                    tokio::spawn(async move {
+                    crate::connections::spawn(async move {
                         if let Err(e) = handle_h2mux_session(
                             Box::new(vmess_stream),
                             None, // initial data already fed to vmess_stream

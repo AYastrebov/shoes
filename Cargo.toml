@@ -204,7 +204,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["time"] }
+tokio-util = { version = "0.7", features = ["rt", "time"] }
 url = "2"
 webpki-roots = { version = "1" }
 x509-parser = { version = "0.18", default-features = false, features = ["verify-aws"] }

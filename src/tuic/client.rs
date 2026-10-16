@@ -259,6 +259,7 @@ mod tests {
             resolver,
             false,
             CongestionControl::Cubic,
+            Default::default(),
         )
         .await
         .unwrap();

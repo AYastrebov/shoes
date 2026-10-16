@@ -434,7 +434,9 @@ mod linux {
             // reply sockets' share of the budgets until its cancellation
             // lands, which on another worker can be after this one's first
             // datagram asks for a session. Its datagrams wait in the queue.
-            let task = Some(tokio::spawn(async move {
+            // Into the listener's connection set (the demux runs in its
+            // scope), so a reload can drain or cancel the flow.
+            let task = Some(crate::connections::spawn(async move {
                 if let Some(predecessor) = predecessor {
                     let _ = predecessor.await;
                 }
@@ -527,6 +529,7 @@ mod linux {
     pub async fn start_tproxy_udp_server(
         config: ServerConfig,
         resolver: Arc<dyn Resolver>,
+        connections: &crate::connections::ConnectionSet,
     ) -> std::io::Result<Vec<JoinHandle<()>>> {
         let ServerProxyConfig::Tproxy {
             udp_timeout,
@@ -578,14 +581,14 @@ mod linux {
                 shared_budget: Some(Arc::new(Semaphore::new(udp_nat_max))),
             };
             let reply_budget = Arc::new(Semaphore::new(udp_nat_max));
-            handles.push(tokio::spawn(demux(
+            handles.push(tokio::spawn(connections.scope(demux(
                 listener,
                 bind,
                 selector.clone(),
                 resolver.clone(),
                 limits,
                 reply_budget,
-            )));
+            ))));
         }
         Ok(handles)
     }

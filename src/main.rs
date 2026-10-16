@@ -26,11 +26,17 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use shoes::cli::{generate_reality_keypair, get_num_threads, set_num_threads};
-use shoes::control::servers::{PreparedServers, launch_servers, prepare_servers};
+use shoes::control::servers::{Ending, Launched, PreparedServers, launch_servers, prepare_servers};
 use shoes::{config, logging};
 
 #[derive(Debug)]
 struct ConfigChanged;
+
+/// How long a reload lets the previous configuration's connections finish
+/// before cancelling them. Long enough for a page load or a short download
+/// to complete on the old settings, short enough that a rule an operator
+/// removed stops applying within a minute.
+const RELOAD_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Watch `paths` for edits. Built after the first configuration has loaded,
 /// so every path is one that was just read: a missing file is reported by
@@ -397,10 +403,10 @@ fn main() {
             } = prepared;
             let mut running = None;
 
-            let join_handles = match launch(servers).await {
-                Ok(handles) => {
+            let launched = match launch(servers).await {
+                Ok(launched) => {
                     running = Some(loaded);
-                    handles
+                    Some(launched)
                 }
                 Err(e) if first_launch => {
                     eprintln!("{e}\n");
@@ -412,7 +418,7 @@ fn main() {
                     // gone, so there is nothing to keep; but the process
                     // survives and the next edit retries.
                     eprintln!("{e}\nNo servers are running; fix the config to retry.");
-                    Vec::new()
+                    None
                 }
             };
             first_launch = false;
@@ -436,7 +442,7 @@ fn main() {
             prepared = loop {
                 let debounce = tokio::select! {
                     biased;
-                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
+                    (what, code) = signals.recv() => shut_down(what, code, launched).await,
                     () = reload.recv() => false,
                     () = async {
                         match reload_state.as_mut() {
@@ -513,7 +519,7 @@ fn main() {
                         reload.drain();
                         Some(prepare(&args, reload_state.as_mut().map(|(w, _)| w)).await)
                     } => outcome,
-                    (what, code) = signals.recv() => shut_down(what, code, join_handles).await,
+                    (what, code) = signals.recv() => shut_down(what, code, launched).await,
                 };
 
                 match outcome {
@@ -528,13 +534,27 @@ fn main() {
             };
 
             println!("Restarting servers..");
-            for join_handle in &join_handles {
-                join_handle.abort();
-            }
-            // Awaited, not slept over: abort only schedules cancellation,
-            // and the replacements bind these same addresses next.
-            for join_handle in join_handles {
-                let _ = join_handle.await;
+            if let Some(mut launched) = launched {
+                // Awaited, not slept over: abort only schedules
+                // cancellation, and the replacements bind these same
+                // addresses next.
+                launched.stop_accepting().await;
+                // The live connections finish on the configuration they
+                // started with, in the background, while the new one
+                // serves; whatever outlives the grace is cancelled rather
+                // than left running on a configuration nothing owns.
+                tokio::spawn(async move {
+                    let live = launched.connections().len();
+                    let cancelled = launched.end(Ending::Drain(RELOAD_DRAIN)).await;
+                    if live > 0 {
+                        println!(
+                            "Previous configuration: {} of {live} connection(s) finished, \
+                             {cancelled} cancelled after {}s",
+                            live - cancelled,
+                            RELOAD_DRAIN.as_secs()
+                        );
+                    }
+                });
             }
         }
     });
@@ -551,17 +571,10 @@ fn main() {
 /// shell convention (128+signum) has it -- exiting 0 made wrappers that
 /// key on "user interrupted" (shell loops, make, CI) restart the proxy
 /// they had just asked to stop.
-async fn shut_down(
-    what: &'static str,
-    code: i32,
-    join_handles: Vec<tokio::task::JoinHandle<()>>,
-) -> ! {
+async fn shut_down(what: &'static str, code: i32, launched: Option<Launched>) -> ! {
     println!("\nReceived {what}, shutting down..");
-    for join_handle in &join_handles {
-        join_handle.abort();
-    }
-    for join_handle in join_handles {
-        let _ = join_handle.await;
+    if let Some(launched) = launched {
+        launched.end(Ending::Abort).await;
     }
     log::logger().flush();
     std::process::exit(code);
@@ -786,7 +799,7 @@ async fn prepare(
     Ok(Loaded { servers, sources })
 }
 
-async fn launch(servers: PreparedServers) -> Result<Vec<tokio::task::JoinHandle<()>>, String> {
+async fn launch(servers: PreparedServers) -> Result<Launched, String> {
     println!("\nStarting {} server(s)..", servers.len());
     launch_servers(servers)
         .await

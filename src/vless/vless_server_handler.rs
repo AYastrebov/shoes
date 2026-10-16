@@ -107,7 +107,7 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     // Spawn the long-running bidirectional copy as a background task.
     // This allows the setup to complete within the timeout while the actual
     // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    crate::connections::spawn(async move {
         let mut client_stream = client_stream;
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut client_stream,
@@ -205,7 +205,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     // Pass any unparsed data for the h2mux session
                     let initial_data = stream_reader.unparsed_data_owned();
 
-                    tokio::spawn(async move {
+                    crate::connections::spawn(async move {
                         if let Err(e) = handle_h2mux_session(
                             server_stream,
                             initial_data,

@@ -261,6 +261,7 @@ mod tests {
             direct_selector(resolver.clone()),
             resolver,
             true,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -572,6 +573,7 @@ mod tests {
             http_chain_selector(proxy, resolver.clone()),
             resolver.clone(),
             true,
+            Default::default(),
         )
         .await
         .unwrap();

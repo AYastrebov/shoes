@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use log::{debug, error};
 use tokio::task::JoinHandle;
+
+use crate::connections::ConnectionSet;
 use tokio::time::timeout;
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
@@ -72,6 +74,7 @@ async fn run_tcp_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    connections: ConnectionSet,
 ) {
     let TcpConfig { no_delay } = tcp_config;
     let limiter = Arc::new(tokio::sync::Semaphore::new(
@@ -117,7 +120,7 @@ async fn run_tcp_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{}:{} finished successfully", addr.ip(), addr.port()),
                 Err(e) => log::log!(
@@ -153,6 +156,7 @@ async fn run_unix_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     sniff: Option<SniffSettings>,
+    connections: ConnectionSet,
 ) {
     let limiter = Arc::new(tokio::sync::Semaphore::new(
         crate::util::MAX_INFLIGHT_PER_LISTENER,
@@ -179,7 +183,7 @@ async fn run_unix_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let cloned_sniff = sniff.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             match process_stream(stream, cloned_handler, cloned_resolver, cloned_sniff).await {
                 Ok(()) => debug!("{addr:?} finished successfully"),
                 Err(e) => log::log!(
@@ -351,9 +355,14 @@ pub async fn run_udp_copy(
     copy_result
 }
 
+/// Start `config`'s listeners. The connections they accept run in
+/// `connections`, which the caller owns: stopping the returned accept loops
+/// stops new connections, and draining or aborting the set is what ends the
+/// live ones.
 pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
+    connections: &ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(any(unix, windows))]
@@ -365,7 +374,9 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver, connections).await
+        }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
@@ -373,11 +384,12 @@ pub async fn start_servers(
 async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    connections: &ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = Vec::with_capacity(3);
 
     match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
+        Transport::Tcp => match start_tcp_servers(config.clone(), resolver, connections).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -388,7 +400,7 @@ async fn start_tcp_or_quic_servers(
                 return Err(e);
             }
         },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
+        Transport::Quic => match start_quic_servers(config.clone(), resolver, connections).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -403,7 +415,9 @@ async fn start_tcp_or_quic_servers(
         // Linux.
         #[cfg(target_os = "linux")]
         Transport::Udp => {
-            match crate::tproxy::start_tproxy_udp_server(config.clone(), resolver).await {
+            match crate::tproxy::start_tproxy_udp_server(config.clone(), resolver, connections)
+                .await
+            {
                 Ok(handles) => join_handles.extend(handles),
                 Err(e) => return Err(e),
             }
@@ -430,6 +444,7 @@ async fn start_tcp_or_quic_servers(
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    connections: &ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -489,6 +504,7 @@ async fn start_tcp_servers(
                         resolver,
                         tcp_handler,
                         sniff,
+                        connections.clone(),
                     ));
                     handles.push(handle);
                 }
@@ -504,7 +520,13 @@ async fn start_tcp_servers(
                         .into();
                 debug!("TCP handler: {tcp_handler:?}");
                 let listener = bind_unix_listener(_path_buf).await?;
-                let handle = tokio::spawn(run_unix_server(listener, resolver, tcp_handler, sniff));
+                let handle = tokio::spawn(run_unix_server(
+                    listener,
+                    resolver,
+                    tcp_handler,
+                    sniff,
+                    connections.clone(),
+                ));
                 handles.push(handle);
             }
             #[cfg(not(target_family = "unix"))]
