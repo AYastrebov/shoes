@@ -41,9 +41,41 @@ fn create_auth_credentials(
     }
 }
 
+/// What a layer of a client chain may need to know about the hop it runs on.
+#[derive(Debug, Clone)]
+pub struct HopContext {
+    /// The proxy server's address as dialled, `host:port` with an IPv6 host
+    /// bracketed: the `Host` a WebSocket or HTTPUpgrade request falls back to.
+    pub dialled_address: String,
+    /// The TLS server name of the layer below, which HTTPUpgrade prefers over
+    /// the dialled address (sing-box transport/v2rayhttpupgrade/client.go).
+    pub tls_server_name: Option<String>,
+}
+
+impl HopContext {
+    pub fn new(server: &crate::address::NetLocation) -> Self {
+        let dialled_address = match server.address() {
+            crate::address::Address::Ipv6(ip) => format!("[{ip}]:{}", server.port()),
+            _ => server.to_string(),
+        };
+        Self {
+            dialled_address,
+            tls_server_name: None,
+        }
+    }
+
+    fn under_tls(&self, server_name: Option<String>) -> Self {
+        Self {
+            dialled_address: self.dialled_address.clone(),
+            tls_server_name: server_name,
+        }
+    }
+}
+
 pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
     default_sni_hostname: Option<String>,
+    hop: &HopContext,
     resolver: Arc<dyn Resolver>,
 ) -> Box<dyn TcpClientHandler> {
     match client_proxy_config {
@@ -151,6 +183,7 @@ pub fn create_tcp_client_handler(
             } else {
                 sni_hostname.into_option()
             };
+            let inner_hop = hop.under_tls(sni_hostname.clone());
 
             let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
                 // Certificates are already embedded as PEM data during config validation
@@ -197,7 +230,8 @@ pub fn create_tcp_client_handler(
                     *udp_enabled,
                 ))
             } else {
-                let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+                let handler =
+                    create_tcp_client_handler(*protocol, None, &inner_hop, resolver.clone());
 
                 Box::new(TlsClientHandler::new(
                     client_config,
@@ -225,6 +259,7 @@ pub fn create_tcp_client_handler(
 
             // Determine SNI hostname
             let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
+            let inner_hop = hop.under_tls(sni_hostname.clone());
             let server_name = match sni_hostname {
                 Some(s) => rustls::pki_types::ServerName::try_from(s)
                     .unwrap()
@@ -259,7 +294,8 @@ pub fn create_tcp_client_handler(
                     ),
                 )
             } else {
-                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+                let inner_handler =
+                    create_tcp_client_handler(*protocol, None, &inner_hop, resolver.clone());
                 Box::new(crate::reality_client_handler::RealityClientHandler::new(
                     public_key_bytes,
                     short_id_bytes,
@@ -296,7 +332,7 @@ pub fn create_tcp_client_handler(
                 true,       // tls13_only - required for ShadowTLS v3
             ));
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+            let handler = create_tcp_client_handler(*protocol, None, hop, resolver.clone());
 
             Box::new(ShadowTlsClientHandler::new(
                 password.into_inner(),
@@ -330,9 +366,10 @@ pub fn create_tcp_client_handler(
                 protocol,
             } = websocket_client_config;
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+            let handler = create_tcp_client_handler(*protocol, None, hop, resolver.clone());
 
             Box::new(WebsocketTcpClientHandler::new(
+                hop.dialled_address.clone(),
                 matching_path,
                 matching_headers.map(|h| h.into_iter().collect()),
                 ping_type,
@@ -347,10 +384,11 @@ pub fn create_tcp_client_handler(
                 protocol,
             } = httpupgrade_client_config;
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+            let handler = create_tcp_client_handler(*protocol, None, hop, resolver.clone());
 
             Box::new(HttpUpgradeTcpClientHandler::new(
-                host,
+                host.or_else(|| hop.tls_server_name.clone())
+                    .unwrap_or_else(|| hop.dialled_address.clone()),
                 matching_path,
                 matching_headers.map(|h| h.into_iter().collect()),
                 handler,
@@ -425,4 +463,29 @@ pub fn create_tcp_client_proxy_selector(
         })
         .collect::<Vec<_>>();
     ClientProxySelector::new(rules)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+
+    #[test]
+    fn the_dialled_address_brackets_an_ipv6_host() {
+        let v6 = NetLocation::from_str("[2001:db8::1]:443", None).unwrap();
+        assert_eq!(HopContext::new(&v6).dialled_address, "[2001:db8::1]:443");
+        let name = NetLocation::from_str("proxy.example.com:8443", None).unwrap();
+        assert_eq!(
+            HopContext::new(&name).dialled_address,
+            "proxy.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn under_tls_keeps_the_dialled_address() {
+        let hop = HopContext::new(&NetLocation::from_str("1.2.3.4:443", None).unwrap())
+            .under_tls(Some("cdn.example.com".to_string()));
+        assert_eq!(hop.dialled_address, "1.2.3.4:443");
+        assert_eq!(hop.tls_server_name.as_deref(), Some("cdn.example.com"));
+    }
 }

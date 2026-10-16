@@ -930,6 +930,7 @@ mod tests {
             close_fd_on_drop: true,
             utun_header: false,
             orphan_timeout: Duration::from_secs(60),
+            icmp_enabled: true,
         }
     }
 
@@ -1049,6 +1050,7 @@ mod tests {
                 close_fd_on_drop: true,
                 utun_header: false,
                 orphan_timeout: Duration::from_secs(60),
+                icmp_enabled: true,
             },
         )
         .unwrap();

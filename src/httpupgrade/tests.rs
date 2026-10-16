@@ -79,7 +79,7 @@ async fn a_tunnel_carries_bytes_in_both_directions() {
     });
 
     let client = HttpUpgradeTcpClientHandler::new(
-        Some("cdn.example.com".to_string()),
+        "cdn.example.com".to_string(),
         Some("/download".to_string()),
         None,
         Box::new(PassthroughClient),

@@ -535,6 +535,10 @@ pub struct TcpStackOptions {
     /// holds its four buffers for as long as the peer likes. Linux's
     /// `tcp_fin_timeout` is 60 s.
     pub orphan_timeout: Duration,
+    /// Whether ICMP and ICMPv6 reach smoltcp, which answers echo requests.
+    /// Off, they are dropped on arrival, so a ping through the tunnel times
+    /// out as `icmp_enabled: false` promises.
+    pub icmp_enabled: bool,
 }
 
 /// Longest the stack thread sleeps with nothing to do.
@@ -806,6 +810,7 @@ pub fn run_stack_loop<D: StackDevice>(
         tcp_buffer_size,
         max_connections,
         orphan_timeout,
+        icmp_enabled,
         ..
     } = options;
 
@@ -914,16 +919,16 @@ pub fn run_stack_loop<D: StackDevice>(
                                     sockets.promote(parked_handle, &notifier);
                                     promoted = true;
                                 }
-                                if is_syn && slot.is_none() {
-                                    // Check connection limit
-                                    if sockets.len() >= max_connections {
-                                        warn!(
-                                            "Connection limit reached ({}), dropping SYN from {}",
-                                            max_connections, src_addr
-                                        );
-                                        continue;
-                                    }
-
+                                if is_syn && slot.is_none() && sockets.len() >= max_connections {
+                                    // Handed to smoltcp with no socket to
+                                    // take it, so it answers RST: the client
+                                    // fails fast instead of retrying a SYN
+                                    // into silence for a minute.
+                                    warn!(
+                                        "Connection limit reached ({}), resetting SYN from {}",
+                                        max_connections, src_addr
+                                    );
+                                } else if is_syn && slot.is_none() {
                                     // debug, not info: one line per connection
                                     // at info level fills a mobile log file
                                     // with a page load's worth of noise.
@@ -979,8 +984,10 @@ pub fn run_stack_loop<D: StackDevice>(
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                        // ICMP goes to smoltcp immediately
-                        tcp_packets.push(pkt);
+                        // ICMP goes to smoltcp immediately, when allowed
+                        if icmp_enabled {
+                            tcp_packets.push(pkt);
+                        }
                     }
                     IpProtocol::Udp => {
                         // UDP goes to tokio in its pooled buffer: the pool is
@@ -1530,6 +1537,12 @@ fn should_filter_packet(packet: &[u8]) -> bool {
                 if dst_bytes == [0, 0, 0, 0] {
                     return true;
                 }
+                // Filter fragments. Nothing here reassembles (smoltcp is
+                // built without it), and the UDP path would read a first
+                // fragment as a whole datagram and a later one as a header.
+                if ip.more_frags() || ip.frag_offset() != 0 {
+                    return true;
+                }
 
                 false
             } else {
@@ -1556,6 +1569,11 @@ fn should_filter_packet(packet: &[u8]) -> bool {
                 if dst_bytes == [0u8; 16] {
                     return true;
                 }
+                // Filter fragments, for the reason above. Only the first
+                // header is checked.
+                if ip.next_header() == IpProtocol::Ipv6Frag {
+                    return true;
+                }
 
                 false
             } else {
@@ -1573,7 +1591,7 @@ pub mod test_util {
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
-        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
     };
 
     /// One IPv4 SYN, checksummed, from 10.0.0.2:`src_port` to
@@ -1626,6 +1644,36 @@ pub mod test_util {
             &mut TcpPacket::new_unchecked(&mut buffer[ip.buffer_len()..]),
             &src_addr.into(),
             &dst_addr.into(),
+            &checksums,
+        );
+        buffer
+    }
+
+    /// One IPv4 UDP datagram, checksummed, from 10.0.0.2:`src_port` to
+    /// 93.184.216.34:53.
+    pub fn udp_packet(src_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp = UdpRepr {
+            src_port,
+            dst_port: 53,
+        };
+        let src_addr = Ipv4Address::new(10, 0, 0, 2);
+        let dst_addr = Ipv4Address::new(93, 184, 216, 34);
+        let ip = Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let checksums = ChecksumCapabilities::default();
+        let mut buffer = vec![0u8; ip.buffer_len() + udp.header_len() + payload.len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer), &checksums);
+        udp.emit(
+            &mut UdpPacket::new_unchecked(&mut buffer[ip.buffer_len()..]),
+            &src_addr.into(),
+            &dst_addr.into(),
+            payload.len(),
+            |b| b.copy_from_slice(payload),
             &checksums,
         );
         buffer
@@ -1895,6 +1943,28 @@ mod tests {
             orphan_timeout: StdDuration,
             tcp_timeout: Option<SmolDuration>,
         ) -> Self {
+            Self::spawn_with_options(
+                TcpStackOptions {
+                    orphan_timeout,
+                    ..Self::options()
+                },
+                tcp_timeout,
+            )
+        }
+
+        fn options() -> TcpStackOptions {
+            TcpStackOptions {
+                mtu: 1500,
+                tcp_buffer_size: 32 * 1024,
+                max_connections: 16,
+                close_fd_on_drop: false,
+                utun_header: false,
+                orphan_timeout: StdDuration::from_secs(60),
+                icmp_enabled: true,
+            }
+        }
+
+        fn spawn_with_options(options: TcpStackOptions, tcp_timeout: Option<SmolDuration>) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
@@ -1908,15 +1978,6 @@ mod tests {
                 written: written.clone(),
                 pending: VecDeque::new(),
                 mtu: 1500,
-            };
-
-            let options = TcpStackOptions {
-                mtu: 1500,
-                tcp_buffer_size: 32 * 1024,
-                max_connections: 16,
-                close_fd_on_drop: false,
-                utun_header: false,
-                orphan_timeout,
             };
 
             let shared_state = Arc::new(Mutex::new(SharedState {
@@ -2029,6 +2090,143 @@ mod tests {
 
     fn recv_bounded_within<T>(rx: &mut Receiver<T>, what: &str) -> T {
         poll_within(what, || rx.try_recv().ok())
+    }
+
+    /// An IPv4 echo request from the client to 93.184.216.34, id 7, seq 1.
+    fn echo_request() -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, Ipv4Repr};
+        let icmp = Icmpv4Repr::EchoRequest {
+            ident: 7,
+            seq_no: 1,
+            data: b"ping",
+        };
+        let ip = Ipv4Repr {
+            src_addr: Ipv4Address::new(10, 0, 0, 2),
+            dst_addr: Ipv4Address::new(93, 184, 216, 34),
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp.buffer_len(),
+            hop_limit: 64,
+        };
+        let checksums = ChecksumCapabilities::default();
+        let mut buffer = vec![0u8; ip.buffer_len() + icmp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer), &checksums);
+        icmp.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut buffer[ip.buffer_len()..]),
+            &checksums,
+        );
+        buffer
+    }
+
+    fn is_echo_reply(packet: &[u8]) -> bool {
+        Ipv4Packet::new_checked(packet).is_ok_and(|ip| {
+            ip.next_header() == IpProtocol::Icmp && ip.payload().first() == Some(&0)
+        })
+    }
+
+    #[test]
+    fn an_echo_request_is_answered_when_icmp_is_enabled() {
+        let harness = Harness::spawn();
+        harness
+            .script_tx
+            .send(Script::Packet(echo_request()))
+            .unwrap();
+        harness.wait_for_written("an echo reply", |w| w.iter().any(|p| is_echo_reply(p)));
+        harness.stop();
+    }
+
+    /// `icmp_enabled: false` was stored by the builder and never read, so a
+    /// ping through such a tunnel was still answered.
+    #[test]
+    fn an_echo_request_is_dropped_when_icmp_is_disabled() {
+        let mut harness = Harness::spawn_with_options(
+            TcpStackOptions {
+                icmp_enabled: false,
+                ..Harness::options()
+            },
+            None,
+        );
+        harness
+            .script_tx
+            .send(Script::Packet(echo_request()))
+            .unwrap();
+        // A SYN after it, so its SYN+ACK proves the echo was processed first.
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20101)))
+            .unwrap();
+        recv_within(&mut harness.conn_rx, "the connection behind the echo");
+        harness.wait_for_written("a SYN+ACK", |w| w.iter().any(|p| is_syn_ack(p)));
+        assert!(
+            !harness
+                .written
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| is_echo_reply(p)),
+            "the echo request was answered"
+        );
+        harness.stop();
+    }
+
+    /// A SYN over the connection cap is reset, not dropped into silence the
+    /// client would retry against for a minute.
+    #[test]
+    fn a_syn_over_the_cap_draws_a_reset() {
+        #[cfg(feature = "control-stats")]
+        let _guard = counter_guard();
+        let mut harness = Harness::spawn_with_options(
+            TcpStackOptions {
+                max_connections: 1,
+                ..Harness::options()
+            },
+            None,
+        );
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20201)))
+            .unwrap();
+        recv_within(&mut harness.conn_rx, "the first connection");
+
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20202)))
+            .unwrap();
+        harness.wait_for_written("a RST for the second SYN", |w| {
+            w.iter().any(|p| {
+                segment_from_server(p).is_some_and(|s| s.rst)
+                    && TcpPacket::new_checked(&p[20..]).is_ok_and(|t| t.dst_port() == 20202)
+            })
+        });
+        assert!(harness.conn_rx.try_recv().is_err(), "no second connection");
+        harness.stop();
+    }
+
+    /// Fragments never reach a handler: a first fragment would be read as a
+    /// whole UDP datagram, a later one as a UDP header.
+    #[test]
+    fn fragments_are_filtered() {
+        let mut first = super::test_util::udp_packet(5353, b"0123456789abcdef");
+        let mut ip = Ipv4Packet::new_unchecked(&mut first);
+        ip.set_more_frags(true);
+        ip.fill_checksum();
+        assert!(should_filter_packet(&first), "a first fragment");
+
+        let mut later = super::test_util::udp_packet(5353, b"0123456789abcdef");
+        let mut ip = Ipv4Packet::new_unchecked(&mut later);
+        ip.set_frag_offset(8);
+        ip.fill_checksum();
+        assert!(should_filter_packet(&later), "a later fragment");
+
+        assert!(
+            !should_filter_packet(&super::test_util::udp_packet(5353, b"x")),
+            "a whole datagram"
+        );
+
+        let mut v6 = super::test_util::syn6_packet(20301);
+        let mut ip6 = Ipv6Packet::new_unchecked(&mut v6);
+        ip6.set_next_header(IpProtocol::Ipv6Frag);
+        assert!(should_filter_packet(&v6), "an IPv6 Fragment header");
     }
 
     #[test]

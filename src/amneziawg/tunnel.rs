@@ -323,7 +323,7 @@ impl TunnelRuntime {
             peer_public_key,
             preshared_key,
             persistent_keepalive,
-            0,
+            session_index(),
             None,
             amnezia,
         )
@@ -867,6 +867,15 @@ async fn encapsulate_loop(
 }
 
 /// Everything needed to build the tunnel's `Tunn` again.
+/// The high 24 bits of every local sender index awgtun hands out: it shifts
+/// this left by 8 and counts sessions in the low byte (`noise/mod.rs`). The
+/// index travels in clear in each initiation, so a constant one -- 0 gave
+/// `0x000000xx` -- marks every shoes client on the wire. wireguard-go draws
+/// each index at random.
+fn session_index() -> u32 {
+    rand::random::<u32>() & 0x00FF_FFFF
+}
+
 struct TunnelKeys {
     private_key: x25519::StaticSecret,
     peer_public_key: x25519::PublicKey,
@@ -962,7 +971,7 @@ async fn trailer_probe_loop(
             keys.peer_public_key,
             keys.preshared_key,
             keys.persistent_keepalive,
-            0,
+            session_index(),
             None,
             amnezia,
         ) {
@@ -1313,6 +1322,43 @@ mod tests {
             vec![datagrams.len() - 1],
             "the only recognisable WireGuard datagram must be the last one; \
              anything earlier means a decoy was sent after the handshake"
+        );
+    }
+
+    /// Two tunnels' first initiations carry different sender indices. With a
+    /// plain WireGuard config the index sits at bytes 4..8 of the initiation.
+    #[test]
+    fn sender_indices_are_random_per_tunnel() {
+        let sender_index = || {
+            let (secret, _) = keypair(1);
+            let (_, peer) = keypair(2);
+            let mut tunn = Tunn::new_with_amnezia3(
+                secret,
+                peer,
+                None,
+                None,
+                session_index(),
+                None,
+                Amnezia3Config::default(),
+            )
+            .unwrap();
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            match tunn.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(packet) => {
+                    assert_eq!(packet[0], 1, "a plain initiation");
+                    u32::from_le_bytes(packet[4..8].try_into().unwrap())
+                }
+                other => panic!("expected an initiation, got {other:?}"),
+            }
+        };
+        let indices: std::collections::HashSet<u32> = (0..8).map(|_| sender_index()).collect();
+        assert!(
+            indices.len() > 1,
+            "eight tunnels shared one index: {indices:?}"
+        );
+        assert!(
+            indices.iter().any(|i| i >> 8 != 0),
+            "every index had zero high bytes, as the constant 0 gave"
         );
     }
 

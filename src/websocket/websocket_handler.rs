@@ -135,6 +135,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 
 #[derive(Debug)]
 pub struct WebsocketTcpClientHandler {
+    /// A `Host` header from the configured headers, else the proxy address as
+    /// dialled, as sing-box does (transport/v2raywebsocket/client.go). Always
+    /// sent: a Go server refuses a request without one.
+    host: String,
     matching_path: Option<String>,
     matching_headers: Option<FxHashMap<String, String>>,
     ping_type: WebsocketPingType,
@@ -143,12 +147,21 @@ pub struct WebsocketTcpClientHandler {
 
 impl WebsocketTcpClientHandler {
     pub fn new(
+        dialled_address: String,
         matching_path: Option<String>,
-        matching_headers: Option<FxHashMap<String, String>>,
+        mut matching_headers: Option<FxHashMap<String, String>>,
         ping_type: WebsocketPingType,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
+        let configured_host = matching_headers.as_mut().and_then(|headers| {
+            let key = headers
+                .keys()
+                .find(|key| key.eq_ignore_ascii_case("host"))?
+                .clone();
+            headers.remove(&key)
+        });
         Self {
+            host: configured_host.unwrap_or(dialled_address),
             matching_path,
             matching_headers,
             ping_type,
@@ -166,7 +179,9 @@ impl WebsocketTcpClientHandler {
         let mut http_request = String::with_capacity(1024);
         http_request.push_str("GET ");
         http_request.push_str(request_path);
-        http_request.push_str(" HTTP/1.1\r\n");
+        http_request.push_str(" HTTP/1.1\r\nHost: ");
+        http_request.push_str(&self.host);
+        http_request.push_str("\r\n");
         http_request.push_str(concat!("Connection: Upgrade\r\n", "Upgrade: websocket\r\n",));
 
         if let Some(ref headers) = self.matching_headers {
@@ -271,6 +286,72 @@ mod tests {
     /// The same shape that panicked in the HTTPUpgrade server: `GET HTTP/1.1`
     /// passes a prefix test and a suffix test while carrying no request target.
     /// Both transports now split the line rather than slicing between the two.
+    #[derive(Debug)]
+    struct NeverCalled;
+
+    #[async_trait]
+    impl TcpClientHandler for NeverCalled {
+        async fn setup_client_tcp_stream(
+            &self,
+            _client_stream: Box<dyn AsyncStream>,
+            _remote_location: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            unreachable!("the handshake is never answered")
+        }
+    }
+
+    /// The request a client writes, given its configured headers.
+    async fn client_request(headers: &[(&str, &str)]) -> String {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let handler = WebsocketTcpClientHandler::new(
+            "proxy.example.com:443".to_string(),
+            Some("/ws".to_string()),
+            Some(headers),
+            WebsocketPingType::default(),
+            Box::new(NeverCalled),
+        );
+        let (near, mut far) = duplex(8192);
+        let task = tokio::spawn(async move {
+            let _ = handler
+                .setup_client_stream_common(Box::new(TestStream(near)))
+                .await;
+        });
+        let mut request = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut far, &mut request)
+            .await
+            .unwrap();
+        task.abort();
+        String::from_utf8(request[..n].to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_configured_host_names_the_dialled_address() {
+        let request = client_request(&[]).await;
+        assert!(
+            request.starts_with("GET /ws HTTP/1.1\r\nHost: proxy.example.com:443\r\n"),
+            "{request}"
+        );
+        assert_eq!(request.matches("Host:").count(), 1, "{request}");
+    }
+
+    #[tokio::test]
+    async fn a_configured_host_header_is_sent_once_in_its_place() {
+        let request = client_request(&[("host", "cdn.example.com"), ("X-A", "b")]).await;
+        assert!(
+            request.starts_with("GET /ws HTTP/1.1\r\nHost: cdn.example.com\r\n"),
+            "{request}"
+        );
+        assert_eq!(
+            request.to_lowercase().matches("host:").count(),
+            1,
+            "{request}"
+        );
+        assert!(request.contains("\r\nX-A: b\r\n"), "{request}");
+    }
+
     #[tokio::test]
     async fn a_request_line_with_no_path_is_an_error_not_a_panic() {
         let handler = WebsocketTcpServerHandler::new(vec![]);
