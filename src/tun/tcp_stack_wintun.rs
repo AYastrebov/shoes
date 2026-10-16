@@ -37,6 +37,8 @@ struct WakeEvent(HANDLE);
 // SAFETY: an event handle is a thread-safe kernel object; SetEvent and
 // waiting may happen from any thread concurrently.
 unsafe impl Send for WakeEvent {}
+// SAFETY: as above; nothing in WakeEvent is touched except through the
+// handle's thread-safe calls.
 unsafe impl Sync for WakeEvent {}
 
 impl Drop for WakeEvent {
