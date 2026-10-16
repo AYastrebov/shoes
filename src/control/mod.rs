@@ -233,8 +233,9 @@ impl ServiceHandle {
 /// module has no business deciding.
 ///
 /// `on_exit` runs once, from the service task, when the service ends for
-/// any reason the host did not ask for: `Some(message)` when it failed,
-/// `None` when it returned without an error. It is not called after
+/// any reason the host did not ask for: [`ExitReason::Failed`] when it
+/// failed, [`ExitReason::EndedUnrequested`] when it returned without an
+/// error. It is not called after
 /// [`stop_handle`]. By the time it runs `running` is already false, so a
 /// callback that stops the engine does not wait out [`STOP_TIMEOUT`].
 ///
@@ -256,7 +257,7 @@ impl ServiceHandle {
 pub fn start(
     runtime: tokio::runtime::Runtime,
     prepared: PreparedService,
-    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+    on_exit: impl FnOnce(ExitReason) + Send + 'static,
 ) -> ServiceHandle {
     reset_counters();
     start_with(
@@ -273,7 +274,7 @@ pub fn start(
 pub fn start_and_install(
     runtime: tokio::runtime::Runtime,
     prepared: PreparedService,
-    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+    on_exit: impl FnOnce(ExitReason) + Send + 'static,
     install: impl FnOnce(ServiceHandle),
 ) {
     reset_counters();
@@ -291,7 +292,7 @@ pub fn start_and_install(
 pub fn start_with<F, Fut>(
     runtime: tokio::runtime::Runtime,
     make_service: F,
-    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+    on_exit: impl FnOnce(ExitReason) + Send + 'static,
 ) -> ServiceHandle
 where
     F: FnOnce(oneshot::Receiver<()>) -> Fut,
@@ -320,7 +321,7 @@ fn reset_counters() {
 fn spawn_service<F, Fut>(
     runtime: tokio::runtime::Runtime,
     make_service: F,
-    on_exit: impl FnOnce(Option<String>) + Send + 'static,
+    on_exit: impl FnOnce(ExitReason) + Send + 'static,
 ) -> (ServiceHandle, impl FnOnce())
 where
     F: FnOnce(oneshot::Receiver<()>) -> Fut,
@@ -368,10 +369,35 @@ where
     })
 }
 
-/// What `status` and `on_exit` say about a service that returned `Ok` on its
-/// own. `run_prepared` does that only for the shutdown signal today, so this
-/// is reserved rather than expected.
+/// What `status` says about a service that returned `Ok` on its own.
+/// `run_prepared` does that only for the shutdown signal today, so this is
+/// reserved rather than expected.
 pub(crate) const ENDED_UNREQUESTED: &str = "service ended without being asked";
+
+/// Why a service ended without the host asking it to: what `on_exit` is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// It returned an error; the message is the error's.
+    Failed(String),
+    /// It returned `Ok` on its own.
+    EndedUnrequested,
+}
+
+impl ExitReason {
+    /// The sentence a host shows or stores for this exit.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Failed(message) => message,
+            Self::EndedUnrequested => ENDED_UNREQUESTED,
+        }
+    }
+}
+
+impl std::fmt::Display for ExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
 
 /// Runs at the end of the service task, however it ends. Order matters:
 /// `running` goes false first, then the host is told -- so
@@ -381,7 +407,7 @@ struct ExitGuard {
     running: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     failure: Arc<parking_lot::Mutex<Option<String>>>,
-    on_exit: Option<Box<dyn FnOnce(Option<String>) + Send>>,
+    on_exit: Option<Box<dyn FnOnce(ExitReason) + Send>>,
 }
 
 impl Drop for ExitGuard {
@@ -404,14 +430,13 @@ impl Drop for ExitGuard {
         // the iOS callback announcing a reasonless stop while
         // shoes_get_last_error answered with whatever an earlier failure
         // had written -- a stale message dressed as this stop's reason.
-        let error = self
-            .failure
-            .lock()
-            .clone()
-            .or_else(|| Some(ENDED_UNREQUESTED.to_string()));
-        *self.failure.lock() = error.clone();
+        let reason = match self.failure.lock().clone() {
+            Some(message) => ExitReason::Failed(message),
+            None => ExitReason::EndedUnrequested,
+        };
+        *self.failure.lock() = Some(reason.message().to_string());
         if let Some(on_exit) = self.on_exit.take() {
-            on_exit(error);
+            on_exit(reason);
         }
     }
 }
@@ -1054,7 +1079,7 @@ mod tests {
             move |reason| tx.send(reason).unwrap(),
         );
         let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        assert_eq!(reason.as_deref(), Some("boom"));
+        assert_eq!(reason, ExitReason::Failed("boom".to_string()));
         assert!(!handle.running.load(Ordering::SeqCst));
         let _ = stop_handle(handle);
     }
@@ -1189,7 +1214,7 @@ mod tests {
     }
 
     /// An Ok that nobody requested is still an exit the host must hear
-    /// about; `None` is what it hears.
+    /// about.
     #[test]
     fn on_exit_reports_an_unrequested_ok_with_the_recorded_sentence() {
         let (tx, rx) = mpsc::channel();
@@ -1199,10 +1224,10 @@ mod tests {
             move |reason| tx.send(reason).unwrap(),
         );
         let reason = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        // The same sentence status() records: the FFI hosts read only what
-        // on_exit carries, and None here meant a reasonless callback plus a
-        // stale shoes_get_last_error.
-        assert_eq!(reason.as_deref(), Some(ENDED_UNREQUESTED));
+        // The variant, so the FFI can tell this exit from a failure without
+        // comparing sentences; and the same sentence status() records.
+        assert_eq!(reason, ExitReason::EndedUnrequested);
+        assert_eq!(reason.message(), ENDED_UNREQUESTED);
         assert_eq!(
             handle.failure.lock().as_deref(),
             Some(ENDED_UNREQUESTED),

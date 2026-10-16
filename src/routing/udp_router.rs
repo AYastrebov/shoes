@@ -486,8 +486,16 @@ struct SessionCreateResult {
     resolved_addr: SocketAddr,
 }
 
+/// What creating a session came to. A block is an outcome of its own rather
+/// than an error kind: `PermissionDenied` used to carry it, so a real `EACCES`
+/// from a socket was remembered as a routing block.
+enum CreateOutcome {
+    Blocked,
+    Remote(SessionCreateResult),
+}
+
 /// Type alias for the session creation future
-type SessionCreateFuture = Pin<Box<dyn Future<Output = io::Result<SessionCreateResult>> + Send>>;
+type SessionCreateFuture = Pin<Box<dyn Future<Output = io::Result<CreateOutcome>> + Send>>;
 
 /// See `UdpRouter::remote_factory`.
 #[cfg(test)]
@@ -1138,10 +1146,10 @@ impl<'a> UdpRouter<'a> {
         } = pending;
 
         match result {
-            Ok(SessionCreateResult {
+            Ok(CreateOutcome::Remote(SessionCreateResult {
                 remote,
                 resolved_addr,
-            }) => {
+            })) => {
                 debug!(
                     "Session created for {} (resolved to {})",
                     destination, resolved_addr
@@ -1215,11 +1223,15 @@ impl<'a> UdpRouter<'a> {
                 self.sessions.insert(id, session);
                 true
             }
-            Err(e) => {
-                warn!("Failed to create session for {}: {}", destination, e);
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    // Mark as blocked
-                    self.blocked.put(destination.clone(), ());
+            outcome @ (Ok(CreateOutcome::Blocked) | Err(_)) => {
+                match outcome {
+                    Ok(_) => {
+                        debug!("UDP proxying blocked to {destination}");
+                        self.blocked.put(destination.clone(), ());
+                    }
+                    // Not cached: a failure here is the socket's or the
+                    // remote's, and the next packet should try again.
+                    Err(e) => warn!("Failed to create session for {}: {}", destination, e),
                 }
                 // Remove from pending in lookup
                 match (&mut self.session_lookup, &lookup_key) {
@@ -1257,15 +1269,12 @@ impl<'a> UdpRouter<'a> {
                         .connect_udp_bidirectional(&resolver, remote_location)
                         .await?;
 
-                    Ok(SessionCreateResult {
+                    Ok(CreateOutcome::Remote(SessionCreateResult {
                         remote: client_stream,
                         resolved_addr,
-                    })
+                    }))
                 }
-                ConnectDecision::Block => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Destination blocked by routing rules",
-                )),
+                ConnectDecision::Block => Ok(CreateOutcome::Blocked),
             }
         })
     }
@@ -1945,10 +1954,10 @@ mod tests {
         router.remote_factory = Some(Box::new(move |_destination| {
             let remote: Box<dyn AsyncMessageStream> = Box::new(FakeRemote(state.clone()));
             Box::pin(async move {
-                Ok(SessionCreateResult {
+                Ok(CreateOutcome::Remote(SessionCreateResult {
                     remote,
                     resolved_addr: "192.0.2.1:9".parse().unwrap(),
-                })
+                }))
             })
         }));
         router.await
@@ -2260,6 +2269,44 @@ mod tests {
 
     /// A destination the rules block must not take the router down, and must
     /// not stop traffic to destinations that are allowed.
+    /// Run a router for one packet to `destination`, its session created by
+    /// `outcome`, and report whether the destination was remembered as blocked.
+    async fn remembered_as_blocked(outcome: fn() -> io::Result<CreateOutcome>) -> bool {
+        let destination: SocketAddr = "192.0.2.7:9".parse().unwrap();
+        let (stream, _inner) = scripted(vec![(location(destination), b"one".to_vec())], usize::MAX);
+        let mut server = ServerStream::Targeted(Box::new(stream));
+        let resolver = test_resolver();
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        router.remote_factory = Some(Box::new(move |_| Box::pin(async move { outcome() })));
+        let _ = tokio::time::timeout(Duration::from_millis(200), &mut router).await;
+        router.blocked.contains(&location(destination))
+    }
+
+    /// A socket's own `EACCES` is a failure to retry, not a rule: it used to
+    /// share `PermissionDenied` with "blocked by rules" and was cached as one,
+    /// so the destination stayed unreachable for as long as the LRU kept it.
+    #[tokio::test]
+    async fn test_a_failed_connect_is_not_remembered_as_a_block() {
+        assert!(
+            !remembered_as_blocked(|| Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)"
+            )))
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_rules_block_is_remembered() {
+        assert!(remembered_as_blocked(|| Ok(CreateOutcome::Blocked)).await);
+    }
+
     #[tokio::test]
     async fn test_a_blocked_destination_does_not_stall_the_rest() {
         let echo = spawn_udp_echo().await;

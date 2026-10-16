@@ -370,11 +370,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     crate::control::start_and_install(
         runtime,
         prepared,
-        |reason| {
-            if let Some(msg) = reason {
-                common::set_last_error(msg);
-            }
-        },
+        |reason| common::set_last_exit(&reason),
         |handle| {
             let service = TUN_SERVICE.get_or_init(|| parking_lot::Mutex::new(None));
             previous = service.lock().replace(handle);

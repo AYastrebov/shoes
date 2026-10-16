@@ -140,7 +140,7 @@ enum Command {
         reply: oneshot::Sender<Status>,
     },
     /// From the engine's exit callback.
-    EngineExited(Option<String>),
+    EngineExited(control::ExitReason),
     /// From the route monitor: something in the routing table moved.
     NetworkChanged,
     Shutdown,
@@ -553,14 +553,14 @@ impl<N: HostNetwork> Inner<N> {
         outcome
     }
 
-    fn engine_exited(&mut self, reason: Option<String>) {
+    fn engine_exited(&mut self, reason: control::ExitReason) {
         if self.handle.is_none() {
             // A stop the user asked for already took the handle; the callback
             // is not called for those, but a race between the two is cheaper
             // to ignore than to reason about.
             return;
         }
-        let message = reason.unwrap_or_else(|| "the tunnel ended unexpectedly".to_string());
+        let message = reason.message().to_string();
         log::error!("the engine exited on its own: {message}");
 
         // The handle is spent -- the task is already gone -- so it is

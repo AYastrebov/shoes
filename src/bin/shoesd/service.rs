@@ -327,7 +327,12 @@ fn start_error_to_status(error: StartError) -> Status {
             Status::already_exists("a session is already running; stop it first")
         }
         // Forwarded verbatim: this is shoes' own message about the user's own
-        // config, and rewording it would lose the field it names.
+        // config, and rewording it would lose the field it names. A config
+        // asking for what this platform cannot do -- a Linux-only inbound on
+        // macOS -- is well-formed: the precondition that fails is the host's.
+        StartError::Config(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            Status::failed_precondition(e.to_string())
+        }
         StartError::Config(e) => Status::invalid_argument(e.to_string()),
         StartError::Device(message) => Status::failed_precondition(message),
         // The daemon has already undone whatever it applied, which is what
@@ -981,6 +986,26 @@ mod tests {
         assert_eq!(status.state, proto::status::State::Stopped as i32);
 
         let _ = shutdown.send(());
+    }
+
+    #[test]
+    fn a_config_this_platform_cannot_run_is_a_failed_precondition() {
+        let unsupported = StartError::Config(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the tproxy inbound needs Linux",
+        ));
+        let status = start_error_to_status(unsupported);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "the tproxy inbound needs Linux");
+
+        let malformed = StartError::Config(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unknown field `prot`",
+        ));
+        assert_eq!(
+            start_error_to_status(malformed).code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     /// A config the engine cannot parse comes back as INVALID_ARGUMENT with

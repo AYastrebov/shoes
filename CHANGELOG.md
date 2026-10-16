@@ -46,6 +46,22 @@ One crate, one pipeline (plan PR 1.2; A-1, A-6, A-8):
 - **`shoesd` reports a stop the supervisor could not confirm as timed out**,
   not released, so a client does not reuse a device nothing vouched for.
 
+Typed outcomes at the layer boundaries (plan PR 1.3; A-3):
+
+- **A socket's own `EACCES` is no longer cached as a routing block.** The UDP
+  router used `PermissionDenied` to mean "blocked by rules", so a real
+  permission failure kept its destination unreachable for as long as the
+  block cache held it. A block is now an outcome of its own; a failure is
+  retried on the next packet.
+- **`on_exit` carries an `ExitReason`** -- `Failed(message)` or
+  `EndedUnrequested` -- instead of an optional string, and the FFI tells a
+  stop's own echo from a real failure by that variant rather than by
+  comparing sentences. A failure whose message happened to read like the
+  unrequested sentence used to be discarded.
+- **`shoesd` answers a config this platform cannot run with
+  `FAILED_PRECONDITION`**, not `INVALID_ARGUMENT`: the document is well-formed,
+  and what fails is the host.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
