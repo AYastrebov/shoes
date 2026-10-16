@@ -424,6 +424,18 @@ impl AsyncFlushMessage for Socks5UdpRelayStream {
     }
 }
 
+/// The reader task holds the socket and parks in `recv` until a datagram
+/// arrives, so dropping the stream -- the normal end of an association, when
+/// the TCP control connection closes -- left it, and the bound port, alive
+/// for the life of the process unless a shutdown happened to run first.
+impl Drop for Socks5UdpRelayStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.reader_task.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl AsyncShutdownMessage for Socks5UdpRelayStream {
     fn poll_shutdown_message(
         self: Pin<&mut Self>,
@@ -452,6 +464,27 @@ impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dropping the stream releases its port: the reader task is aborted
+    /// with it. Before, the task parked in `recv` kept the socket bound.
+    #[tokio::test]
+    async fn dropping_the_stream_releases_its_port() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let stream = Socks5UdpRelayStream::new(socket, None);
+        drop(stream);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match std::net::UdpSocket::bind(addr) {
+                Ok(_) => return,
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    panic!("the port is still bound 100 ms after the drop: {e}")
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
 
     #[test]
     fn test_parse_ipv4_packet() {

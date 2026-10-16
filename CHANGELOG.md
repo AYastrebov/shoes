@@ -104,6 +104,15 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
 - A property test checks that a generated config parses, writes back, and
   parses to the same thing.
 
+Cancellation and waiting (plan PR 1.5, part 1; A-4 in part, A-8):
+
+- **A SOCKS5 UDP association releases its port when it ends.** Its reader
+  task was aborted only by an explicit shutdown; on the normal end, the TCP
+  control connection closing, it stayed parked in `recv`, holding the bound
+  socket for the life of the process.
+- **Stopping a service waits on its exit instead of polling** every 5 ms, and
+  `shoesd` waits on the TUN device being published instead of every 20 ms.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
