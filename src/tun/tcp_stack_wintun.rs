@@ -434,6 +434,7 @@ mod tests {
                 close_fd_on_drop: false,
                 utun_header: false,
                 orphan_timeout: std::time::Duration::from_secs(60),
+                icmp_enabled: true,
             },
         )
         .unwrap();

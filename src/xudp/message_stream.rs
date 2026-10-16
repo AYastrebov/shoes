@@ -201,11 +201,33 @@ impl XudpMessageStream {
             let is_end = status_byte == 0x03; // SessionStatus::End
             let is_keepalive = status_byte == 0x04; // SessionStatus::KeepAlive
 
-            // For End or KeepAlive frames, or frames without data, we only need the metadata
+            // For End or KeepAlive frames, or frames without data, nothing is delivered
             if is_end || is_keepalive || !has_data {
+                // An End or KeepAlive may carry OptionData, which Xray reads and discards
+                // (common/mux/server.go, handleStatusKeepAlive and handleStatusEnd). Its
+                // length and bytes must be consumed with the frame, or the next frame is
+                // read from the middle of them.
+                let discard_len = if has_data {
+                    let data_len_offset = 2 + metadata_len;
+                    if self.read_buffer.len() < data_len_offset + 2 {
+                        return Ok(None);
+                    }
+                    let data_len = u16::from_be_bytes([
+                        self.read_buffer[data_len_offset],
+                        self.read_buffer[data_len_offset + 1],
+                    ]) as usize;
+                    if self.read_buffer.len() < data_len_offset + 2 + data_len {
+                        return Ok(None);
+                    }
+                    2 + data_len
+                } else {
+                    0
+                };
+
                 // We have enough data to decode this frame - proceed with actual decode
                 let metadata = FrameMetadata::decode(&mut self.read_buffer)?
                     .expect("metadata decode should succeed after length check");
+                self.read_buffer.advance(discard_len);
 
                 log::debug!(
                     "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -680,3 +702,63 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
 }
 
 impl AsyncSessionMessageStream for XudpMessageStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::testing::TestStream;
+
+    fn frame(status: SessionStatus, target: Option<NetLocation>, data: &[u8]) -> BytesMut {
+        let mut buf = BytesMut::new();
+        FrameMetadata {
+            session_id: 1,
+            status,
+            option: FrameOption::new().with_data(),
+            network: target.as_ref().map(|_| TargetNetwork::Udp),
+            target,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// A KeepAlive carrying OptionData, then a New frame: both are consumed and
+    /// the New frame's payload is what comes out.
+    #[tokio::test]
+    async fn data_on_a_keepalive_is_skipped_with_its_frame() {
+        let (near, _far) = tokio::io::duplex(1024);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let target = NetLocation::new(Address::Ipv4("1.1.1.1".parse().unwrap()), 53);
+
+        stream
+            .read_buffer
+            .extend_from_slice(&frame(SessionStatus::KeepAlive, None, &[0xAA; 10]));
+        stream.read_buffer.extend_from_slice(&frame(
+            SessionStatus::New,
+            Some(target.clone()),
+            b"hi",
+        ));
+
+        let (data, destination) = stream.try_decode_one_frame().unwrap().unwrap();
+        assert_eq!(data, b"hi");
+        assert_eq!(destination, target);
+        assert!(stream.read_buffer.is_empty());
+    }
+
+    /// A KeepAlive whose data has not fully arrived waits rather than
+    /// consuming its metadata alone.
+    #[tokio::test]
+    async fn a_partial_keepalive_waits_for_its_data() {
+        let (near, _far) = tokio::io::duplex(1024);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)));
+        let whole = frame(SessionStatus::KeepAlive, None, &[0xAA; 10]);
+        stream
+            .read_buffer
+            .extend_from_slice(&whole[..whole.len() - 3]);
+
+        assert!(stream.try_decode_one_frame().unwrap().is_none());
+        assert_eq!(stream.read_buffer.len(), whole.len() - 3);
+    }
+}

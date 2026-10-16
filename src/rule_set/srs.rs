@@ -309,6 +309,11 @@ fn read_ip_set(reader: &mut Reader<'_>) -> Result<IpSet> {
         let to = read_addr(reader)?;
         ranges.push((from, to));
     }
+    // sing-box writes every IPv4 range before any IPv6 one and reads them back
+    // into separate lists (common/srs/ip_set.go). shoes keeps one u128 space
+    // with IPv4 mapped into ::ffff:0:0/96, above ::1 or 64:ff9b::/96, so the
+    // file's order is not ours: sort by start.
+    ranges.sort_unstable_by_key(|&(from, _)| from);
     IpSet::new(ranges)
 }
 

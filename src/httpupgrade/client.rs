@@ -9,7 +9,8 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
 pub struct HttpUpgradeTcpClientHandler {
-    host: Option<String>,
+    /// Always sent: a Go server answers a request without one with 400.
+    host: String,
     request_path: String,
     /// Sorted, and with the three headers this transport owns removed, so the
     /// bytes on the wire are the same on every run and cannot be forged from
@@ -20,7 +21,7 @@ pub struct HttpUpgradeTcpClientHandler {
 
 impl HttpUpgradeTcpClientHandler {
     pub fn new(
-        host: Option<String>,
+        host: String,
         matching_path: Option<String>,
         matching_headers: Option<Vec<(String, String)>>,
         handler: Box<dyn TcpClientHandler>,
@@ -54,11 +55,9 @@ impl HttpUpgradeTcpClientHandler {
         request.push_str(&self.request_path);
         request.push_str(" HTTP/1.1\r\n");
 
-        if let Some(ref host) = self.host {
-            request.push_str("Host: ");
-            request.push_str(host);
-            request.push_str("\r\n");
-        }
+        request.push_str("Host: ");
+        request.push_str(&self.host);
+        request.push_str("\r\n");
 
         for (key, value) in self.headers.iter() {
             request.push_str(key);
@@ -188,7 +187,7 @@ mod tests {
         received: Arc<Mutex<Vec<u8>>>,
     ) -> HttpUpgradeTcpClientHandler {
         HttpUpgradeTcpClientHandler::new(
-            host.map(String::from),
+            host.unwrap_or("proxy.example.com:443").to_string(),
             Some("/download".to_string()),
             headers.map(|hs| {
                 hs.into_iter()
@@ -249,6 +248,16 @@ mod tests {
         assert!(
             !request.to_lowercase().contains("sec-websocket"),
             "request carried a websocket header: {request}"
+        );
+        // With no `host` configured, the address the factory passed down.
+        assert_eq!(
+            request.matches("Host: ").count(),
+            1,
+            "exactly one Host line: {request}"
+        );
+        assert!(
+            request.contains("\r\nHost: proxy.example.com:443\r\n"),
+            "{request}"
         );
 
         far.write_all(GOOD_RESPONSE).await.unwrap();

@@ -34,6 +34,27 @@ RE-R6, VL-V4):
   Xray does; one of 64 KB or more used to wrap the u16 length and corrupt the
   stream.
 
+Seven correctness bugs, each with a known consumer (RS-1, WG-A1, TN-T1,
+TN-T2, TN-T3, TR-2, XU-X1):
+
+- **A sing-box rule-set mixing IPv4 with low IPv6 ranges loads.** One holding
+  `::1/128` or `64:ff9b::/96` next to IPv4 was refused as unsorted, which
+  failed the whole config.
+- **AmneziaWG and WireGuard initiations carry a random sender index.** It was
+  always `0x000000xx`, in clear, on every shoes client.
+- **`icmp_enabled: false` drops ICMP.** It was stored and never read, so ping
+  through the tunnel was still answered.
+- **A SYN over the TUN connection cap is reset** rather than dropped, so the
+  client fails at once instead of retrying for a minute.
+- **The TUN drops IP fragments.** Nothing reassembles them, and a UDP
+  fragment was read as a whole datagram.
+- **WebSocket and HTTPUpgrade clients always send `Host`**, which Go servers
+  require. WebSocket takes it from `matching_headers`, else the proxy address
+  as dialled; HTTPUpgrade from `host`, else the TLS server name, else the
+  address -- sing-box's orders. CONFIG.md said otherwise and is corrected.
+- **XUDP consumes data attached to a KeepAlive or End frame**; it used to
+  read the next frame from the middle of it.
+
 ## v0.4.1
 
 `awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no

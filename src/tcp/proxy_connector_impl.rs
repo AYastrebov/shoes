@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use log::debug;
 
 use super::proxy_connector::ProxyConnector;
-use super::tcp_client_handler_factory::create_tcp_client_handler;
+use super::tcp_client_handler_factory::{HopContext, create_tcp_client_handler};
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientConfig;
@@ -42,10 +42,11 @@ impl ProxyConnectorImpl {
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
         Some(Self {
-            location: config.address,
+            location: config.address.clone(),
             client_handler: create_tcp_client_handler(
                 config.protocol,
                 default_sni_hostname,
+                &HopContext::new(&config.address),
                 resolver,
             ),
         })

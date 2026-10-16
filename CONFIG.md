@@ -846,6 +846,11 @@ protocol:
   protocol: ClientProxyConfig
 ```
 
+The request always carries a `Host` header: a `Host` entry in
+`matching_headers` if there is one, otherwise the proxy's address as dialled
+(`host:port`), as sing-box sends. Put the CDN or fronted name in
+`matching_headers` when it differs from the address.
+
 ### HTTPUpgrade Client
 ```yaml
 protocol:
@@ -857,10 +862,12 @@ protocol:
   protocol: ClientProxyConfig
 ```
 
-Set `host` whenever a CDN, or a sing-box server with its own `host` configured,
-sits in front: left unset the request goes out without a `Host` header, which a
-bare sing-box server accepts and a CDN does not. `Host`, `Connection` and
-`Upgrade` in `matching_headers` are ignored -- the transport owns all three.
+The request always carries a `Host` header, since a Go server answers one
+without it with `400`. It is `host` if set, otherwise the TLS server name of the
+layer below, otherwise the proxy's address as dialled (`host:port`) -- sing-box's
+order. Set `host` whenever a CDN, or a sing-box server with its own `host`
+configured, sits in front. `Host`, `Connection` and `Upgrade` in
+`matching_headers` are ignored -- the transport owns all three.
 
 ### Port Forward (No-op)
 ```yaml

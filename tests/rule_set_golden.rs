@@ -99,3 +99,23 @@ fn an_ip_set_does_not_match_on_domain_alone() {
     let set = load("geoip-ru.srs");
     assert!(!set.matches(&domain_target("yandex.ru")));
 }
+
+/// sing-box writes IPv4 ranges as 4-byte addresses ahead of IPv6 ones, while
+/// shoes maps IPv4 into `::ffff:0:0/96`, above `::1` and `64:ff9b::/96`. A set
+/// mixing the two must still load, and match on both sides.
+/// Source: `mixed-v4-v6.json`, compiled by `regenerate-mixed-v4-v6.sh`.
+#[test]
+fn a_set_mixing_ipv4_with_low_ipv6_ranges_loads_and_matches() {
+    let set = load("mixed-v4-v6.srs");
+    assert!(set.matches(&ip_target(10, 1, 2, 3)));
+    assert!(set.matches(&ip_target(192, 168, 7, 7)));
+    assert!(!set.matches(&ip_target(8, 8, 8, 8)));
+
+    let v6 = |ip: &str| MatchTarget {
+        domain: None,
+        ip: Some(u128::from(ip.parse::<std::net::Ipv6Addr>().unwrap())),
+    };
+    assert!(set.matches(&v6("::1")));
+    assert!(set.matches(&v6("64:ff9b::808:808")));
+    assert!(!set.matches(&v6("::2")));
+}
