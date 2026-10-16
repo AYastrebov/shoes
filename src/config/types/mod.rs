@@ -38,7 +38,9 @@ pub use client::{
     WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
-pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
+pub use dns::{
+    DnsBootstrap, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec,
+};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
 pub use obfs::ObfsConfig;
 pub use redacted::Redacted;

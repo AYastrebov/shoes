@@ -20,11 +20,11 @@ use crate::thread_util::get_num_threads;
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
-    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, HttpUpgradeServerConfig, ObfsConfig, PemSource, RuleActionConfig, RuleConfig,
-    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
-    WebsocketServerConfig, direct_allow_rule,
+    DEFAULT_REALITY_SHORT_ID, DnsBootstrap, DnsConfig, DnsConfigGroup, DnsServerSpec,
+    ExpandedDnsGroup, ExpandedDnsSpec, HttpUpgradeServerConfig, ObfsConfig, PemSource,
+    RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig, ServerQuicConfig,
+    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig,
+    Transport, TunConfig, WebsocketServerConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -517,11 +517,7 @@ fn tun_dns_verdicts(groups: &[ExpandedDnsGroup]) -> HashMap<&str, TunDnsVerdict>
         let mut as_root: Option<String> = None;
         let mut as_bootstrap: Option<String> = None;
         for spec in &group.specs {
-            // Parsed successfully during expansion; unparseable URLs never
-            // reach this point.
-            let Ok(parsed) = ParsedDnsUrl::parse(&spec.url) else {
-                continue;
-            };
+            let parsed = &spec.parsed_url;
             if matches!(parsed, ParsedDnsUrl::System) {
                 as_bootstrap.get_or_insert_with(|| {
                     format!(
@@ -542,7 +538,7 @@ fn tun_dns_verdicts(groups: &[ExpandedDnsGroup]) -> HashMap<&str, TunDnsVerdict>
                 as_root.get_or_insert_with(|| msg.clone());
                 as_bootstrap.get_or_insert(msg);
             }
-            match &spec.bootstrap_url {
+            match spec.bootstrap.as_ref().map(DnsBootstrap::as_str) {
                 None => {
                     if parsed.has_hostname() {
                         let msg = format!(
@@ -561,7 +557,7 @@ fn tun_dns_verdicts(groups: &[ExpandedDnsGroup]) -> HashMap<&str, TunDnsVerdict>
                     // as-bootstrap verdict; groups are in dependency order,
                     // so it is already computed. IP-only bootstrap URLs
                     // were validated during expansion.
-                    if let Some(v) = verdicts.get(bootstrap.as_str())
+                    if let Some(v) = verdicts.get(bootstrap)
                         && let Some(reason) = &v.as_bootstrap
                     {
                         let msg = format!(
@@ -775,31 +771,38 @@ fn expand_dns_specs(
             }
         }
 
-        // Validate bootstrap_url
-        if let Some(bootstrap_url) = spec.bootstrap_url() {
-            // Must be either a known group name or a valid IP-only URL
-            if !dns_group_names.contains(bootstrap_url) {
-                let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
+        // Validate bootstrap_url: a known group name, or a valid IP-only URL.
+        let bootstrap = match spec.bootstrap_url() {
+            None => None,
+            Some(name) if dns_group_names.contains(name) => {
+                Some(DnsBootstrap::Group(name.to_string()))
+            }
+            Some(bootstrap_url) => {
+                let parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
                     std::io::Error::other(format!(
                         "invalid bootstrap_url '{}': {}",
                         bootstrap_url, e
                     ))
                 })?;
 
-                if bootstrap_parsed.has_hostname() {
+                if parsed.has_hostname() {
                     return Err(std::io::Error::other(format!(
                         "bootstrap_url '{}' contains hostname - must use IP address or dns_group name",
                         bootstrap_url
                     )));
                 }
+                Some(DnsBootstrap::Url {
+                    url: bootstrap_url.to_string(),
+                    parsed,
+                })
             }
-        }
+        };
 
         result.push(ExpandedDnsSpec {
             url: url_str.to_string(),
-            server_name: server_name_override.map(String::from),
+            parsed_url,
             client_chains: expanded_chains,
-            bootstrap_url: spec.bootstrap_url().map(String::from),
+            bootstrap,
             ip_strategy: spec.ip_strategy(),
             timeout_secs: spec.timeout_secs(),
             connect_timeout_secs: spec.connect_timeout_secs(),

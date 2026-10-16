@@ -85,6 +85,10 @@ Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
   5000 ms floor -- is checked in one place, and the runtime no longer
   re-parses and `expect`s it.
 
+- **DNS server and bootstrap URLs are parsed once**, during config
+  expansion; the TUN-DNS check and the resolver builder use the parsed form
+  instead of parsing the string again.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan
