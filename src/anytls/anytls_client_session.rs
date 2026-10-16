@@ -750,7 +750,7 @@ impl AnyTlsClientSession {
         };
 
         // Encode destination address
-        let dest_data = write_location_to_vec(&destination);
+        let dest_data = write_location_to_vec(&destination)?;
 
         // Try to take the initial buffer (only first stream gets it)
         // If present, we send Settings + SYN + destination as single message

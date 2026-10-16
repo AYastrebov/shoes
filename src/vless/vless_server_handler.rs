@@ -223,6 +223,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     remote_location,
                     stream: server_stream,
                     need_initial_flush: false,
+                    connection_failure_response: None,
                     connection_success_response: Some(
                         SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
                     ),
@@ -376,6 +377,7 @@ where
                 remote_location,
                 stream: flow_stream,
                 need_initial_flush: false,
+                connection_failure_response: None,
                 connection_success_response: None, // VisionStream will send VLESS response with first write
                 initial_remote_data: None,         // Data fed to VisionStream instead
                 proxy_selector: proxy_selector.clone(),

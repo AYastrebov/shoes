@@ -51,6 +51,28 @@ mod auth_tests {
 
 const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
 
+/// The 407 answer to missing or wrong proxy credentials (RFC 9110 section
+/// 15.5.8). It names the scheme, which FoxyProxy and similar clients need
+/// before they send credentials, and it is the same either way, so it says
+/// nothing about which was the case.
+async fn write_proxy_auth_required(
+    server_stream: &mut Box<dyn AsyncStream>,
+    http_version: &str,
+) -> std::io::Result<()> {
+    server_stream
+        .write_all(
+            format!(
+                "{http_version} 407 Proxy Authentication Required\r\n\
+                 Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    server_stream.flush().await
+}
+
 /// Compare a presented credential against the configured one in constant time.
 ///
 /// `None` means no credential is configured, which the callers only reach when
@@ -172,6 +194,7 @@ pub async fn setup_http_server_stream_inner(
                 {
                     if !auth_token_matches(&line[PROXY_AUTH_HEADER_PREFIX.len()..], auth_token) {
                         debug!("Received incorrect HTTP CONNECT authentication");
+                        write_proxy_auth_required(&mut server_stream, &http_version).await?;
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -184,11 +207,7 @@ pub async fn setup_http_server_stream_inner(
             }
 
             if need_auth {
-                // FoxyProxy and similar clients require Proxy-Authenticate header to send credentials
-                server_stream.write_all(
-                &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
-            ).await?;
-                server_stream.flush().await?;
+                write_proxy_auth_required(&mut server_stream, &http_version).await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Missing HTTP CONNECT authentication",
@@ -271,6 +290,7 @@ pub async fn setup_http_server_stream_inner(
                         if !auth_token_matches(&line[PROXY_AUTH_HEADER_PREFIX.len()..], auth_token)
                         {
                             debug!("Received incorrect HTTP GET authentication");
+                            write_proxy_auth_required(&mut server_stream, &http_version).await?;
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",
@@ -304,11 +324,7 @@ pub async fn setup_http_server_stream_inner(
             }
 
             if need_auth {
-                // FoxyProxy and similar clients require Proxy-Authenticate header to send credentials
-                server_stream.write_all(
-                &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
-            ).await?;
-                server_stream.flush().await?;
+                write_proxy_auth_required(&mut server_stream, &http_version).await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Missing HTTP GET authentication",
@@ -342,6 +358,7 @@ pub async fn setup_http_server_stream_inner(
         remote_location,
         stream: server_stream,
         need_initial_flush,
+        connection_failure_response: None,
         connection_success_response,
         initial_remote_data,
         proxy_selector,
@@ -540,6 +557,58 @@ mod tests {
             } => Ok(remote_location),
             _ => panic!("expected a TCP forward"),
         }
+    }
+
+    /// What the handler writes back to `request` with credentials configured.
+    async fn reply_with_auth(request: &str) -> String {
+        let (near, mut far) = tokio::io::duplex(4096);
+        far.write_all(request.as_bytes()).await.unwrap();
+        let token = create_http_auth_token("user", "pass");
+        let result = setup_http_server_stream_inner(
+            Some(&token),
+            Box::new(crate::async_stream::testing::TestStream(near)),
+            StreamReader::new(),
+            allow_all(),
+        )
+        .await;
+        assert!(result.is_err());
+        let mut reply = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut far, &mut reply)
+            .await
+            .unwrap();
+        String::from_utf8(reply[..n].to_vec()).unwrap()
+    }
+
+    /// A wrong password draws the same 407 as a missing one. It used to drop
+    /// the connection, which a browser reports as a network error rather
+    /// than asking for the password again.
+    #[tokio::test]
+    async fn test_a_wrong_password_is_answered_407() {
+        let wrong = create_http_auth_token("user", "wrong");
+        for request in [
+            format!(
+                "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {wrong}\r\n\r\n"
+            ),
+            format!(
+                "GET http://example.com/ HTTP/1.1\r\nProxy-Authorization: Basic {wrong}\r\n\r\n"
+            ),
+        ] {
+            let reply = reply_with_auth(&request).await;
+            assert!(
+                reply.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+                "{reply}"
+            );
+            assert!(
+                reply.contains("\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n"),
+                "{reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_credentials_are_answered_407() {
+        let reply = reply_with_auth("CONNECT example.com:443 HTTP/1.1\r\n\r\n").await;
+        assert!(reply.starts_with("HTTP/1.1 407 "), "{reply}");
     }
 
     /// An HTTP client asking for an IPv6 destination sends the address in

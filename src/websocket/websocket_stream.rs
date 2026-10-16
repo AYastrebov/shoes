@@ -34,7 +34,17 @@ pub struct WebsocketStream {
     ping_data: Box<[u8]>,
     ping_data_size: usize,
     pending_write_pong: bool,
+
+    /// The peer sent Close: reading is over (RFC 6455 section 5.5.1).
+    read_closed: bool,
+    /// A Close is owed in reply and not yet packed.
+    pending_write_close: bool,
+    /// A Close has been packed; no data frame may follow it.
+    close_sent: bool,
 }
+
+/// The largest payload a control frame may carry (RFC 6455 section 5.5).
+const MAX_CONTROL_PAYLOAD: usize = 125;
 
 #[derive(Debug, PartialEq)]
 enum ReadState {
@@ -81,7 +91,7 @@ impl WebsocketStream {
         let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
-        let ping_data = allocate_vec(80).into_boxed_slice();
+        let ping_data = allocate_vec(MAX_CONTROL_PAYLOAD).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
             unprocessed_buf[0..unprocessed_data.len()].copy_from_slice(unprocessed_data);
@@ -111,6 +121,9 @@ impl WebsocketStream {
             ping_data,
             ping_data_size: 0,
             pending_write_pong: false,
+            read_closed: false,
+            pending_write_close: false,
+            close_sent: false,
         }
     }
 
@@ -247,6 +260,20 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
+        let is_control = matches!(
+            self.read_frame_opcode,
+            OpCode::Close | OpCode::Ping | OpCode::Pong
+        );
+        if is_control && self.read_frame_length > MAX_CONTROL_PAYLOAD as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{:?} frame payload of {} bytes, over the 125 a control frame may carry",
+                    self.read_frame_opcode, self.read_frame_length
+                ),
+            ));
+        }
+
         match self.read_frame_opcode {
             OpCode::Binary | OpCode::Continue => {
                 if self.read_frame_length == 0 {
@@ -268,13 +295,6 @@ impl WebsocketStream {
                     self.pending_write_pong = true;
                     self.step_init(cx, buf)
                 } else {
-                    if self.read_frame_length as usize > self.ping_data.len() {
-                        return Err(std::io::Error::other(format!(
-                            "cannot handle ping data length ({})",
-                            self.read_frame_length
-                        )));
-                    }
-
                     // Make sure we aren't writing pongs when we're reading new ping data.
                     self.pending_write_pong = false;
                     self.read_state = ReadState::ReadPingContent;
@@ -292,17 +312,23 @@ impl WebsocketStream {
                 // So it's hard to keep track of if a pong is "valid".
                 // https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.3
 
-                // Our ping frames are always with zero data.
-                if self.read_frame_length != 0 {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected pong data length ({})",
-                        self.read_frame_length
-                    )));
+                // Our pings carry no data, but a pong may (section 5.5.3:
+                // an unsolicited one is allowed, and a heartbeat may
+                // carry anything); its payload is skipped.
+                if self.read_frame_length == 0 {
+                    self.read_state = ReadState::Init;
+                    self.step_init(cx, buf)
+                } else {
+                    self.read_state = ReadState::SkipContent;
+                    self.step_skip_content(cx, buf)
                 }
-                self.read_state = ReadState::Init;
-                self.step_init(cx, buf)
             }
-            // TODO: handle close frames
+            OpCode::Close => {
+                // The status code and reason, if any, are skipped; the reply
+                // carries none, which section 5.5.1 allows.
+                self.read_state = ReadState::SkipContent;
+                self.step_skip_content(cx, buf)
+            }
             _ => {
                 warn!("Ignoring unknown frame type: {:?}", self.read_frame_opcode);
                 if self.read_frame_length == 0 {
@@ -336,6 +362,12 @@ impl WebsocketStream {
         }
 
         self.read_state = ReadState::Init;
+        if self.read_frame_opcode == OpCode::Close {
+            // Nothing after a Close is read; answer it with one.
+            self.read_closed = true;
+            self.pending_write_close = !self.close_sent;
+            return Ok(());
+        }
         self.step_init(cx, buf)
     }
 
@@ -365,6 +397,14 @@ impl WebsocketStream {
             .copy_from_slice(content_bytes);
         self.ping_data_size += read_amount;
         self.read_frame_length -= read_amount as u64;
+
+        // Consumed, like any content: left in place, the payload was read
+        // again as the next frame's header.
+        self.unprocessed_start_offset += read_amount;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
 
         if self.read_frame_length == 0 {
             self.read_frame_mask_offset = 0;
@@ -466,6 +506,27 @@ impl WebsocketStream {
         true
     }
 
+    /// Pack the owed Close, if there is room. Returns whether one is still owed.
+    fn pack_pending_close(&mut self) -> bool {
+        if !self.pending_write_close {
+            return false;
+        }
+        let available_space = self.write_frame.len() - self.write_frame_end_offset;
+        if available_space < 6 {
+            return true;
+        }
+        let written = pack_frame(
+            0x08,
+            self.is_client,
+            &[],
+            &mut self.write_frame[self.write_frame_end_offset..],
+        );
+        self.write_frame_end_offset += written;
+        self.pending_write_close = false;
+        self.close_sent = true;
+        false
+    }
+
     fn pack_write_pong_frame(&mut self) -> bool {
         let available_space = self.write_frame.len() - self.write_frame_end_offset;
 
@@ -563,6 +624,18 @@ impl AsyncRead for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if this.read_closed {
+            // Answer the Close now rather than whenever a write comes along;
+            // a write that would block is finished by flush or shutdown.
+            this.pack_pending_close();
+            if this.write_frame_end_offset > 0
+                && let Err(e) = this.do_write_frame(cx)
+            {
+                return Poll::Ready(Err(e));
+            }
+            return Poll::Ready(Ok(()));
+        }
+
         // If there is unprocessed data and we are reading content, it must be because there
         // is data still to be read, but the passed in `buf` from the previous iteration
         // didn't have enough space to read it all.
@@ -627,6 +700,15 @@ impl AsyncRead for WebsocketStream {
             if !buf.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
+
+            if this.read_closed {
+                // End of stream, once the reply Close is on its way.
+                this.pack_pending_close();
+                if let Err(e) = this.do_write_frame(cx) {
+                    return Poll::Ready(Err(e));
+                }
+                return Poll::Ready(Ok(()));
+            }
         }
     }
 }
@@ -638,6 +720,14 @@ impl AsyncWrite for WebsocketStream {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+
+        if this.close_sent || this.pending_write_close {
+            // Section 5.5.1: no data frames after a Close.
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "websocket closed by the peer",
+            )));
+        }
 
         if this.pending_write_pong {
             if this.pack_write_pong_frame() {
@@ -688,6 +778,14 @@ impl AsyncWrite for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        while this.pack_pending_close() {
+            // No room yet: write out what is queued first.
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
+        }
+
         if this.write_frame_end_offset == 0 {
             return Pin::new(&mut this.stream).poll_flush(cx);
         }
@@ -714,6 +812,10 @@ impl AsyncWrite for WebsocketStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        // An owed Close, and anything queued before it, goes out first.
+        if self.pending_write_close || self.write_frame_end_offset > 0 {
+            ready!(self.as_mut().poll_flush(cx))?;
+        }
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -895,5 +997,112 @@ mod tests {
         mask_in_place(b, mask, 7 % 4);
 
         assert_eq!(one_shot, split);
+    }
+
+    mod frames {
+        use super::super::*;
+        use crate::async_stream::testing::TestStream;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+
+        /// An unmasked frame, as a server receives from a lenient client or a
+        /// client receives from a server.
+        fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![0x80 | opcode];
+            if payload.len() < 126 {
+                out.push(payload.len() as u8);
+            } else {
+                out.push(126);
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// A client-side stream reading `incoming`, and the peer's end.
+        async fn stream_reading(incoming: &[u8]) -> (WebsocketStream, DuplexStream) {
+            let (near, mut far) = duplex(1 << 16);
+            far.write_all(incoming).await.unwrap();
+            let stream = WebsocketStream::new(
+                Box::new(TestStream(near)),
+                true,
+                WebsocketPingType::Disabled,
+                &[],
+            );
+            (stream, far)
+        }
+
+        async fn read_some(stream: &mut WebsocketStream) -> std::io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("the stream stalled")?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+
+        /// A ping may carry up to 125 bytes (section 5.5); it used to be
+        /// refused over 80, and its payload was then read again as a header.
+        #[tokio::test]
+        async fn a_125_byte_ping_is_answered_and_data_follows() {
+            let mut incoming = frame(0x9, &[0x5A; 125]);
+            incoming.extend(frame(0x2, b"hi"));
+            let (mut stream, mut far) = stream_reading(&incoming).await;
+
+            assert_eq!(read_some(&mut stream).await.unwrap(), b"hi");
+
+            // The pong goes out ahead of the next write.
+            stream.write_all(b"x").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut written = vec![0u8; 256];
+            let n = far.read(&mut written).await.unwrap();
+            // A masked pong: header, 125 length, 4-byte mask, payload.
+            assert_eq!(written[0], 0x8A);
+            assert_eq!(written[1], 0x80 | 125);
+            let mask = [written[2], written[3], written[4], written[5]];
+            let payload: Vec<u8> = written[6..6 + 125]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % 4])
+                .collect();
+            assert_eq!(payload, vec![0x5A; 125]);
+            assert!(n > 6 + 125, "the data frame follows the pong");
+        }
+
+        #[tokio::test]
+        async fn a_pong_with_data_is_skipped() {
+            let mut incoming = frame(0xA, b"heartbeat");
+            incoming.extend(frame(0x2, b"hi"));
+            let (mut stream, _far) = stream_reading(&incoming).await;
+            assert_eq!(read_some(&mut stream).await.unwrap(), b"hi");
+        }
+
+        #[tokio::test]
+        async fn a_control_frame_over_125_bytes_fails_the_stream() {
+            let (mut stream, _far) = stream_reading(&frame(0x9, &[0; 126])).await;
+            let err = read_some(&mut stream).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        /// A Close ends the stream and is answered with a Close (section
+        /// 5.5.1); after it, no data frame may be sent.
+        #[tokio::test]
+        async fn a_close_is_answered_and_ends_the_stream() {
+            let mut incoming = frame(0x8, &1000u16.to_be_bytes());
+            incoming.extend(frame(0x2, b"never read"));
+            let (mut stream, mut far) = stream_reading(&incoming).await;
+
+            assert_eq!(read_some(&mut stream).await.unwrap(), b"");
+            assert_eq!(read_some(&mut stream).await.unwrap(), b"");
+
+            let mut written = vec![0u8; 16];
+            let n = far.read(&mut written).await.unwrap();
+            // A masked Close with an empty body.
+            assert_eq!(&written[..2], [0x88, 0x80]);
+            assert_eq!(n, 6);
+
+            let err = stream.write(b"late").await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     }
 }

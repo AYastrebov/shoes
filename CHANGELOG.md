@@ -80,6 +80,28 @@ XU-X3, HY-D2, TU-D4, H2-4):
   server without brutal does. It used to dial `_BrutalBwExchange` as a
   hostname, fail, and make a brutal-enabled client tear the session down.
 
+The inbound edge answers as the RFCs say it MUST (TR-5, TR-6, TR-7, TR-8,
+TR-11):
+
+- **SOCKS5 says why it refuses.** `05 FF` when no offered method is
+  acceptable, `01 01` on a failed login, `07` for BIND, and a reply before
+  closing when CONNECT fails: `02` when the rules block it, `05` when it is
+  refused, `03`/`04` when unreachable, `01` otherwise. Clients used to see
+  only a closed connection.
+- **The HTTP proxy answers a wrong password with 407**, as it does a missing
+  one, so a browser asks again instead of reporting a network error.
+- **The WebSocket server checks the handshake and answers it as RFC 6455
+  does**: `101 Switching Protocols` with no `Host` echoed, 400 for a request
+  that is not an upgrade, 426 naming version 13 for another version, 404 for
+  a path no target serves.
+- **WebSocket frames:** a ping may carry up to 125 bytes (it was refused over
+  80), a pong's payload is skipped instead of failing the connection, and a
+  Close is answered with a Close and ends the stream. A ping with any payload
+  used to desync the stream: its payload was read again as a frame header.
+- **A hostname over 255 bytes is refused** when encoding a SOCKS-style
+  address (SOCKS, Shadowsocks, Trojan, AnyTLS, Mieru) instead of wrapping its
+  one-byte length and misframing the stream.
+
 ## v0.4.1
 
 `awgtun` 0.9.0 -> 0.10.0, which is a dependency bump and nothing else: no

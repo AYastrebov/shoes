@@ -43,6 +43,7 @@ impl TcpServerHandler for PortForwardServerHandler {
             remote_location: location.clone(),
             stream: server_stream,
             need_initial_flush: true,
+            connection_failure_response: None,
             connection_success_response: None,
             initial_remote_data: None,
             proxy_selector: self.proxy_selector.clone(),
