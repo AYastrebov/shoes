@@ -191,7 +191,7 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
         ClientProxyConfig::Tuic(tuic) => Arc::new(
             crate::tuic::TuicConnector::new(
                 config.address,
-                &tuic.uuid,
+                *tuic.uuid.as_bytes(),
                 tuic.password.into_inner(),
                 tuic.udp_enabled,
                 tuic.udp_relay_mode,
@@ -491,7 +491,7 @@ mod tests {
                 build_terminal_connector(ClientConfig {
                     address: NetLocation::from_str("127.0.0.1:443", None).unwrap(),
                     protocol: ClientProxyConfig::Tuic(Box::new(TuicClientConfig {
-                        uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4".to_string(),
+                        uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4".parse().unwrap(),
                         password: "secret".into(),
                         udp_enabled: true,
                         udp_relay_mode: Default::default(),

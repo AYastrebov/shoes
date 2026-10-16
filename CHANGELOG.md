@@ -67,6 +67,14 @@ Typed outcomes at the layer boundaries (plan PR 1.3; A-3):
   unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449) out of the build. The
   security-advisory check is green again.
 
+Parse, don't validate: user ids (plan PR 1.4, part 2; A-2):
+
+- **VLESS, VMess and TUIC user ids are parsed when the config loads**, into
+  a `Uuid` the handlers take as bytes. Client-side ids were never checked at
+  load: a malformed one panicked when its handler was built. One of the
+  shipped examples, `socks_through_vmess.yaml`, had exactly that typo and is
+  corrected.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

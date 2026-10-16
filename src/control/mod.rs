@@ -69,12 +69,15 @@ pub struct ServiceHandle {
     /// Set by `stop_handle` before the shutdown signal, so the exit guard
     /// can tell a stop the host asked for from one it must be told about.
     stop_requested: Arc<AtomicBool>,
-    /// When `start` spawned the service, for `uptime`.
+    /// When `start` spawned the service, for `uptime`. Only `status` reads
+    /// it, and the mobile builds have no `status`.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     started_at: std::time::Instant,
     /// Set if the service ended without being asked -- the error's message,
     /// or a fixed one for a clean but unrequested end -- so `status` can tell
     /// that from a stop the host asked for. The FFI gets the error through
     /// `on_exit`, because a C caller cannot receive an enum carrying a String.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     failure: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
@@ -361,7 +364,9 @@ where
         shutdown_tx: Some(shutdown_tx),
         running,
         stop_requested,
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         started_at: std::time::Instant::now(),
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         failure,
     };
     (handle, move || {

@@ -40,7 +40,6 @@ use crate::tls_server_handler::{
     InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
 };
 use crate::trojan_handler::TrojanTcpHandler;
-use crate::uuid_util::parse_uuid;
 use crate::vless::vless_server_handler::VlessTcpServerHandler;
 use crate::vmess::VmessTcpServerHandler;
 use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
@@ -148,7 +147,7 @@ pub fn create_tcp_server_handler(
             udp_enabled,
             fallback,
         } => Box::new(VlessTcpServerHandler::new(
-            &user_id,
+            user_id.as_bytes(),
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
@@ -225,7 +224,7 @@ pub fn create_tcp_server_handler(
             udp_enabled,
         } => Box::new(VmessTcpServerHandler::new(
             &cipher,
-            &user_id,
+            user_id.as_bytes(),
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
@@ -403,9 +402,7 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes: Box<[u8]> = Box::new(*user_id.as_bytes());
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,
@@ -562,9 +559,7 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes: Box<[u8]> = Box::new(*user_id.as_bytes());
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,

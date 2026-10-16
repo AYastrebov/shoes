@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::redacted::Redacted;
+use super::uuid::Uuid;
 
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
@@ -125,7 +126,7 @@ where
 /// Custom deserializer for ServerProxyConfig::Vmess that validates legacy force_aead field
 fn deserialize_vmess_server<'de, D>(
     deserializer: D,
-) -> Result<(String, Redacted<String>, bool), D::Error>
+) -> Result<(String, Redacted<Uuid>, bool), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -135,7 +136,7 @@ where
     #[serde(deny_unknown_fields)]
     struct VmessServerTemp {
         cipher: String,
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         #[serde(default)]
@@ -723,7 +724,7 @@ pub enum ServerProxyConfig {
         udp_enabled: bool,
     },
     Vless {
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         /// Fallback destination for failed authentication (optional)
@@ -758,7 +759,7 @@ pub enum ServerProxyConfig {
     #[serde(deserialize_with = "deserialize_vmess_server")]
     Vmess {
         cipher: String,
-        user_id: Redacted<String>,
+        user_id: Redacted<Uuid>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
@@ -826,7 +827,7 @@ pub enum ServerProxyConfig {
     },
     #[serde(alias = "tuic")]
     TuicV5 {
-        uuid: String,
+        uuid: Uuid,
         password: Redacted<String>,
         /// Enable 0-RTT (0.5-RTT for server) handshake for faster connection establishment.
         /// Default is false for security - 0-RTT data is vulnerable to replay attacks.
@@ -990,7 +991,10 @@ mod tests {
             )
             .into(),
             protocol: ServerProxyConfig::Vless {
-                user_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                user_id: "550e8400-e29b-41d4-a716-446655440000"
+                    .parse::<Uuid>()
+                    .unwrap()
+                    .into(),
                 udp_enabled: true,
                 fallback: None,
             },
@@ -1092,7 +1096,10 @@ mod tests {
             .into(),
             protocol: ServerProxyConfig::Vmess {
                 cipher: "aes-128-gcm".to_string(),
-                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811"
+                    .parse::<Uuid>()
+                    .unwrap()
+                    .into(),
                 udp_enabled: false,
             },
             transport: Transport::Tcp,
@@ -1178,7 +1185,7 @@ mod tests {
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
                 .into(),
             protocol: ServerProxyConfig::TuicV5 {
-                uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                uuid: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
                 password: "tuic_password".into(),
                 zero_rtt_handshake: false,
                 congestion_control: TuicCongestionControl::Bbr,

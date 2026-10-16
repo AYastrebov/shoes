@@ -16,7 +16,6 @@ use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::rule_set::RuleSet;
 use crate::thread_util::get_num_threads;
-use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
@@ -1487,12 +1486,6 @@ fn validate_client_config(
             }
         }
         ClientProxyConfig::Tuic(tuic) => {
-            parse_uuid(&tuic.uuid).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("TUIC uuid is not a valid UUID: {e}"),
-                )
-            })?;
             if tuic.heartbeat_ms == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1799,12 +1792,6 @@ fn validate_server_proxy_config(
                  datagram's original destination from the listening socket",
             ));
         }
-        ServerProxyConfig::Vless { user_id, .. } => {
-            parse_uuid(user_id)?;
-        }
-        ServerProxyConfig::Vmess { user_id, .. } => {
-            parse_uuid(user_id)?;
-        }
         ServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
@@ -2077,9 +2064,6 @@ fn validate_server_proxy_config(
                     )?;
                 }
             }
-        }
-        ServerProxyConfig::TuicV5 { uuid, .. } => {
-            parse_uuid(uuid)?;
         }
         ServerProxyConfig::Hysteria2 { obfs, .. } => {
             validate_obfs_config(obfs.as_ref())?;
@@ -2798,7 +2782,7 @@ mod tests {
             ClientConfig {
                 address: server(),
                 protocol: ClientProxyConfig::Tuic(Box::new(TuicClientConfig {
-                    uuid: uuid.to_string(),
+                    uuid: uuid.parse().unwrap(),
                     password: "secret".into(),
                     udp_enabled: true,
                     udp_relay_mode: TuicUdpRelayMode::Native,
@@ -2980,8 +2964,11 @@ mod tests {
 
         #[test]
         fn test_tuic_rejects_bad_uuid() {
-            let mut config = tuic_client("not-a-uuid", 10_000);
-            let err = validate(&mut config).unwrap_err().to_string();
+            // At parse time now: a `Uuid` field does not deserialize from it.
+            let yaml = "address: 127.0.0.1:443\nprotocol:\n  type: tuic\n  uuid: not-a-uuid\n  password: secret\n";
+            let err = serde_yaml::from_str::<ClientConfig>(yaml)
+                .unwrap_err()
+                .to_string();
             assert!(err.to_lowercase().contains("uuid"), "{err}");
         }
 

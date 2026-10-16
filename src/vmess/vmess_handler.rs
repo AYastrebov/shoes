@@ -37,7 +37,6 @@ use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::{allocate_vec, unix_time_secs, write_all};
-use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
@@ -148,12 +147,12 @@ impl std::fmt::Debug for VmessTcpServerHandler {
 impl VmessTcpServerHandler {
     pub fn new(
         cipher_name: &str,
-        user_id: &str,
+        user_id: &[u8; 16],
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
+        let mut user_id_bytes = user_id.to_vec();
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -804,8 +803,8 @@ impl std::fmt::Debug for VmessTcpClientHandler {
 }
 
 impl VmessTcpClientHandler {
-    pub fn new(cipher_name: &str, user_id: &str, udp_enabled: bool) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
+    pub fn new(cipher_name: &str, user_id: &[u8; 16], udp_enabled: bool) -> Self {
+        let mut user_id_bytes = user_id.to_vec();
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -1349,6 +1348,10 @@ mod tests {
 
     const TEST_UUID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
 
+    fn test_uuid() -> [u8; 16] {
+        *TEST_UUID.parse::<crate::config::Uuid>().unwrap().as_bytes()
+    }
+
     #[test]
     fn replay_filter_accepts_once_and_rejects_repeats() {
         let mut filter = AuthIdReplayFilter::new();
@@ -1375,7 +1378,7 @@ mod tests {
         let client_target = requested.clone();
         let client = tokio::spawn(async move {
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let handler = VmessTcpClientHandler::new("aes-128-gcm", TEST_UUID, false);
+            let handler = VmessTcpClientHandler::new("aes-128-gcm", &test_uuid(), false);
             handler
                 .setup_client_tcp_stream(Box::new(stream), client_target.into())
                 .await
@@ -1386,7 +1389,7 @@ mod tests {
         let resolver = test_resolver();
         let server = VmessTcpServerHandler::new(
             "aes-128-gcm",
-            TEST_UUID,
+            &test_uuid(),
             false,
             direct_selector(resolver.clone()),
             resolver,
@@ -1441,7 +1444,7 @@ mod tests {
         let sent = payload.clone();
         let client = tokio::spawn(async move {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let handler = VmessTcpClientHandler::new("aes-128-gcm", TEST_UUID, false);
+            let handler = VmessTcpClientHandler::new("aes-128-gcm", &test_uuid(), false);
             let mut client_stream = handler
                 .setup_client_tcp_stream(Box::new(tcp), target.into())
                 .await?
@@ -1458,7 +1461,7 @@ mod tests {
         let resolver = test_resolver();
         let server = VmessTcpServerHandler::new(
             "aes-128-gcm",
-            TEST_UUID,
+            &test_uuid(),
             false,
             direct_selector(resolver.clone()),
             resolver,

@@ -79,7 +79,7 @@ impl TuicConnector {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: NetLocation,
-        uuid: &str,
+        uuid: [u8; 16],
         password: String,
         udp_enabled: bool,
         udp_relay_mode: TuicUdpRelayMode,
@@ -88,28 +88,7 @@ impl TuicConnector {
         bind_interface: Option<String>,
         congestion: CongestionControl,
     ) -> std::io::Result<Self> {
-        // parse_uuid hands back a Vec; the protocol field is exactly 16 bytes,
-        // and pinning that in the type means the encoder cannot be handed
-        // something of the wrong length.
-        let uuid_bytes: [u8; 16] = crate::uuid_util::parse_uuid(uuid)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("TUIC uuid is not a valid UUID: {e}"),
-                )
-            })?
-            .try_into()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "TUIC uuid did not decode to 16 bytes",
-                )
-            })?;
-
-        let authenticator = Arc::new(TuicAuthenticator {
-            uuid: uuid_bytes,
-            password,
-        });
+        let authenticator = Arc::new(TuicAuthenticator { uuid, password });
 
         let settings = QuicOutboundSettings {
             server,
@@ -250,6 +229,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_UUID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+
+    fn uuid_bytes(uuid: &str) -> [u8; 16] {
+        *uuid.parse::<crate::config::Uuid>().unwrap().as_bytes()
+    }
     const SERVER_PASSWORD: &str = "test password";
 
     async fn spawn_server() -> SocketAddr {
@@ -293,7 +276,7 @@ mod tests {
         ] {
             let connector = TuicConnector::new(
                 NetLocation::from_str("127.0.0.1:1", None).unwrap(),
-                TEST_UUID,
+                uuid_bytes(TEST_UUID),
                 "pw".to_string(),
                 true,
                 TuicUdpRelayMode::Native,
@@ -319,7 +302,7 @@ mod tests {
     ) -> TuicConnector {
         TuicConnector::new(
             NetLocation::from_str(&server.to_string(), None).unwrap(),
-            uuid,
+            uuid_bytes(uuid),
             password.to_string(),
             true,
             mode,
@@ -338,28 +321,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_a_malformed_uuid() {
-        let err = TuicConnector::new(
-            NetLocation::from_str("127.0.0.1:1", None).unwrap(),
-            "not-a-uuid",
-            "password".to_string(),
-            true,
-            TuicUdpRelayMode::Native,
-            Duration::from_millis(10_000),
-            client_quic_config(),
-            None,
-            CongestionControl::Cubic,
-        )
-        .expect_err("a malformed uuid must be refused at construction")
-        .to_string();
-        assert!(err.to_lowercase().contains("uuid"), "{err}");
-    }
-
-    #[test]
     fn test_keeps_its_configured_settings() {
         let connector = TuicConnector::new(
             NetLocation::from_str("127.0.0.1:1", None).unwrap(),
-            TEST_UUID,
+            uuid_bytes(TEST_UUID),
             "password".to_string(),
             true,
             TuicUdpRelayMode::Quic,
@@ -650,7 +615,7 @@ mod tests {
         let resolver = test_resolver();
         let connector = TuicConnector::new(
             NetLocation::from_str(&server.to_string(), None).unwrap(),
-            TEST_UUID,
+            uuid_bytes(TEST_UUID),
             SERVER_PASSWORD.to_string(),
             false,
             TuicUdpRelayMode::Native,

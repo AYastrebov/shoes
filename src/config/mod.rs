@@ -144,7 +144,7 @@ mod redaction_tests {
 - address: "127.0.0.1:2443"
   protocol:
     type: vless
-    user_id: 11111111-2222-3333-4444-555555555555
+    user_id: 11111111-2222-4333-8444-555555555555
 "#;
 
     /// Every secret above, as it appears in the YAML.
@@ -152,7 +152,7 @@ mod redaction_tests {
         "LEAK-socks-inbound-password",
         "LEAK-shadowsocks-password",
         "LEAK-trojan-password",
-        "11111111-2222-3333-4444-555555555555",
+        "11111111-2222-4333-8444-555555555555",
         "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", // private key
         "ERERERERERERERERERERERERERERERERERERERERERE=", // preshared key
         "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=", // header protection key
