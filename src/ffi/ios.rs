@@ -104,19 +104,17 @@ fn stopped_slot_is_empty() -> bool {
 /// Deliver an exit to the host. The reason is stored for
 /// `shoes_get_last_error` first, and the lock is released before the call
 /// so a callback that calls `shoes_stop` cannot deadlock on this slot.
-fn fire_stopped(reason: Option<String>) {
-    if let Some(msg) = &reason {
-        common::set_last_error(msg.clone());
-    }
+fn fire_stopped(reason: crate::control::ExitReason) {
+    common::set_last_exit(&reason);
     let callback = STOPPED_CALLBACK
         .get_or_init(|| Mutex::new(None))
         .lock()
         .take();
     let Some(callback) = callback else { return };
-    match reason.as_deref().map(common::c_string_lossy) {
-        Some(c) => callback(c.as_ptr()),
-        None => callback(std::ptr::null()),
-    }
+    // Every exit has a sentence, so the callback is never handed NULL --
+    // which the contract reserves for "no reason".
+    let reason = common::c_string_lossy(reason.message());
+    callback(reason.as_ptr());
 }
 
 /// Global socket protector callback.
@@ -817,7 +815,9 @@ mod tests {
         let _errors = common::LAST_ERROR_TEST_LOCK.lock().unwrap();
         STOPPED_CALLS.store(0, Ordering::SeqCst);
         install_stopped_callback(Some(count_stopped));
-        fire_stopped(Some("engine fell over".to_string()));
+        fire_stopped(crate::control::ExitReason::Failed(
+            "engine fell over".to_string(),
+        ));
         assert_eq!(STOPPED_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(
             common::get_last_error().as_deref(),

@@ -18,6 +18,8 @@ use std::sync::atomic::AtomicBool;
 
 use log::info;
 
+use crate::control::ExitReason;
+
 // Only what ios.rs and android.rs actually name. `mod common` is private, so
 // re-exporting more than that is an unused import rather than a public API --
 // and the Android clippy job builds with -D warnings.
@@ -61,7 +63,15 @@ pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Last error message from the service. Set when `start_from_config` fails
 /// or the service stops with an error. Read via `shoes_get_last_error()`.
-pub static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
+static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<LastError>>> = OnceLock::new();
+
+/// The message, and whether it reports an [`ExitReason::EndedUnrequested`]
+/// -- the one exit a stop can manufacture by racing the exit guard.
+#[derive(Clone, PartialEq, Eq)]
+struct LastError {
+    message: String,
+    ended_unrequested: bool,
+}
 
 /// Serializes start/stop transitions across the FFI surface.
 ///
@@ -162,14 +172,14 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
 
     // A stop the host asked for must not manufacture an error: the exit
     // guard reads stop_requested in a race with our store of it, and the
-    // losing interleaving reports ENDED_UNREQUESTED -- for this very stop
-    // -- during the wait below. That exact sentence appearing mid-stop is
-    // the race's fingerprint and is discarded. Anything ELSE written
-    // mid-stop is a genuine failure that raced the stop -- an engine that
-    // died of a real error as the host reached for the switch -- and it
-    // must survive: restoring unconditionally erased the only report of
-    // a crash and dressed it as a clean user stop.
-    let before = get_last_error();
+    // losing interleaving reports EndedUnrequested -- for this very stop --
+    // during the wait below. That exit appearing mid-stop is the race's
+    // fingerprint and is discarded; the variant says so, not its sentence.
+    // A failure written mid-stop is a genuine one that raced the stop -- an
+    // engine that died of a real error as the host reached for the switch --
+    // and it must survive: restoring unconditionally erased the only report
+    // of a crash and dressed it as a clean user stop.
+    let before = last_error();
 
     // The C and JNI surfaces answer with an int, so the obligation the type
     // carries is flattened here rather than at the call sites.
@@ -177,12 +187,9 @@ pub fn stop_service_locked(_transition: &parking_lot::MutexGuard<'static, ()>) -
 
     // One snapshot, compared and matched: two separate reads could see
     // two different values if a late writer lands between them.
-    let after = get_last_error();
-    if after != before && after.as_deref() == Some(crate::control::ENDED_UNREQUESTED) {
-        match before {
-            Some(msg) => set_last_error(msg),
-            None => clear_last_error(),
-        }
+    let after = last_error();
+    if written_by_the_stop(&before, &after) {
+        store_last_error(before);
     }
 
     // The protector holds a reference to the platform's VPN service object.
@@ -231,10 +238,35 @@ pub fn refuse_start_from_runtime_thread(who: &str) -> bool {
     true
 }
 
+fn store_last_error(error: Option<LastError>) {
+    let err = LAST_ERROR.get_or_init(|| parking_lot::Mutex::new(None));
+    *err.lock() = error;
+}
+
+fn last_error() -> Option<LastError> {
+    LAST_ERROR.get().and_then(|m| m.lock().clone())
+}
+
+/// Whether what changed in the last error during a stop is the stop's own
+/// echo -- an unrequested-end report -- rather than a failure that raced it.
+fn written_by_the_stop(before: &Option<LastError>, after: &Option<LastError>) -> bool {
+    after != before && after.as_ref().is_some_and(|e| e.ended_unrequested)
+}
+
 /// Store an error message.
 pub fn set_last_error(error: String) {
-    let err = LAST_ERROR.get_or_init(|| parking_lot::Mutex::new(None));
-    *err.lock() = Some(error);
+    store_last_error(Some(LastError {
+        message: error,
+        ended_unrequested: false,
+    }));
+}
+
+/// Store the reason a service ended without being asked.
+pub fn set_last_exit(reason: &ExitReason) {
+    store_last_error(Some(LastError {
+        message: reason.message().to_string(),
+        ended_unrequested: *reason == ExitReason::EndedUnrequested,
+    }));
 }
 
 /// Clear the last error message (called on successful start).
@@ -246,7 +278,7 @@ pub fn clear_last_error() {
 
 /// Get the last error message, if any.
 pub fn get_last_error() -> Option<String> {
-    LAST_ERROR.get().and_then(|m| m.lock().clone())
+    last_error().map(|e| e.message)
 }
 
 /// Check if the TUN service is running.
@@ -270,6 +302,42 @@ pub(crate) static LAST_ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exit(reason: ExitReason) -> Option<LastError> {
+        Some(LastError {
+            message: reason.message().to_string(),
+            ended_unrequested: reason == ExitReason::EndedUnrequested,
+        })
+    }
+
+    /// An unrequested end that lands during a stop is the stop's own echo and
+    /// is discarded; a failure that lands then is real and is kept -- even one
+    /// whose words match the unrequested sentence, which the string
+    /// comparison this replaced would have thrown away.
+    #[test]
+    fn only_the_stops_own_echo_is_discarded() {
+        let earlier = exit(ExitReason::Failed("an earlier failure".to_string()));
+        assert!(written_by_the_stop(
+            &earlier,
+            &exit(ExitReason::EndedUnrequested)
+        ));
+        assert!(written_by_the_stop(
+            &None,
+            &exit(ExitReason::EndedUnrequested)
+        ));
+
+        let crash = exit(ExitReason::Failed("the stack died".to_string()));
+        assert!(!written_by_the_stop(&None, &crash));
+
+        let lookalike = exit(ExitReason::Failed(
+            crate::control::ENDED_UNREQUESTED.to_string(),
+        ));
+        assert!(!written_by_the_stop(&None, &lookalike));
+
+        // Nothing changed: nothing to restore.
+        let unchanged = exit(ExitReason::EndedUnrequested);
+        assert!(!written_by_the_stop(&unchanged, &unchanged));
+    }
 
     /// The ceiling is reported in the spelling `shoes_set_log_level` takes,
     /// and names the level this build actually compiles in.
