@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::redacted::Redacted;
 use super::uuid::Uuid;
+use super::wg::{IpPrefix, WgKey, named};
 
 use crate::address::NetLocation;
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
@@ -72,12 +73,20 @@ fn default_amneziawg_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireGuardClientConfig {
-    pub private_key: Redacted<String>,
-    pub peer_public_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preshared_key: Option<Redacted<String>>,
-    pub local_addresses: OneOrSome<String>,
-    pub allowed_ips: OneOrSome<String>,
+    #[serde(deserialize_with = "named::private_key")]
+    pub private_key: Redacted<WgKey>,
+    #[serde(deserialize_with = "named::peer_public_key")]
+    pub peer_public_key: WgKey,
+    #[serde(
+        default,
+        deserialize_with = "named::preshared_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preshared_key: Option<Redacted<WgKey>>,
+    #[serde(deserialize_with = "named::local_addresses")]
+    pub local_addresses: OneOrSome<IpPrefix>,
+    #[serde(deserialize_with = "named::allowed_ips")]
+    pub allowed_ips: OneOrSome<IpPrefix>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_keepalive: Option<u16>,
     #[serde(default = "default_amneziawg_mtu")]
@@ -88,12 +97,20 @@ pub struct WireGuardClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmneziaWgClientConfig {
-    pub private_key: Redacted<String>,
-    pub peer_public_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preshared_key: Option<Redacted<String>>,
-    pub local_addresses: OneOrSome<String>,
-    pub allowed_ips: OneOrSome<String>,
+    #[serde(deserialize_with = "named::private_key")]
+    pub private_key: Redacted<WgKey>,
+    #[serde(deserialize_with = "named::peer_public_key")]
+    pub peer_public_key: WgKey,
+    #[serde(
+        default,
+        deserialize_with = "named::preshared_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preshared_key: Option<Redacted<WgKey>>,
+    #[serde(deserialize_with = "named::local_addresses")]
+    pub local_addresses: OneOrSome<IpPrefix>,
+    #[serde(deserialize_with = "named::allowed_ips")]
+    pub allowed_ips: OneOrSome<IpPrefix>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_keepalive: Option<u16>,
     #[serde(default = "default_amneziawg_mtu")]

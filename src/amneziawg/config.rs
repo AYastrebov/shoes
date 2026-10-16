@@ -24,44 +24,15 @@ pub struct AwgRuntimeConfig {
 
 impl AwgRuntimeConfig {
     pub fn from_client_config(config: &AmneziaWgClientConfig) -> std::io::Result<Self> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-
-        // Decode private key
-        let private_key_bytes: [u8; 32] = b64
-            .decode(config.private_key.expose())
-            .map_err(|e| ioerr(&format!("invalid private_key base64: {}", e)))?
-            .try_into()
-            .map_err(|_| ioerr("private_key must be 32 bytes"))?;
-        let private_key = x25519::StaticSecret::from(private_key_bytes);
-
-        // Decode peer public key
-        let peer_pub_bytes: [u8; 32] = b64
-            .decode(&config.peer_public_key)
-            .map_err(|e| ioerr(&format!("invalid peer_public_key base64: {}", e)))?
-            .try_into()
-            .map_err(|_| ioerr("peer_public_key must be 32 bytes"))?;
-        let peer_public_key = x25519::PublicKey::from(peer_pub_bytes);
-
-        // Decode optional preshared key
-        let preshared_key = config
-            .preshared_key
-            .as_ref()
-            .map(|psk| {
-                let bytes: [u8; 32] = b64
-                    .decode(psk.expose())
-                    .map_err(|e| ioerr(&format!("invalid preshared_key base64: {}", e)))?
-                    .try_into()
-                    .map_err(|_| ioerr("preshared_key must be 32 bytes"))?;
-                Ok::<_, std::io::Error>(bytes)
-            })
-            .transpose()?;
-
-        // Parse local addresses
+        // Keys and prefixes were parsed with the config (`WgKey`, `IpPrefix`).
+        let private_key = x25519::StaticSecret::from(*config.private_key.as_bytes());
+        let peer_public_key = x25519::PublicKey::from(*config.peer_public_key.as_bytes());
+        let preshared_key = config.preshared_key.as_ref().map(|psk| *psk.as_bytes());
         let local_addresses: Vec<(IpAddr, u8)> = config
             .local_addresses
             .iter()
-            .map(|s| parse_ip_prefix(s))
-            .collect::<Result<_, _>>()?;
+            .map(|prefix| (prefix.addr, prefix.len))
+            .collect();
 
         // Convert AWG 2.0/3.0 params. Content padding is clamped against the
         // tunnel MTU, so the two have to agree.
@@ -220,34 +191,6 @@ fn parse_optional_cps(s: &Option<String>) -> std::io::Result<Option<CpsChain>> {
     }
 }
 
-fn parse_ip_prefix(s: &str) -> std::io::Result<(IpAddr, u8)> {
-    if let Some((addr_str, prefix_str)) = s.split_once('/') {
-        let addr: IpAddr = addr_str
-            .parse()
-            .map_err(|e| ioerr(&format!("invalid IP '{}': {}", addr_str, e)))?;
-        let prefix: u8 = prefix_str
-            .parse()
-            .map_err(|e| ioerr(&format!("invalid prefix '{}': {}", prefix_str, e)))?;
-        // smoltcp's IpCidr::new panics on an out-of-range prefix, so validate here
-        // (this comes from user config) rather than letting it abort the netstack task.
-        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
-        if prefix > max_prefix {
-            return Err(ioerr(&format!(
-                "prefix /{} out of range for {} address",
-                prefix,
-                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-            )));
-        }
-        Ok((addr, prefix))
-    } else {
-        let addr: IpAddr = s
-            .parse()
-            .map_err(|e| ioerr(&format!("invalid IP '{}': {}", s, e)))?;
-        let prefix = if addr.is_ipv4() { 32 } else { 128 };
-        Ok((addr, prefix))
-    }
-}
-
 fn ioerr(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string())
 }
@@ -255,44 +198,6 @@ fn ioerr(msg: &str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_ip_prefix_v4_with_prefix() {
-        let (addr, prefix) = parse_ip_prefix("10.0.0.1/24").unwrap();
-        assert_eq!(addr, "10.0.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 24);
-    }
-
-    #[test]
-    fn test_parse_ip_prefix_v4_without_prefix() {
-        let (addr, prefix) = parse_ip_prefix("192.168.1.1").unwrap();
-        assert_eq!(addr, "192.168.1.1".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 32);
-    }
-
-    #[test]
-    fn test_parse_ip_prefix_v6_with_prefix() {
-        let (addr, prefix) = parse_ip_prefix("fd00::1/64").unwrap();
-        assert_eq!(addr, "fd00::1".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 64);
-    }
-
-    #[test]
-    fn test_parse_ip_prefix_v6_without_prefix() {
-        let (addr, prefix) = parse_ip_prefix("::1").unwrap();
-        assert_eq!(addr, "::1".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 128);
-    }
-
-    #[test]
-    fn test_parse_ip_prefix_invalid_addr() {
-        assert!(parse_ip_prefix("not-an-ip/24").is_err());
-    }
-
-    #[test]
-    fn test_parse_ip_prefix_invalid_prefix() {
-        assert!(parse_ip_prefix("10.0.0.1/abc").is_err());
-    }
 
     /// Every field unset — the 2.0 fields and the 3.0 ones alike.
     fn empty_params() -> AmneziaWgParams {

@@ -1610,28 +1610,9 @@ fn validate_client_proxy_config(
     Ok(())
 }
 
+/// Keys and prefixes are checked as the config is parsed (`WgKey`,
+/// `IpPrefix`); what is left is the MTU.
 fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> std::io::Result<()> {
-    validate_wg_key(&config.private_key, "private_key")?;
-    validate_wg_key(&config.peer_public_key, "peer_public_key")?;
-    if let Some(ref psk) = config.preshared_key {
-        validate_wg_key(psk, "preshared_key")?;
-    }
-    for addr_str in config.local_addresses.iter() {
-        parse_ip_prefix(addr_str).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("WireGuard invalid local_address '{}': {}", addr_str, e),
-            )
-        })?;
-    }
-    for ip_str in config.allowed_ips.iter() {
-        parse_ip_prefix(ip_str).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("WireGuard invalid allowed_ip '{}': {}", ip_str, e),
-            )
-        })?;
-    }
     if config.mtu < 576 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1641,34 +1622,9 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
     Ok(())
 }
 
+/// Keys and prefixes are checked as the config is parsed (`WgKey`,
+/// `IpPrefix`).
 fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> std::io::Result<()> {
-    // Validate private key (base64 -> 32 bytes)
-    validate_wg_key(&config.private_key, "private_key")?;
-    validate_wg_key(&config.peer_public_key, "peer_public_key")?;
-    if let Some(ref psk) = config.preshared_key {
-        validate_wg_key(psk, "preshared_key")?;
-    }
-
-    // Validate local_addresses are valid IP prefixes
-    for addr_str in config.local_addresses.iter() {
-        parse_ip_prefix(addr_str).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("AmneziaWG invalid local_address '{}': {}", addr_str, e),
-            )
-        })?;
-    }
-
-    // Validate allowed_ips
-    for ip_str in config.allowed_ips.iter() {
-        parse_ip_prefix(ip_str).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("AmneziaWG invalid allowed_ip '{}': {}", ip_str, e),
-            )
-        })?;
-    }
-
     // Validate MTU
     if config.mtu < 576 {
         return Err(std::io::Error::new(
@@ -1705,57 +1661,6 @@ fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> st
     crate::amneziawg::convert_amnezia_config(&config.awg, config.mtu)?;
 
     Ok(())
-}
-
-fn validate_wg_key(key_b64: &str, field_name: &str) -> std::io::Result<()> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("AmneziaWG {}: invalid base64: {}", field_name, e),
-            )
-        })?;
-    if bytes.len() != 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "AmneziaWG {}: key must be 32 bytes, got {}",
-                field_name,
-                bytes.len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn parse_ip_prefix(s: &str) -> Result<(std::net::IpAddr, u8), String> {
-    if let Some((addr_str, prefix_str)) = s.split_once('/') {
-        let addr: std::net::IpAddr = addr_str
-            .parse()
-            .map_err(|e| format!("invalid IP address: {}", e))?;
-        let prefix: u8 = prefix_str
-            .parse()
-            .map_err(|e| format!("invalid prefix length: {}", e))?;
-        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
-        if prefix > max_prefix {
-            return Err(format!(
-                "prefix length {} exceeds maximum {} for {}",
-                prefix,
-                max_prefix,
-                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-            ));
-        }
-        Ok((addr, prefix))
-    } else {
-        // Allow bare IP address (treat as /32 or /128)
-        let addr: std::net::IpAddr = s
-            .parse()
-            .map_err(|e| format!("invalid IP address or CIDR: {}", e))?;
-        let prefix = if addr.is_ipv4() { 32 } else { 128 };
-        Ok((addr, prefix))
-    }
 }
 
 fn validate_server_proxy_config(
@@ -2913,11 +2818,16 @@ mod tests {
                 address: server(),
                 protocol: ClientProxyConfig::Wireguard(Box::new(
                     crate::config::WireGuardClientConfig {
-                        private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI=".into(),
-                        peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU=".to_string(),
+                        private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI="
+                            .parse::<crate::config::WgKey>()
+                            .unwrap()
+                            .into(),
+                        peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU="
+                            .parse()
+                            .unwrap(),
                         preshared_key: None,
-                        local_addresses: OneOrSome::One("10.0.0.2/32".to_string()),
-                        allowed_ips: OneOrSome::One("0.0.0.0/0".to_string()),
+                        local_addresses: OneOrSome::One("10.0.0.2/32".parse().unwrap()),
+                        allowed_ips: OneOrSome::One("0.0.0.0/0".parse().unwrap()),
                         persistent_keepalive: None,
                         mtu: 1280,
                     },

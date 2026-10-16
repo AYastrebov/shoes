@@ -28,6 +28,7 @@ pub mod sniff;
 pub mod transport;
 pub mod tun;
 pub mod uuid;
+pub mod wg;
 
 // Re-export all public types for convenience
 pub use client::{
@@ -54,3 +55,4 @@ pub use sniff::{SniffConfig, SniffProtocolConfig};
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::{FakeIpConfig, TunConfig};
 pub use uuid::Uuid;
+pub use wg::{IpPrefix, WgKey};

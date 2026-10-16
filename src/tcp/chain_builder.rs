@@ -455,11 +455,16 @@ mod tests {
         ClientConfig {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
             protocol: ClientProxyConfig::Wireguard(Box::new(WireGuardClientConfig {
-                private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI=".into(),
-                peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU=".to_string(),
+                private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI="
+                    .parse::<crate::config::WgKey>()
+                    .unwrap()
+                    .into(),
+                peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU="
+                    .parse()
+                    .unwrap(),
                 preshared_key: None,
-                local_addresses: OneOrSome::One("10.0.0.2/32".to_string()),
-                allowed_ips: OneOrSome::One("0.0.0.0/0".to_string()),
+                local_addresses: OneOrSome::One("10.0.0.2/32".parse().unwrap()),
+                allowed_ips: OneOrSome::One("0.0.0.0/0".parse().unwrap()),
                 persistent_keepalive: None,
                 mtu: 1280,
             })),
