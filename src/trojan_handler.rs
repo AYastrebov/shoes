@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
 use log::debug;
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
+use crate::deferred_header_stream::DeferredHeaderStream;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::shadowsocks::{
@@ -26,7 +26,6 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::write_all;
 
 #[derive(Debug)]
 struct ShadowsocksData {
@@ -234,15 +233,17 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        write_all(&mut client_stream, &self.password_hash).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        write_all(&mut client_stream, &[CMD_CONNECT]).await?;
         let location_bytes = write_location_to_vec(remote_location.location())?;
-        write_all(&mut client_stream, &location_bytes).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        client_stream.flush().await?;
+        let mut header = Vec::with_capacity(self.password_hash.len() + 5 + location_bytes.len());
+        header.extend_from_slice(&self.password_hash);
+        header.extend_from_slice(&CRLF_BYTES);
+        header.push(CMD_CONNECT);
+        header.extend_from_slice(&location_bytes);
+        header.extend_from_slice(&CRLF_BYTES);
+        // Sent with the first payload, as the reference clients do, rather
+        // than as a record of its own (SS-D7).
         Ok(TcpClientSetupResult {
-            client_stream,
+            client_stream: Box::new(DeferredHeaderStream::new(client_stream, header)),
             early_data: None,
         })
     }
