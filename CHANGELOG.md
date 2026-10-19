@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## v0.7.0
+
+Phase 1 of the 2026-10-15 quality plan
+(`docs/plans/2026-10-15-quality-and-correctness.md`) -- the Rust foundations --
+and the first client-fidelity work of Phase 3. The audit IDs closed are Q-1 to
+Q-4 (#60); A-1, A-6, A-8 (#61); A-3 (#62); A-2 (#63-#69); A-4 (#70, #71); A-7
+(#73); A-9 (#75, #77); SS-D7 (#79); VL-V3 (#80); and the client half of RE-R2
+(#81). ST-S1 is deferred with its reason recorded (#78).
+
+Behaviour changes to know before upgrading:
+
+- **A config with an unknown or misspelled field in a `protocol:` block no
+  longer loads** (#69). It used to load with the setting silently ignored.
+  Run `shoes check` on configs an app or a script generated.
+- Malformed user ids, WireGuard keys and prefixes, port-hopping ranges and DNS
+  URLs fail when the config loads, naming the field, where some used to fail
+  later or panic (#64-#67).
+- A reload lets the previous configuration's connections finish for up to
+  30 seconds, then cancels them (#71); before, they ran on with nothing
+  owning them.
+- Trojan and Shadowsocks clients send their header with the first payload
+  (#79), and VLESS Vision sends its request inside the first padded frame
+  (#80). A protocol where the server speaks first (SSH, SMTP) starts up to
+  300 ms (Trojan, Shadowsocks) or 500 ms (Vision) later.
+- The Reality client sends a Chrome 133 ClientHello with an X25519MLKEM768 key
+  share (#81). It is about 1.8 KB, and the client now also completes the
+  ML-KEM exchange when the decoy picks it.
+- h2mux's `max_connections`, `min_streams` and `max_streams` have no effect
+  and log that they don't (#60); they never did.
+
+No change to the C or JNI surface (#77), the mobile size budget (#74 brought
+the arm64 library back under it), or the `shoesd` protocol.
+
 
 Lints, dead code and unsafe hygiene (plan PR 1.1; Q-1 to Q-4):
 
