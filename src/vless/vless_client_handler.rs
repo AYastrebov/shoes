@@ -100,26 +100,28 @@ where
 }
 
 pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
-    mut tls_stream: CryptoTlsStream<IO>,
+    tls_stream: CryptoTlsStream<IO>,
     user_id: &[u8],
     remote_location: &NetLocation,
 ) -> std::io::Result<TcpClientSetupResult>
 where
     IO: crate::async_stream::AsyncStream + 'static,
 {
+    // Not written here: the stream sends it inside the first padded frame,
+    // as Xray does, rather than as a TLS record of its own (VL-V3).
+    let mut request_header = Vec::new();
     write_vless_header(
-        &mut tls_stream,
+        &mut request_header,
         user_id,
         vision_flow_addon_data(),
         remote_location,
     )
     .await?;
-    tls_stream.flush().await?;
 
     let (io, connection) = tls_stream.into_inner();
     let mut user_uuid = [0u8; 16];
     user_uuid.copy_from_slice(user_id);
-    let vision_stream = VisionStream::new_client(io, connection, user_uuid);
+    let vision_stream = VisionStream::new_client(io, connection, user_uuid, request_header);
 
     Ok(TcpClientSetupResult {
         client_stream: Box::new(vision_stream),
