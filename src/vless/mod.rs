@@ -18,3 +18,6 @@ mod vless_util;
 
 // Re-export VlessMessageStream for use by other protocols (e.g., Shadowsocks UoT V2)
 pub use vless_message_stream::VlessMessageStream;
+
+#[cfg(test)]
+mod tests;

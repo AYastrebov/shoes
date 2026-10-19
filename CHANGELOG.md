@@ -173,6 +173,13 @@ First flight carries the payload (plan PR 3.2, part 1; SS-D7):
   as SSH or SMTP) sends the header alone after 300 ms, the wait sing-box uses
   (`C.ReadPayloadTimeout`), so those protocols start up to 300 ms later; a
   shutdown sends it at once.
+- **The VLESS Vision client sends its request inside the first padded frame.**
+  It wrote the request as a TLS record of its own before the Vision stream
+  existed -- about 60 bytes, the same on every connection -- where Xray puts it
+  in the same record as the first padded frame. When the client has nothing to
+  send first, the request goes out with an empty long-padded frame after
+  500 ms, as Xray's outbound does. A Vision server likewise sends its two-byte
+  response in the same record as its first frame.
 
 ## v0.6.0
 

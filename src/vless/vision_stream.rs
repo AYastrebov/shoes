@@ -35,6 +35,10 @@ const COMMAND_CONTINUE: u8 = 0x00;
 const COMMAND_END: u8 = 0x01;
 const COMMAND_DIRECT: u8 = 0x02;
 
+/// How long a client's header waits for a first write before it goes out
+/// with an empty frame: Xray's outbound (`ReadMultiBufferTimeout(500ms)`).
+pub(crate) const FIRST_FRAME_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[inline]
 fn feed_and_process_crypto_connection(
     session: &mut CryptoConnection,
@@ -124,10 +128,24 @@ pub struct VisionStream<IO> {
     /// Used in PaddingTls mode
     partial_vless_response: BytesMut,
 
-    /// Whether we need to send VLESS response header (server-side only)
-    /// The response will be prepended to the first write as per the protocol
+    /// The VLESS header this side owes the other, not yet written: the
+    /// client's request, or the server's two-byte response. It goes into the
+    /// TLS session in the same write as the first padded frame, so the two
+    /// leave as one record -- Xray hides the request inside that first
+    /// 900-1400-byte frame, and a header written as a record of its own was
+    /// a signature on every connection (VL-V3).
     /// Used in PaddingTls mode
-    vless_response_to_send: bool,
+    pending_prefix: Option<Vec<u8>>,
+
+    /// Client side: the wait for a first write, after which the header goes
+    /// out with an empty long-padded frame instead (Xray's outbound waits
+    /// 500 ms for the same). Created on the first read.
+    first_frame_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// A first frame written by the timer or a shutdown, which no caller
+    /// flush follows, is still being pushed out of the session and the
+    /// transport.
+    flushing_first_frame: bool,
 
     /// Flag indicating we should switch to direct mode on the NEXT write call
     /// Used in PaddingTls mode
@@ -169,9 +187,13 @@ where
             ));
         }
 
+        // VLESS response header: [version=0, addon_length=0]
         let mut stream = Self::new_common(
-            tcp, session, user_uuid, false, // vless_response_pending
-            true,  // vless_response_to_send
+            tcp,
+            session,
+            user_uuid,
+            false, // vless_response_pending
+            Some(vec![0, 0]),
         );
 
         // feed in the initial read data that came from reading the VLESS request
@@ -183,15 +205,24 @@ where
         Ok(stream)
     }
 
-    /// Create a new VisionStream for client-side connections with VLESS response handling
-    pub fn new_client(tcp: IO, session: CryptoConnection, user_uuid: [u8; 16]) -> Self {
+    /// Create a new VisionStream for client-side connections with VLESS response handling.
+    /// `request_header` is the VLESS request, written with the first padded frame.
+    pub fn new_client(
+        tcp: IO,
+        session: CryptoConnection,
+        user_uuid: [u8; 16],
+        request_header: Vec<u8>,
+    ) -> Self {
         if !session.is_client() {
             panic!("VisionStream::new_client requires a client-side connection");
         }
 
         Self::new_common(
-            tcp, session, user_uuid, true,  // vless_response_pending
-            false, // vless_response_to_send
+            tcp,
+            session,
+            user_uuid,
+            true, // vless_response_pending
+            Some(request_header),
         )
     }
 
@@ -200,7 +231,7 @@ where
         session: CryptoConnection,
         user_uuid: [u8; 16],
         vless_response_pending: bool,
-        vless_response_to_send: bool,
+        pending_prefix: Option<Vec<u8>>,
     ) -> Self {
         Self {
             tcp,
@@ -223,7 +254,9 @@ where
             pending_read: BytesMut::new(),
             vless_response_pending,
             partial_vless_response: BytesMut::new(),
-            vless_response_to_send,
+            pending_prefix,
+            first_frame_timer: None,
+            flushing_first_frame: false,
             pending_direct_mode_switch: false,
             pending_tls_mode_switch: false,
             pending_plain_writes: BytesMut::new(),
@@ -493,7 +526,45 @@ where
 
     /// Write data to TLS session, handling buffer full by saving to pending buffer
     /// Used in PaddingTls mode
+    /// Whether the client still owes its header: nothing has been written.
+    fn client_header_unsent(&self) -> bool {
+        self.session.is_client() && self.write_first_packet && self.pending_prefix.is_some()
+    }
+
+    /// Send the header with an empty, long-padded first frame, as Xray's
+    /// client does when it has nothing to say first.
+    fn queue_empty_first_frame(&mut self) -> io::Result<()> {
+        self.write_first_packet = false;
+        let frame = super::vision_pad::pad_with_uuid_and_command(
+            &[],
+            &self.user_uuid,
+            COMMAND_CONTINUE,
+            true, // is_tls: the long padding
+        );
+        self.write_to_session(&frame)?;
+        self.flushing_first_frame = true;
+        Ok(())
+    }
+
+    /// Push a timer- or shutdown-written first frame through the session
+    /// and the transport: nothing else will flush it.
+    fn poll_flush_first_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.drain_all_writes_padding(cx))?;
+        ready!(Pin::new(&mut self.tcp).poll_flush(cx))?;
+        self.flushing_first_frame = false;
+        Poll::Ready(Ok(()))
+    }
+
     fn write_to_session(&mut self, data: &[u8]) -> io::Result<()> {
+        // The header and the first padded frame, as one plaintext write.
+        if let Some(mut prefix) = self.pending_prefix.take() {
+            prefix.extend_from_slice(data);
+            return self.write_plain_to_session(&prefix);
+        }
+        self.write_plain_to_session(data)
+    }
+
+    fn write_plain_to_session(&mut self, data: &[u8]) -> io::Result<()> {
         if !self.pending_plain_writes.is_empty() {
             // If there's already pending data, just append to it
             // (don't try to write, as that would require cx for polling)
@@ -1104,19 +1175,6 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.vless_response_to_send {
-            log::debug!("VISION WRITE: Sending VLESS response to TLS session");
-
-            // VLESS response header: [version=0, addon_length=0]
-            const VLESS_RESPONSE: [u8; 2] = [0, 0];
-
-            // Write VLESS response to TLS session (will be encrypted)
-            self.write_to_session(&VLESS_RESPONSE)?;
-
-            // Clear flag so we don't send it again
-            self.vless_response_to_send = false;
-        }
-
         // Drain all pending writes - this must be done before mode switch
         // as the session could contain the DIRECT/END packet that triggered the mode switch flag,
         // and because we no longer use `pending_plain_writes` afterwards.
@@ -1413,6 +1471,23 @@ where
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
+        // A server-first protocol reads before it writes; the header cannot
+        // wait for a write forever.
+        if this.client_header_unsent() && this.write_mode == VisionMode::PaddingTls {
+            let timer = this
+                .first_frame_timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(FIRST_FRAME_AFTER)));
+            if timer.as_mut().poll(cx).is_ready() {
+                this.queue_empty_first_frame()?;
+            }
+        }
+        // Progress on it without making the read wait.
+        if this.flushing_first_frame
+            && let Poll::Ready(Err(e)) = this.poll_flush_first_frame(cx)
+        {
+            return Poll::Ready(Err(e));
+        }
+
         // If we have leftover buffered data, return it first
         if !this.pending_read.is_empty() {
             let len = buf.remaining().min(this.pending_read.len());
@@ -1491,7 +1566,18 @@ where
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().tcp).poll_shutdown(cx)
+        let this = self.get_mut();
+        // A client that closes without writing still owes its request.
+        if this.client_header_unsent() && this.write_mode == VisionMode::PaddingTls {
+            this.queue_empty_first_frame()?;
+        }
+        // Everything accepted goes out before the transport closes, whatever
+        // the mode: a caller's write can leave plaintext in the TLS session
+        // (a drain that returned Pending), and `write_all` then `shutdown`
+        // with no flush between would close the socket on it.
+        ready!(AsyncWrite::poll_flush(Pin::new(&mut *this), cx))?;
+        this.flushing_first_frame = false;
+        Pin::new(&mut this.tcp).poll_shutdown(cx)
     }
 }
 
