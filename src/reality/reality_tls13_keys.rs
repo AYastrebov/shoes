@@ -200,12 +200,13 @@ pub fn derive_handshake_keys(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
     let digest_algorithm = cipher_suite.digest_algorithm();
 
-    // Validate input lengths
-    if shared_secret.len() != 32 {
+    // Validate input lengths: 32 for X25519, 64 for X25519MLKEM768 (the
+    // ML-KEM-768 and X25519 secrets concatenated).
+    if shared_secret.len() != 32 && shared_secret.len() != 64 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
+                "Invalid shared_secret length: {} (expected 32 or 64)",
                 shared_secret.len()
             ),
         ));

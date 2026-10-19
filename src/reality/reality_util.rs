@@ -271,11 +271,12 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
     ))
 }
 
-/// Extract server's X25519 public key from ServerHello message
+/// The server's key_share entry from a ServerHello record: its group and
+/// the key exchange data, checked against the lengths the client can use.
 ///
-/// This parses the TLS 1.3 ServerHello to find the KeyShare extension
-/// and extracts the X25519 public key (group 0x001d).
-pub fn extract_server_public_key(server_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
+/// X25519 is 32 bytes; X25519MLKEM768 is the ML-KEM-768 ciphertext (1088)
+/// followed by the server's X25519 public key (32).
+pub fn extract_server_key_share(server_hello: &[u8]) -> Result<(u16, Vec<u8>), std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if server_hello.len() < TLS_HEADER_LEN {
@@ -287,77 +288,54 @@ pub fn extract_server_public_key(server_hello: &[u8]) -> Result<[u8; 32], std::i
 
     let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
 
-    // Parse handshake header
+    // Handshake header, legacy version, random.
     let _handshake_type = reader.read_u8()?;
     let _handshake_len = reader.read_u24_be()?;
     let _protocol_version = reader.read_u16_be()?;
-
-    // Skip random
     reader.skip(32)?;
-
-    // Read session ID (ServerHello can echo it back)
     let session_id_len = reader.read_u8()? as usize;
     reader.skip(session_id_len)?;
-
-    // Read cipher suite (single 2-byte value in ServerHello)
+    // Cipher suite, compression method.
     reader.skip(2)?;
-
-    // Read compression method (single byte in ServerHello)
     reader.skip(1)?;
 
-    // Parse extensions
     let extensions_len = reader.read_u16_be()? as usize;
-    let extensions_start = reader.position();
-    let extensions_end = extensions_start + extensions_len;
-
+    let extensions_end = reader.position() + extensions_len;
     while reader.position() < extensions_end {
         let ext_type = reader.read_u16_be()?;
         let ext_len = reader.read_u16_be()? as usize;
-
         if ext_type == 51 {
-            // KeyShare extension (0x0033)
-            return parse_server_keyshare_extension(reader.read_slice(ext_len)?);
-        } else {
-            reader.skip(ext_len)?;
+            let mut share = BufReader::new(reader.read_slice(ext_len)?);
+            let group = share.read_u16_be()?;
+            let key_len = share.read_u16_be()? as usize;
+            let expected = match group {
+                super::reality_client_hello::GROUP_X25519 => 32,
+                super::reality_client_hello::GROUP_X25519_MLKEM768 => {
+                    super::reality_client_hello::MLKEM768_CIPHERTEXT_LEN + 32
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("server chose an unsupported key exchange group 0x{other:04x}"),
+                    ));
+                }
+            };
+            if key_len != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "key share for group 0x{group:04x} is {key_len} bytes, expected {expected}"
+                    ),
+                ));
+            }
+            return Ok((group, share.read_slice(key_len)?.to_vec()));
         }
+        reader.skip(ext_len)?;
     }
 
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         "KeyShare extension not found in ServerHello",
-    ))
-}
-
-/// Parses the ServerHello KeyShare extension to extract X25519 public key
-fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
-    let mut reader = BufReader::new(data);
-
-    // ServerHello KeyShare extension format:
-    // - Group: 2 bytes
-    // - Key Exchange Length: 2 bytes
-    // - Key Exchange Data: variable
-
-    let group = reader.read_u16_be()?;
-    let key_len = reader.read_u16_be()? as usize;
-
-    if group == 29 {
-        // X25519
-        if key_len != 32 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid X25519 key length: {}", key_len),
-            ));
-        }
-
-        let key_bytes = reader.read_slice(32)?;
-        let mut key = [0u8; 32];
-        key.copy_from_slice(key_bytes);
-        return Ok(key);
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "X25519 key share not found in ServerHello KeyShare extension",
     ))
 }
 
