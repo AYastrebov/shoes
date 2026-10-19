@@ -162,6 +162,18 @@ One session value on the FFI side (plan PR 1.6, part 4; A-9):
   platforms; the iOS protector holds its callback itself. No change to the C
   or JNI surface or to callback timing.
 
+First flight carries the payload (plan PR 3.2, part 1; SS-D7):
+
+- **Trojan and Shadowsocks clients send their request header with the first
+  payload** instead of flushing it as a record of its own, as the reference
+  clients do -- a fixed-size first record on every connection was a cheap rule
+  to match. For SS2022 the payload is now inside the request's
+  variable-length header, as SIP022 lays it out. Up to 8 KiB of the first write
+  joins the header. A client that writes nothing (a server-first protocol such
+  as SSH or SMTP) sends the header alone after 300 ms, the wait sing-box uses
+  (`C.ReadPayloadTimeout`), so those protocols start up to 300 ms later; a
+  shutdown sends it at once.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

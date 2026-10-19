@@ -54,6 +54,7 @@ pub mod connections;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
+mod deferred_header_stream;
 pub mod dns;
 mod fatal;
 mod h2mux;

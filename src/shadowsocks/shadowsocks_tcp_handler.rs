@@ -327,7 +327,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             ShadowsocksStreamType::Aead
         };
 
-        let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
+        let client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
             client_stream,
             stream_type,
             self.cipher.algorithm(),
@@ -351,11 +351,14 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             rng.fill_bytes(&mut location_vec[location_len + 2..]);
         }
 
-        write_all(&mut client_stream, &location_vec).await?;
-        client_stream.flush().await?;
-
+        // Sent with the first payload, as the reference clients do -- for
+        // SS2022 that makes the payload part of the request's variable-length
+        // header, as SIP022 lays it out (SS-D7).
         Ok(TcpClientSetupResult {
-            client_stream,
+            client_stream: Box::new(crate::deferred_header_stream::DeferredHeaderStream::new(
+                client_stream,
+                location_vec,
+            )),
             early_data: None,
         })
     }
