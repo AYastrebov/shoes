@@ -12,10 +12,48 @@ use rand::{Rng, RngExt};
 /// Target probability for the rarer bit. `pkg/protocol/padding.go:31`.
 const TARGET_BIT_PROBABILITY: f64 = 0.325;
 
-/// The ASCII run length is drawn from `24 + [0, 17)`.
-/// `pkg/protocol/padding.go:30`.
+/// The ASCII run length is `24 + [0, 17)`, fixed for the process: upstream
+/// derives it once from the host name and version (`FixedIntVH(17)`,
+/// `pkg/protocol/padding.go:30`), so one client's runs are all one length.
+/// Drawn once here instead (MI-M5).
 const ASCII_RUN_BASE: usize = 24;
 const ASCII_RUN_SPREAD: usize = 17;
+
+fn ascii_run_len() -> usize {
+    static RUN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| ASCII_RUN_BASE + rand::rng().random_range(0..ASCII_RUN_SPREAD))
+}
+
+/// mieru's `rng.Intn` (`pkg/rng/rng.go:34-36`, `scaleDown` at the end of the
+/// file): a uniform draw from `[0, n]` scaled by `sqrt(u^3)` for a uniform
+/// `u` in `[0, 1)`. Every padding length goes through it, which skews them
+/// small -- a mean of about `0.4 n`, where a plain uniform draw gives `0.5 n`
+/// and the padding was visibly longer than the Go client's (MI-M1).
+pub(crate) fn intn(n: usize) -> usize {
+    let mut rng = rand::rng();
+    let base: f64 = rng.random();
+    let scale = (base * base * base).sqrt();
+    (rng.random_range(0..=n) as f64 * scale) as usize
+}
+
+/// `common.ToPrintableChar` (`pkg/common/ascii.go`): a byte already
+/// printable stays; one whose low seven bits are printable loses its high
+/// bit; any other becomes a uniformly drawn printable character.
+fn to_printable(span: &mut [u8]) {
+    let printable = PRINTABLE_FIRST..=PRINTABLE_LAST;
+    let mut rng = rand::rng();
+    for byte in span {
+        if printable.contains(byte) {
+            continue;
+        }
+        let low = *byte & 0x7f;
+        *byte = if *byte & 0x80 != 0 && printable.contains(&low) {
+            low
+        } else {
+            PRINTABLE_FIRST + rng.random_range(0..=(PRINTABLE_LAST - PRINTABLE_FIRST))
+        };
+    }
+}
 
 /// The printable range upstream forces a run into. `pkg/common/ascii.go`.
 const PRINTABLE_FIRST: u8 = 0x20;
@@ -51,11 +89,11 @@ impl PaddingStrategy {
     }
 }
 
-/// Padding for a data or ack segment: random bytes, uniform length.
+/// Padding for a data or ack segment: random bytes.
 ///
 /// Upstream builds these with a zero-valued `asciiPaddingOpts`
 /// (`pkg/protocol/underlay_stream.go:672`), which makes
-/// `minConsecutiveASCIILen` zero — so the length is uniform over the whole
+/// `minConsecutiveASCIILen` zero -- so the length is `rng.Intn` over the whole
 /// range and the printable-run transform covers an empty span and does
 /// nothing. The per-user strategy applies to session segments only. Using it
 /// here would give every packet the same shape, which is a signature.
@@ -63,7 +101,7 @@ pub fn build_data_padding(max_len: usize) -> Vec<u8> {
     if max_len == 0 {
         return Vec::new();
     }
-    let len = rand::rng().random_range(0..=max_len);
+    let len = intn(max_len + 1).min(max_len);
     let mut padding = vec![0u8; len];
     rand::rng().fill_bytes(&mut padding);
     padding
@@ -75,8 +113,9 @@ pub fn build_ascii_padding(max_len: usize) -> Vec<u8> {
     if max_len == 0 {
         return Vec::new();
     }
-    let run_len = (ASCII_RUN_BASE + rand::rng().random_range(0..ASCII_RUN_SPREAD)).min(max_len);
-    let len = rand::rng().random_range(run_len..=max_len);
+    let run_len = ascii_run_len().min(max_len);
+    // `rng.Intn(maxLen - min + 1) + min` (`pkg/protocol/padding.go:143`).
+    let len = (intn(max_len - run_len + 1) + run_len).min(max_len);
 
     let mut padding = vec![0u8; len];
     rand::rng().fill_bytes(&mut padding);
@@ -91,10 +130,7 @@ pub fn build_ascii_padding(max_len: usize) -> Vec<u8> {
     } else {
         0
     };
-    let span = PRINTABLE_LAST - PRINTABLE_FIRST + 1;
-    for byte in &mut padding[begin..begin + run_len] {
-        *byte = PRINTABLE_FIRST + (*byte % span);
-    }
+    to_printable(&mut padding[begin..begin + run_len]);
     padding
 }
 
@@ -135,7 +171,8 @@ pub fn build_entropy_padding(max_len: usize, existing: &[u8]) -> Vec<u8> {
     let len = if needed_bytes >= max_len {
         max_len
     } else {
-        rand::rng().random_range(needed_bytes..=max_len)
+        // `rng.Intn(maxLen - min + 1) + min` (`pkg/protocol/padding.go:179`).
+        (intn(max_len - needed_bytes + 1) + needed_bytes).min(max_len)
     };
     if len == 0 {
         return Vec::new();
@@ -369,5 +406,51 @@ mod tests {
             }
         }
         longest
+    }
+
+    /// MI-M1: mieru's `rng.Intn(n)` averages about `0.4 n` -- a uniform
+    /// draw times `sqrt(u^3)`, whose mean is 2/5 -- where a plain uniform
+    /// draw gives `0.5 n`. Data padding over its 255-byte range therefore
+    /// averages about 51 bytes, not 128.
+    #[test]
+    fn padding_lengths_follow_mierus_scaled_draw() {
+        const DRAWS: usize = 10_000;
+        let mean = (0..DRAWS).map(|_| intn(255) as f64).sum::<f64>() / DRAWS as f64;
+        assert!((45.0..58.0).contains(&mean), "intn mean {mean}");
+        assert!((0..DRAWS).all(|_| intn(255) <= 255));
+
+        let data_mean = (0..DRAWS)
+            .map(|_| build_data_padding(MAX_PADDING_LEN).len() as f64)
+            .sum::<f64>()
+            / DRAWS as f64;
+        assert!(data_mean < 70.0, "data padding mean {data_mean}");
+    }
+
+    /// MI-M5: one ASCII run length for the process, as upstream fixes it
+    /// per host, not one per segment.
+    #[test]
+    fn the_ascii_run_length_is_fixed_for_the_process() {
+        let run = ascii_run_len();
+        assert!((ASCII_RUN_BASE..ASCII_RUN_BASE + ASCII_RUN_SPREAD).contains(&run));
+        assert!((0..100).all(|_| ascii_run_len() == run));
+        for _ in 0..100 {
+            let padding = build_ascii_padding(MAX_PADDING_LEN);
+            assert!(longest_printable_run(&padding) >= run);
+        }
+    }
+
+    /// `ToPrintableChar`: printable bytes stay, a high-bit byte whose low
+    /// bits are printable keeps them, anything else becomes printable.
+    #[test]
+    fn printable_mapping_follows_upstream() {
+        let mut bytes = [b'A', 0x80 | b'z', 0x00, 0xff, 0x7f];
+        to_printable(&mut bytes);
+        assert_eq!(bytes[0], b'A');
+        assert_eq!(bytes[1], b'z');
+        assert!(
+            bytes
+                .iter()
+                .all(|b| (PRINTABLE_FIRST..=PRINTABLE_LAST).contains(b))
+        );
     }
 }

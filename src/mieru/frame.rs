@@ -17,29 +17,37 @@ use crate::mieru::{MAX_PADDING_LEN, METADATA_LEN, TAG_LEN};
 /// the payload's tag. `pkg/protocol/underlay_stream.go:41`.
 const STREAM_OVERHEAD: usize = METADATA_LEN + TAG_LEN * 2;
 
-/// Assemble a session segment: encrypted metadata, then trailing padding.
+/// Assemble a session segment: encrypted metadata, the encrypted payload if
+/// there is one, then padding (`StreamUnderlay.writeOneSegment`,
+/// `pkg/protocol/underlay_stream.go:626-660`).
+///
+/// Only the client's openSessionRequest carries a payload -- the first
+/// write, up to [`MAX_SESSION_OPEN_PAYLOAD`] bytes (`pkg/protocol/session.go:357`).
 pub fn encode_session_segment(
     cipher: &mut DirectionCipher,
     meta: &SessionMetadata,
     strategy: PaddingStrategy,
+    payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    // This encoder writes metadata and padding only. A non-zero payload_len
-    // would describe a payload that never reaches the wire, and the peer would
-    // sit waiting for bytes that are not coming.
-    if meta.payload_len != 0 {
+    if payload.len() > MAX_SESSION_OPEN_PAYLOAD {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "a mieru session segment carries no payload, so payload_len must be zero",
+            format!(
+                "a mieru session segment carries at most {MAX_SESSION_OPEN_PAYLOAD} payload bytes, \
+                 got {}",
+                payload.len()
+            ),
         ));
     }
     let mut meta = meta.clone();
+    meta.payload_len = payload.len() as u16;
     // The entropy strategy balances against the bytes that will precede the
     // padding. Those are ciphertext, so upstream models them with random data
     // of the right length rather than the real thing
     // (`buildRecommendedPaddingOpts`, `pkg/protocol/padding.go:108-134`).
     // Passing an empty slice instead makes every bit count zero, and the
     // calculation degenerates into a near-constant run of 0xFF.
-    let mut preceding = vec![0u8; STREAM_OVERHEAD + meta.payload_len as usize];
+    let mut preceding = vec![0u8; STREAM_OVERHEAD + payload.len()];
     rand::rng().fill_bytes(&mut preceding);
     let suffix = strategy.build(MAX_PADDING_LEN, &preceding);
     meta.suffix_len = suffix.len() as u8;
@@ -50,8 +58,15 @@ pub fn encode_session_segment(
     meta.timestamp_minutes = current_timestamp_minutes()?;
 
     let sealed = cipher.seal(&metadata::encode_session(&meta))?;
-    let mut out = Vec::with_capacity(sealed.len() + suffix.len());
+    // An empty payload gets no second encryption, as in a data segment.
+    let sealed_payload = if payload.is_empty() {
+        Vec::new()
+    } else {
+        cipher.seal(payload)?
+    };
+    let mut out = Vec::with_capacity(sealed.len() + sealed_payload.len() + suffix.len());
     out.extend_from_slice(&sealed);
+    out.extend_from_slice(&sealed_payload);
     out.extend_from_slice(&suffix);
     Ok(out)
 }
@@ -68,6 +83,7 @@ pub fn encode_data_segment(
     cipher: &mut DirectionCipher,
     session_id: u32,
     seq: u32,
+    flow: DataFlow,
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
     let prefix = build_data_padding(MAX_PADDING_LEN);
@@ -81,11 +97,14 @@ pub fn encode_data_segment(
         timestamp_minutes: current_timestamp_minutes()?,
         session_id,
         seq,
-        // Carried because the format has the fields; over TCP neither end
-        // acts on them. See the spec, "Metadata".
+        // What upstream sends over TCP (`Session.writeChunk`,
+        // `pkg/protocol/session.go:651-661`): `nextRecv`, which only the
+        // packet transport advances, so 0 here; the receive window; and the
+        // fragment countdown within one write. Neither end acts on them over
+        // TCP, but zeros where the Go client has values were a fingerprint.
         unack_seq: 0,
-        window_size: 0,
-        fragment: 0,
+        window_size: flow.window_size,
+        fragment: flow.fragment,
         prefix_len: prefix.len() as u8,
         payload_len: payload.len() as u16,
         suffix_len: suffix.len() as u8,
@@ -107,6 +126,33 @@ pub fn encode_data_segment(
     out.extend_from_slice(&sealed_payload);
     out.extend_from_slice(&suffix);
     Ok(out)
+}
+
+/// The most a client's openSessionRequest carries: its first write, when it
+/// fits (`MaxSessionOpenPayload`, `pkg/protocol/metadata.go:102`).
+pub const MAX_SESSION_OPEN_PAYLOAD: usize = 1024;
+
+/// A session's receive window as upstream counts it: its segment tree's
+/// capacity (`segmentTreeCapacity`, `pkg/protocol/session.go:48`).
+pub const RECEIVE_WINDOW_SEGMENTS: usize = 4096;
+
+/// The flow-control fields of a data segment.
+#[derive(Debug, Clone, Copy)]
+pub struct DataFlow {
+    /// Free segment slots in the receive queue
+    /// (`receiveWindowSize`, `pkg/protocol/session.go:1415`).
+    pub window_size: u16,
+    /// Segments of the same write still to come after this one: the first
+    /// carries `n - 1`, the last 0 (`pkg/protocol/session.go:617`).
+    pub fragment: u8,
+}
+
+impl DataFlow {
+    /// What a peer with nothing queued sends for a single-segment write.
+    pub const IDLE: DataFlow = DataFlow {
+        window_size: RECEIVE_WINDOW_SEGMENTS as u16,
+        fragment: 0,
+    };
 }
 
 /// Minutes since the Unix epoch.
@@ -216,7 +262,7 @@ mod tests {
             suffix_len: 0,
         };
 
-        let wire = encode_session_segment(&mut sender, &meta, PaddingStrategy::Ascii).unwrap();
+        let wire = encode_session_segment(&mut sender, &meta, PaddingStrategy::Ascii, &[]).unwrap();
         let (parsed, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(consumed, wire.len());
         assert!(payload.is_empty());
@@ -234,7 +280,14 @@ mod tests {
         let (mut sender, mut receiver) = cipher_pair();
         let body = b"the quick brown fox";
 
-        let wire = encode_data_segment(&mut sender, 99, 1, body).unwrap();
+        let wire = encode_data_segment(
+            &mut sender,
+            99,
+            1,
+            crate::mieru::frame::DataFlow::IDLE,
+            body,
+        )
+        .unwrap();
         let (parsed, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(consumed, wire.len());
         assert_eq!(payload, body);
@@ -251,7 +304,14 @@ mod tests {
     fn test_both_padding_strategies_produce_decodable_segments() {
         for strategy in [PaddingStrategy::Ascii, PaddingStrategy::Entropy] {
             let (mut sender, mut receiver) = cipher_pair();
-            let wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
+            let wire = encode_data_segment(
+                &mut sender,
+                1,
+                0,
+                crate::mieru::frame::DataFlow::IDLE,
+                b"payload",
+            )
+            .unwrap();
             let (_, payload, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
             assert_eq!(
                 payload, b"payload",
@@ -266,7 +326,14 @@ mod tests {
     #[test]
     fn test_an_incomplete_segment_returns_none_without_advancing() {
         let (mut sender, mut receiver) = cipher_pair();
-        let wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
+        let wire = encode_data_segment(
+            &mut sender,
+            1,
+            0,
+            crate::mieru::frame::DataFlow::IDLE,
+            b"payload",
+        )
+        .unwrap();
 
         // Feed every prefix to the same receiver. None may consume anything.
         for cut in 1..wire.len() {
@@ -283,11 +350,39 @@ mod tests {
         assert_eq!(payload, b"payload");
     }
 
-    /// A session segment is metadata plus padding; nothing writes a payload.
-    /// Announcing one would leave the peer waiting on bytes that never come,
-    /// so the encoder refuses rather than emitting a segment that lies.
+    /// The client's openSessionRequest carries its first write: sealed after
+    /// the metadata, before the padding, and decoded back intact (MI-M2).
     #[test]
-    fn test_a_session_segment_refuses_to_announce_a_payload() {
+    fn test_an_open_request_carries_its_payload() {
+        let (mut sender, mut receiver) = cipher_pair();
+        let request = b"\x05\x01\x00\x01\x7f\x00\x00\x01\x01\xbb";
+        let wire = encode_session_segment(
+            &mut sender,
+            &SessionMetadata {
+                protocol: OPEN_SESSION_REQUEST,
+                timestamp_minutes: 0,
+                session_id: 7,
+                seq: 0,
+                status: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+            request,
+        )
+        .unwrap();
+        let (meta, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(payload, request);
+        match meta {
+            Metadata::Session(session) => assert_eq!(session.payload_len as usize, request.len()),
+            Metadata::Data(_) => panic!("a session segment"),
+        }
+    }
+
+    /// Upstream piggybacks at most 1024 bytes on the open request.
+    #[test]
+    fn test_a_session_segment_refuses_a_payload_over_the_open_limit() {
         let (mut cipher, _) = cipher_pair();
         let err = encode_session_segment(
             &mut cipher,
@@ -297,10 +392,11 @@ mod tests {
                 session_id: 7,
                 seq: 0,
                 status: 0,
-                payload_len: 16,
+                payload_len: 0,
                 suffix_len: 0,
             },
             PaddingStrategy::Ascii,
+            &[0u8; MAX_SESSION_OPEN_PAYLOAD + 1],
         )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -309,8 +405,24 @@ mod tests {
     #[test]
     fn test_two_segments_decode_in_sequence() {
         let (mut sender, mut receiver) = cipher_pair();
-        let mut wire = encode_data_segment(&mut sender, 1, 0, b"first").unwrap();
-        wire.extend_from_slice(&encode_data_segment(&mut sender, 1, 1, b"second").unwrap());
+        let mut wire = encode_data_segment(
+            &mut sender,
+            1,
+            0,
+            crate::mieru::frame::DataFlow::IDLE,
+            b"first",
+        )
+        .unwrap();
+        wire.extend_from_slice(
+            &encode_data_segment(
+                &mut sender,
+                1,
+                1,
+                crate::mieru::frame::DataFlow::IDLE,
+                b"second",
+            )
+            .unwrap(),
+        );
 
         let (_, first, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(first, b"first");
@@ -323,7 +435,14 @@ mod tests {
     #[test]
     fn test_a_corrupted_metadata_byte_is_rejected() {
         let (mut sender, mut receiver) = cipher_pair();
-        let mut wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
+        let mut wire = encode_data_segment(
+            &mut sender,
+            1,
+            0,
+            crate::mieru::frame::DataFlow::IDLE,
+            b"payload",
+        )
+        .unwrap();
         // Flip a byte inside the encrypted metadata, past the nonce.
         wire[crate::mieru::NONCE_LEN + 1] ^= 0xff;
         assert!(decode_segment(&mut receiver, &wire).is_err());
@@ -351,6 +470,7 @@ mod tests {
                 suffix_len: 0,
             },
             PaddingStrategy::Ascii,
+            &[],
         )
         .unwrap();
 
@@ -372,7 +492,9 @@ mod tests {
         let (mut sender, mut receiver) = cipher_pair();
         let now_minutes = (crate::util::unix_time_secs().unwrap() / 60) as u32;
 
-        let wire = encode_data_segment(&mut sender, 1, 0, b"x").unwrap();
+        let wire =
+            encode_data_segment(&mut sender, 1, 0, crate::mieru::frame::DataFlow::IDLE, b"x")
+                .unwrap();
         let (parsed, _, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         let Metadata::Data(data) = parsed else {
             panic!("expected data metadata")
@@ -383,7 +505,8 @@ mod tests {
     #[test]
     fn test_an_empty_payload_segment_carries_no_payload_tag() {
         let (mut sender, mut receiver) = cipher_pair();
-        let wire = encode_data_segment(&mut sender, 1, 0, b"").unwrap();
+        let wire = encode_data_segment(&mut sender, 1, 0, crate::mieru::frame::DataFlow::IDLE, b"")
+            .unwrap();
         let (_, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert!(payload.is_empty());
         assert_eq!(consumed, wire.len());

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+mieru looks like the Go client (plan PR 3.4; MI-M1 to MI-M5):
+
+- **mieru padding lengths follow the Go client's distribution.** Every length
+  goes through a port of mieru's `rng.Intn`, a uniform draw scaled by
+  `sqrt(u^3)`, so data padding averages about 51 bytes where it averaged 128.
+  The printable run is one length for the process, as upstream fixes it per
+  host, and its bytes are made printable as `ToPrintableChar` does.
+- **The open request carries the socks5 request**, as the Go client sends it,
+  instead of a data segment one round trip later: a mieru connection is ready
+  one round trip sooner. A first write over 1024 bytes still follows as data.
+- **A session ends with the close handshake.** Shutting down sends
+  closeSessionRequest before the FIN, and a closeSessionRequest from the
+  server is answered with closeSessionResponse.
+- Data segments carry the Go client's receive window and fragment countdown
+  instead of zeros. `unack_seq` stays 0, which is what upstream sends over TCP.
+
+Checked against the mieru server (mita 3.38.1) in Docker: small requests and
+8 MiB intact, and the server logging the close handshake.
+
 ## v0.7.0
 
 Phase 1 of the 2026-10-15 quality plan
