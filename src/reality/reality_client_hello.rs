@@ -112,9 +112,14 @@ fn extension(ext_type: u16, body: &[u8]) -> Vec<u8> {
 }
 
 /// A GREASE encrypted_client_hello, as BoringSSL sends when it has no ECH
-/// config: outer type, HKDF-SHA256 / AES-128-GCM, random config id and
+/// config: outer type, HKDF-SHA256 / AES-128-GCM, a random config id, an
 /// `enc`, and a random payload of a Chrome length plus the AEAD tag.
-fn grease_ech(rng: &mut impl Rng) -> Vec<u8> {
+///
+/// `enc` is a real X25519 public key, as HPKE's encapsulation produces it
+/// (uTLS `u_ech.go`). Random bytes would not do: an encoded X25519 public
+/// key always has the top bit of its last byte clear, and random bytes set
+/// it on half of connections -- a passive fingerprint.
+fn grease_ech(rng: &mut impl Rng) -> std::io::Result<Vec<u8>> {
     const PAYLOAD_LENS: [usize; 4] = [128, 160, 192, 224];
     const AEAD_TAG_LEN: usize = 16;
     let payload_len = PAYLOAD_LENS[rng.random_range(0..PAYLOAD_LENS.len())] + AEAD_TAG_LEN;
@@ -124,13 +129,14 @@ fn grease_ech(rng: &mut impl Rng) -> Vec<u8> {
     push_u16(&mut body, 0x0001); // HKDF-SHA256
     push_u16(&mut body, 0x0001); // AES-128-GCM
     body.push(rng.random());
-    let mut enc = [0u8; 32];
-    rng.fill_bytes(&mut enc);
-    push_u16_prefixed(&mut body, &enc);
+    let enc = aws_lc_rs::agreement::PrivateKey::generate(&aws_lc_rs::agreement::X25519)
+        .and_then(|key| key.compute_public_key())
+        .map_err(|_| std::io::Error::other("Failed to generate the GREASE ECH key"))?;
+    push_u16_prefixed(&mut body, enc.as_ref());
     let mut payload = vec![0u8; payload_len];
     rng.fill_bytes(&mut payload);
     push_u16_prefixed(&mut body, &payload);
-    extension(EXT_ENCRYPTED_CLIENT_HELLO, &body)
+    Ok(extension(EXT_ENCRYPTED_CLIENT_HELLO, &body))
 }
 
 /// Build the ClientHello handshake message (no record header).
@@ -234,7 +240,7 @@ pub fn construct_chrome_client_hello(
         push_u16_prefixed(&mut body, b"\x02h2");
         middle.push(extension(EXT_APPLICATION_SETTINGS, &body));
     }
-    middle.push(grease_ech(&mut rng));
+    middle.push(grease_ech(&mut rng)?);
     shuffle(&mut middle, &mut rng);
 
     let mut extensions = extension(grease.extension1, &[]);
@@ -497,6 +503,29 @@ mod tests {
             crate::reality::reality_util::extract_client_public_key(&record).unwrap(),
             [0x42; 32]
         );
+    }
+
+    /// The GREASE ECH `enc` is an X25519 public key: 32 bytes with the top
+    /// bit of the last one clear, which random bytes would set half the time.
+    #[test]
+    fn the_grease_ech_enc_is_an_x25519_public_key() {
+        for _ in 0..64 {
+            let parsed = parse(&hello());
+            let body = &parsed
+                .extensions
+                .iter()
+                .find(|(t, _)| *t == EXT_ENCRYPTED_CLIENT_HELLO)
+                .unwrap()
+                .1;
+            // type (1), KDF (2), AEAD (2), config id (1), then enc.
+            assert_eq!(&body[..5], &[0x00, 0x00, 0x01, 0x00, 0x01]);
+            let enc_len = u16::from_be_bytes([body[6], body[7]]) as usize;
+            assert_eq!(enc_len, 32);
+            let enc = &body[8..8 + enc_len];
+            assert_eq!(enc[31] & 0x80, 0, "an encoded X25519 key: {enc:02x?}");
+            let payload_len = u16::from_be_bytes([body[8 + enc_len], body[9 + enc_len]]) as usize;
+            assert!([144, 176, 208, 240].contains(&payload_len), "{payload_len}");
+        }
     }
 
     #[test]
