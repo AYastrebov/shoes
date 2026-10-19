@@ -1571,9 +1571,12 @@ where
         if this.client_header_unsent() && this.write_mode == VisionMode::PaddingTls {
             this.queue_empty_first_frame()?;
         }
-        if this.flushing_first_frame {
-            ready!(this.poll_flush_first_frame(cx))?;
-        }
+        // Everything accepted goes out before the transport closes, whatever
+        // the mode: a caller's write can leave plaintext in the TLS session
+        // (a drain that returned Pending), and `write_all` then `shutdown`
+        // with no flush between would close the socket on it.
+        ready!(AsyncWrite::poll_flush(Pin::new(&mut *this), cx))?;
+        this.flushing_first_frame = false;
         Pin::new(&mut this.tcp).poll_shutdown(cx)
     }
 }

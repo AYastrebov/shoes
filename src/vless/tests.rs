@@ -16,6 +16,9 @@ use crate::tcp::tcp_client_handler_factory::{
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 
+/// Long enough that only a hang trips it, on the slowest CI runner.
+const HANG: Duration = Duration::from_secs(30);
+
 const USER_ID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
 
 fn indent(pem: &str) -> String {
@@ -147,7 +150,7 @@ async fn the_request_rides_in_the_first_padded_frame() {
         stream: mut server_stream,
         initial_remote_data,
         ..
-    } = tokio::time::timeout(Duration::from_secs(5), accepted)
+    } = tokio::time::timeout(HANG, accepted)
         .await
         .expect("the server read the request")
         .unwrap()
@@ -216,7 +219,7 @@ async fn a_client_that_only_reads_sends_the_request_after_the_wait() {
         remote_location,
         stream: mut server_stream,
         ..
-    } = tokio::time::timeout(Duration::from_secs(5), accepted)
+    } = tokio::time::timeout(HANG, accepted)
         .await
         .expect("the request arrived without a client write")
         .unwrap()
@@ -232,10 +235,49 @@ async fn a_client_that_only_reads_sends_the_request_after_the_wait() {
 
     server_stream.write_all(b"SSH-2.0").await.unwrap();
     server_stream.flush().await.unwrap();
-    let greeting = tokio::time::timeout(Duration::from_secs(5), reader)
+    let greeting = tokio::time::timeout(HANG, reader)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(&greeting, b"SSH-2.0");
+}
+
+/// A write and then a shutdown with no flush between still delivers the
+/// write: the shutdown pushes out what the TLS session holds.
+#[tokio::test]
+async fn a_shutdown_delivers_what_was_written_before_it() {
+    let (server, client) = handlers();
+    let (client_end, server_end) = tcp_pair().await;
+    let accepted =
+        tokio::spawn(async move { server.setup_server_stream(Box::new(server_end)).await });
+
+    let mut stream = client
+        .setup_client_tcp_stream(Box::new(client_end), target().into())
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"last words").await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let TcpServerSetupResult::TcpForward {
+        stream: mut server_stream,
+        initial_remote_data,
+        ..
+    } = tokio::time::timeout(HANG, accepted)
+        .await
+        .expect("the server read the request")
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not a TCP forward");
+    };
+    let mut received = initial_remote_data.map(Vec::from).unwrap_or_default();
+    let mut rest = Vec::new();
+    tokio::time::timeout(HANG, server_stream.read_to_end(&mut rest))
+        .await
+        .expect("EOF after the payload")
+        .unwrap();
+    received.extend_from_slice(&rest);
+    assert_eq!(received, b"last words");
 }
