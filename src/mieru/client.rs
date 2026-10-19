@@ -146,9 +146,12 @@ impl MieruTcpHandler {
         }
     }
 
+    /// Open a session whose first write is `first_payload`, the socks5
+    /// request; the open request carries it.
     async fn open_session(
         &self,
         client_stream: Box<dyn AsyncStream>,
+        first_payload: &[u8],
     ) -> std::io::Result<MieruStream> {
         let now = crate::util::unix_time_secs().map_err(|e| {
             std::io::Error::new(
@@ -158,7 +161,14 @@ impl MieruTcpHandler {
                 ),
             )
         })?;
-        MieruStream::open(client_stream, &self.password, &self.username, now).await
+        MieruStream::open(
+            client_stream,
+            &self.password,
+            &self.username,
+            now,
+            first_payload,
+        )
+        .await
     }
 }
 
@@ -169,12 +179,8 @@ impl TcpClientHandler for MieruTcpHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut session = self.open_session(client_stream).await?;
         let request = encode_socks5_request(SOCKS5_CONNECT, &remote_location.into_location())?;
-        session.write_all(&request).await?;
-        session.flush().await?;
+        let mut session = self.open_session(client_stream, &request).await?;
         read_socks5_reply(&mut session).await?;
 
         Ok(TcpClientSetupResult {
@@ -192,13 +198,9 @@ impl TcpClientHandler for MieruTcpHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut session = self.open_session(client_stream).await?;
         let target_location = target.into_location();
         let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &target_location)?;
-        session.write_all(&request).await?;
-        session.flush().await?;
+        let mut session = self.open_session(client_stream, &request).await?;
         read_socks5_reply(&mut session).await?;
 
         Ok(Box::new(MieruUdpStream::new(session, target_location)))

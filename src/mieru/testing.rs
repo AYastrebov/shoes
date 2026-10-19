@@ -52,14 +52,21 @@ impl ScriptedPeer {
                 suffix_len: 0,
             },
             PaddingStrategy::Ascii,
+            &[],
         )
         .expect("encoding an open session response")
     }
 
     /// A data segment carrying `payload` toward the client.
     pub fn data(&mut self, session_id: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
-        encode_data_segment(&mut self.send, session_id, seq, payload)
-            .expect("encoding a data segment")
+        encode_data_segment(
+            &mut self.send,
+            session_id,
+            seq,
+            crate::mieru::frame::DataFlow::IDLE,
+            payload,
+        )
+        .expect("encoding a data segment")
     }
 }
 
@@ -74,7 +81,7 @@ pub async fn connect() -> (MieruStream, tokio::net::TcpStream, ScriptedPeer) {
 
     let client = tokio::spawn(async move {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
+        MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000, &[]).await
     });
 
     let (mut server_tcp, _) = listener.accept().await.unwrap();

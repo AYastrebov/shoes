@@ -6,14 +6,17 @@
 //! machine.
 
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::mieru::crypto::{DirectionCipher, derive_key, round_to_interval};
-use crate::mieru::frame::{decode_segment, encode_data_segment, encode_session_segment};
+use crate::mieru::frame::{
+    DataFlow, MAX_SESSION_OPEN_PAYLOAD, RECEIVE_WINDOW_SEGMENTS, decode_segment,
+    encode_data_segment, encode_session_segment,
+};
 use crate::mieru::metadata::{
     CLOSE_SESSION_REQUEST, CLOSE_SESSION_RESPONSE, Metadata, OPEN_SESSION_REQUEST,
     OPEN_SESSION_RESPONSE, SESSION_STATUS_OK, SessionMetadata,
@@ -65,6 +68,20 @@ pub struct MieruStream {
     /// Set when the peer closed the session. The underlay may stay open, so
     /// this is what turns a close into EOF for the caller.
     session_closed: bool,
+    /// Our closeSessionRequest is staged or sent.
+    close_sent: bool,
+
+    /// Shapes the session segments this side still sends (the close).
+    strategy: PaddingStrategy,
+    /// Where each data segment in `ready` starts, for those whose delivery
+    /// has not begun. Upstream's `Session.Read` takes a segment off its
+    /// receive queue as it starts copying it, leaving any remainder in
+    /// `unreadBuf`, so a segment holds a window slot until its first byte is
+    /// read -- not until the whole buffer is.
+    unstarted_segments: std::collections::VecDeque<usize>,
+    /// A control segment (the close response) is written but not yet
+    /// flushed through the underlay.
+    control_flush_pending: bool,
 }
 
 impl std::fmt::Debug for MieruStream {
@@ -81,18 +98,31 @@ impl MieruStream {
     /// The response is awaited here rather than lazily, so a wrong password
     /// surfaces as a failed connection instead of a stream that silently
     /// carries nothing.
+    ///
+    /// `first_payload` is the session's first write -- the client's socks5
+    /// request. Upstream seals it into the openSessionRequest when it fits
+    /// in [`MAX_SESSION_OPEN_PAYLOAD`] bytes (`pkg/protocol/session.go:343-371`),
+    /// so the request and the destination arrive in one segment; sending them
+    /// apart cost a round trip and gave the first packet a shape of its own
+    /// (MI-M2). A larger one follows as data once the session is open.
     pub async fn open(
         mut inner: Box<dyn AsyncStream>,
         password: &[u8],
         username: &[u8],
         unix_secs: u64,
+        first_payload: &[u8],
     ) -> std::io::Result<Self> {
         let key = derive_key(password, username, round_to_interval(unix_secs));
         let mut send = DirectionCipher::new(&key, username);
         let mut recv = DirectionCipher::new(&key, username);
         // The strategy shapes the session segments only; data segments use
-        // plain random padding, so it is not kept past the handshake.
+        // plain random padding.
         let strategy = PaddingStrategy::for_user(username);
+        let (in_open, after_open) = if first_payload.len() <= MAX_SESSION_OPEN_PAYLOAD {
+            (first_payload, &[][..])
+        } else {
+            (&[][..], first_payload)
+        };
 
         // Session ids are the peer's bookkeeping; any value works as long as
         // it is consistent for the connection.
@@ -112,6 +142,7 @@ impl MieruStream {
                 suffix_len: 0,
             },
             strategy,
+            in_open,
         )?;
         write_all(&mut inner, &request).await?;
         inner.flush().await?;
@@ -177,7 +208,7 @@ impl MieruStream {
             }
         }
 
-        Ok(Self {
+        let mut stream = Self {
             inner,
             send,
             recv,
@@ -189,7 +220,91 @@ impl MieruStream {
             outgoing: Vec::new(),
             outgoing_at: 0,
             session_closed: false,
-        })
+            close_sent: false,
+            strategy,
+            unstarted_segments: std::collections::VecDeque::new(),
+            control_flush_pending: false,
+        };
+        // What arrived with the open response -- the reply to the socks5
+        // request the open carried, now that both travel together -- is
+        // decoded here; left in `pending`, a read would wait on the socket
+        // for bytes already in hand.
+        stream.drain_pending()?;
+        // A close request that came with the response is answered now; once
+        // open returns, nothing else would push the answer out.
+        if !stream.outgoing.is_empty() {
+            stream.flush().await?;
+        }
+        if !after_open.is_empty() {
+            stream.write_all(after_open).await?;
+            stream.flush().await?;
+        }
+        Ok(stream)
+    }
+
+    /// Stage a session segment after whatever is already staged.
+    fn queue_session_segment(&mut self, protocol: u8) -> std::io::Result<()> {
+        let segment = encode_session_segment(
+            &mut self.send,
+            &SessionMetadata {
+                protocol,
+                timestamp_minutes: 0,
+                session_id: self.session_id,
+                seq: self.next_seq,
+                status: SESSION_STATUS_OK,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            self.strategy,
+            &[],
+        )?;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.outgoing.drain(..self.outgoing_at);
+        self.outgoing_at = 0;
+        self.outgoing.extend_from_slice(&segment);
+        Ok(())
+    }
+
+    /// Write what is staged and flush it: for segments no caller's write is
+    /// pushing out, the close response sent from the read path. Pending
+    /// until both are done, so the read path can wait on it before it
+    /// reports EOF.
+    fn poll_push_outgoing(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.outgoing_at < self.outgoing.len() {
+            match ready!(
+                Pin::new(&mut self.inner).poll_write(cx, &self.outgoing[self.outgoing_at..])
+            ) {
+                Ok(0) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "mieru transport accepted no bytes",
+                    )));
+                }
+                Ok(n) => {
+                    self.outgoing_at += n;
+                    self.control_flush_pending = true;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        self.outgoing.clear();
+        self.outgoing_at = 0;
+        if self.control_flush_pending {
+            ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+            self.control_flush_pending = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Whether a control segment is still on its way out.
+    fn control_output_pending(&self) -> bool {
+        self.outgoing_at < self.outgoing.len() || self.control_flush_pending
+    }
+
+    /// The receive window this side advertises: the queue's capacity less
+    /// the segments whose delivery has not begun.
+    fn window_size(&self) -> u16 {
+        RECEIVE_WINDOW_SEGMENTS.saturating_sub(self.unstarted_segments.len()) as u16
     }
 
     /// Move every complete segment out of `pending` and into `ready`.
@@ -199,17 +314,24 @@ impl MieruStream {
             match meta {
                 Metadata::Data(_) => {
                     if !payload.is_empty() {
+                        self.unstarted_segments.push_back(self.ready.len());
                         self.ready.extend_from_slice(&payload);
                     }
                 }
                 // The server closes a session while keeping the TCP underlay
                 // open, so a close has to become EOF here. Without the flag
                 // the reader goes back to the socket and the connection hangs
-                // until an outer timeout.
-                Metadata::Session(session)
-                    if session.protocol == CLOSE_SESSION_REQUEST
-                        || session.protocol == CLOSE_SESSION_RESPONSE =>
-                {
+                // until an outer timeout. A request gets its response first,
+                // as upstream's inputClose sends one (MI-M3).
+                Metadata::Session(session) if session.protocol == CLOSE_SESSION_REQUEST => {
+                    if !self.close_sent {
+                        self.close_sent = true;
+                        self.queue_session_segment(CLOSE_SESSION_RESPONSE)?;
+                    }
+                    self.session_closed = true;
+                    break;
+                }
+                Metadata::Session(session) if session.protocol == CLOSE_SESSION_RESPONSE => {
                     self.session_closed = true;
                     break;
                 }
@@ -235,15 +357,27 @@ impl AsyncRead for MieruStream {
                 let n = available.len().min(buf.remaining());
                 buf.put_slice(&available[..n]);
                 this.ready_at += n;
+                // Every segment this read reached has started delivery.
+                while this
+                    .unstarted_segments
+                    .front()
+                    .is_some_and(|&start| start < this.ready_at)
+                {
+                    this.unstarted_segments.pop_front();
+                }
                 if this.ready_at == this.ready.len() {
                     this.ready.clear();
                     this.ready_at = 0;
+                    this.unstarted_segments.clear();
                 }
                 return Poll::Ready(Ok(()));
             }
 
             if this.session_closed {
-                // Closed and drained: EOF.
+                // Closed and drained: EOF -- once the close response, if one
+                // is owed, has left. Reporting EOF first would let the caller
+                // drop the stream with the answer still unsent.
+                ready!(this.poll_push_outgoing(cx))?;
                 return Poll::Ready(Ok(()));
             }
 
@@ -264,6 +398,14 @@ impl AsyncRead for MieruStream {
                     }
                     this.pending.extend_from_slice(filled);
                     this.drain_pending()?;
+                    // A close response queued while draining goes out now;
+                    // no write is coming to carry it. Not waited on here: the
+                    // EOF above waits, and data already decoded need not.
+                    if this.control_output_pending()
+                        && let Poll::Ready(Err(e)) = this.poll_push_outgoing(cx)
+                    {
+                        return Poll::Ready(Err(e));
+                    }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -305,8 +447,20 @@ impl AsyncWrite for MieruStream {
         // The payload length field is 16 bits and the protocol caps a fragment
         // at 32768 bytes, so a larger write becomes several segments.
         let take = buf.len().min(MAX_FRAGMENT_LEN);
-        let segment =
-            encode_data_segment(&mut this.send, this.session_id, this.next_seq, &buf[..take])?;
+        // `fragment` is 0: over TCP upstream's Session.Write cuts input into
+        // maxPDU chunks before writeChunk, and the TCP fragment size is that
+        // same maxPDU (`segment.go:76-80`), so every chunk is one fragment.
+        let flow = DataFlow {
+            window_size: this.window_size(),
+            fragment: 0,
+        };
+        let segment = encode_data_segment(
+            &mut this.send,
+            this.session_id,
+            this.next_seq,
+            flow,
+            &buf[..take],
+        )?;
         this.next_seq = this.next_seq.wrapping_add(1);
         this.outgoing = segment;
         this.outgoing_at = 0;
@@ -346,6 +500,13 @@ impl AsyncWrite for MieruStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        // A session ends with a closeSessionRequest before the FIN, as
+        // upstream's closeWithError sends one (MI-M3); a FIN alone is a
+        // shape no Go client produces.
+        if !this.close_sent && !this.session_closed {
+            this.close_sent = true;
+            this.queue_session_segment(CLOSE_SESSION_REQUEST)?;
+        }
         // Shutting down on top of a half-written segment would put a truncated
         // one on the wire; the peer cannot decrypt it and the last of the
         // caller's data is lost.
@@ -364,6 +525,7 @@ impl AsyncWrite for MieruStream {
         }
         this.outgoing.clear();
         this.outgoing_at = 0;
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -523,7 +685,7 @@ mod tests {
 
             let client = tokio::spawn(async move {
                 let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-                MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
+                MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000, &[]).await
             });
 
             let (mut server_tcp, _) = listener.accept().await.unwrap();
@@ -543,6 +705,7 @@ mod tests {
                     suffix_len: 0,
                 },
                 PaddingStrategy::Ascii,
+                &[],
             )
             .unwrap();
             server_tcp.write_all(&refusal).await.unwrap();
@@ -581,6 +744,7 @@ mod tests {
                 suffix_len: 0,
             },
             PaddingStrategy::Ascii,
+            &[],
         )
         .unwrap();
         server.write_all(&close).await.unwrap();
@@ -609,7 +773,7 @@ mod tests {
 
         let client = tokio::spawn(async move {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
+            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000, &[]).await
         });
 
         let (mut server_tcp, _) = listener.accept().await.unwrap();
@@ -644,7 +808,14 @@ mod tests {
 
         let client = tokio::spawn(async move {
             let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            MieruStream::open(Box::new(tcp), b"the wrong password", TEST_USERNAME, 1000).await
+            MieruStream::open(
+                Box::new(tcp),
+                b"the wrong password",
+                TEST_USERNAME,
+                1000,
+                &[],
+            )
+            .await
         });
 
         let (mut server_tcp, _) = listener.accept().await.unwrap();
@@ -656,5 +827,409 @@ mod tests {
         let _ = server_tcp.write_all(&response).await;
 
         assert!(client.await.unwrap().is_err());
+    }
+
+    /// Every segment the server end has received so far, decoded.
+    async fn read_segments(
+        server: &mut tokio::net::TcpStream,
+        peer: &mut ScriptedPeer,
+        want: usize,
+    ) -> Vec<(Metadata, Vec<u8>)> {
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        while out.len() < want {
+            while let Some((meta, payload, consumed)) =
+                decode_segment(&mut peer.recv, &pending).unwrap()
+            {
+                pending.drain(..consumed);
+                out.push((meta, payload));
+                if out.len() == want {
+                    return out;
+                }
+            }
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), server.read(&mut buf))
+                .await
+                .expect("segments arrive")
+                .unwrap();
+            assert!(n > 0, "the client closed before sending {want} segments");
+            pending.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// MI-M2: the first write rides in the openSessionRequest, as upstream's
+    /// client sends it, rather than in a data segment a round trip later.
+    #[tokio::test]
+    async fn the_open_request_carries_the_first_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = b"\x05\x01\x00\x01\xc0\x00\x02\x07\x01\xbb".to_vec();
+        let sent = request.clone();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000, &sent).await
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut peer = ScriptedPeer::new(1000);
+
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let (Metadata::Session(open), payload) = &segments[0] else {
+            panic!("the first segment opens the session");
+        };
+        assert_eq!(open.protocol, OPEN_SESSION_REQUEST);
+        assert_eq!(payload, &request, "the request is inside the open");
+
+        // The reply comes back with the open response, in one write; the
+        // client must find it without waiting on the socket for more.
+        let mut answer = peer.open_session_response(open.session_id);
+        answer.extend_from_slice(&peer.data(open.session_id, 1, b"\x05\x00"));
+        server.write_all(&answer).await.unwrap();
+
+        let mut stream = client.await.unwrap().unwrap();
+        let mut reply = [0u8; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut reply),
+        )
+        .await
+        .expect("the reply that arrived with the open response is readable")
+        .unwrap();
+        assert_eq!(&reply, b"\x05\x00");
+    }
+
+    /// A first write too large for the open request follows it as data.
+    #[tokio::test]
+    async fn a_first_payload_over_the_limit_follows_the_open_as_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let big = vec![7u8; MAX_SESSION_OPEN_PAYLOAD + 1];
+        let sent = big.clone();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000, &sent).await
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut peer = ScriptedPeer::new(1000);
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let (Metadata::Session(open), payload) = &segments[0] else {
+            panic!("the first segment opens the session");
+        };
+        assert!(payload.is_empty());
+        let response = peer.open_session_response(open.session_id);
+        server.write_all(&response).await.unwrap();
+        let _stream = client.await.unwrap().unwrap();
+
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        assert!(matches!(segments[0].0, Metadata::Data(_)));
+        assert_eq!(segments[0].1, big);
+    }
+
+    /// MI-M3: a shutdown sends closeSessionRequest before the FIN.
+    #[tokio::test]
+    async fn a_shutdown_sends_a_close_request_before_the_fin() {
+        let (mut stream, mut server, mut peer) = connect().await;
+        stream.shutdown().await.unwrap();
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let Metadata::Session(close) = &segments[0].0 else {
+            panic!("a session segment");
+        };
+        assert_eq!(close.protocol, CLOSE_SESSION_REQUEST);
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "then the FIN");
+    }
+
+    /// MI-M3: a closeSessionRequest from the server is answered with a
+    /// closeSessionResponse, and the stream ends.
+    #[tokio::test]
+    async fn a_close_request_is_answered_and_ends_the_stream() {
+        let (mut stream, mut server, mut peer) = connect().await;
+        let close = encode_session_segment(
+            &mut peer.send,
+            &SessionMetadata {
+                protocol: CLOSE_SESSION_REQUEST,
+                timestamp_minutes: 0,
+                session_id: 1,
+                seq: 1,
+                status: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+            &[],
+        )
+        .unwrap();
+        server.write_all(&close).await.unwrap();
+
+        let mut all = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut all),
+        )
+        .await
+        .expect("EOF, not a hang")
+        .unwrap();
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let Metadata::Session(response) = &segments[0].0 else {
+            panic!("a session segment");
+        };
+        assert_eq!(response.protocol, CLOSE_SESSION_RESPONSE);
+
+        // And the stream's own shutdown does not ask again.
+        stream.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "no second close: {} bytes", rest.len());
+    }
+
+    /// MI-M4: data segments carry upstream's receive window, and fragment 0
+    /// on every chunk -- over TCP upstream cuts a write into 32 KiB chunks
+    /// before fragmenting, and each chunk is a single fragment.
+    #[tokio::test]
+    async fn data_segments_carry_the_window_and_fragment_zero() {
+        let (mut stream, mut server, mut peer) = connect().await;
+        let body = vec![1u8; MAX_FRAGMENT_LEN * 2 + MAX_FRAGMENT_LEN / 2];
+        stream.write_all(&body).await.unwrap();
+        stream.flush().await.unwrap();
+        let segments = read_segments(&mut server, &mut peer, 3).await;
+        let fields: Vec<(u8, u16, u32)> = segments
+            .iter()
+            .map(|(meta, _)| match meta {
+                Metadata::Data(data) => (data.fragment, data.window_size, data.unack_seq),
+                Metadata::Session(_) => panic!("data"),
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![(0, 4096, 0), (0, 4096, 0), (0, 4096, 0)],
+            "fragment 0, a full window, and unack_seq 0, as upstream sends over TCP"
+        );
+    }
+
+    fn close_request(peer: &mut ScriptedPeer, session_id: u32, seq: u32) -> Vec<u8> {
+        encode_session_segment(
+            &mut peer.send,
+            &SessionMetadata {
+                protocol: CLOSE_SESSION_REQUEST,
+                timestamp_minutes: 0,
+                session_id,
+                seq,
+                status: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn expect_close_response(segments: &[(Metadata, Vec<u8>)]) {
+        let Metadata::Session(response) = &segments[0].0 else {
+            panic!("a session segment");
+        };
+        assert_eq!(response.protocol, CLOSE_SESSION_RESPONSE);
+    }
+
+    /// The open response, the socks5 reply and a close request can arrive in
+    /// one read. The close is answered before open returns -- nothing after
+    /// it would push the answer out -- and the reply is still delivered.
+    #[tokio::test]
+    async fn a_close_that_arrives_with_the_open_response_is_answered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            MieruStream::open(
+                Box::new(tcp),
+                TEST_PASSWORD,
+                TEST_USERNAME,
+                1000,
+                b"\x05\x01",
+            )
+            .await
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut peer = ScriptedPeer::new(1000);
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let Metadata::Session(open) = &segments[0].0 else {
+            panic!("the open request");
+        };
+        let id = open.session_id;
+
+        let mut answer = peer.open_session_response(id);
+        answer.extend_from_slice(&peer.data(id, 1, b"\x05\x00"));
+        answer.extend_from_slice(&close_request(&mut peer, id, 2));
+        server.write_all(&answer).await.unwrap();
+
+        let mut stream = client.await.unwrap().unwrap();
+        // Answered without the client reading or shutting down.
+        expect_close_response(&read_segments(&mut server, &mut peer, 1).await);
+        let mut all = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut all),
+        )
+        .await
+        .expect("EOF, not a hang")
+        .unwrap();
+        assert_eq!(all, b"\x05\x00");
+    }
+
+    /// A transport whose writes and flushes stall a set number of times.
+    struct Stalling {
+        inner: tokio::net::TcpStream,
+        stall_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stall_flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn take_stall(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        counter
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+    }
+
+    impl AsyncRead for Stalling {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Stalling {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if take_stall(&this.stall_writes) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if take_stall(&this.stall_flushes) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for Stalling {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl crate::async_stream::SocketPassthrough for Stalling {}
+    impl AsyncStream for Stalling {}
+
+    /// The close response is finished before EOF is reported, even when the
+    /// transport makes both the write and the flush wait -- the caller need
+    /// not shut down for the answer to leave.
+    #[tokio::test]
+    async fn a_close_response_survives_a_stalling_transport() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stall_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stall_flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (writes, flushes) = (stall_writes.clone(), stall_flushes.clone());
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let stalling = Stalling {
+                inner: tcp,
+                stall_writes: writes,
+                stall_flushes: flushes,
+            };
+            MieruStream::open(Box::new(stalling), TEST_PASSWORD, TEST_USERNAME, 1000, &[]).await
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut peer = ScriptedPeer::new(1000);
+        let segments = read_segments(&mut server, &mut peer, 1).await;
+        let Metadata::Session(open) = &segments[0].0 else {
+            panic!("the open request");
+        };
+        let id = open.session_id;
+        let response = peer.open_session_response(id);
+        server.write_all(&response).await.unwrap();
+        let mut stream = client.await.unwrap().unwrap();
+
+        stall_writes.store(3, std::sync::atomic::Ordering::SeqCst);
+        stall_flushes.store(3, std::sync::atomic::Ordering::SeqCst);
+        server
+            .write_all(&close_request(&mut peer, id, 1))
+            .await
+            .unwrap();
+
+        let mut all = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut all),
+        )
+        .await
+        .expect("EOF, not a hang")
+        .unwrap();
+        expect_close_response(&read_segments(&mut server, &mut peer, 1).await);
+        assert_eq!(stall_writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(stall_flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// The window a data segment advertises after `reads` reads of the given
+    /// sizes, with `segments` queued data segments of 4 bytes each.
+    async fn window_after(segments: u32, reads: &[usize]) -> u16 {
+        let (mut stream, mut server, mut peer) = connect().await;
+        let mut wire = Vec::new();
+        for i in 0..segments {
+            wire.extend_from_slice(&peer.data(1, i + 1, b"abcd"));
+        }
+        server.write_all(&wire).await.unwrap();
+        // Let every segment arrive and decode before reading from it.
+        let mut first = vec![0u8; reads[0]];
+        stream.read_exact(&mut first).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for &n in &reads[1..] {
+            let mut buf = vec![0u8; n];
+            stream.read_exact(&mut buf).await.unwrap();
+        }
+        stream.write_all(b"x").await.unwrap();
+        stream.flush().await.unwrap();
+        match &read_segments(&mut server, &mut peer, 1).await[0].0 {
+            Metadata::Data(data) => data.window_size,
+            Metadata::Session(_) => panic!("data"),
+        }
+    }
+
+    /// A segment frees its window slot when its delivery starts, as
+    /// upstream's Session.Read takes it off the queue, not when the whole
+    /// buffer is drained.
+    #[tokio::test]
+    async fn a_segment_frees_its_window_slot_when_its_delivery_starts() {
+        assert_eq!(
+            window_after(1, &[1]).await,
+            4096,
+            "one segment, partly read"
+        );
+        assert_eq!(window_after(2, &[1]).await, 4095, "the second not started");
+        assert_eq!(window_after(2, &[5]).await, 4096, "a read reaching both");
     }
 }
