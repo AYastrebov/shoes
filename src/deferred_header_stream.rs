@@ -37,10 +37,14 @@ enum State {
     },
     /// Bytes accepted from the caller but not yet written to the inner
     /// stream: the header, and the first payload if one came in time.
+    /// `then_flush` when no caller flush is coming to push them out.
     Draining {
         pending: Vec<u8>,
         written: usize,
+        then_flush: bool,
     },
+    /// Written, and being flushed through the inner stream's own buffers.
+    Flushing,
     Passthrough,
 }
 
@@ -63,31 +67,55 @@ impl<S> DeferredHeaderStream<S> {
 
 impl<S: AsyncWrite + Unpin> DeferredHeaderStream<S> {
     /// Stop holding: what is to be written is the header, then `payload`.
-    fn release(&mut self, payload: &[u8]) {
+    ///
+    /// `then_flush` when the release is not a caller's write -- the timer, a
+    /// shutdown -- and so no caller flush follows. An accepted write can sit
+    /// in the inner stream's buffer (Shadowsocks keeps ciphertext it could
+    /// not send, TLS holds a record until flushed), and a header left there
+    /// on a server-first connection never reaches the server.
+    fn release(&mut self, payload: &[u8], then_flush: bool) {
         if let State::Holding { header, .. } = &mut self.state {
             let mut pending = std::mem::take(header);
             pending.extend_from_slice(payload);
             self.state = State::Draining {
                 pending,
                 written: 0,
+                then_flush,
             };
         }
     }
 
-    /// Write out what was accepted. Ready once it all has been.
+    /// Deliver what was accepted. Ready once it all has been, flushed where
+    /// the release asked for that.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        while let State::Draining { pending, written } = &mut self.state {
-            if *written == pending.len() {
-                self.state = State::Passthrough;
-                break;
+        loop {
+            match &mut self.state {
+                State::Draining {
+                    pending,
+                    written,
+                    then_flush,
+                } => {
+                    if *written == pending.len() {
+                        self.state = if *then_flush {
+                            State::Flushing
+                        } else {
+                            State::Passthrough
+                        };
+                        continue;
+                    }
+                    let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &pending[*written..]))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                    }
+                    *written += n;
+                }
+                State::Flushing => {
+                    ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+                    self.state = State::Passthrough;
+                }
+                State::Holding { .. } | State::Passthrough => return Poll::Ready(Ok(())),
             }
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &pending[*written..]))?;
-            if n == 0 {
-                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
-            }
-            *written += n;
         }
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -102,13 +130,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for DeferredHeaderStream<S> {
             let timer =
                 timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(HEADER_ALONE_AFTER)));
             if timer.as_mut().poll(cx).is_ready() {
-                this.release(&[]);
+                this.release(&[], true);
             }
         }
         // Progress on the header without making the read wait for it: the
         // server cannot answer before it arrives anyway, and the write side
         // finishes it if this cannot.
-        if let State::Draining { .. } = this.state
+        if matches!(this.state, State::Draining { .. } | State::Flushing)
             && let Poll::Ready(Err(e)) = this.poll_drain(cx)
         {
             return Poll::Ready(Err(e));
@@ -129,7 +157,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for DeferredHeaderStream<S> {
                 return Poll::Ready(Ok(0));
             }
             let taken = buf.len().min(FIRST_PAYLOAD_MAX);
-            this.release(&buf[..taken]);
+            // The caller flushes when it wants the bytes out.
+            this.release(&buf[..taken], false);
             // Accepted: the bytes are ours to deliver now, and a write the
             // inner stream cannot take yet finishes on the next poll.
             if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
@@ -153,8 +182,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for DeferredHeaderStream<S> {
         let this = self.get_mut();
         // A client that closes without writing still owes the server its
         // request, or the server cannot tell where the connection was for.
-        this.release(&[]);
+        this.release(&[], true);
         ready!(this.poll_drain(cx))?;
+        // Flushed here whatever the state, not left to the inner stream:
+        // Shadowsocks' shutdown goes straight to its transport and would drop
+        // ciphertext still in its buffer.
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -223,6 +256,83 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// A transport that, like Shadowsocks or TLS, keeps what it was given
+    /// until flushed -- and whose first flush is not ready at once.
+    #[derive(Default)]
+    struct Buffering {
+        buffered: Vec<u8>,
+        sent: Vec<u8>,
+        flushes_pending: usize,
+        shut_down_with: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for Buffering {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Buffering {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.get_mut().buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.flushes_pending > 0 {
+                this.flushes_pending -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let buffered = std::mem::take(&mut this.buffered);
+            this.sent.extend_from_slice(&buffered);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            // Like Shadowsocks: no flush of its own.
+            let this = self.get_mut();
+            this.shut_down_with = Some(this.sent.clone());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn buffering() -> Buffering {
+        Buffering {
+            flushes_pending: 1,
+            ..Buffering::default()
+        }
+    }
+
+    /// The timer's release is not a caller's write, so no caller flush
+    /// follows it: the header must be flushed through a buffering transport,
+    /// or a server-first connection waits for a request that never left.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_flushes_the_header_through_a_buffering_transport() {
+        let mut stream = DeferredHeaderStream::new(buffering(), b"HDR".to_vec());
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(HEADER_ALONE_AFTER * 2, stream.read(&mut buf)).await;
+        assert!(read.is_err(), "nothing to read");
+        assert_eq!(stream.inner.sent, b"HDR", "flushed, past one Pending flush");
+        assert!(stream.inner.buffered.is_empty());
+    }
+
+    /// A shutdown sends the header and flushes it before the transport is
+    /// shut down, even when the transport's shutdown does not flush.
+    #[tokio::test]
+    async fn a_shutdown_flushes_the_header_before_shutting_down() {
+        let mut stream = DeferredHeaderStream::new(buffering(), b"HDR".to_vec());
+        stream.shutdown().await.unwrap();
+        assert_eq!(stream.inner.shut_down_with.as_deref(), Some(&b"HDR"[..]));
     }
 
     /// SS-D7: the header and the first payload reach the inner stream as one
