@@ -181,6 +181,19 @@ First flight carries the payload (plan PR 3.2, part 1; SS-D7):
   500 ms, as Xray's outbound does. A Vision server likewise sends its two-byte
   response in the same record as its first frame.
 
+Reality client looks like Chrome (plan PR 3.3, part 1; RE-R2 client half):
+
+- **The Reality client sends a Chrome 133 ClientHello** (uTLS `HelloChrome_133`,
+  what sing-box and Xray clients send by default) instead of a six-extension
+  hello with X25519 only: GREASE, Chrome's 15 cipher suites, the full extension
+  set in an order shuffled per connection, a GREASE ECH extension, and an
+  X25519MLKEM768 key share ahead of X25519. When the decoy picks the hybrid,
+  the client completes the ML-KEM-768 exchange (aws-lc-rs). This also makes the
+  client work against Xray's REALITY, which refuses a hello without the hybrid
+  share. Checked against sing-box 1.14.3 with the decoy choosing
+  X25519MLKEM768, with it restricted to X25519, and with Vision. Spec:
+  `docs/specs/2026-10-19-reality-chrome-client-hello.md`.
+
 ## v0.6.0
 
 Phase 0 of the 2026-10-15 quality plan

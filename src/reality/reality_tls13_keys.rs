@@ -200,12 +200,13 @@ pub fn derive_handshake_keys(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
     let digest_algorithm = cipher_suite.digest_algorithm();
 
-    // Validate input lengths
-    if shared_secret.len() != 32 {
+    // Validate input lengths: 32 for X25519, 64 for X25519MLKEM768 (the
+    // ML-KEM-768 and X25519 secrets concatenated).
+    if shared_secret.len() != 32 && shared_secret.len() != 64 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
+                "Invalid shared_secret length: {} (expected 32 or 64)",
                 shared_secret.len()
             ),
         ));
@@ -392,6 +393,105 @@ mod tests {
     use super::*;
 
     const CS_SHA256: CipherSuite = CipherSuite::AES_128_GCM_SHA256;
+
+    /// RFC 8446 7.1, written against aws-lc-rs's HKDF rather than this
+    /// module's helpers, so the check does not share their mistakes.
+    fn expand_label(
+        prk: &aws_lc_rs::hkdf::Prk,
+        label: &[u8],
+        context: &[u8],
+        len: usize,
+    ) -> Vec<u8> {
+        struct Len(usize);
+        impl aws_lc_rs::hkdf::KeyType for Len {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+        let mut info = Vec::new();
+        info.extend_from_slice(&(len as u16).to_be_bytes());
+        info.push((6 + label.len()) as u8);
+        info.extend_from_slice(b"tls13 ");
+        info.extend_from_slice(label);
+        info.push(context.len() as u8);
+        info.extend_from_slice(context);
+        let mut out = vec![0u8; len];
+        prk.expand(&[&info], Len(len))
+            .unwrap()
+            .fill(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// The handshake and master secrets RFC 8446 7.1 derives from an
+    /// (EC)DHE secret and the ClientHello..ServerHello transcript hash.
+    fn reference_handshake_keys(
+        hkdf: aws_lc_rs::hkdf::Algorithm,
+        digest: &'static aws_lc_rs::digest::Algorithm,
+        shared_secret: &[u8],
+        transcript_hash: &[u8],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let hash_len = digest.output_len();
+        let zeros = vec![0u8; hash_len];
+        let empty_hash = aws_lc_rs::digest::digest(digest, b"");
+        let early = aws_lc_rs::hkdf::Salt::new(hkdf, &zeros).extract(&zeros);
+        let derived = expand_label(&early, b"derived", empty_hash.as_ref(), hash_len);
+        let handshake = aws_lc_rs::hkdf::Salt::new(hkdf, &derived).extract(shared_secret);
+        let client = expand_label(&handshake, b"c hs traffic", transcript_hash, hash_len);
+        let server = expand_label(&handshake, b"s hs traffic", transcript_hash, hash_len);
+        let derived = expand_label(&handshake, b"derived", empty_hash.as_ref(), hash_len);
+        let master = aws_lc_rs::hkdf::Salt::new(hkdf, &derived).extract(&zeros);
+        // A Prk does not expose its bytes; the master secret is checked
+        // through the one secret every handshake derives from it.
+        let client_app = expand_label(&master, b"c ap traffic", transcript_hash, hash_len);
+        (client, server, client_app)
+    }
+
+    /// X25519MLKEM768 feeds a 64-byte secret into the key schedule. The
+    /// interop run against sing-box found this function refusing it; this
+    /// pins that it is taken, and derived as RFC 8446 says, for both hashes.
+    #[test]
+    fn a_64_byte_hybrid_secret_derives_rfc_8446_keys() {
+        let shared_secret: Vec<u8> = (0..64u8).collect();
+        for (suite, hkdf, digest) in [
+            (
+                CipherSuite::AES_128_GCM_SHA256,
+                aws_lc_rs::hkdf::HKDF_SHA256,
+                &aws_lc_rs::digest::SHA256,
+            ),
+            (
+                CipherSuite::AES_256_GCM_SHA384,
+                aws_lc_rs::hkdf::HKDF_SHA384,
+                &aws_lc_rs::digest::SHA384,
+            ),
+        ] {
+            let transcript_hash = aws_lc_rs::digest::digest(digest, b"ClientHello..ServerHello");
+            let keys = derive_handshake_keys(suite, &shared_secret, &[], transcript_hash.as_ref())
+                .unwrap();
+            let (client, server, client_app) =
+                reference_handshake_keys(hkdf, digest, &shared_secret, transcript_hash.as_ref());
+            assert_eq!(keys.client_handshake_traffic_secret, client, "{suite:?}");
+            assert_eq!(keys.server_handshake_traffic_secret, server, "{suite:?}");
+
+            let master = aws_lc_rs::hkdf::Prk::new_less_safe(hkdf, &keys.master_secret);
+            assert_eq!(
+                expand_label(
+                    &master,
+                    b"c ap traffic",
+                    transcript_hash.as_ref(),
+                    digest.output_len()
+                ),
+                client_app,
+                "{suite:?}: the master secret"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_secret_of_another_length_is_refused() {
+        let hash = [0u8; 32];
+        assert!(derive_handshake_keys(CS_SHA256, &[0u8; 48], &[], &hash).is_err());
+    }
 
     // Test vectors from RFC 5869 Appendix A
     #[test]

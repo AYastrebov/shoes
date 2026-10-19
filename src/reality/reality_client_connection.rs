@@ -8,6 +8,7 @@
 
 use std::io::{self, Read, Write};
 
+use aws_lc_rs::kem;
 use aws_lc_rs::{agreement, digest};
 use rand::Rng;
 
@@ -22,6 +23,11 @@ use super::common::{
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
 use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
 use super::reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
+use super::reality_client_hello::{
+    ClientKeyShares, EXT_APPLICATION_SETTINGS, EXT_APPLICATION_SETTINGS_OLD, GROUP_X25519,
+    GROUP_X25519_MLKEM768, MLKEM768_CIPHERTEXT_LEN, client_hello_record,
+    construct_chrome_client_hello,
+};
 use super::reality_client_verify::{
     extract_certificate_der, extract_certificate_verify_signature, extract_ed25519_public_key,
     verify_certificate_hmac, verify_certificate_verify_signature,
@@ -33,15 +39,113 @@ use super::reality_tls13_keys::{
     compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,
     derive_traffic_keys,
 };
-use super::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished, write_record_header,
-};
-use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
+use super::reality_tls13_messages::{DEFAULT_ALPN_PROTOCOLS, construct_finished};
+use super::reality_util::{extract_server_cipher_suite, extract_server_key_share};
 use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
 
 // Matches the maximum handshake size accepted by Xray's REALITY implementation.
 const MAX_HANDSHAKE_PLAINTEXT: usize = 4 * MAX_TLS_PLAINTEXT_LEN;
+
+/// The ServerHello random that marks a HelloRetryRequest (RFC 8446 4.1.3).
+const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
+/// A HelloRetryRequest means the server wants a group this client did not
+/// send a share for; the client does not retry, so it says which.
+fn reject_hello_retry_request(record: &[u8]) -> io::Result<()> {
+    // Record header (5), handshake header (4), legacy version (2), random.
+    const RANDOM_AT: usize = 5 + 4 + 2;
+    if record.len() >= RANDOM_AT + 32
+        && record[RANDOM_AT..RANDOM_AT + 32] == HELLO_RETRY_REQUEST_RANDOM
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server sent a HelloRetryRequest: it wants a key exchange group this client does \
+             not offer",
+        ));
+    }
+    Ok(())
+}
+
+/// The (EC)DHE input to the TLS 1.3 key schedule for the group the server
+/// chose. For X25519MLKEM768 that is the ML-KEM shared secret followed by the
+/// X25519 one (draft-ietf-tls-ecdhe-mlkem), 64 bytes where X25519 gives 32.
+fn key_exchange_secret(
+    group: u16,
+    server_share: &[u8],
+    x25519_private: &[u8; 32],
+    mlkem_key: Option<&kem::DecapsulationKey<kem::AlgorithmId>>,
+) -> io::Result<Vec<u8>> {
+    let x25519 = |peer: &[u8]| -> io::Result<Vec<u8>> {
+        let private_key =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, x25519_private)
+                .map_err(|_| io::Error::other("Failed to create private key"))?;
+        agreement::agree(
+            &private_key,
+            agreement::UnparsedPublicKey::new(&agreement::X25519, peer),
+            io::Error::other("ECDH failed"),
+            |key_material| Ok(key_material.to_vec()),
+        )
+    };
+    match group {
+        GROUP_X25519 => x25519(server_share),
+        GROUP_X25519_MLKEM768 => {
+            let mlkem_key = mlkem_key.ok_or_else(|| {
+                io::Error::other("server chose X25519MLKEM768, which was not offered")
+            })?;
+            if server_share.len() != MLKEM768_CIPHERTEXT_LEN + 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "X25519MLKEM768 server share has the wrong length",
+                ));
+            }
+            let (ciphertext, x25519_public) = server_share.split_at(MLKEM768_CIPHERTEXT_LEN);
+            let mlkem_secret = mlkem_key
+                .decapsulate(kem::Ciphertext::from(ciphertext))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ML-KEM-768 decapsulation failed",
+                    )
+                })?;
+            let mut secret = mlkem_secret.as_ref().to_vec();
+            secret.extend_from_slice(&x25519(x25519_public)?);
+            Ok(secret)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("server chose an unsupported key exchange group 0x{other:04x}"),
+        )),
+    }
+}
+
+/// CompressedCertificate (RFC 8879).
+const HANDSHAKE_TYPE_COMPRESSED_CERTIFICATE: u8 = 25;
+
+/// EncryptedExtensions that negotiate ALPS would need a client
+/// EncryptedExtensions in reply, which this client does not send.
+fn reject_unimplemented_extensions(encrypted_extensions: &[u8]) -> io::Result<()> {
+    let Some(list) = encrypted_extensions.get(2..) else {
+        return Ok(());
+    };
+    let mut at = 0;
+    while at + 4 <= list.len() {
+        let ext_type = u16::from_be_bytes([list[at], list[at + 1]]);
+        let ext_len = u16::from_be_bytes([list[at + 2], list[at + 3]]) as usize;
+        if ext_type == EXT_APPLICATION_SETTINGS || ext_type == EXT_APPLICATION_SETTINGS_OLD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "server negotiated application_settings (ALPS), which this client advertises \
+                 but does not implement",
+            ));
+        }
+        at += 4 + ext_len;
+    }
+    Ok(())
+}
 
 fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io::Result<usize> {
     let previous_len = accumulated.len();
@@ -74,6 +178,9 @@ enum HandshakeState {
     AwaitingServerHello {
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message (raw bytes for transcript)
         client_private_key: [u8; 32],
+        /// The ML-KEM-768 half of the X25519MLKEM768 share, for when the
+        /// server picks the hybrid.
+        mlkem_key: Option<Box<kem::DecapsulationKey<kem::AlgorithmId>>>,
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
     },
     /// ServerHello received, processing encrypted handshake messages
@@ -136,6 +243,7 @@ impl RealityClientConnection {
             handshake_state: HandshakeState::AwaitingServerHello {
                 client_hello_bytes: Vec::new(),
                 client_private_key: [0u8; 32],
+                mlkem_key: None,
                 auth_key: [0u8; 32],
             },
             app_read_key: None,
@@ -209,10 +317,26 @@ impl RealityClientConnection {
             self.config.cipher_suites.clone()
         };
         let cipher_suite_ids: Vec<u16> = cipher_suites.iter().map(|cs| cs.id()).collect();
-        let mut client_hello = construct_client_hello(
+
+        // Chrome offers X25519MLKEM768 ahead of X25519, with one X25519 key
+        // in both; a decoy that supports the hybrid picks it.
+        let mlkem_key = kem::DecapsulationKey::generate(&kem::ML_KEM_768)
+            .map_err(|_| io::Error::other("Failed to generate an ML-KEM-768 key"))?;
+        let mlkem_encapsulation_key = mlkem_key
+            .encapsulation_key()
+            .and_then(|key| key.key_bytes())
+            .map_err(|_| io::Error::other("Failed to encode the ML-KEM-768 key"))?;
+        let x25519_public: [u8; 32] = our_public_key_bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| io::Error::other("X25519 public key is not 32 bytes"))?;
+        let mut client_hello = construct_chrome_client_hello(
             &client_random,
             &session_id_for_hello,
-            our_public_key_bytes.as_ref(),
+            &ClientKeyShares {
+                x25519_public: &x25519_public,
+                mlkem768_encapsulation_key: mlkem_encapsulation_key.as_ref(),
+            },
             &self.config.server_name,
             &cipher_suite_ids,
             DEFAULT_ALPN_PROTOCOLS,
@@ -247,8 +371,7 @@ impl RealityClientConnection {
         // REALITY transcripts use the wire ClientHello, not the zeroed AAD form.
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
-        let mut record = write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
-        record.extend_from_slice(&client_hello);
+        let record = client_hello_record(&client_hello);
         self.ciphertext_write_buf.extend_from_slice(&record);
 
         // Store the wire ClientHello bytes for transcript hashing after ServerHello.
@@ -256,6 +379,7 @@ impl RealityClientConnection {
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
             client_private_key: our_private_bytes,
+            mlkem_key: Some(Box::new(mlkem_key)),
             auth_key, // Save auth_key for HMAC certificate verification
         };
 
@@ -344,6 +468,7 @@ impl RealityClientConnection {
         let HandshakeState::AwaitingServerHello {
             client_hello_bytes,
             client_private_key,
+            mlkem_key,
             auth_key,
         } = &self.handshake_state
         else {
@@ -387,7 +512,9 @@ impl RealityClientConnection {
             server_hello
         );
 
-        let server_public_key = extract_server_public_key(&record)?;
+        reject_hello_retry_request(&record)?;
+        let (server_group, server_share) = extract_server_key_share(&record)?;
+        log::debug!("REALITY CLIENT: server chose key exchange group 0x{server_group:04x}");
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
         let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
             io::Error::new(
@@ -426,21 +553,11 @@ impl RealityClientConnection {
             ctx.finish().as_ref().to_vec()
         };
 
-        let peer_public_key =
-            agreement::UnparsedPublicKey::new(&agreement::X25519, &server_public_key);
-        let my_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, client_private_key)
-                .map_err(|_| io::Error::other("Failed to create private key"))?;
-
-        let mut tls_shared_secret = [0u8; 32];
-        agreement::agree(
-            &my_private_key,
-            peer_public_key,
-            io::Error::other("ECDH failed"),
-            |key_material| {
-                tls_shared_secret.copy_from_slice(key_material);
-                Ok(())
-            },
+        let tls_shared_secret = key_exchange_secret(
+            server_group,
+            &server_share,
+            client_private_key,
+            mlkem_key.as_deref(),
         )?;
 
         let hs_keys = derive_handshake_keys(
@@ -644,6 +761,22 @@ impl RealityClientConnection {
                 msg_type,
                 msg_len
             );
+
+            // Advertised for the shape, implemented by neither end of an
+            // authenticated Reality handshake; refuse them by name rather
+            // than misparse what follows.
+            if msg_type == HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS {
+                reject_unimplemented_extensions(
+                    &accumulated_plaintext[offset + 4..offset + 4 + msg_len],
+                )?;
+            }
+            if msg_type == HANDSHAKE_TYPE_COMPRESSED_CERTIFICATE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server sent a compressed certificate, which this client advertises but does \
+                     not implement",
+                ));
+            }
 
             // Verify HMAC signature when we encounter the Certificate message
             if msg_type == HANDSHAKE_TYPE_CERTIFICATE {
@@ -1092,5 +1225,89 @@ mod tests {
             &[0u8; 32],
             "transcript ClientHello must retain encrypted wire SessionId"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_exchange_tests {
+    use super::*;
+
+    fn x25519_pair() -> ([u8; 32], Vec<u8>) {
+        let mut private = [0u8; 32];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut private);
+        let public = agreement::PrivateKey::from_private_key(&agreement::X25519, &private)
+            .unwrap()
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        (private, public)
+    }
+
+    /// The hybrid secret is the ML-KEM shared secret then the X25519 one, as
+    /// a server that encapsulated to the client's key computes it.
+    #[test]
+    fn the_hybrid_secret_is_mlkem_then_x25519() {
+        let (client_private, client_public) = x25519_pair();
+        let (server_private, server_public) = x25519_pair();
+        let mlkem_key = kem::DecapsulationKey::generate(&kem::ML_KEM_768).unwrap();
+        let encapsulation_key = mlkem_key.encapsulation_key().unwrap().key_bytes().unwrap();
+
+        // The server's side.
+        let (ciphertext, server_mlkem_secret) =
+            kem::EncapsulationKey::new(&kem::ML_KEM_768, encapsulation_key.as_ref())
+                .unwrap()
+                .encapsulate()
+                .unwrap();
+        let server_x25519_secret =
+            key_exchange_secret(GROUP_X25519, &client_public, &server_private, None).unwrap();
+        let mut share = ciphertext.as_ref().to_vec();
+        share.extend_from_slice(&server_public);
+
+        let secret = key_exchange_secret(
+            GROUP_X25519_MLKEM768,
+            &share,
+            &client_private,
+            Some(&mlkem_key),
+        )
+        .unwrap();
+        assert_eq!(secret.len(), 64);
+        assert_eq!(&secret[..32], server_mlkem_secret.as_ref());
+        assert_eq!(&secret[32..], &server_x25519_secret[..]);
+    }
+
+    #[test]
+    fn a_truncated_hybrid_share_fails() {
+        let (client_private, _) = x25519_pair();
+        let mlkem_key = kem::DecapsulationKey::generate(&kem::ML_KEM_768).unwrap();
+        let err = key_exchange_secret(
+            GROUP_X25519_MLKEM768,
+            &[0u8; 1000],
+            &client_private,
+            Some(&mlkem_key),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong length"), "{err}");
+    }
+
+    #[test]
+    fn a_hello_retry_request_is_refused_by_name() {
+        let mut record = vec![
+            0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+        ];
+        record.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+        let err = reject_hello_retry_request(&record).unwrap_err();
+        assert!(err.to_string().contains("HelloRetryRequest"), "{err}");
+        record[11] ^= 1;
+        assert!(reject_hello_retry_request(&record).is_ok());
+    }
+
+    #[test]
+    fn alps_in_encrypted_extensions_is_refused_by_name() {
+        // Extensions length, then application_settings with an empty body.
+        let ee = [0x00, 0x04, 0x44, 0xcd, 0x00, 0x00];
+        let err = reject_unimplemented_extensions(&ee).unwrap_err();
+        assert!(err.to_string().contains("ALPS"), "{err}");
+        assert!(reject_unimplemented_extensions(&[0x00, 0x04, 0x00, 0x10, 0x00, 0x00]).is_ok());
     }
 }
