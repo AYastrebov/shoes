@@ -98,14 +98,18 @@ pub fn parse_padding_type_request(value: &str) -> Vec<PaddingType> {
 
 /// Threshold for small payload bias on server side
 const SMALL_PAYLOAD_THRESHOLD: usize = 100;
-/// Threshold for medium payload fragmentation (lower bound)
-const MEDIUM_PAYLOAD_LOW: usize = 400;
-/// Threshold for medium payload fragmentation (upper bound)
+/// A server write over this and under [`MEDIUM_PAYLOAD_HIGH`] is cut into
+/// pieces of [`FRAGMENT_SIZE_MIN`]..=[`FRAGMENT_SIZE_MAX`] bytes, as
+/// naiveproxy's server does (`naive_padding_socket.cc:255-257`:
+/// `> 200 && < 1024`, `RandIntInclusive(100, 200)`). These were 400 and
+/// 200-300, a different shape from the reference (NA-N2).
+const MEDIUM_PAYLOAD_LOW: usize = 200;
+/// Upper bound (exclusive) of the payloads that are fragmented.
 const MEDIUM_PAYLOAD_HIGH: usize = 1024;
-/// Minimum fragment size for server-side write fragmentation
-const FRAGMENT_SIZE_MIN: usize = 200;
-/// Maximum fragment size for server-side write fragmentation
-const FRAGMENT_SIZE_MAX: usize = 300;
+/// Minimum fragment size for server-side write fragmentation.
+const FRAGMENT_SIZE_MIN: usize = 100;
+/// Maximum fragment size for server-side write fragmentation.
+const FRAGMENT_SIZE_MAX: usize = 200;
 
 /// Wrapper stream that applies NaiveProxy padding.
 ///
@@ -692,6 +696,33 @@ mod tests {
     impl crate::async_stream::SocketPassthrough for MockStream {}
 
     impl AsyncStream for MockStream {}
+
+    /// NA-N2: a server write over 200 and under 1024 bytes goes out in
+    /// 100-200-byte pieces, as naiveproxy's server cuts it; others go whole,
+    /// and a client never fragments.
+    #[test]
+    fn server_writes_between_200_and_1024_bytes_are_cut_like_naiveproxy() {
+        let server = NaivePaddingStream::new(
+            MockStream::from_data(Vec::new()),
+            PaddingDirection::Server,
+            PaddingType::Variant1,
+        );
+        for len in [201, 500, 1023] {
+            for _ in 0..100 {
+                let piece = server.compute_fragment_limit(len, len);
+                assert!((100..=200).contains(&piece), "{len}: {piece}");
+            }
+        }
+        for len in [150, 200, 1024, 4096] {
+            assert_eq!(server.compute_fragment_limit(len, len), len, "{len}");
+        }
+        let client = NaivePaddingStream::new(
+            MockStream::from_data(Vec::new()),
+            PaddingDirection::Client,
+            PaddingType::Variant1,
+        );
+        assert_eq!(client.compute_fragment_limit(500, 500), 500);
+    }
 
     #[tokio::test]
     async fn test_read_single_padded_frame() {

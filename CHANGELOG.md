@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+NaiveProxy sessions survive a dropped connection (plan PR 3.5a; NA-N1, NA-N2):
+
+- **A NaiveProxy client recovers when its connection to the server drops.**
+  Its H2 session was never replaced: `is_ready` always answered yes and the
+  slot was never cleared, so after one dropped connection -- a server restart,
+  a network change on a phone -- every new connection failed until shoes
+  restarted. A dead session is now noticed and the next connection dials a new
+  one. Checked against sing-box's NaiveProxy inbound, restarted mid-run.
+- **Reusing the NaiveProxy session no longer dials a TLS connection it throws
+  away.** Every proxied connection used to open and handshake a fresh TLS
+  connection only to drop it unused when a session already existed. The chain
+  now asks a hop for a live session before it dials (a new
+  `try_reuse_tcp_stream` on `TcpClientHandler`, forwarded through TLS), so a
+  reused session means no new TCP connection and no TLS handshake. Spec:
+  `docs/specs/2026-10-19-session-reuse-without-dialling.md`; AnyTLS's session
+  pool will use the same hook.
+- A NaiveProxy stream the server has already reset shuts down cleanly. Against
+  a sing-box server every connection used to end with an `ERROR ... H2 send
+  END_STREAM failed: inactive stream` log line.
+- The NaiveProxy server cuts a 200-1024-byte write into 100-200-byte pieces,
+  as naiveproxy's server does, instead of 400-1024 into 200-300.
+
 mieru looks like the Go client (plan PR 3.4; MI-M1 to MI-M5):
 
 - **mieru padding lengths follow the Go client's distribution.** Every length

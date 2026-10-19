@@ -43,6 +43,9 @@ pub struct NaiveClientSession {
     send_request: h2::client::SendRequest<Bytes>,
     /// Handle to abort the connection driver on drop (shared across clones)
     driver_handle: Arc<DriverHandle>,
+    /// Set when a request failed in a way that means the connection, not
+    /// the target, is gone: a GOAWAY, an I/O error, a closed sender.
+    broken: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Wrapper to abort the driver when all session clones are dropped.
@@ -60,6 +63,7 @@ impl Clone for NaiveClientSession {
         Self {
             send_request: self.send_request.clone(),
             driver_handle: Arc::clone(&self.driver_handle),
+            broken: Arc::clone(&self.broken),
         }
     }
 }
@@ -95,14 +99,28 @@ impl NaiveClientSession {
         Ok(Self {
             send_request,
             driver_handle: Arc::new(DriverHandle(abort_handle)),
+            broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
-    /// Check if this session is still usable for new streams.
+    /// Whether this session can still open streams: its connection driver
+    /// is running and no request has found the connection gone. It used to
+    /// answer `true` unconditionally, so after one dropped connection every
+    /// new request went to a dead session until the process restarted
+    /// (NA-N1).
     pub fn is_ready(&self) -> bool {
-        // SendRequest::poll_ready would be more accurate, but this is a good heuristic
-        // The actual check happens when we try to send a request
-        true // Optimistic - let send_request fail if not ready
+        !self.driver_handle.0.is_finished()
+            && !self.broken.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether `other` is a clone of this session.
+    pub fn is_same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.broken, &other.broken)
+    }
+
+    fn mark_broken(&self) {
+        self.broken
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Open a new CONNECT stream to the specified target.
@@ -136,11 +154,23 @@ impl NaiveClientSession {
         let (response_future, send_stream) = self
             .send_request
             .send_request(request, false)
-            .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
+            .map_err(|e| {
+                // The sender refuses only when the connection is closing.
+                self.mark_broken();
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("Failed to send CONNECT: {}", e),
+                )
+            })?;
 
-        let response = response_future
-            .await
-            .map_err(|e| io::Error::other(format!("CONNECT response error: {}", e)))?;
+        let response = response_future.await.map_err(|e| {
+            // A GOAWAY or a transport error ends the connection; a reset of
+            // this one stream does not.
+            if e.is_go_away() || e.is_io() {
+                self.mark_broken();
+            }
+            io::Error::other(format!("CONNECT response error: {}", e))
+        })?;
 
         debug!(
             "NaiveClientSession: CONNECT response: status={}, headers={:?}",
@@ -175,7 +205,11 @@ impl NaiveClientSession {
         };
 
         let recv_stream = response.into_body();
-        let h2_stream = H2MultiStream::new(send_stream, recv_stream);
+        // The stream keeps the connection driver running: the session that
+        // opened it may be replaced in the handler's slot, or never stored,
+        // while this stream is still carrying data.
+        let h2_stream = H2MultiStream::new(send_stream, recv_stream)
+            .keeping_alive(Arc::clone(&self.driver_handle) as Arc<dyn std::any::Any + Send + Sync>);
 
         let client_stream: Box<dyn AsyncStream> = if padding_type != PaddingType::None {
             Box::new(NaivePaddingStream::new(

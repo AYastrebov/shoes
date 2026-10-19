@@ -19,6 +19,9 @@ pub struct H2MultiStream {
     recv_buf: Bytes,
     /// Whether we've sent END_STREAM
     shutdown_sent: bool,
+    /// Keeps the H2 connection this stream rides on running for as long as
+    /// the stream lives, whatever happens to the session that opened it.
+    _connection: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl H2MultiStream {
@@ -28,7 +31,17 @@ impl H2MultiStream {
             recv,
             recv_buf: Bytes::new(),
             shutdown_sent: false,
+            _connection: None,
         }
+    }
+
+    /// Hold `connection` alive while this stream exists.
+    pub fn keeping_alive(
+        mut self,
+        connection: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self._connection = Some(connection);
+        self
     }
 }
 
@@ -105,13 +118,16 @@ impl AsyncWrite for H2MultiStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.shutdown_sent {
-            match self.send.send_data(Bytes::new(), true) {
-                Ok(()) => self.shutdown_sent = true,
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 send END_STREAM failed: {e}"
-                    ))));
-                }
+            self.shutdown_sent = true;
+            // END_STREAM fails only when the stream is no longer open: the
+            // peer reset it -- a Go HTTP/2 server sends RST_STREAM(NO_ERROR)
+            // when its handler returns -- or both ends finished it. Nothing
+            // more is going out either way, which is all a shutdown is for.
+            // Reported as an error, it logged one on every connection a
+            // sing-box NaiveProxy server closed.
+            if let Err(e) = self.send.send_data(Bytes::new(), true) {
+                log::debug!("H2 stream already closed at shutdown: {e}");
+                return Poll::Ready(Ok(()));
             }
         }
 

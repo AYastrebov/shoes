@@ -77,6 +77,13 @@ impl ProxyConnector for ProxyConnectorImpl {
             .await
     }
 
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        self.client_handler.try_reuse_tcp_stream(target).await
+    }
+
     async fn setup_udp_bidirectional(
         &self,
         stream: Box<dyn AsyncStream>,

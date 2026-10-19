@@ -491,6 +491,213 @@ fn a_chain_without_counters_is_unattributed_not_empty() {
     assert_eq!(chain.initial_counter_len(), 1);
 }
 
+// --- Session reuse ----------------------------------------------------
+//
+// A hop holding a live session answers before the chain dials. The sockets
+// here are MockSocketConnector, whose connect fails, so a chain that dials
+// when it should reuse fails the test.
+
+/// A stream that reads EOF and accepts every write.
+#[derive(Debug)]
+struct NullStream;
+
+impl tokio::io::AsyncRead for NullStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for NullStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncPing for NullStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<bool>> {
+        std::task::Poll::Ready(Ok(false))
+    }
+}
+impl crate::async_stream::SocketPassthrough for NullStream {}
+impl AsyncStream for NullStream {}
+
+/// A hop holding a live session: it answers the reuse question, and records
+/// the target it was asked for. Its setup path is never meant to run.
+#[derive(Debug)]
+struct SessionProxy {
+    location: NetLocation,
+    asked_for: std::sync::Mutex<Vec<NetLocation>>,
+}
+
+impl SessionProxy {
+    fn new(port: u16) -> Self {
+        Self {
+            location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+            asked_for: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ProxyConnector for SessionProxy {
+    fn proxy_location(&self) -> &NetLocation {
+        &self.location
+    }
+    fn supports_udp_over_tcp(&self) -> bool {
+        false
+    }
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        self.asked_for
+            .lock()
+            .unwrap()
+            .push(target.location().clone());
+        Some(Ok(TcpClientSetupResult {
+            client_stream: Box::new(NullStream),
+            early_data: None,
+        }))
+    }
+    async fn setup_tcp_stream(
+        &self,
+        _stream: Box<dyn AsyncStream>,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        panic!("a hop with a live session was handed a fresh transport")
+    }
+    async fn setup_udp_bidirectional(
+        &self,
+        _stream: Box<dyn AsyncStream>,
+        _target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        unreachable!()
+    }
+}
+
+/// A hop that passes the stream through and counts its setups.
+#[derive(Debug)]
+struct CountingProxy {
+    location: NetLocation,
+    setups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ProxyConnector for CountingProxy {
+    fn proxy_location(&self) -> &NetLocation {
+        &self.location
+    }
+    fn supports_udp_over_tcp(&self) -> bool {
+        false
+    }
+    async fn setup_tcp_stream(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        self.setups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(TcpClientSetupResult {
+            client_stream: stream,
+            early_data: None,
+        })
+    }
+    async fn setup_udp_bidirectional(
+        &self,
+        _stream: Box<dyn AsyncStream>,
+        _target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        unreachable!()
+    }
+}
+
+fn destination() -> ResolvedLocation {
+    NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443).into()
+}
+
+fn resolver() -> Arc<dyn Resolver> {
+    Arc::new(crate::resolver::NativeResolver::new())
+}
+
+/// The first hop holds a session: the connection is made without its socket.
+#[tokio::test]
+async fn a_live_session_at_the_first_hop_means_no_dial() {
+    let chain = ClientProxyChain::new(
+        vec![InitialHopEntry::Proxy {
+            socket: mock_socket(0),
+            proxy: Box::new(SessionProxy::new(8443)),
+        }],
+        vec![],
+    );
+    chain
+        .connect_tcp(destination(), &resolver())
+        .await
+        .expect("the session was reused; the failing socket was not dialled");
+}
+
+/// A session at a middle hop carries the hops below it; the hop after it
+/// still runs, on the reused stream, and the session is asked for that
+/// hop's address.
+#[tokio::test]
+async fn a_live_session_at_a_middle_hop_skips_the_hops_below_it() {
+    let setups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let exit = NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9001);
+    let chain = ClientProxyChain::new(
+        vec![direct_entry(0)],
+        vec![
+            vec![Box::new(SessionProxy::new(8443)) as Box<dyn ProxyConnector>],
+            vec![Box::new(CountingProxy {
+                location: exit.clone(),
+                setups: setups.clone(),
+            })],
+        ],
+    );
+    chain
+        .connect_tcp(destination(), &resolver())
+        .await
+        .expect("reused at hop 1, hop 2 run on top");
+    assert_eq!(setups.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// With no live session anywhere, the chain dials as before -- here into
+/// the mock socket, which fails, proving the dial happened.
+#[tokio::test]
+async fn without_a_session_the_chain_dials() {
+    let chain = ClientProxyChain::new(vec![proxy_entry(0, 8443, false)], vec![]);
+    let err = chain
+        .connect_tcp(destination(), &resolver())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.to_string().contains("not implemented"), "{err}");
+}
+
 /// The tests that read what was counted, which only exists with the feature.
 #[cfg(feature = "control-stats")]
 mod counting {
