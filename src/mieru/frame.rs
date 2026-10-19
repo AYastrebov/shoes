@@ -100,8 +100,9 @@ pub fn encode_data_segment(
         // What upstream sends over TCP (`Session.writeChunk`,
         // `pkg/protocol/session.go:651-661`): `nextRecv`, which only the
         // packet transport advances, so 0 here; the receive window; and the
-        // fragment countdown within one write. Neither end acts on them over
-        // TCP, but zeros where the Go client has values were a fingerprint.
+        // fragment index, 0 for every TCP chunk. Neither end acts on them
+        // over TCP, but a zero where the Go client sends its window was a
+        // fingerprint.
         unack_seq: 0,
         window_size: flow.window_size,
         fragment: flow.fragment,
@@ -142,8 +143,11 @@ pub struct DataFlow {
     /// Free segment slots in the receive queue
     /// (`receiveWindowSize`, `pkg/protocol/session.go:1415`).
     pub window_size: u16,
-    /// Segments of the same write still to come after this one: the first
-    /// carries `n - 1`, the last 0 (`pkg/protocol/session.go:617`).
+    /// Fragments of the same chunk still to come. Always 0 over TCP:
+    /// `Session.Write` cuts input into `maxPDU` chunks and the TCP fragment
+    /// size is `maxPDU`, so a chunk is one fragment (`session.go:381`,
+    /// `segment.go:76-80`). Kept as a field because the packet transport,
+    /// which shoes does not implement, would count down.
     pub fragment: u8,
 }
 

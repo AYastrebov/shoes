@@ -203,8 +203,8 @@ TCP already provides ordering and retransmission. `sequence`, `unack` and
 `window` are carried because the format requires them, not acted upon. They
 carry what upstream sends over TCP (2026-10, PR 3.4): `unack` is `nextRecv`,
 which only the packet transport advances, so 0; `window` is 4096 less the
-segments queued unread; `fragment` counts down within one write, `n - 1` to
-0. The client's openSessionRequest carries its first write -- the socks5
+segments whose delivery has not begun; `fragment` is 0, since `Session.Write`
+cuts input into 32 KiB chunks and a TCP chunk is a single fragment. The client's openSessionRequest carries its first write -- the socks5
 request -- when it is at most 1024 bytes (`MaxSessionOpenPayload`), and a
 session ends with closeSessionRequest / closeSessionResponse before the FIN.
 

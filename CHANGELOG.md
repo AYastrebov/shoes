@@ -15,8 +15,9 @@ mieru looks like the Go client (plan PR 3.4; MI-M1 to MI-M5):
 - **A session ends with the close handshake.** Shutting down sends
   closeSessionRequest before the FIN, and a closeSessionRequest from the
   server is answered with closeSessionResponse.
-- Data segments carry the Go client's receive window and fragment countdown
-  instead of zeros. `unack_seq` stays 0, which is what upstream sends over TCP.
+- Data segments carry the Go client's receive window instead of zero, a
+  segment freeing its slot when its first byte is read. `unack_seq` and
+  `fragment` stay 0, which is what upstream sends over TCP.
 
 Checked against the mieru server (mita 3.38.1) in Docker: small requests and
 8 MiB intact, and the server logging the close handshake.
