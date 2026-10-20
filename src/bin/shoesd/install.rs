@@ -2120,6 +2120,7 @@ mod linux_tests {
     /// gid 0, which every Linux calls `root`.
     #[test]
     fn the_real_predicate_answers_for_root() {
+        let _db = crate::auth::group_db_test_lock();
         assert!(group_contains("root", 0), "root is in its own group");
         assert!(!group_contains("no-such-group-exists-here", 0));
     }
@@ -2131,6 +2132,7 @@ mod linux_tests {
     /// nothing to ask about.
     #[test]
     fn the_real_predicate_answers_for_a_supplementary_group() {
+        let _db = crate::auth::group_db_test_lock();
         // SAFETY: `getgroups` with a null pointer and count 0 returns how many
         // there are without writing anything; the second call writes exactly
         // that many into a buffer with room for them.

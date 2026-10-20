@@ -312,6 +312,16 @@ fn username_of(uid: u32) -> Option<CString> {
     }
 }
 
+/// `getgrnam`, `getgrgid` and `getpwuid` answer from one process-wide
+/// buffer, so two tests reading the databases on parallel threads can
+/// overwrite each other's entry mid-read. The production callers run once,
+/// before any thread exists; every test that reaches one of them holds this.
+#[cfg(test)]
+pub fn group_db_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +373,7 @@ mod tests {
     /// runs and refuses everyone.
     #[test]
     fn an_unknown_group_does_not_resolve() {
+        let _db = group_db_test_lock();
         let err = Authorizer::for_group("no-such-group-exists-here")
             .expect_err("an unknown group must not resolve");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -390,6 +401,7 @@ mod tests {
     /// not the host it runs on.
     #[test]
     fn a_known_group_resolves() {
+        let _db = group_db_test_lock();
         // SAFETY: `getgid` takes no arguments and cannot fail. `getgrgid`
         // returns a pointer into a static buffer, read here before anything
         // else on this thread can call into the group database again.
