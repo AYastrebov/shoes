@@ -11,7 +11,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
-use crate::http_parse::{ParsedHttpData, parse_request_line};
+use crate::http_parse::{MAX_LINE_LEN, ParsedHttpData, parse_request_line};
 use crate::prepend_stream::PrependStream;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -143,12 +143,18 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 Some(EarlyData {
                     header_name: None, ..
                 }) => {
-                    let prefix = target.matching_path.as_deref().unwrap_or("/");
-                    let Some(rest) = request_path.strip_prefix(prefix) else {
+                    // The data ends the path, before any query; a configured
+                    // query still has to match.
+                    let (prefix, query) =
+                        split_query(target.matching_path.as_deref().unwrap_or("/"));
+                    let (path, request_query) = split_query(request_path);
+                    let Some(data) = path.strip_prefix(prefix) else {
                         return false;
                     };
-                    // A query is not data; sing-box would fail to decode it.
-                    Some(rest.split_once('?').map_or(rest, |(data, _)| data))
+                    if query.is_some() && query != request_query {
+                        return false;
+                    }
+                    Some(data)
                 }
                 _ => {
                     if let Some(path) = &target.matching_path
@@ -259,6 +265,14 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
+/// A request target's path and query.
+fn split_query(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    }
+}
+
 /// What every upgrade request of one client handler carries.
 #[derive(Debug)]
 pub struct ClientRequest {
@@ -271,6 +285,23 @@ pub struct ClientRequest {
     pub ping_type: WebsocketPingType,
 }
 
+impl ClientRequest {
+    /// The most early data bytes whose base64 fits the line carrying them
+    /// (the request line, or the header) under the HTTP parser's limit,
+    /// which a shoes server applies to the request and a shoes client to
+    /// the echoed `Sec-WebSocket-Protocol`.
+    pub fn early_data_room(&self, header_name: Option<&str>) -> usize {
+        let overhead = match header_name {
+            Some(name) => name.len() + ": ".len(),
+            None => {
+                let target = self.matching_path.as_deref().unwrap_or("/");
+                "GET ".len() + target.len() + " HTTP/1.1".len()
+            }
+        };
+        (MAX_LINE_LEN - 1).saturating_sub(overhead) / 4 * 3
+    }
+}
+
 /// Upgrade `client_stream`. Early data, already encoded, goes in
 /// `early_data_header` when one is named and is otherwise appended to the
 /// path, before any query, as sing-box appends it to the URL's path.
@@ -280,11 +311,7 @@ pub async fn client_handshake(
     early_data_header: Option<String>,
     encoded_early_data: Option<String>,
 ) -> std::io::Result<WebsocketStream> {
-    let request_path = request.matching_path.as_deref().unwrap_or("/");
-    let (path, query) = match request_path.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (request_path, None),
-    };
+    let (path, query) = split_query(request.matching_path.as_deref().unwrap_or("/"));
     let (early_data_header, encoded_early_data) = match (early_data_header, encoded_early_data) {
         (Some(header), Some(data)) => (Some((header, data)), None),
         (None, data) => (None, data),

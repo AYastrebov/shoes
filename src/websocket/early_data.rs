@@ -82,11 +82,15 @@ impl EarlyDataStream {
         request: Arc<ClientRequest>,
         early_data: &EarlyData,
     ) -> Self {
+        // A larger first write sends the rest as frames.
+        let max = early_data
+            .max
+            .min(request.early_data_room(early_data.header_name.as_deref()));
         Self {
             state: State::Waiting(stream),
             request,
             header_name: early_data.header_name.clone(),
-            max: early_data.max,
+            max,
             read_waker: None,
             write_waker: None,
         }
@@ -274,7 +278,7 @@ mod tests {
 
     /// Reads the payload, reports it, and answers "ok".
     #[derive(Debug)]
-    struct Captures(mpsc::UnboundedSender<Vec<u8>>);
+    struct Captures(mpsc::UnboundedSender<Vec<u8>>, usize);
 
     #[async_trait]
     impl TcpServerHandler for Captures {
@@ -282,7 +286,7 @@ mod tests {
             &self,
             mut server_stream: Box<dyn AsyncStream>,
         ) -> io::Result<TcpServerSetupResult> {
-            let mut got = vec![0u8; PAYLOAD.len()];
+            let mut got = vec![0u8; self.1];
             server_stream.read_exact(&mut got).await?;
             let _ = self.0.send(got);
             server_stream.write_all(b"ok").await?;
@@ -305,14 +309,24 @@ mod tests {
         server_early: Option<EarlyData>,
         path: &str,
     ) -> (Box<dyn AsyncStream>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        pair_at(client_early, server_early, path, "/ws", PAYLOAD.len()).await
+    }
+
+    async fn pair_at(
+        client_early: Option<EarlyData>,
+        server_early: Option<EarlyData>,
+        path: &str,
+        server_path: &str,
+        payload_len: usize,
+    ) -> (Box<dyn AsyncStream>, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (near, far) = duplex(65536);
         let (tx, rx) = mpsc::unbounded_channel();
         let server = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
-            matching_path: Some("/ws".to_string()),
+            matching_path: Some(server_path.to_string()),
             matching_headers: None,
             ping_type: WebsocketPingType::Disabled,
             early_data: server_early,
-            handler: Box::new(Captures(tx)),
+            handler: Box::new(Captures(tx, payload_len)),
         }]);
         tokio::spawn(async move {
             let _ = server.setup_server_stream(Box::new(TestStream(far))).await;
@@ -336,17 +350,22 @@ mod tests {
         (stream, rx)
     }
 
-    async fn round_trip(
+    async fn round_trip(stream: Box<dyn AsyncStream>, rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+        round_trip_with(stream, rx, PAYLOAD).await;
+    }
+
+    async fn round_trip_with(
         mut stream: Box<dyn AsyncStream>,
         mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        payload: &[u8],
     ) {
-        stream.write_all(PAYLOAD).await.unwrap();
+        stream.write_all(payload).await.unwrap();
         stream.flush().await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("the server read the payload")
             .unwrap();
-        assert_eq!(got, PAYLOAD);
+        assert_eq!(got, payload);
         let mut ok = [0u8; 2];
         tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut ok))
             .await
@@ -390,6 +409,40 @@ mod tests {
         round_trip(stream, rx).await;
     }
 
+    /// A query configured on both ends still matches: the data goes before
+    /// it, and the server takes it from before it.
+    #[tokio::test]
+    async fn a_query_configured_on_both_ends_matches() {
+        let (stream, rx) = pair_at(
+            early(5, None),
+            early(2048, None),
+            "/ws?token=abc",
+            "/ws?token=abc",
+            PAYLOAD.len(),
+        )
+        .await;
+        round_trip(stream, rx).await;
+    }
+
+    /// A maximum past what one HTTP line carries sends what fits in the
+    /// request and the rest as frames, in either mode, between two shoes
+    /// ends; the echoed protocol header fits the client's parser too.
+    #[tokio::test]
+    async fn a_large_maximum_fits_the_line_limit() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        for header in [None, Some("Sec-WebSocket-Protocol")] {
+            let (stream, rx) = pair_at(
+                early(8192, header),
+                early(8192, header.map(|_| "sec-websocket-protocol")),
+                "/ws",
+                "/ws",
+                payload.len(),
+            )
+            .await;
+            round_trip_with(stream, rx, &payload).await;
+        }
+    }
+
     /// The client's reads wait for its first write, which sends the upgrade.
     #[tokio::test]
     async fn reads_wait_for_the_first_write() {
@@ -421,7 +474,7 @@ mod tests {
             matching_headers: None,
             ping_type: WebsocketPingType::Disabled,
             early_data: early(2048, None),
-            handler: Box::new(Captures(mpsc::unbounded_channel().0)),
+            handler: Box::new(Captures(mpsc::unbounded_channel().0, PAYLOAD.len())),
         }]);
         let (near, mut far) = duplex(8192);
         far.write_all(

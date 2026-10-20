@@ -849,7 +849,9 @@ protocol:
 
 With `max_early_data` set, the upgrade request waits for the first write and
 carries up to that many of its bytes, as sing-box's client does; the rest
-follow as WebSocket frames. Match the server's settings: sing-box defaults to
+follow as WebSocket frames. The request carries no more than fits one HTTP
+line under shoes's 4096-byte limit (about 3000 bytes), so a shoes server
+can read it. Match the server's settings: sing-box defaults to
 the path, and Xray needs `early_data_header_name: Sec-WebSocket-Protocol`.
 
 The request always carries a `Host` header: a `Host` entry in
