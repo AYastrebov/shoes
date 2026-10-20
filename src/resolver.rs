@@ -117,6 +117,10 @@ pub struct RefreshPolicy {
     /// resolves a DoH or DoT server's name again through its bootstrap, and a
     /// resolver that never idles kept the address it started with.
     pub max_age: Duration,
+    /// After a failed idle or age rebuild, wait this long before the next
+    /// attempt, using the resolver already built in between: a bootstrap that
+    /// is down must not make every working lookup wait for it.
+    pub retry_after_failure: Duration,
     /// After a refreshable error, rebuild and retry the lookup once.
     pub retry_once_after_refresh: bool,
 }
@@ -136,11 +140,16 @@ pub struct RefreshingResolver {
 struct RefreshState {
     last_activity_at: Option<Instant>,
     built_at: Instant,
+    failed_refresh_at: Option<Instant>,
     generation: u64,
 }
 
 impl RefreshState {
     fn is_stale(&self, policy: &RefreshPolicy) -> bool {
+        if matches!(self.failed_refresh_at, Some(failed) if failed.elapsed() < policy.retry_after_failure)
+        {
+            return false;
+        }
         matches!(self.last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
             || self.built_at.elapsed() > policy.max_age
     }
@@ -169,6 +178,7 @@ impl RefreshingResolver {
             refresh_state: Arc::new(Mutex::new(RefreshState {
                 last_activity_at: None,
                 built_at: Instant::now(),
+                failed_refresh_at: None,
                 generation: 0,
             })),
             policy,
@@ -220,9 +230,11 @@ impl Resolver for RefreshingResolver {
                             let mut state = refresh_state.lock();
                             state.last_activity_at = Some(Instant::now());
                             state.built_at = Instant::now();
+                            state.failed_refresh_at = None;
                             state.generation = state.generation.wrapping_add(1);
                         }
                         Err(e) => {
+                            refresh_state.lock().failed_refresh_at = Some(Instant::now());
                             log::warn!(
                                 "RefreshingResolver ({}): idle refresh failed: {}",
                                 description,
@@ -263,6 +275,7 @@ impl Resolver for RefreshingResolver {
                             {
                                 let mut state = refresh_state.lock();
                                 state.built_at = Instant::now();
+                                state.failed_refresh_at = None;
                                 state.generation = state.generation.wrapping_add(1);
                             }
                             let addrs = fresh.resolve_location(&location).await?;
@@ -761,6 +774,7 @@ mod tests {
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
             max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -793,6 +807,7 @@ mod tests {
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
             max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -824,6 +839,7 @@ mod tests {
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(50),
             max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -866,13 +882,14 @@ mod tests {
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(3600),
             max_age: Duration::from_millis(100),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
         let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
             .await
             .unwrap();
 
-        // Never idle: a lookup every 10 ms for 250 ms.
+        // Never idle: a lookup every 10 ms for at least 250 ms.
         for _ in 0..25 {
             assert_eq!(
                 resolver.resolve_location(&test_location()).await.unwrap(),
@@ -880,10 +897,58 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // A lower bound only: the sleeps are minimums, so a slow runner can
+        // see more age rebuilds, never fewer.
         let builds = call_count.load(Ordering::Relaxed);
         assert!(
-            (2..=4).contains(&builds),
-            "a busy resolver is rebuilt by age, about every 100 ms: {builds} builds"
+            builds >= 2,
+            "a busy resolver is rebuilt by age: {builds} builds"
+        );
+    }
+
+    /// A failed age rebuild keeps the working resolver and waits out the
+    /// retry interval, instead of retrying on every lookup.
+    #[tokio::test]
+    async fn test_refreshing_resolver_waits_after_a_failed_rebuild() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            let call = call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(async move {
+                if call == 0 {
+                    Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
+                } else {
+                    Err(std::io::Error::other("bootstrap down"))
+                }
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(3600),
+            max_age: Duration::from_millis(20),
+            retry_after_failure: Duration::from_secs(3600),
+            retry_once_after_refresh: true,
+        };
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        for _ in 0..10 {
+            assert_eq!(
+                resolver.resolve_location(&test_location()).await.unwrap(),
+                addrs,
+                "the resolver already built keeps answering"
+            );
+        }
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            2,
+            "one failed rebuild, then none until the retry interval"
         );
     }
 
@@ -912,6 +977,7 @@ mod tests {
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(20),
             max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 

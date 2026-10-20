@@ -564,6 +564,7 @@ async fn build_resolver_from_specs(
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
             max_age: Duration::from_secs(10 * 60),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
