@@ -103,6 +103,24 @@ const COMMAND_TCP: u8 = 1;
 const COMMAND_UDP: u8 = 2;
 const COMMAND_MUX: u8 = 3; // MUX/XUDP mode
 
+// Request options (v2ray `protocol.RequestOption`).
+const OPTION_CHUNK_STREAM: u8 = 0x01;
+const OPTION_CHUNK_MASKING: u8 = 0x04;
+const OPTION_GLOBAL_PADDING: u8 = 0x08;
+const OPTION_AUTHENTICATED_LENGTH: u8 = 0x10;
+
+/// The options a client requests, as Xray's does: a chunk stream with masked
+/// lengths, and global padding whenever the body is encrypted
+/// (`shouldEnablePadding`, proxy/vmess/outbound). A client without the
+/// padding is one Xray never is (VM-D5).
+fn client_request_options(encrypted: bool) -> u8 {
+    let mut option = OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING;
+    if encrypted {
+        option |= OPTION_GLOBAL_PADDING;
+    }
+    option
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DataCipher {
     Any,
@@ -198,7 +216,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     "AEAD auth ID decryption failed",
                 )
             })?;
-        let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
+        let checksum = super::crc32::crc32_ieee(&aead_bytes[0..12]);
         let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
 
         if checksum != expected_checksum {
@@ -423,22 +441,22 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let response_authentication_v = fixed_header[33];
         let option = fixed_header[34];
 
-        if option & 0x01 != 0x01 {
+        if option & OPTION_CHUNK_STREAM == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Standard format data stream was not requested",
             ));
         }
 
-        if option & 0x10 == 0x10 {
+        if option & OPTION_AUTHENTICATED_LENGTH != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Auth length option is not supported",
             ));
         }
 
-        let enable_chunk_masking = option & 0x04 == 0x04;
-        let enable_global_padding = option & 0x08 == 0x08;
+        let enable_chunk_masking = option & OPTION_CHUNK_MASKING != 0;
+        let enable_global_padding = option & OPTION_GLOBAL_PADDING != 0;
 
         if enable_global_padding && !enable_chunk_masking {
             return Err(std::io::Error::new(
@@ -836,7 +854,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
         rand::rng().fill_bytes(&mut aead_bytes[8..12]);
 
-        let checksum_value = super::crc32::crc32c(&aead_bytes[0..12]);
+        let checksum_value = super::crc32::crc32_ieee(&aead_bytes[0..12]);
         let checksum = checksum_value.to_be_bytes();
         aead_bytes[12..16].copy_from_slice(&checksum);
 
@@ -922,6 +940,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             }
             DataCipher::None => (5u8, None),
         };
+        let global_padding = unbound_keys.is_some();
 
         let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
             let opening_key = OpeningKey::new(
@@ -939,8 +958,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
         // continue filling out other parts of instructions_to_addr_type.
 
-        // set options, standard format data stream and metadata obfuscation
-        header_bytes[34] = 0x01 | 0x04;
+        header_bytes[34] = client_request_options(global_padding);
 
         // only 4 bits, generate this now before our first await.
         let margin_len: u8 = rand::random::<u8>() & 0xf;
@@ -1070,7 +1088,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             data_keys,
             read_length_shake_reader,
             write_length_shake_reader,
-            false,
+            global_padding,
             None,
             Some(read_header_info),
         ));
@@ -1116,7 +1134,7 @@ impl VmessTcpClientHandler {
 
         rand::rng().fill_bytes(&mut aead_bytes[8..12]);
 
-        let checksum_value = super::crc32::crc32c(&aead_bytes[0..12]);
+        let checksum_value = super::crc32::crc32_ieee(&aead_bytes[0..12]);
         let checksum = checksum_value.to_be_bytes();
         aead_bytes[12..16].copy_from_slice(&checksum);
 
@@ -1187,6 +1205,7 @@ impl VmessTcpClientHandler {
             ),
             DataCipher::None => (5u8, None),
         };
+        let global_padding = unbound_keys.is_some();
 
         let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
             let opening_key = OpeningKey::new(
@@ -1202,8 +1221,7 @@ impl VmessTcpClientHandler {
             None
         };
 
-        // Set options: standard format data stream and metadata obfuscation
-        header_bytes[34] = 0x01 | 0x04;
+        header_bytes[34] = client_request_options(global_padding);
 
         // Margin length (4 bits) + encryption method
         let margin_len: u8 = rand::random::<u8>() & 0xf;
@@ -1332,7 +1350,7 @@ impl VmessTcpClientHandler {
             data_keys,
             read_length_shake_reader,
             write_length_shake_reader,
-            false,
+            global_padding,
             None,
             Some(read_header_info),
         );
@@ -1497,6 +1515,82 @@ mod tests {
 
         client.abort();
         Ok(received)
+    }
+
+    /// VM-D5: an encrypting client asks for global padding, as Xray's does;
+    /// `none` has nothing to pad.
+    #[test]
+    fn the_client_requests_global_padding_when_it_encrypts() {
+        assert_eq!(client_request_options(true), 0x01 | 0x04 | 0x08);
+        assert_eq!(client_request_options(false), 0x01 | 0x04);
+    }
+
+    /// With global padding on, padded chunks cross in both directions, for
+    /// each cipher: the server pads its answer because the request asked.
+    #[tokio::test]
+    async fn padded_chunks_cross_both_ways() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for cipher in ["aes-128-gcm", "chacha20-poly1305"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let request: Vec<u8> = (0..40_000u32).map(|i| (i * 7) as u8).collect();
+            let answer: Vec<u8> = (0..40_000u32).map(|i| (i * 13) as u8).collect();
+
+            let (sent, expected) = (request.clone(), answer.clone());
+            let client = tokio::spawn(async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let handler = VmessTcpClientHandler::new(cipher, &test_uuid(), false);
+                let mut stream = handler
+                    .setup_client_tcp_stream(
+                        Box::new(tcp),
+                        NetLocation::from_str("1.2.3.4:80", None).unwrap().into(),
+                    )
+                    .await
+                    .unwrap()
+                    .client_stream;
+                stream.write_all(&sent).await.unwrap();
+                stream.flush().await.unwrap();
+                let mut got = vec![0u8; expected.len()];
+                stream.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expected, "{cipher}: the answer");
+            });
+
+            let (server_tcp, _) = listener.accept().await.unwrap();
+            let resolver = test_resolver();
+            let server = VmessTcpServerHandler::new(
+                cipher,
+                &test_uuid(),
+                false,
+                direct_selector(resolver.clone()),
+                resolver,
+            );
+            let TcpServerSetupResult::TcpForward {
+                mut stream,
+                initial_remote_data,
+                ..
+            } = server
+                .setup_server_stream(Box::new(server_tcp))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a TCP forward");
+            };
+            let mut received = initial_remote_data.map(|d| d.to_vec()).unwrap_or_default();
+            let mut buf = vec![0u8; 8192];
+            while received.len() < request.len() {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "{cipher}: EOF");
+                received.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(received, request, "{cipher}: the request");
+            stream.write_all(&answer).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), client)
+                .await
+                .expect("the client read the answer")
+                .unwrap();
+        }
     }
 
     #[tokio::test]

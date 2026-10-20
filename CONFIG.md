@@ -762,6 +762,11 @@ protocol:
 
 **Note:** VMess AEAD mode is always enabled. The legacy `aead` field is deprecated.
 
+With `aes-128-gcm` or `chacha20-poly1305` the client asks for global padding,
+as Xray's client does. `cipher: none` works against sing-box and shoes
+servers, but current Xray servers no longer accept it; use an encrypting
+cipher there.
+
 ### VLESS
 ```yaml
 protocol:

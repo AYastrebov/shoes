@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+VMess client parity (plan PR 3.7, VMess half; VM-D5, VM-D1):
+
+- **The VMess client asks for global padding** when it encrypts, as Xray's
+  client does, so its chunks carry random padding in both directions. A
+  client without it was one Xray never is.
+- CONFIG.md notes that current Xray servers refuse `cipher: none`.
+- The VMess AuthID checksum is renamed `crc32_ieee`: it is the IEEE CRC32
+  Go's `ChecksumIEEE` computes, never the Castagnoli one its name said.
+
 WebSocket early data and the SOCKS UDP address (plan PR 3.6; TR-3, TR-12):
 
 - **WebSocket early data**, on both sides, with sing-box's names and wire
