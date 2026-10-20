@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+AmneziaWG client parity (plan PR 3.7, AmneziaWG half; WG-A2 to WG-A4):
+
+- **Handshake retransmits carry the reference's 0-334 ms jitter.** awgtun
+  only claimed it in a comment, so every retry fired on a whole second; the
+  retransmit and new-handshake timers now add it, as wireguard-go and
+  amneziawg-go do (awgtun `7a78f45`).
+- **A handshake's decoys always go out ahead of it.** The decoys were taken
+  under a second lock after the initiation was made, so the timer task could
+  send them with an ordinary packet and leave the initiation without them.
+  They are now taken in the same critical section.
+- **`jc` over 128, or junk larger than the tunnel's own datagrams (the MTU
+  plus S4 plus 32), is refused** at config load. The kernel module refuses the
+  first, and the path fragments or drops the second.
+
 VMess client parity (plan PR 3.7, VMess half; VM-D5, VM-D1):
 
 - **The VMess client asks for global padding** when it encrypts, as Xray's
