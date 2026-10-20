@@ -274,12 +274,14 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let server_config = Arc::new(create_server_config(
-        &cert_bytes,
-        &key_bytes,
-        processed_ca_certs,
-        &alpn_protocols.into_vec(),
-        &client_fingerprints.into_vec(),
+    let server_config = Arc::new(crate::rustls_config_util::allow_quic_early_data(
+        create_server_config(
+            &cert_bytes,
+            &key_bytes,
+            processed_ca_certs,
+            &alpn_protocols.into_vec(),
+            &client_fingerprints.into_vec(),
+        ),
     ));
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config

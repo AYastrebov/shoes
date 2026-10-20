@@ -297,9 +297,20 @@ pub fn create_server_config(
         .collect();
 
     config.max_fragment_size = None;
-    config.max_early_data_size = u32::MAX;
+    // No TCP handler reads early data, so a resuming client's 0-RTT bytes
+    // would be accepted and then lost (TL-1). Zero refuses 0-RTT; the client
+    // sends the same bytes after the handshake. A QUIC server sets it back to
+    // `u32::MAX` (`allow_quic_early_data`): quinn reads 0-RTT itself.
+    config.max_early_data_size = 0;
     config.ignore_client_order = true;
 
+    config
+}
+
+/// The early data a QUIC server accepts: quinn reads 0-RTT itself, and QUIC
+/// allows only 0 or `u32::MAX` (quinn-proto `QuicServerConfig`).
+pub fn allow_quic_early_data(mut config: rustls::ServerConfig) -> rustls::ServerConfig {
+    config.max_early_data_size = u32::MAX;
     config
 }
 
@@ -407,5 +418,31 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.supported_algs.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod early_data_tests {
+    use super::*;
+
+    fn server_config() -> rustls::ServerConfig {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        create_server_config(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+            vec![],
+            &[],
+            &[],
+        )
+    }
+
+    /// TL-1: a TCP TLS server refuses 0-RTT, which nothing reads; a QUIC
+    /// server takes it, since quinn does.
+    #[test]
+    fn only_quic_servers_accept_early_data() {
+        assert_eq!(server_config().max_early_data_size, 0);
+        let quic = allow_quic_early_data(server_config());
+        assert_eq!(quic.max_early_data_size, u32::MAX);
+        assert!(quinn::crypto::rustls::QuicServerConfig::try_from(quic).is_ok());
     }
 }

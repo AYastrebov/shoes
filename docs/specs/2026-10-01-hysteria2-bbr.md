@@ -208,3 +208,15 @@ there is no runtime switch to get wrong.
 - **quinn's BBR against quic-go's.** They are different implementations, and
   this one is about 10% behind Cubic on a clean path. Tuning a controller is
   not this change.
+
+## Fidelity (added 2026-10-20, audit HY-D5)
+
+"As upstream does" holds for the choice of BBR, not for its details:
+
+- **Initial window:** now upstream's 32 packets (`32 × 1200` bytes), set on
+  quinn's `BbrConfig`. quinn's default of 200 packets was a first burst no
+  reference sends. Plan PR 5.1.
+- **Pacer:** quinn paces from the congestion window over the RTT; quic-go's
+  BBR paces from its own pacing-rate estimate. They differ, most visibly in
+  how a flow leaves startup. Matching it needs a custom quinn `Controller`,
+  the same work Brutal needs, and is left for that change.

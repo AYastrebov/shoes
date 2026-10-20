@@ -224,6 +224,10 @@ impl HickoryResolver {
             resolver_opts.timeout = timeout;
         }
         resolver_opts.attempts = options.attempts;
+        // DNS 0x20 (DN-D1): hickory randomises the query name's case over UDP
+        // and drops an answer that does not echo it, which an off-path
+        // spoofer cannot do without guessing the case too.
+        resolver_opts.case_randomization = true;
         let builder =
             builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder
@@ -309,6 +313,21 @@ impl ShoesResolver for HickoryResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DN-D1: every hickory-backed resolver randomises the query name's case.
+    #[tokio::test]
+    async fn resolvers_randomise_the_query_case() {
+        let resolver = HickoryResolver::udp(
+            "127.0.0.1:53".parse().unwrap(),
+            Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            HickoryResolverOptions::default(),
+        )
+        .unwrap();
+        assert!(resolver.inner.options().case_randomization);
+    }
 
     #[test]
     fn test_hickory_resolver_options_default() {

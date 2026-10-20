@@ -61,11 +61,11 @@ impl DnsRegistry {
     /// Unlike listeners, a TUN without a `dns:` block gets a FRESH system
     /// resolver rather than the caching default. The honoured-dns change
     /// promised "without the block nothing changes", and the caching
-    /// default's flat one-hour cap (record TTLs ignored) would break it:
-    /// a WireGuard/AmneziaWG tunnel rebuild would resolve a failed-over
-    /// endpoint hostname to its dead pre-failover address for up to an
-    /// hour, where the old in-place resolver followed the provider on the
-    /// next lookup.
+    /// default's flat cap (record TTLs ignored; five minutes, once an hour)
+    /// would break it: a WireGuard/AmneziaWG tunnel rebuild would resolve a
+    /// failed-over endpoint hostname to its dead pre-failover address for
+    /// that long, where the old in-place resolver followed the provider on
+    /// the next lookup.
     pub fn get_for_tun(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(_) => self.get_for_server(dns),
@@ -563,6 +563,8 @@ async fn build_resolver_from_specs(
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
+            max_age: Duration::from_secs(10 * 60),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -695,7 +697,7 @@ async fn build_entry_and_plan(
 #[cfg(test)]
 mod tests {
     /// The no-dns TUN default must be the uncached system resolver: the
-    /// caching default's flat one-hour cap would pin a failed-over
+    /// caching default's flat five-minute cap would pin a failed-over
     /// WG/AWG endpoint to its dead address across rebuilds. Asserted by
     /// pointer identity against the caching default.
     #[test]

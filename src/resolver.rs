@@ -103,11 +103,24 @@ type ResolverFactoryFuture =
 
 pub type ResolverFactory = Arc<dyn Fn() -> ResolverFactoryFuture + Send + Sync>;
 
+/// How long a cached answer is used without asking again (DN-D3). The
+/// system resolver behind the native caches honours TTLs itself, so this
+/// only saves lookups; an hour kept a moved host's old address that long.
+const CACHED_RESULT_SECS: u64 = 5 * 60;
+
 /// Policy controlling when a RefreshingResolver rebuilds its inner resolver.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshPolicy {
     /// Rebuild the inner resolver if it has been idle longer than this.
     pub max_idle: Duration,
+    /// Rebuild it once it is this old, however busy (DN-D2): a rebuild
+    /// resolves a DoH or DoT server's name again through its bootstrap, and a
+    /// resolver that never idles kept the address it started with.
+    pub max_age: Duration,
+    /// After a failed idle or age rebuild, wait this long before the next
+    /// attempt, using the resolver already built in between: a bootstrap that
+    /// is down must not make every working lookup wait for it.
+    pub retry_after_failure: Duration,
     /// After a refreshable error, rebuild and retry the lookup once.
     pub retry_once_after_refresh: bool,
 }
@@ -126,7 +139,20 @@ pub struct RefreshingResolver {
 
 struct RefreshState {
     last_activity_at: Option<Instant>,
+    built_at: Instant,
+    failed_refresh_at: Option<Instant>,
     generation: u64,
+}
+
+impl RefreshState {
+    fn is_stale(&self, policy: &RefreshPolicy) -> bool {
+        if matches!(self.failed_refresh_at, Some(failed) if failed.elapsed() < policy.retry_after_failure)
+        {
+            return false;
+        }
+        matches!(self.last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
+            || self.built_at.elapsed() > policy.max_age
+    }
 }
 
 impl Debug for RefreshingResolver {
@@ -151,6 +177,8 @@ impl RefreshingResolver {
             refresh_lock: Arc::new(AsyncMutex::new(())),
             refresh_state: Arc::new(Mutex::new(RefreshState {
                 last_activity_at: None,
+                built_at: Instant::now(),
+                failed_refresh_at: None,
                 generation: 0,
             })),
             policy,
@@ -186,25 +214,27 @@ impl Resolver for RefreshingResolver {
         let description = self.description.clone();
 
         Box::pin(async move {
-            // Refreshes if idle too long using double-checked locking.
-            if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
-            {
+            // Refreshes if idle or old too long using double-checked locking.
+            if refresh_state.lock().is_stale(&policy) {
                 let _guard = refresh_lock.lock().await;
-                if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
-                {
+                if refresh_state.lock().is_stale(&policy) {
                     log::info!(
-                        "RefreshingResolver ({}): rebuilding after idle timeout ({:?})",
+                        "RefreshingResolver ({}): rebuilding after idle timeout ({:?}) or age ({:?})",
                         description,
-                        policy.max_idle
+                        policy.max_idle,
+                        policy.max_age
                     );
                     match factory().await {
                         Ok(fresh) => {
                             *inner.write().await = fresh;
                             let mut state = refresh_state.lock();
                             state.last_activity_at = Some(Instant::now());
+                            state.built_at = Instant::now();
+                            state.failed_refresh_at = None;
                             state.generation = state.generation.wrapping_add(1);
                         }
                         Err(e) => {
+                            refresh_state.lock().failed_refresh_at = Some(Instant::now());
                             log::warn!(
                                 "RefreshingResolver ({}): idle refresh failed: {}",
                                 description,
@@ -244,6 +274,8 @@ impl Resolver for RefreshingResolver {
                             *inner.write().await = fresh.clone();
                             {
                                 let mut state = refresh_state.lock();
+                                state.built_at = Instant::now();
+                                state.failed_refresh_at = None;
                                 state.generation = state.generation.wrapping_add(1);
                             }
                             let addrs = fresh.resolve_location(&location).await?;
@@ -369,7 +401,7 @@ impl std::fmt::Debug for CachingNativeResolver {
 }
 
 impl CachingNativeResolver {
-    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
+    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = CACHED_RESULT_SECS;
 
     pub fn new() -> Self {
         Self::with_timeout(Self::DEFAULT_RESULT_TIMEOUT_SECS)
@@ -454,7 +486,7 @@ pub struct ResolverCache {
 }
 
 impl ResolverCache {
-    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60;
+    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = CACHED_RESULT_SECS;
 
     pub fn new(resolver: Arc<dyn Resolver>) -> Self {
         Self::new_with_timeout(resolver, Self::DEFAULT_RESULT_TIMEOUT_SECS)
@@ -741,6 +773,8 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
+            max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -772,6 +806,8 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
+            max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -802,6 +838,8 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(50),
+            max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
@@ -824,6 +862,102 @@ mod tests {
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
     }
 
+    /// DN-D2: a resolver in constant use is rebuilt once it reaches its
+    /// maximum age, which re-resolves a DoH or DoT server's name.
+    #[tokio::test]
+    async fn test_refreshing_resolver_rebuilds_a_busy_resolver_at_max_age() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(
+                async move { Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>) },
+            )
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(3600),
+            max_age: Duration::from_millis(100),
+            retry_after_failure: Duration::from_secs(30),
+            retry_once_after_refresh: true,
+        };
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        // Never idle: a lookup every 10 ms for at least 250 ms.
+        for _ in 0..25 {
+            assert_eq!(
+                resolver.resolve_location(&test_location()).await.unwrap(),
+                addrs
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A lower bound only: the sleeps are minimums, so a slow runner can
+        // see more age rebuilds, never fewer.
+        let builds = call_count.load(Ordering::Relaxed);
+        assert!(
+            builds >= 2,
+            "a busy resolver is rebuilt by age: {builds} builds"
+        );
+    }
+
+    /// A failed age rebuild keeps the working resolver and waits out the
+    /// retry interval, instead of retrying on every lookup.
+    #[tokio::test]
+    async fn test_refreshing_resolver_waits_after_a_failed_rebuild() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            let call = call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(async move {
+                if call == 0 {
+                    Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
+                } else {
+                    Err(std::io::Error::other("bootstrap down"))
+                }
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(3600),
+            max_age: Duration::from_millis(20),
+            retry_after_failure: Duration::from_secs(3600),
+            retry_once_after_refresh: true,
+        };
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        for _ in 0..10 {
+            assert_eq!(
+                resolver.resolve_location(&test_location()).await.unwrap(),
+                addrs,
+                "the resolver already built keeps answering"
+            );
+        }
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            2,
+            "one failed rebuild, then none until the retry interval"
+        );
+    }
+
+    #[test]
+    fn cached_answers_are_kept_five_minutes() {
+        assert_eq!(CachingNativeResolver::DEFAULT_RESULT_TIMEOUT_SECS, 300);
+        assert_eq!(ResolverCache::DEFAULT_RESULT_TIMEOUT_SECS, 300);
+    }
+
     #[tokio::test]
     async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -842,6 +976,8 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(20),
+            max_age: Duration::from_secs(3600),
+            retry_after_failure: Duration::from_secs(30),
             retry_once_after_refresh: true,
         };
 
