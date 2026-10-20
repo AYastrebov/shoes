@@ -28,6 +28,11 @@ pub const DEFAULT_PADDING_SCHEME: &str = r#"stop=8
 6=500-1000
 7=500-1000"#;
 
+/// The largest record size a scheme may name: a padding frame's length is
+/// a u16. A scheme from the server is otherwise trusted with the client's
+/// memory, since each size is allocated and zeroed per write.
+pub const MAX_RECORD_SIZE: i64 = u16::MAX as i64;
+
 /// PaddingFactory generates padding sizes according to the configured scheme
 #[derive(Debug, Clone)]
 pub struct PaddingFactory {
@@ -51,6 +56,29 @@ impl PaddingFactory {
             .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
             .parse::<u32>()
             .map_err(|_| "invalid 'stop' value in padding scheme".to_string())?;
+
+        for (key, spec) in scheme.iter() {
+            if key.parse::<u32>().is_err() {
+                continue;
+            }
+            for part in spec.split(',') {
+                let Some((min, max)) = part.trim().split_once('-') else {
+                    continue;
+                };
+                for bound in [min, max] {
+                    if bound
+                        .trim()
+                        .parse::<i64>()
+                        .is_ok_and(|v| v > MAX_RECORD_SIZE)
+                    {
+                        return Err(format!(
+                            "padding size {} for packet {key} is over {MAX_RECORD_SIZE}",
+                            bound.trim()
+                        ));
+                    }
+                }
+            }
+        }
 
         let mut hasher = Md5::new();
         hasher.update(raw_scheme);
@@ -177,6 +205,15 @@ mod tests {
             assert_eq!(factory.generate_record_payload_sizes(1), vec![30]);
         }
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![10, 11]);
+    }
+
+    /// A size over a frame's length is refused, so a server's scheme cannot
+    /// have the client allocate a gigabyte per write.
+    #[test]
+    fn a_size_over_a_frame_is_refused() {
+        assert!(PaddingFactory::new(b"stop=8\n1=1073741824-1073741824").is_err());
+        assert!(PaddingFactory::new(b"stop=8\n2=400-500,c,500-99999999999").is_err());
+        assert!(PaddingFactory::new(b"stop=2\n1=65535-65535").is_ok());
     }
 
     #[test]

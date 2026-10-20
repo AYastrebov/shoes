@@ -110,7 +110,15 @@ impl TcpClientHandler for AnyTlsClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         let session = self.new_session(client_stream).await?;
 
-        let stream = session.open_stream(remote_location.into_location()).await?;
+        // The pool holds the session from the start, so a failed first open
+        // has to close it: no stream exists to finish it.
+        let stream = match session.open_stream(remote_location.into_location()).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                session.shut().await;
+                return Err(e);
+            }
+        };
 
         Ok(TcpClientSetupResult {
             client_stream: Box::new(stream),
@@ -138,7 +146,13 @@ impl TcpClientHandler for AnyTlsClientHandler {
 
         // UoT V2 Connect Mode: single destination via magic address
         let uot_dest = NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0);
-        let mut stream = session.open_stream(uot_dest).await?;
+        let mut stream = match session.open_stream(uot_dest).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                session.shut().await;
+                return Err(e);
+            }
+        };
 
         // UoT V2 header: isConnect(1) + destination
         stream.write_u8(1).await?;
@@ -316,6 +330,61 @@ mod pool_tests {
             1,
             "one TCP connection for both"
         );
+    }
+
+    /// A destination that says goodbye and closes, so the server's FIN comes
+    /// before the client's.
+    async fn closer() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let _ = tcp.write_all(b"bye").await;
+            }
+        });
+        addr
+    }
+
+    /// The server's FIN returns the session; the client's own FIN, coming
+    /// after the session took a newer stream, must not return it again,
+    /// which would offer an active session as idle.
+    #[tokio::test]
+    async fn a_late_fin_does_not_release_a_reused_session() {
+        let echo: ResolvedLocation = crate::address::NetLocation::from(echo().await).into();
+        let closing: ResolvedLocation = crate::address::NetLocation::from(closer().await).into();
+        let (addr, _) = server().await;
+        let handler = handler(0);
+
+        let mut first = handler
+            .setup_client_tcp_stream(dial(addr).await, closing)
+            .await
+            .unwrap()
+            .client_stream;
+        let mut bye = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first.read_to_end(&mut bye),
+        )
+        .await
+        .expect("the server's FIN")
+        .unwrap();
+        assert_eq!(bye, b"bye");
+        wait_for_idle(&handler, 1).await;
+
+        let second = handler
+            .try_reuse_tcp_stream(&echo)
+            .await
+            .expect("an idle session")
+            .unwrap()
+            .client_stream;
+        first.shutdown().await.unwrap();
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(handler.pool.idle_len(), 0, "the session is in use");
+
+        use_and_close(second, b"second").await;
+        wait_for_idle(&handler, 1).await;
     }
 
     /// AT-A1: the server's UpdatePaddingScheme replaces the client's scheme,

@@ -145,6 +145,10 @@ impl StringMap {
         self.0.get(key)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+
     /// Parse from bytes (newline-separated key=value pairs)
     pub fn from_bytes(data: &[u8]) -> Self {
         let mut map = Self::new();

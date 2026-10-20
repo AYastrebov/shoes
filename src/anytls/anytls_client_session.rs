@@ -373,8 +373,12 @@ impl AnyTlsClientSession {
                         .await?;
                     writer.flush().await?;
 
-                    session.streams.write().await.remove(&stream_id);
-                    session.stream_finished();
+                    // Only the FIN that ends a registered stream returns the
+                    // session: after the server's FIN has already done so,
+                    // the session may carry a newer stream.
+                    if session.streams.write().await.remove(&stream_id).is_some() {
+                        session.stream_finished();
+                    }
                 }
             }
         }
@@ -871,20 +875,28 @@ impl AnyTlsClientSession {
         let outgoing_tx = self.outgoing_tx.clone();
         let is_closed = Arc::clone(&self.is_closed);
         let close_notify_fwd = Arc::clone(&self.close_notify);
+        // A stream dropped with its channel full loses its FIN, so the end of
+        // the channel sends one after the queued data. Without it the session
+        // would never come back to the pool, nor be expired from it.
         tokio::spawn(async move {
+            let mut fin_sent = false;
             loop {
                 let received = tokio::select! {
                     r = stream_write_rx.recv() => r,
-                    _ = close_notify_fwd.notified() => None,
-                };
-                let Some((sid, data)) = received else {
-                    break;
+                    _ = close_notify_fwd.notified() => break,
                 };
                 if is_closed.load(Ordering::Relaxed) {
                     break;
                 }
+                let Some((sid, data)) = received else {
+                    if !fin_sent {
+                        let _ = outgoing_tx.send(OutgoingMessage::Fin { stream_id }).await;
+                    }
+                    break;
+                };
                 // Empty data signals FIN, non-empty is PSH data
                 let msg = if data.is_empty() {
+                    fin_sent = true;
                     OutgoingMessage::Fin { stream_id: sid }
                 } else {
                     OutgoingMessage::Data {
