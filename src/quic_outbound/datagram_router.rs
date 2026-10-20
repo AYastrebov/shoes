@@ -12,6 +12,9 @@ use tokio::sync::mpsc;
 /// How many datagrams may queue for one session before the rest are dropped.
 const SESSION_CAPACITY: usize = 64;
 
+/// How many unidirectional streams `run_uni` reads at once.
+const MAX_UNI_READS: usize = 64;
+
 /// Reads the session key out of a datagram's header.
 ///
 /// Supplied by the protocol, because only the protocol knows its own framing.
@@ -91,16 +94,23 @@ impl DatagramRouter {
     /// random id would eventually draw one already registered and quietly take
     /// over that session's datagrams - which is the failure this type exists to
     /// remove, reintroduced by the back door.
-    pub fn register(&self) -> (u32, mpsc::Receiver<Bytes>) {
+    pub fn register(&self) -> std::io::Result<(u32, mpsc::Receiver<Bytes>)> {
         let (sender, receiver) = mpsc::channel(SESSION_CAPACITY);
         let mut sessions = self.sessions.lock();
-        let mut rng = rand::rng();
-        let session_id = loop {
-            let candidate = rng.random_range(0..=self.max_id);
-            if !sessions.queues.contains_key(&candidate) {
-                break candidate;
-            }
-        };
+        // A scan from a random start rather than redrawing: it ends whatever
+        // is in use, and a full id space -- TUIC's 65 536 -- is an error to
+        // report, not a loop that would spin under the lock forever.
+        let span = u64::from(self.max_id) + 1;
+        let start = u64::from(rand::rng().random_range(0..=self.max_id));
+        let session_id = (0..span)
+            .map(|offset| ((start + offset) % span) as u32)
+            .find(|candidate| !sessions.queues.contains_key(candidate))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!("all {span} session ids on this connection are in use"),
+                )
+            })?;
 
         // A caller can be handed a connection that dies before it registers:
         // `get` checks the connection under its own lock and the reader stops
@@ -111,7 +121,7 @@ impl DatagramRouter {
         if !sessions.terminated {
             sessions.queues.insert(session_id, sender);
         }
-        (session_id, receiver)
+        Ok((session_id, receiver))
     }
 
     pub fn deregister(&self, session_id: u32) {
@@ -150,25 +160,31 @@ impl DatagramRouter {
     /// Read this connection's unidirectional streams until it ends, one
     /// command per stream, routing each like a datagram.
     ///
-    /// Each stream is read in a task of its own, so a peer that opens a
-    /// stream and stalls holds up nothing else. The datagram reader is the one
-    /// that fails the sessions when the connection ends.
+    /// Up to `MAX_UNI_READS` streams are read at once, all polled here rather
+    /// than in a task each: a stream carries one packet, so a task per stream
+    /// would be a task per packet. A stalled stream holds one slot and nothing
+    /// else; with every slot taken, new streams wait until one finishes. The
+    /// datagram reader is the one that fails the sessions when the connection
+    /// ends.
     pub async fn run_uni(self: Arc<Self>, connection: quinn::Connection, limit: usize) {
+        use futures::StreamExt;
+        let mut reads = futures::stream::FuturesUnordered::new();
         loop {
-            let mut recv = match connection.accept_uni().await {
-                Ok(recv) => recv,
-                Err(e) => {
-                    debug!("QUIC uni stream reader stopping: {e}");
-                    return;
+            tokio::select! {
+                accepted = connection.accept_uni(), if reads.len() < MAX_UNI_READS => {
+                    match accepted {
+                        Ok(mut recv) => reads.push(async move { recv.read_to_end(limit).await }),
+                        Err(e) => {
+                            debug!("QUIC uni stream reader stopping: {e}");
+                            return;
+                        }
+                    }
                 }
-            };
-            let router = self.clone();
-            tokio::spawn(async move {
-                match recv.read_to_end(limit).await {
-                    Ok(command) => router.dispatch(Bytes::from(command)),
+                Some(read) = reads.next(), if !reads.is_empty() => match read {
+                    Ok(command) => self.dispatch(Bytes::from(command)),
                     Err(e) => debug!("QUIC uni stream dropped: {e}"),
-                }
-            });
+                },
+            }
         }
     }
 
@@ -212,8 +228,8 @@ mod tests {
     #[tokio::test]
     async fn test_each_session_gets_only_its_own_datagrams() {
         let router = DatagramRouter::new(first_four);
-        let (first_id, mut first) = router.register();
-        let (second_id, mut second) = router.register();
+        let (first_id, mut first) = router.register().unwrap();
+        let (second_id, mut second) = router.register().unwrap();
 
         router.dispatch(datagram(first_id, 1));
         router.dispatch(datagram(second_id, 2));
@@ -235,11 +251,17 @@ mod tests {
         let mut held = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..16 {
-            let (id, receiver) = router.register();
+            let (id, receiver) = router.register().unwrap();
             assert!(id <= 15, "id {id} is past the maximum");
             assert!(seen.insert(id));
             held.push(receiver);
         }
+        // Full: an error at once, not a search that never ends.
+        let err = router.register().expect_err("the id space is full");
+        assert_eq!(err.kind(), std::io::ErrorKind::ResourceBusy);
+        // A freed id is handed out again.
+        router.deregister(3);
+        assert_eq!(router.register().unwrap().0, 3);
     }
 
     #[tokio::test]
@@ -248,7 +270,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         let mut held = Vec::new();
         for _ in 0..64 {
-            let (id, receiver) = router.register();
+            let (id, receiver) = router.register().unwrap();
             assert!(ids.insert(id), "session id {id} was handed out twice");
             held.push(receiver);
         }
@@ -257,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_datagram_for_an_unknown_session_is_dropped() {
         let router = DatagramRouter::new(first_four);
-        let (id, mut session) = router.register();
+        let (id, mut session) = router.register().unwrap();
         router.dispatch(datagram(id.wrapping_add(1), 9));
         assert!(session.try_recv().is_err());
     }
@@ -265,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_deregistered_session_stops_receiving() {
         let router = DatagramRouter::new(first_four);
-        let (id, mut session) = router.register();
+        let (id, mut session) = router.register().unwrap();
         router.deregister(id);
         router.dispatch(datagram(id, 1));
         assert!(session.try_recv().is_err());
@@ -276,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_closed_session_is_forgotten_on_the_next_datagram() {
         let router = DatagramRouter::new(first_four);
-        let (id, session) = router.register();
+        let (id, session) = router.register().unwrap();
         drop(session);
         router.dispatch(datagram(id, 1));
         assert!(!router.sessions.lock().queues.contains_key(&id));
@@ -292,7 +314,7 @@ mod tests {
         let router = DatagramRouter::new(first_four);
         router.sessions.lock().terminated = true;
 
-        let (_id, mut session) = router.register();
+        let (_id, mut session) = router.register().unwrap();
 
         // Bounded on purpose. The failure this guards against is a wait that
         // never ends, and a bare `recv().await` would express that by hanging
@@ -308,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_datagram_too_short_to_key_is_dropped() {
         let router = DatagramRouter::new(first_four);
-        let (_id, mut session) = router.register();
+        let (_id, mut session) = router.register().unwrap();
         router.dispatch(Bytes::from_static(&[0u8; 3]));
         assert!(session.try_recv().is_err());
     }

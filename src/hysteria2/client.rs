@@ -226,7 +226,7 @@ impl TerminalConnector for Hysteria2Connector {
 
         Ok(Box::new(super::udp::Hysteria2UdpSession::new(
             connection, router, address,
-        )))
+        )?))
     }
 
     fn supports_udp(&self) -> bool {

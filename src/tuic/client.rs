@@ -39,16 +39,45 @@ impl Drop for LiveTask {
     }
 }
 
+/// Each connection's count of live relaying tasks, by quinn's stable id.
+///
+/// Per connection, not per outbound: the authenticator outlives reconnects,
+/// so one shared count would keep a replacement connection heartbeating for
+/// tasks still held on the one it replaced. A task counts against the
+/// connection it was opened on, and the entry goes when that connection does.
+#[derive(Debug, Default)]
+pub(crate) struct LiveCounts(
+    parking_lot::Mutex<std::collections::HashMap<usize, Arc<AtomicUsize>>>,
+);
+
+impl LiveCounts {
+    pub(crate) fn of(&self, connection: &quinn::Connection) -> Arc<AtomicUsize> {
+        self.0
+            .lock()
+            .entry(connection.stable_id())
+            .or_default()
+            .clone()
+    }
+
+    fn forget(&self, connection: &quinn::Connection) {
+        self.0.lock().remove(&connection.stable_id());
+    }
+}
+
 /// The connection's heartbeat, as the reference client sends it: one task per
-/// connection, a Heartbeat every interval while any relaying task is live,
-/// none while the connection is idle (TU-D10). One per UDP association, as
-/// before, sent N for N associations and none at all for TCP streams.
-async fn heartbeat(connection: quinn::Connection, live: Arc<AtomicUsize>, interval: Duration) {
+/// connection, a Heartbeat every interval while any relaying task on it is
+/// live, none while it is idle (TU-D10). One per UDP association, as before,
+/// sent N for N associations and none at all for TCP streams.
+async fn heartbeat(connection: quinn::Connection, counts: Arc<LiveCounts>, interval: Duration) {
+    let live = counts.of(&connection);
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // the first tick fires immediately
     loop {
         tokio::select! {
-            _ = connection.closed() => return,
+            _ = connection.closed() => {
+                counts.forget(&connection);
+                return;
+            }
             _ = ticker.tick() => {}
         }
         if live.load(Ordering::Relaxed) == 0 {
@@ -69,7 +98,7 @@ async fn heartbeat(connection: quinn::Connection, live: Arc<AtomicUsize>, interv
 struct TuicAuthenticator {
     uuid: [u8; 16],
     password: String,
-    live_tasks: Arc<AtomicUsize>,
+    live: Arc<LiveCounts>,
     heartbeat_interval: Duration,
 }
 
@@ -102,7 +131,7 @@ impl ConnectionAuthenticator for TuicAuthenticator {
         debug!("TUIC Authenticate sent");
         tokio::spawn(heartbeat(
             connection.clone(),
-            self.live_tasks.clone(),
+            self.live.clone(),
             self.heartbeat_interval,
         ));
         Ok(())
@@ -117,7 +146,7 @@ pub struct TuicConnector {
     /// for the tests that check the configured value arrived.
     #[cfg(test)]
     heartbeat_interval: Duration,
-    live_tasks: Arc<AtomicUsize>,
+    live: Arc<LiveCounts>,
 }
 
 impl std::fmt::Debug for TuicConnector {
@@ -143,11 +172,11 @@ impl TuicConnector {
         bind_interface: Option<String>,
         congestion: CongestionControl,
     ) -> std::io::Result<Self> {
-        let live_tasks = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(LiveCounts::default());
         let authenticator = Arc::new(TuicAuthenticator {
             uuid,
             password,
-            live_tasks: live_tasks.clone(),
+            live: live.clone(),
             heartbeat_interval,
         });
 
@@ -182,7 +211,7 @@ impl TuicConnector {
             udp_relay_mode,
             #[cfg(test)]
             heartbeat_interval,
-            live_tasks,
+            live,
         })
     }
 
@@ -213,7 +242,7 @@ impl TuicConnector {
                 )
             })?;
 
-        Ok(QuicStream::from(send, recv).with_guard(LiveTask::new(&self.live_tasks)))
+        Ok(QuicStream::from(send, recv).with_guard(LiveTask::new(&self.live.of(&connection))))
     }
 
     #[cfg(test)]
@@ -274,11 +303,12 @@ impl TerminalConnector for TuicConnector {
         let (connection, router) = self.connection.get_with_datagrams(resolver).await?;
         let location = target.into_location();
         // The router allocates the id: only it knows which are in use.
-        let (assoc_id, incoming) = router.register();
+        let (assoc_id, incoming) = router.register()?;
         let assoc_id = u16::try_from(assoc_id)
             .map_err(|_| std::io::Error::other("TUIC association id past 16 bits"))?;
         debug!("TUIC: UDP association {assoc_id} to {location}");
 
+        let task = LiveTask::new(&self.live.of(&connection));
         Ok(Box::new(super::udp::TuicUdpSession::new(
             connection,
             router,
@@ -286,7 +316,7 @@ impl TerminalConnector for TuicConnector {
             incoming,
             location,
             self.udp_relay_mode,
-            LiveTask::new(&self.live_tasks),
+            task,
         )))
     }
 
@@ -588,7 +618,9 @@ mod tests {
         let echo = spawn_udp_echo().await;
         let resolver = test_resolver();
         let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
-        let live = || connector.live_tasks.load(Ordering::Relaxed);
+        let connection = connector.connection.get(&resolver).await.unwrap();
+        let count = connector.live.of(&connection);
+        let live = || count.load(Ordering::Relaxed);
         assert_eq!(live(), 0);
 
         let tcp = connector
@@ -604,6 +636,41 @@ mod tests {
         assert_eq!(live(), 1);
         drop(udp);
         assert_eq!(live(), 0, "an idle connection owes no heartbeat");
+    }
+
+    /// A task counts against the connection it was opened on: one still held
+    /// on a connection that was replaced does not keep the replacement
+    /// heartbeating once the replacement's own tasks are gone.
+    #[tokio::test]
+    async fn test_a_replaced_connections_tasks_do_not_count_on_the_new_one() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+
+        let old_connection = connector.connection.get(&resolver).await.unwrap();
+        let held = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+        old_connection.close(0u32.into(), b"replaced");
+
+        let tcp = connector
+            .connect_tcp(&resolver, target(echo))
+            .await
+            .unwrap();
+        let new_connection = connector.connection.get(&resolver).await.unwrap();
+        assert_ne!(new_connection.stable_id(), old_connection.stable_id());
+        assert_eq!(connector.connection_count(), 2);
+        let new_count = connector.live.of(&new_connection);
+        assert_eq!(new_count.load(Ordering::Relaxed), 1);
+        drop(tcp);
+        assert_eq!(
+            new_count.load(Ordering::Relaxed),
+            0,
+            "the old connection's association must not count on the new one"
+        );
+        drop(held);
     }
 
     #[tokio::test]
@@ -691,7 +758,7 @@ mod tests {
                     .try_into()
                     .unwrap(),
                 password: SERVER_PASSWORD.to_string(),
-                live_tasks: Arc::new(AtomicUsize::new(0)),
+                live: Arc::new(LiveCounts::default()),
                 heartbeat_interval: Duration::from_secs(10),
             },
             target: NetLocation::from_str(&echo.to_string(), None).unwrap(),

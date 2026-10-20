@@ -60,11 +60,11 @@ impl Hysteria2UdpSession {
         connection: quinn::Connection,
         router: Arc<DatagramRouter>,
         address: String,
-    ) -> Self {
-        let (session_id, incoming) = router.register();
+    ) -> std::io::Result<Self> {
+        let (session_id, incoming) = router.register()?;
         debug!("Hysteria2: UDP session {session_id} to {address}");
 
-        Self {
+        Ok(Self {
             connection,
             router,
             session_id,
@@ -72,7 +72,7 @@ impl Hysteria2UdpSession {
             next_packet_id: AtomicU16::new(0),
             incoming,
             fragments: Defragmenter::new(),
-        }
+        })
     }
 }
 
