@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+TUIC UDP (plan PR 5.2; TU-D6, TU-D10, TU-D3):
+
+- **Two TUIC UDP associations on one connection no longer take each other's
+  replies.** Each ran its own reader on the shared connection and dropped
+  what was not its own, so with two associations each lost about half its
+  replies. One router per connection now hands each association its own
+  packets, in both relay modes.
+- **The client sends one heartbeat per connection**, while any stream or
+  association is open, as the reference does. It sent one per UDP
+  association, and none for TCP.
+- **The server sends no heartbeats** (the reference client logs them as bad
+  commands), and a UDP association lives `udp_timeout` seconds idle (new,
+  default 300, sing-box's), not 60, so a quiet tunnel inside TUIC keeps its
+  NAT mapping.
+
 Performance fidelity and DNS (plan PR 5.1; HY-D5, TL-1, DN-D1 to DN-D3):
 
 - **Hysteria2's BBR starts at upstream's 32-packet window**, not quinn's

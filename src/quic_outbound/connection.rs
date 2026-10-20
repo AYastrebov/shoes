@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::resolver::{Resolver, resolve_addresses};
 
 use super::QuicOutboundSettings;
-use super::datagram_router::{DatagramRouter, SessionKeyFn};
+use super::datagram_router::{DatagramRouter, DatagramRouting};
 
 /// How long one address gets before the next is tried.
 ///
@@ -72,13 +72,13 @@ fn needs_reconnect(state: Option<&State>) -> bool {
 pub struct LiveConnection {
     settings: QuicOutboundSettings,
     authenticator: Arc<dyn ConnectionAuthenticator>,
-    /// How to key an incoming datagram, for protocols that want one reader per
+    /// How to route what arrives, for protocols that want one reader per
     /// connection instead of one per session.
     ///
-    /// `None` leaves datagrams entirely alone, and must: a protocol that reads
-    /// them itself - TUIC does, in its native relay mode - would find them
-    /// already consumed by a reader it never asked for.
-    datagram_key: Option<SessionKeyFn>,
+    /// `None` leaves datagrams and uni streams entirely alone, and must: a
+    /// protocol that reads them itself would find them already consumed by a
+    /// reader it never asked for.
+    routing: Option<DatagramRouting>,
     state: Mutex<Option<State>>,
     connections_raised: AtomicUsize,
 }
@@ -93,12 +93,12 @@ impl LiveConnection {
     pub fn new(
         settings: QuicOutboundSettings,
         authenticator: Arc<dyn ConnectionAuthenticator>,
-        datagram_key: Option<SessionKeyFn>,
+        routing: Option<DatagramRouting>,
     ) -> Self {
         Self {
             settings,
             authenticator,
-            datagram_key,
+            routing,
             state: Mutex::new(None),
             connections_raised: AtomicUsize::new(0),
         }
@@ -211,9 +211,13 @@ impl LiveConnection {
                     // connection is handed out so that no datagram can arrive
                     // before something is there to route it. It ends when the
                     // connection does.
-                    let router = self.datagram_key.map(|key_of| {
-                        let router = Arc::new(DatagramRouter::new(key_of));
+                    let router = self.routing.map(|routing| {
+                        let router =
+                            Arc::new(DatagramRouter::with_max_id(routing.key_of, routing.max_id));
                         tokio::spawn(router.clone().run(connection.clone()));
+                        if let Some(limit) = routing.uni_stream_limit {
+                            tokio::spawn(router.clone().run_uni(connection.clone(), limit));
+                        }
                         router
                     });
                     *state = Some(State {
@@ -493,7 +497,9 @@ mod tests {
             Arc::new(crate::hysteria2::auth::Hysteria2Authenticator::new(
                 PASSWORD.to_string(),
             )),
-            Some(|d: &[u8]| Some(u32::from_be_bytes(d.get(0..4)?.try_into().ok()?))),
+            Some(super::super::datagram_router::DatagramRouting::datagrams(
+                |d: &[u8]| Some(u32::from_be_bytes(d.get(0..4)?.try_into().ok()?)),
+            )),
         );
 
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());

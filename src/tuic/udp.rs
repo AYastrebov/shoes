@@ -1,9 +1,9 @@
 //! One TUIC UDP association as an AsyncMessageStream.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use bytes::Bytes;
 use log::debug;
@@ -11,6 +11,7 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 
 use crate::address::NetLocation;
+use crate::quic_outbound::datagram_router::DatagramRouter;
 use crate::quic_transport::fragments::FragmentTable;
 
 use crate::async_stream::{
@@ -19,18 +20,16 @@ use crate::async_stream::{
 };
 use crate::config::TuicUdpRelayMode;
 
+use super::client::LiveTask;
 use super::frame::{
     ADDRESS_TYPE_NONE, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION, encode_dissociate,
-    encode_heartbeat, encode_packet_header,
+    encode_packet_header,
 };
-
-/// How many reassembled payloads may queue up before the reader blocks.
-const INCOMING_CAPACITY: usize = 64;
 
 /// Ceiling on a single Packet command read from a unidirectional stream: the
 /// two command bytes, the largest header the protocol allows, and a maximal
 /// UDP payload.
-const MAX_COMMAND_BYTES: usize = 2 + MAX_HEADER_LEN + u16::MAX as usize;
+pub(crate) const MAX_COMMAND_BYTES: usize = 2 + MAX_HEADER_LEN + u16::MAX as usize;
 
 /// How many outgoing packets may wait for the quic-mode writer. Past this the
 /// sender is outrunning the link and the queue would only add latency to
@@ -164,24 +163,33 @@ fn push_command(table: &mut FragmentTable, command: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
-/// The association id a Packet command carries, without parsing the rest.
-fn assoc_id_of(command: &[u8]) -> Option<u16> {
-    if command.len() < 4 {
+/// The association a Packet command belongs to, for the connection's router;
+/// anything else (a Heartbeat) is not routed.
+pub(crate) fn assoc_key(command: &[u8]) -> Option<u32> {
+    if command.len() < 4 || command[0] != TUIC_VERSION || command[1] != COMMAND_TYPE_PACKET {
         return None;
     }
-    Some(u16::from_be_bytes([command[2], command[3]]))
+    Some(u32::from(u16::from_be_bytes([command[2], command[3]])))
 }
 
+/// One association. The connection's router reads every datagram and uni
+/// stream once and hands this session its own Packet commands (TU-D6): a
+/// reader per association took about half of every other association's
+/// replies and dropped them.
 pub struct TuicUdpSession {
     connection: quinn::Connection,
+    router: Arc<DatagramRouter>,
     assoc_id: u16,
     target: NetLocation,
     mode: TuicUdpRelayMode,
     next_packet_id: AtomicU16,
-    incoming: mpsc::Receiver<Vec<u8>>,
+    incoming: mpsc::Receiver<Bytes>,
+    fragments: FragmentTable,
     /// Set only in the quic relay mode, where sending needs to await.
     outgoing: Option<mpsc::Sender<Vec<Vec<u8>>>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    writer: Option<tokio::task::JoinHandle<()>>,
+    /// Counted by the connection's heartbeat while the session lives.
+    _task: LiveTask,
 }
 
 impl std::fmt::Debug for TuicUdpSession {
@@ -194,148 +202,69 @@ impl std::fmt::Debug for TuicUdpSession {
 }
 
 impl TuicUdpSession {
-    pub fn new(
+    /// `assoc_id` and `incoming` come from registering with `router`.
+    pub(crate) fn new(
         connection: quinn::Connection,
+        router: Arc<DatagramRouter>,
         assoc_id: u16,
+        incoming: mpsc::Receiver<Bytes>,
         target: NetLocation,
         mode: TuicUdpRelayMode,
-        heartbeat_interval: Duration,
+        task: LiveTask,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(INCOMING_CAPACITY);
-        let mut tasks = Vec::with_capacity(3);
         let mut outgoing = None;
+        let mut writer = None;
 
-        // The server replies in whichever mode the association's first packet
-        // used, so only that reader is started. Heartbeats travel as datagrams
-        // in both modes, but they carry no payload and the reader ignores
-        // anything that is not a Packet for us.
-        match mode {
-            TuicUdpRelayMode::Native => {
-                let datagram_connection = connection.clone();
-                let tx = tx.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut fragments = FragmentTable::new();
-                    loop {
-                        let datagram: Bytes = match datagram_connection.read_datagram().await {
-                            Ok(datagram) => datagram,
-                            Err(e) => {
-                                debug!(
-                                    "TUIC datagram reader for association {assoc_id} stopping: {e}"
-                                );
-                                return;
-                            }
-                        };
-                        if assoc_id_of(&datagram) != Some(assoc_id) {
-                            continue;
-                        }
-                        if let Some(payload) = push_command(&mut fragments, &datagram)
-                            && tx.send(payload).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                }));
-            }
-            TuicUdpRelayMode::Quic => {
-                // One writer for the association, fed by a bounded queue, so
-                // packets keep their order and a fast sender cannot spawn work
-                // faster than the link retires it.
-                let (outgoing_tx, mut outgoing_rx) =
-                    mpsc::channel::<Vec<Vec<u8>>>(OUTGOING_CAPACITY);
-                outgoing = Some(outgoing_tx);
+        if matches!(mode, TuicUdpRelayMode::Quic) {
+            // One writer for the association, fed by a bounded queue, so
+            // packets keep their order and a fast sender cannot spawn work
+            // faster than the link retires it.
+            let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<Vec<u8>>>(OUTGOING_CAPACITY);
+            outgoing = Some(outgoing_tx);
 
-                let writer_connection = connection.clone();
-                tasks.push(tokio::spawn(async move {
-                    while let Some(packets) = outgoing_rx.recv().await {
-                        for packet in packets {
-                            match writer_connection.open_uni().await {
-                                Ok(mut stream) => {
-                                    if stream.write_all(&packet).await.is_err() {
-                                        return;
-                                    }
-                                    let _ = stream.finish();
-                                }
-                                Err(e) => {
-                                    debug!("TUIC uni send failed: {e}");
+            let writer_connection = connection.clone();
+            writer = Some(tokio::spawn(async move {
+                while let Some(packets) = outgoing_rx.recv().await {
+                    for packet in packets {
+                        match writer_connection.open_uni().await {
+                            Ok(mut stream) => {
+                                if stream.write_all(&packet).await.is_err() {
                                     return;
                                 }
+                                let _ = stream.finish();
                             }
-                        }
-                    }
-                }));
-
-                let stream_connection = connection.clone();
-                let tx = tx.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut fragments = FragmentTable::new();
-                    loop {
-                        let mut recv = match stream_connection.accept_uni().await {
-                            Ok(recv) => recv,
                             Err(e) => {
-                                debug!(
-                                    "TUIC uni stream reader for association {assoc_id} stopping: {e}"
-                                );
+                                debug!("TUIC uni send failed: {e}");
                                 return;
                             }
-                        };
-                        // One command per stream, which is what the reference
-                        // sends and what our server now sends.
-                        let command = match recv.read_to_end(MAX_COMMAND_BYTES).await {
-                            Ok(command) => command,
-                            Err(e) => {
-                                debug!("TUIC uni stream dropped: {e}");
-                                continue;
-                            }
-                        };
-                        if assoc_id_of(&command) != Some(assoc_id) {
-                            continue;
-                        }
-                        if let Some(payload) = push_command(&mut fragments, &command)
-                            && tx.send(payload).await.is_err()
-                        {
-                            return;
                         }
                     }
-                }));
-            }
-        }
-
-        // The specification asks for heartbeats only while a relaying task is
-        // in flight, which is exactly the lifetime of this session. An idle
-        // connection is left to quinn's own keep-alive.
-        let heartbeat_connection = connection.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(heartbeat_interval);
-            ticker.tick().await; // the first tick fires immediately
-            loop {
-                ticker.tick().await;
-                if heartbeat_connection
-                    .send_datagram(Bytes::from(encode_heartbeat()))
-                    .is_err()
-                {
-                    return;
                 }
-            }
-        }));
+            }));
+        }
 
         Self {
             connection,
+            router,
             assoc_id,
             target,
             mode,
             next_packet_id: AtomicU16::new(0),
-            incoming: rx,
+            incoming,
+            fragments: FragmentTable::new(),
             outgoing,
-            tasks,
+            writer,
+            _task: task,
         }
     }
 }
 
 impl Drop for TuicUdpSession {
     fn drop(&mut self) {
-        for task in self.tasks.drain(..) {
-            task.abort();
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
         }
+        self.router.deregister(u32::from(self.assoc_id));
         // Best effort: tell the server the association is over so it can free
         // the socket rather than waiting out its idle timeout.
         let connection = self.connection.clone();
@@ -420,26 +349,33 @@ impl AsyncReadMessage for TuicUdpSession {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        match this.incoming.poll_recv(cx) {
-            Poll::Ready(Some(payload)) => {
-                if payload.len() > buf.remaining() {
+        loop {
+            let command = match this.incoming.poll_recv(cx) {
+                Poll::Ready(Some(command)) => command,
+                Poll::Ready(None) => {
                     return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "UDP payload of {} bytes does not fit a {} byte buffer",
-                            payload.len(),
-                            buf.remaining()
-                        ),
+                        std::io::ErrorKind::BrokenPipe,
+                        "the TUIC UDP association ended",
                     )));
                 }
-                buf.put_slice(&payload);
-                Poll::Ready(Ok(()))
+                Poll::Pending => return Poll::Pending,
+            };
+            // A fragment that does not complete a packet yet: read the next.
+            let Some(payload) = push_command(&mut this.fragments, &command) else {
+                continue;
+            };
+            if payload.len() > buf.remaining() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "UDP payload of {} bytes does not fit a {} byte buffer",
+                        payload.len(),
+                        buf.remaining()
+                    ),
+                )));
             }
-            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "the TUIC UDP association ended",
-            ))),
-            Poll::Pending => Poll::Pending,
+            buf.put_slice(&payload);
+            return Poll::Ready(Ok(()));
         }
     }
 }
@@ -555,7 +491,9 @@ mod tests {
     #[test]
     fn test_assoc_id_is_read_without_parsing_the_rest() {
         let packets = build_packets(0xbeef, 2, &target(), b"hello", 1200).unwrap();
-        assert_eq!(assoc_id_of(&packets[0]), Some(0xbeef));
-        assert_eq!(assoc_id_of(&[0u8; 3]), None);
+        assert_eq!(assoc_key(&packets[0]), Some(0xbeef));
+        assert_eq!(assoc_key(&[0u8; 3]), None);
+        // A Heartbeat is not routed to any association.
+        assert_eq!(assoc_key(&super::super::frame::encode_heartbeat()), None);
     }
 }

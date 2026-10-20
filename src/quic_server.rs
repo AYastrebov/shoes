@@ -332,6 +332,7 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
             congestion_control,
+            udp_timeout,
         } => {
             let uuid: &'static [u8] = Box::leak(Box::new(*uuid.as_bytes()));
             let password: &'static str = Box::leak(password.into_inner().into_boxed_str());
@@ -350,6 +351,7 @@ pub async fn start_quic_servers(
                     resolver.clone(),
                     zero_rtt_handshake,
                     congestion_control.into(),
+                    std::time::Duration::from_secs(udp_timeout),
                     connections.clone(),
                 )
                 .await?;
