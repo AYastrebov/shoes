@@ -43,7 +43,7 @@
           mtu: 1280
           awg:
             # Junk packets sent before the handshake initiation: jc at most
-            # 128 (the kernel module's limit), jmax at most mtu + 32.
+            # 128 (the kernel module's limit), jmax at most mtu + s4 + 32.
             jc: 4
             jmin: 64
             jmax: 256

@@ -13,7 +13,7 @@ AmneziaWG client parity (plan PR 3.7, AmneziaWG half; WG-A2 to WG-A4):
   send them with an ordinary packet and leave the initiation without them.
   They are now taken in the same critical section.
 - **`jc` over 128, or junk larger than the tunnel's own datagrams (the MTU
-  plus 32), is refused** at config load. The kernel module refuses the
+  plus S4 plus 32), is refused** at config load. The kernel module refuses the
   first, and the path fragments or drops the second.
 
 VMess client parity (plan PR 3.7, VMess half; VM-D5, VM-D1):

@@ -144,7 +144,7 @@ pub fn convert_amnezia_config(awg: &AmneziaWgParams, mtu: u16) -> std::io::Resul
         .map_err(|e| ioerr(&format!("invalid AmneziaWG config: {}", e)))?;
     config
         .junk
-        .validate_for_mtu(largest_datagram(mtu))
+        .validate_for_mtu(largest_datagram(mtu, awg.s4))
         .map_err(|e| ioerr(&format!("invalid AmneziaWG config: {}", e)))?;
 
     Ok(config)
@@ -206,10 +206,12 @@ fn parse_optional_cps(s: &Option<String>) -> std::io::Result<Option<CpsChain>> {
 const MAX_JUNK_COUNT: u8 = 128;
 
 /// The largest datagram this tunnel sends itself: a full transport packet,
-/// the MTU plus the 16-byte header and the 16-byte tag. A junk packet past it
-/// is one the path fragments, or drops, when nothing else is.
-fn largest_datagram(mtu: u16) -> usize {
-    usize::from(mtu) + 32
+/// the MTU plus its S4 prefix, the 16-byte header and the 16-byte tag (the
+/// wire size `validate_amneziawg_config` warns about, less UDP and IP). A
+/// junk packet past it is one the path fragments, or drops, when nothing
+/// else is.
+fn largest_datagram(mtu: u16, s4: u8) -> usize {
+    usize::from(mtu) + usize::from(s4) + 32
 }
 
 fn ioerr(msg: &str) -> std::io::Error {
@@ -266,17 +268,20 @@ mod tests {
     }
 
     /// WG-A3: a junk packet may be as large as a full transport packet, the
-    /// MTU plus 32, and no larger.
+    /// MTU plus S4 plus 32, and no larger.
     #[test]
     fn junk_larger_than_the_tunnels_datagrams_is_refused() {
-        let mut params = empty_params();
-        params.jc = 4;
-        params.jmin = 40;
-        params.jmax = 1452;
-        assert!(convert_amnezia_config(&params, 1420).is_ok());
-        params.jmax = 1453;
-        let err = convert_amnezia_config(&params, 1420).err().unwrap();
-        assert!(err.to_string().contains("MTU"), "{err}");
+        for (s4, largest) in [(0u8, 1452u16), (16, 1468)] {
+            let mut params = empty_params();
+            params.s4 = s4;
+            params.jc = 4;
+            params.jmin = 40;
+            params.jmax = largest;
+            assert!(convert_amnezia_config(&params, 1420).is_ok(), "s4 {s4}");
+            params.jmax = largest + 1;
+            let err = convert_amnezia_config(&params, 1420).err().unwrap();
+            assert!(err.to_string().contains("MTU"), "s4 {s4}: {err}");
+        }
     }
 
     #[test]
