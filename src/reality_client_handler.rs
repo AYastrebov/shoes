@@ -133,6 +133,21 @@ impl TcpClientHandler for RealityClientHandler {
         }
     }
 
+    /// A multiplexing protocol inside rides on the transport this handler
+    /// sets up, so the reuse question goes inward: a live session there
+    /// means this layer is not set up again either.
+    async fn try_reuse_tcp_stream(
+        &self,
+        remote_location: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        match &self.handler {
+            RealityInnerClientHandler::Default(handler) => {
+                handler.try_reuse_tcp_stream(remote_location).await
+            }
+            RealityInnerClientHandler::VisionVless { .. } => None,
+        }
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         match &self.handler {
             RealityInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),

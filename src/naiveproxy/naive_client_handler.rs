@@ -90,8 +90,13 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
         remote_location: &ResolvedLocation,
     ) -> Option<io::Result<TcpClientSetupResult>> {
         let mut session = {
-            let guard = self.session.lock().await;
-            guard.as_ref().filter(|s| s.is_ready()).cloned()
+            let mut guard = self.session.lock().await;
+            // A session whose connection already ended goes now, under the
+            // lock, rather than lingering until something tries it.
+            if guard.as_ref().is_some_and(|s| !s.is_ready()) {
+                *guard = None;
+            }
+            guard.clone()
         }?;
         match session
             .open_stream(
@@ -410,5 +415,35 @@ mod tests {
             .shutdown()
             .await
             .expect("a closed stream shuts down cleanly");
+    }
+
+    /// A session whose driver has already exited when the hook runs is
+    /// cleared then and there, not left in the slot.
+    #[tokio::test]
+    async fn a_session_found_dead_by_the_hook_is_cleared() {
+        let server = echo_server().await;
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let _first = handler
+            .setup_client_tcp_stream(dial(&server).await, target())
+            .await
+            .unwrap()
+            .client_stream;
+        let stored = handler.session.lock().await.clone().unwrap();
+        server.stop.send(true).unwrap();
+        // Wait for the driver to exit before asking, so the hook only ever
+        // sees a dead session.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stored.is_ready() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the driver did not exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(handler.try_reuse_tcp_stream(&target()).await.is_none());
+        assert!(
+            handler.session.lock().await.is_none(),
+            "cleared under the lock"
+        );
     }
 }

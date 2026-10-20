@@ -42,11 +42,13 @@ A session that turns out to be dead (the driver ended, a GOAWAY or I/O error,
 or a closed sender) is cleared and answers `None`, so the caller dials.
 Retrying on a dead session is the case that has to be invisible.
 
-**Wrappers forward.** `TlsClientHandler` with a default inner handler forwards
-the question inward. The session already rides on a TLS connection that this
-handler made, so a reused stream means no new TLS handshake either. Vision
-does not multiplex and answers `None`. Other wrappers keep the default until
-one of them carries a multiplexing protocol.
+**Wrappers forward.** Every handler that wraps another passes the question
+inward: TLS, Reality, WebSocket, HTTPUpgrade and ShadowTLS. The session already
+rides on a transport this layer set up, so a reused stream means this layer is
+not set up again either. Vision does not multiplex and answers `None`. A
+wrapper that kept the default would hide a live session behind it: the chain
+would dial, and the fresh-transport path would replace the session on every
+connection.
 
 **The chain asks first.** `ClientProxyChain::connect_tcp` asks the selected
 hops, from the exit backwards, before it dials: each subsequent hop, then the
