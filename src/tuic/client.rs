@@ -1,30 +1,76 @@
 //! The TUIC v5 client outbound.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use log::debug;
-use rand::RngExt;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::{ClientQuicConfig, TuicUdpRelayMode};
 use crate::quic_outbound::QuicOutboundSettings;
 use crate::quic_outbound::connection::{ConnectionAuthenticator, LiveConnection};
+use crate::quic_outbound::datagram_router::DatagramRouting;
 use crate::quic_stream::QuicStream;
 use crate::quic_transport::CongestionControl;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
 
-use super::frame::{encode_authenticate, encode_connect};
+use super::frame::{encode_authenticate, encode_connect, encode_heartbeat};
 
-/// Derives the authentication token and sends the Authenticate command.
+/// One relaying task -- a TCP stream or a UDP association -- counted while
+/// it lives, so the connection's heartbeat knows when it is owed.
+pub(crate) struct LiveTask(Arc<AtomicUsize>);
+
+impl LiveTask {
+    pub(crate) fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for LiveTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The connection's heartbeat, as the reference client sends it: one task per
+/// connection, a Heartbeat every interval while any relaying task is live,
+/// none while the connection is idle (TU-D10). One per UDP association, as
+/// before, sent N for N associations and none at all for TCP streams.
+async fn heartbeat(connection: quinn::Connection, live: Arc<AtomicUsize>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // the first tick fires immediately
+    loop {
+        tokio::select! {
+            _ = connection.closed() => return,
+            _ = ticker.tick() => {}
+        }
+        if live.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        if connection
+            .send_datagram(Bytes::from(encode_heartbeat()))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Derives the authentication token and sends the Authenticate command, then
+/// starts the connection's heartbeat.
 #[derive(Debug)]
 struct TuicAuthenticator {
     uuid: [u8; 16],
     password: String,
+    live_tasks: Arc<AtomicUsize>,
+    heartbeat_interval: Duration,
 }
 
 #[async_trait]
@@ -54,6 +100,11 @@ impl ConnectionAuthenticator for TuicAuthenticator {
         // There is no response: the specification defines none. A wrong UUID or
         // token shows up later, as the server closing the connection.
         debug!("TUIC Authenticate sent");
+        tokio::spawn(heartbeat(
+            connection.clone(),
+            self.live_tasks.clone(),
+            self.heartbeat_interval,
+        ));
         Ok(())
     }
 }
@@ -62,7 +113,11 @@ pub struct TuicConnector {
     connection: LiveConnection,
     udp_enabled: bool,
     udp_relay_mode: TuicUdpRelayMode,
+    /// The authenticator's copy is the one the heartbeat reads; this one is
+    /// for the tests that check the configured value arrived.
+    #[cfg(test)]
     heartbeat_interval: Duration,
+    live_tasks: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for TuicConnector {
@@ -88,7 +143,13 @@ impl TuicConnector {
         bind_interface: Option<String>,
         congestion: CongestionControl,
     ) -> std::io::Result<Self> {
-        let authenticator = Arc::new(TuicAuthenticator { uuid, password });
+        let live_tasks = Arc::new(AtomicUsize::new(0));
+        let authenticator = Arc::new(TuicAuthenticator {
+            uuid,
+            password,
+            live_tasks: live_tasks.clone(),
+            heartbeat_interval,
+        });
 
         let settings = QuicOutboundSettings {
             server,
@@ -105,15 +166,23 @@ impl TuicConnector {
         };
 
         Ok(Self {
-            // No per-connection demultiplexer: TUIC's native relay mode reads
-            // the connection's datagrams itself, and a reader it did not ask
-            // for would consume them first. It has the same defect Hysteria2
-            // had - one reader per association on a shared connection - and
-            // fixing it is its own change, not a side effect of this one.
-            connection: LiveConnection::new(settings, authenticator, None),
+            // One router per connection for both relay modes' replies:
+            // datagrams in native mode, a uni stream per packet in quic mode,
+            // keyed on the 16-bit association id (TU-D6).
+            connection: LiveConnection::new(
+                settings,
+                authenticator,
+                Some(DatagramRouting {
+                    key_of: super::udp::assoc_key,
+                    max_id: u32::from(u16::MAX),
+                    uni_stream_limit: Some(super::udp::MAX_COMMAND_BYTES),
+                }),
+            ),
             udp_enabled,
             udp_relay_mode,
+            #[cfg(test)]
             heartbeat_interval,
+            live_tasks,
         })
     }
 
@@ -144,7 +213,7 @@ impl TuicConnector {
                 )
             })?;
 
-        Ok(QuicStream::from(send, recv))
+        Ok(QuicStream::from(send, recv).with_guard(LiveTask::new(&self.live_tasks)))
     }
 
     #[cfg(test)]
@@ -202,17 +271,22 @@ impl TerminalConnector for TuicConnector {
                 "UDP is disabled for this TUIC outbound (udp_enabled: false)",
             ));
         }
-        let connection = self.connection.get(resolver).await?;
+        let (connection, router) = self.connection.get_with_datagrams(resolver).await?;
         let location = target.into_location();
-        let assoc_id: u16 = rand::rng().random();
+        // The router allocates the id: only it knows which are in use.
+        let (assoc_id, incoming) = router.register();
+        let assoc_id = u16::try_from(assoc_id)
+            .map_err(|_| std::io::Error::other("TUIC association id past 16 bits"))?;
         debug!("TUIC: UDP association {assoc_id} to {location}");
 
         Ok(Box::new(super::udp::TuicUdpSession::new(
             connection,
+            router,
             assoc_id,
+            incoming,
             location,
             self.udp_relay_mode,
-            self.heartbeat_interval,
+            LiveTask::new(&self.live_tasks),
         )))
     }
 
@@ -259,6 +333,7 @@ mod tests {
             resolver,
             false,
             CongestionControl::Cubic,
+            Duration::from_secs(300),
             Default::default(),
         )
         .await
@@ -432,6 +507,105 @@ mod tests {
         assert_eq!(reply, b"tuic udp");
     }
 
+    /// TU-D6: two associations on one connection do not take each other's
+    /// replies. Each used to run its own reader on the shared connection and
+    /// drop what was not its own, so while only the first was reading, every
+    /// reply for the second was taken and thrown away. A reply lost on
+    /// loopback is sent again; a stolen one never arrives however often, and
+    /// the deadline reports it. Mirrors Hysteria2's test of the same router.
+    async fn associations_do_not_steal(mode: TuicUdpRelayMode) {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector_with_mode(server, TEST_UUID, SERVER_PASSWORD, mode);
+
+        let mut first = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+        let mut second = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+        assert_eq!(connector.connection_count(), 1, "one shared connection");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *second).poll_write_message(cx, &[2u8, 0xff])
+            })
+            .await
+            .unwrap();
+            let mut buf = [0u8; 64];
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            let on_first = tokio::time::timeout(
+                Duration::from_millis(250),
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *first).poll_read_message(cx, &mut read)
+                }),
+            )
+            .await;
+            assert!(
+                on_first.is_err(),
+                "{mode:?}: association 1 was handed a reply while only 2 had sent: {:?}",
+                read.filled()
+            );
+            let mut buf = [0u8; 64];
+            let mut read = tokio::io::ReadBuf::new(&mut buf);
+            let on_second = tokio::time::timeout(
+                Duration::from_millis(250),
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *second).poll_read_message(cx, &mut read)
+                }),
+            )
+            .await;
+            if on_second.is_ok() {
+                assert_eq!(read.filled(), [2u8, 0xff]);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{mode:?}: association 2 never received its reply while 1 was reading"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_two_associations_do_not_steal_in_native_mode() {
+        associations_do_not_steal(TuicUdpRelayMode::Native).await;
+    }
+
+    #[tokio::test]
+    async fn test_two_associations_do_not_steal_in_quic_mode() {
+        associations_do_not_steal(TuicUdpRelayMode::Quic).await;
+    }
+
+    /// TU-D10: the connection counts its live relaying tasks, TCP streams and
+    /// UDP associations alike, which is what gates its one heartbeat.
+    #[tokio::test]
+    async fn test_live_tasks_count_streams_and_associations() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+        let live = || connector.live_tasks.load(Ordering::Relaxed);
+        assert_eq!(live(), 0);
+
+        let tcp = connector
+            .connect_tcp(&resolver, target(echo))
+            .await
+            .unwrap();
+        let udp = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+        assert_eq!(live(), 2);
+        drop(tcp);
+        assert_eq!(live(), 1);
+        drop(udp);
+        assert_eq!(live(), 0, "an idle connection owes no heartbeat");
+    }
+
     #[tokio::test]
     async fn test_udp_carries_several_packets_over_one_association() {
         let server = spawn_server().await;
@@ -517,6 +691,8 @@ mod tests {
                     .try_into()
                     .unwrap(),
                 password: SERVER_PASSWORD.to_string(),
+                live_tasks: Arc::new(AtomicUsize::new(0)),
+                heartbeat_interval: Duration::from_secs(10),
             },
             target: NetLocation::from_str(&echo.to_string(), None).unwrap(),
             payload: b"before auth",

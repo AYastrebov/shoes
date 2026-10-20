@@ -67,7 +67,11 @@ impl Hysteria2Connector {
             connection: LiveConnection::new(
                 settings,
                 authenticator.clone(),
-                Some(super::udp::session_id_of),
+                Some(
+                    crate::quic_outbound::datagram_router::DatagramRouting::datagrams(
+                        super::udp::session_id_of,
+                    ),
+                ),
             ),
             authenticator,
             udp_enabled,

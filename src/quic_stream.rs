@@ -9,6 +9,9 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 pub struct QuicStream {
     send_stream: SendStream,
     recv_stream: RecvStream,
+    /// Held for the stream's life, for a protocol that counts its live
+    /// streams (TUIC's heartbeat).
+    _guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl QuicStream {
@@ -16,7 +19,14 @@ impl QuicStream {
         Self {
             send_stream,
             recv_stream,
+            _guard: None,
         }
+    }
+
+    /// Keep `guard` until this stream is dropped.
+    pub fn with_guard(mut self, guard: impl Send + Sync + 'static) -> Self {
+        self._guard = Some(Box::new(guard));
+        self
     }
 }
 

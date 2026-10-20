@@ -39,16 +39,47 @@ struct Sessions {
     terminated: bool,
 }
 
+/// How a protocol's connection routes what arrives on it.
+#[derive(Debug, Clone, Copy)]
+pub struct DatagramRouting {
+    pub key_of: SessionKeyFn,
+    /// The largest session id the protocol's header can carry: `u32::MAX` for
+    /// Hysteria2, `u16::MAX` for TUIC's association ids.
+    pub max_id: u32,
+    /// Also route the commands that arrive one per unidirectional stream, read
+    /// to their end up to this many bytes. TUIC's quic relay mode sends its
+    /// packets that way, and the same one-reader-per-session defect applies to
+    /// `accept_uni` as to `read_datagram`.
+    pub uni_stream_limit: Option<usize>,
+}
+
+impl DatagramRouting {
+    /// Datagrams only, with 32-bit session ids.
+    pub fn datagrams(key_of: SessionKeyFn) -> Self {
+        Self {
+            key_of,
+            max_id: u32::MAX,
+            uni_stream_limit: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DatagramRouter {
     key_of: SessionKeyFn,
+    max_id: u32,
     sessions: Mutex<Sessions>,
 }
 
 impl DatagramRouter {
     pub fn new(key_of: SessionKeyFn) -> Self {
+        Self::with_max_id(key_of, u32::MAX)
+    }
+
+    pub fn with_max_id(key_of: SessionKeyFn, max_id: u32) -> Self {
         Self {
             key_of,
+            max_id,
             sessions: Mutex::new(Sessions::default()),
         }
     }
@@ -65,7 +96,7 @@ impl DatagramRouter {
         let mut sessions = self.sessions.lock();
         let mut rng = rand::rng();
         let session_id = loop {
-            let candidate = rng.random::<u32>();
+            let candidate = rng.random_range(0..=self.max_id);
             if !sessions.queues.contains_key(&candidate) {
                 break candidate;
             }
@@ -113,6 +144,31 @@ impl DatagramRouter {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 sessions.queues.remove(&session_id);
             }
+        }
+    }
+
+    /// Read this connection's unidirectional streams until it ends, one
+    /// command per stream, routing each like a datagram.
+    ///
+    /// Each stream is read in a task of its own, so a peer that opens a
+    /// stream and stalls holds up nothing else. The datagram reader is the one
+    /// that fails the sessions when the connection ends.
+    pub async fn run_uni(self: Arc<Self>, connection: quinn::Connection, limit: usize) {
+        loop {
+            let mut recv = match connection.accept_uni().await {
+                Ok(recv) => recv,
+                Err(e) => {
+                    debug!("QUIC uni stream reader stopping: {e}");
+                    return;
+                }
+            };
+            let router = self.clone();
+            tokio::spawn(async move {
+                match recv.read_to_end(limit).await {
+                    Ok(command) => router.dispatch(Bytes::from(command)),
+                    Err(e) => debug!("QUIC uni stream dropped: {e}"),
+                }
+            });
         }
     }
 
@@ -170,6 +226,20 @@ mod tests {
             first.try_recv().is_err(),
             "the first session was handed a datagram that was not its own"
         );
+    }
+
+    /// A router for 16-bit ids never hands out one past the limit.
+    #[tokio::test]
+    async fn test_ids_stay_below_the_maximum() {
+        let router = DatagramRouter::with_max_id(first_four, 15);
+        let mut held = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let (id, receiver) = router.register();
+            assert!(id <= 15, "id {id} is past the maximum");
+            assert!(seen.insert(id));
+            held.push(receiver);
+        }
     }
 
     #[tokio::test]

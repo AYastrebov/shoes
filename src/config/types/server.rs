@@ -620,7 +620,16 @@ pub struct HttpUpgradeServerConfig {
 }
 
 fn default_tproxy_udp_timeout() -> u64 {
+    default_udp_timeout()
+}
+
+/// sing-box's `udp_timeout` default, five minutes.
+fn default_udp_timeout() -> u64 {
     300
+}
+
+fn is_default_udp_timeout(value: &u64) -> bool {
+    *value == default_udp_timeout()
 }
 
 fn default_tproxy_udp_nat_max() -> usize {
@@ -778,6 +787,15 @@ pub enum ServerProxyConfig {
         /// in the TUIC reference; `bbr` for a lossy path.
         #[serde(default, skip_serializing_if = "TuicCongestionControl::is_default")]
         congestion_control: TuicCongestionControl,
+        /// Seconds a UDP association may sit idle before it is freed, as
+        /// sing-box's `udp_timeout` and with its default. The reference keeps
+        /// an association until Dissociate; 60 s dropped the NAT mapping of a
+        /// quiet tunnel inside TUIC (TU-D3).
+        #[serde(
+            default = "default_udp_timeout",
+            skip_serializing_if = "is_default_udp_timeout"
+        )]
+        udp_timeout: u64,
     },
     /// Mixed HTTP+SOCKS5 server (auto-detects protocol from first byte)
     /// Similar to mihomo's mixed-port feature.
@@ -1131,6 +1149,7 @@ mod tests {
                 password: "tuic_password".into(),
                 zero_rtt_handshake: false,
                 congestion_control: TuicCongestionControl::Bbr,
+                udp_timeout: 300,
             },
             transport: Transport::Quic,
             tcp_settings: None,
@@ -1347,6 +1366,26 @@ protocol:
                 ..
             }
         ));
+    }
+
+    /// TU-D3: a UDP association lives `udp_timeout` seconds idle, sing-box's
+    /// name and default, where it was a fixed 60.
+    #[test]
+    fn test_server_config_tuic_udp_timeout() {
+        let parse = |extra: &str| {
+            let yaml = format!(
+                "address: \"127.0.0.1:8443\"\ntransport: quic\nquic_settings:\n  cert: tuic.crt\n  key: tuic.key\nprotocol:\n  type: tuic\n  uuid: \"550e8400-e29b-41d4-a716-446655440000\"\n  password: pw\n{extra}"
+            );
+            match serde_yaml::from_str::<ServerConfig>(&yaml)
+                .unwrap()
+                .protocol
+            {
+                ServerProxyConfig::TuicV5 { udp_timeout, .. } => udp_timeout,
+                other => panic!("expected TuicV5, got {other:?}"),
+            }
+        };
+        assert_eq!(parse(""), 300);
+        assert_eq!(parse("  udp_timeout: 3600\n"), 3600);
     }
 
     /// The server takes the same option as the client, defaulting to Cubic

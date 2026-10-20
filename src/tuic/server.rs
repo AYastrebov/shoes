@@ -45,7 +45,6 @@ use super::frame::{
 };
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum number of fragmented packets to track per connection.
 /// Old entries are automatically evicted when this limit is reached.
@@ -54,10 +53,6 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Heartbeat interval - server sends heartbeat datagrams to client at this interval.
-/// Default is 10 seconds per sing-box reference implementation.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 
@@ -78,6 +73,7 @@ async fn process_connection(
     password: &'static str,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
+    udp_timeout: Duration,
 ) -> std::io::Result<()> {
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
     // allow 0.5-RTT data transmission before the handshake fully completes.
@@ -117,7 +113,7 @@ async fn process_connection(
         };
 
     // Create a cancellation token for the entire connection lifecycle.
-    // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
+    // When cancelled, all spawned tasks (UDP sessions, cleanup task) will terminate gracefully.
     let cancel_token = CancellationToken::new();
 
     // this allows for:
@@ -127,9 +123,6 @@ async fn process_connection(
     let udp_session_map = Arc::new(DashMap::new());
 
     // Clone what we need for each loop before creating async blocks
-    let heartbeat_connection = connection.clone();
-    let heartbeat_cancel_token = cancel_token.clone();
-
     let bi_connection = connection.clone();
     let bi_client_proxy_selector = client_proxy_selector.clone();
     let bi_resolver = resolver.clone();
@@ -152,8 +145,8 @@ async fn process_connection(
 
     // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
     // This reduces task count and avoids spawning separate tasks for the main loops.
-    let heartbeat_loop = run_heartbeat_loop(heartbeat_connection, heartbeat_cancel_token);
-
+    // No heartbeat from this side (TU-D10): the specification has the client
+    // send them, and the reference client logs a server's as a bad command.
     let bi_loop = run_bidirectional_loop(bi_connection, bi_client_proxy_selector, bi_resolver);
 
     let uni_loop = run_unidirectional_loop(
@@ -164,6 +157,7 @@ async fn process_connection(
         uni_fragments,
         uni_cancel_token,
         streams_before_auth,
+        udp_timeout,
     );
 
     let datagram_loop = run_datagram_loop(
@@ -173,11 +167,12 @@ async fn process_connection(
         udp_session_map,
         fragments,
         datagram_cancel_token,
+        udp_timeout,
     );
 
-    let result = tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop);
+    let result = tokio::try_join!(bi_loop, uni_loop, datagram_loop);
 
-    // Cancel all remaining tasks (UDP session loops, cleanup task, heartbeat)
+    // Cancel all remaining tasks (UDP session loops, cleanup task)
     cancel_token.cancel();
 
     // Per sing-box reference (service.go:382-398), close connection on error
@@ -189,40 +184,6 @@ async fn process_connection(
     match result {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-/// Sends periodic heartbeat datagrams to the client to maintain connection liveness.
-/// Per sing-box reference implementation (service.go:366-380).
-///
-/// A failed send just stops the heartbeat; it must not close the connection.
-/// The TUIC spec defines heartbeats as client-only, so a peer that negotiated
-/// `max_datagram_frame_size = 0` (datagrams disabled) rejects every send here.
-/// Propagating that into the connection's `try_join!` would tear down an
-/// otherwise healthy connection roughly one interval in. QUIC's own keep-alive
-/// and the real stream/datagram loops carry liveness regardless.
-async fn run_heartbeat_loop(
-    connection: quinn::Connection,
-    cancel_token: CancellationToken,
-) -> std::io::Result<()> {
-    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-    // Skip the first immediate tick
-    interval.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                return Ok(());
-            }
-            _ = interval.tick() => {
-                // Send heartbeat datagram: [version, command_heartbeat]
-                let heartbeat = bytes::Bytes::from_static(&[5, COMMAND_TYPE_HEARTBEAT]);
-                if let Err(e) = connection.send_datagram(heartbeat) {
-                    debug!("TUIC heartbeat send failed, stopping heartbeat: {e}");
-                    return Ok(());
-                }
-            }
-        }
     }
 }
 
@@ -889,6 +850,7 @@ async fn run_udp_remote_to_local_datagram_loop(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn run_unidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -897,6 +859,7 @@ async fn run_unidirectional_loop(
     fragments: FragmentCache,
     cancel_token: CancellationToken,
     streams_before_auth: Vec<ParkedStream>,
+    udp_timeout: Duration,
 ) -> std::io::Result<()> {
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
@@ -910,7 +873,7 @@ async fn run_unidirectional_loop(
                 }
                 _ = interval.tick() => {
                     cleanup_session_map.retain(|assoc_id, session| {
-                        if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                        if session.last_activity.elapsed() > udp_timeout {
                             // Cancel the session's background task before removing
                             session.cancel_token.cancel();
                             debug!("Removing inactive UDP session {assoc_id}");
@@ -1261,6 +1224,7 @@ async fn run_datagram_loop(
     udp_session_map: UdpSessionMap,
     fragments: FragmentCache,
     cancel_token: CancellationToken,
+    udp_timeout: Duration,
 ) -> std::io::Result<()> {
     let mut last_cleanup = std::time::Instant::now();
 
@@ -1268,7 +1232,7 @@ async fn run_datagram_loop(
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
             udp_session_map.retain(|assoc_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                if session.last_activity.elapsed() > udp_timeout {
                     // Cancel the session's background task before removing
                     session.cancel_token.cancel();
                     debug!("Removing inactive UDP session {assoc_id}");
@@ -1432,6 +1396,7 @@ pub async fn start_tuic_server(
     resolver: Arc<dyn Resolver>,
     zero_rtt_handshake: bool,
     congestion: CongestionControl,
+    udp_timeout: Duration,
     connections: crate::connections::ConnectionSet,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let params = transport_params(listener.obfs.as_ref(), congestion);
@@ -1447,6 +1412,7 @@ pub async fn start_tuic_server(
                 password,
                 conn,
                 zero_rtt_handshake,
+                udp_timeout,
             )
             .await
         }

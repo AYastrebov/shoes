@@ -446,7 +446,12 @@ protocol:
   password: string
   zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
   congestion_control: cubic    # Default: cubic. One of 'cubic', 'new_reno', 'bbr'
+  udp_timeout: 300             # Default: 300. Seconds a UDP association may sit idle
 ```
+
+A UDP association ends when the client dissociates or the connection closes,
+or after `udp_timeout` seconds without a packet (sing-box's name and default).
+The server sends no heartbeats; the client does.
 
 `congestion_control` governs what the server sends, so it is the one that
 decides download speed for its clients. See the TUIC client below for when to
@@ -980,6 +985,9 @@ protocol:
   heartbeat_ms: 10000          # Default: 10000
   congestion_control: cubic    # Default: cubic. One of 'cubic', 'new_reno', 'bbr'
 ```
+
+The heartbeat is one per connection, sent while any TCP stream or UDP
+association is open on it, as the reference client sends it.
 
 `congestion_control` is the controller for what this end sends, so on a client
 it governs upload, and the server's own setting governs download. The two ends
