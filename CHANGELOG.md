@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+WebSocket early data and the SOCKS UDP address (plan PR 3.6; TR-3, TR-12):
+
+- **WebSocket early data**, on both sides, with sing-box's names and wire
+  format. `max_early_data` sends up to that many bytes of the client's first
+  write in the upgrade request, base64url-encoded, saving a round trip.
+  `early_data_header_name` puts them in that header instead of the path; Xray
+  needs `Sec-WebSocket-Protocol`. The client sends its upgrade request with
+  its first write, as sing-box does. A server target with either option
+  accepts the data, and a client configured for it used to lose its first
+  payload.
+- **SOCKS5 UDP ASSOCIATE on a wildcard listener answers with a real
+  address.** The reply named `0.0.0.0`; it now names the address the
+  connection arrived on, and the relay is bound to it.
+
 AnyTLS client sessions are pooled (plan PR 3.5b; AT-A1 to AT-A4):
 
 - **The AnyTLS client reuses sessions** the way the reference client does,

@@ -99,6 +99,7 @@ async fn every_wrapper_forwards_the_reuse_question() {
             None,
             None,
             crate::config::WebsocketPingType::Disabled,
+            None,
             inner(),
         ),
     )

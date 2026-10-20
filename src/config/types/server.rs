@@ -16,7 +16,7 @@ use super::uuid::Uuid;
 use crate::address::{NetLocation, NetLocationPortRange};
 use crate::option_util::{NoneOrSome, OneOrSome};
 
-use super::client::TuicCongestionControl;
+use super::client::{TuicCongestionControl, is_zero_usize};
 use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
 use super::dns::DnsConfig;
 use super::obfs::ObfsConfig;
@@ -569,6 +569,13 @@ pub struct WebsocketServerConfig {
     pub protocol: ServerProxyConfig,
     #[serde(default)]
     pub ping_type: WebsocketPingType,
+    /// Accept early data in the path (sing-box's `max_early_data`): with it
+    /// non-zero, `matching_path` is a prefix and the rest is the data.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub max_early_data: usize,
+    /// Accept early data in this header instead of the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_data_header_name: Option<String>,
 
     #[serde(alias = "override_rule", default)]
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
@@ -1057,6 +1064,8 @@ mod tests {
                         password: None,
                     },
                     ping_type: WebsocketPingType::PingFrame,
+                    max_early_data: 0,
+                    early_data_header_name: None,
                     override_rules: NoneOrSome::None,
                 })),
             },
