@@ -638,10 +638,8 @@ async fn decapsulate_loop(
         };
 
         // Decapsulate with lock held briefly
-        let result = {
-            let mut tunn = tunn.lock();
-            tunn.decapsulate(None, &buf[..n], &mut out)
-        };
+        let (result, decoys) =
+            locked_call(&tunn, |tunn| tunn.decapsulate(None, &buf[..n], &mut out));
 
         // Anything but Err means the datagram was genuinely the peer's:
         // decrypted data, a handshake message, or a keepalive. That is
@@ -661,6 +659,7 @@ async fn decapsulate_loop(
                 send_to_network(
                     &tunn,
                     &udp,
+                    &decoys,
                     &packet,
                     "handshake",
                     &trailers_on,
@@ -719,16 +718,25 @@ fn take_queued_decoys(tunn: &mut Tunn) -> Vec<Vec<u8>> {
     datagrams
 }
 
-/// The queued decoys followed by `packet`, in the order they must be sent.
+/// One `Tunn` call under the lock, and the decoys it queued, taken under the
+/// same lock when it produced a datagram to send after them.
 ///
-/// Only the test uses this; the send path streams the same sequence to the
-/// socket without collecting it. Kept so the ordering can be asserted without a
-/// socket.
-#[cfg(test)]
-fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
-    let mut datagrams = take_queued_decoys(tunn);
-    datagrams.push(packet);
-    datagrams
+/// Taken under a second lock, as they were, the decoys could go with another
+/// task's packet: the timer and the encapsulate loop each lock the tunnel, so
+/// one could start a handshake and the other drain its decoys ahead of an
+/// ordinary packet, leaving the initiation to go out alone (WG-A4).
+fn locked_call<'a>(
+    tunn: &ParkingMutex<Tunn>,
+    call: impl FnOnce(&mut Tunn) -> TunnResult<'a>,
+) -> (TunnResult<'a>, Vec<Vec<u8>>) {
+    let mut tunn = tunn.lock();
+    let result = call(&mut tunn);
+    let decoys = if matches!(result, TunnResult::WriteToNetwork(_)) {
+        take_queued_decoys(&mut tunn)
+    } else {
+        Vec::new()
+    };
+    (result, decoys)
 }
 
 /// Warn on the first failure of a streak and every 1000th after, so a
@@ -764,17 +772,17 @@ fn report_send_error(
     }
 }
 
-/// Send the datagrams for a `WriteToNetwork` result, decoys first.
+/// Send the datagrams for a `WriteToNetwork` result, its decoys first.
 async fn send_to_network(
     tunn: &Arc<ParkingMutex<Tunn>>,
     udp: &Arc<EndpointSocket>,
+    decoys: &[Vec<u8>],
     packet: &[u8],
     context: &str,
     trailers_on: &AtomicBool,
     send_failures: &AtomicUsize,
 ) {
-    let decoys = take_queued_decoys(&mut tunn.lock());
-    for datagram in &decoys {
+    for datagram in decoys {
         if let Err(e) = udp.send(datagram).await {
             report_send_error(tunn, trailers_on, send_failures, context, &e);
         }
@@ -804,9 +812,9 @@ async fn drain_queued_packets(
     send_failures: &AtomicUsize,
 ) {
     loop {
-        {
-            let mut tunn = tunn.lock();
-            match tunn.decapsulate(None, &[], out) {
+        let decoys = {
+            let (result, decoys) = locked_call(tunn, |tunn| tunn.decapsulate(None, &[], out));
+            match result {
                 // Copied into `packet` rather than sent from `out`: the result
                 // borrows `out` for as long as it lives, and `out` is needed
                 // again on the next turn of this loop. `packet` keeps its
@@ -817,8 +825,18 @@ async fn drain_queued_packets(
                 }
                 _ => break,
             }
-        }
-        send_to_network(tunn, udp, packet, "drain", trailers_on, send_failures).await;
+            decoys
+        };
+        send_to_network(
+            tunn,
+            udp,
+            &decoys,
+            packet,
+            "drain",
+            trailers_on,
+            send_failures,
+        )
+        .await;
     }
 }
 
@@ -840,9 +858,9 @@ async fn encapsulate_loop(
         // whether it has ever moved.
         packets_offered.fetch_add(1, Ordering::Relaxed);
 
+        let (result, decoys) = locked_call(&tunn, |tunn| tunn.encapsulate(&ip_packet, &mut out));
         let has_packet = {
-            let mut tunn = tunn.lock();
-            match tunn.encapsulate(&ip_packet, &mut out) {
+            match result {
                 TunnResult::WriteToNetwork(data) => {
                     packet.clear();
                     packet.extend_from_slice(data);
@@ -861,7 +879,16 @@ async fn encapsulate_loop(
         };
 
         if has_packet {
-            send_to_network(&tunn, &udp, &packet, "encap", &trailers_on, &send_failures).await;
+            send_to_network(
+                &tunn,
+                &udp,
+                &decoys,
+                &packet,
+                "encap",
+                &trailers_on,
+                &send_failures,
+            )
+            .await;
         }
     }
 }
@@ -1072,10 +1099,7 @@ async fn timer_loop(
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-        let result = {
-            let mut tunn = tunn.lock();
-            tunn.update_timers(&mut out)
-        };
+        let (result, decoys) = locked_call(&tunn, |tunn| tunn.update_timers(&mut out));
 
         match result {
             TunnResult::Done => {
@@ -1102,7 +1126,16 @@ async fn timer_loop(
             TunnResult::WriteToNetwork(data) => {
                 packet.clear();
                 packet.extend_from_slice(data);
-                send_to_network(&tunn, &udp, &packet, "timer", &trailers_on, &send_failures).await;
+                send_to_network(
+                    &tunn,
+                    &udp,
+                    &decoys,
+                    &packet,
+                    "timer",
+                    &trailers_on,
+                    &send_failures,
+                )
+                .await;
             }
             _ => {}
         }
@@ -1292,15 +1325,19 @@ mod tests {
     #[test]
     fn decoys_are_sent_before_the_handshake_initiation() {
         let config = convert_amnezia_config(&real_world_params(), 1420).unwrap();
-        let (mut client, _server) = tunnel_pair(&config);
+        let (client, _server) = tunnel_pair(&config);
+        let client = ParkingMutex::new(client);
 
         let mut buf = vec![0u8; MAX_UDP_SIZE];
-        let packet = match client.encapsulate(&[0u8; 64], &mut buf) {
-            TunnResult::WriteToNetwork(data) => data.to_vec(),
+        let (result, mut datagrams) =
+            locked_call(&client, |tunn| tunn.encapsulate(&[0u8; 64], &mut buf));
+        match result {
+            TunnResult::WriteToNetwork(data) => datagrams.push(data.to_vec()),
             other => panic!("first packet must start a handshake, got {:?}", other),
-        };
-
-        let datagrams = ordered_outgoing(&mut client, packet);
+        }
+        // WG-A4: nothing is left for another task to send ahead of its own
+        // packet.
+        assert!(client.lock().poll_outgoing_packet().is_none());
 
         // I1-I5 plus Jc=8 junk datagrams, then the initiation itself.
         assert_eq!(

@@ -166,7 +166,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | VM-D3/D1 | **VM-D1 documented in #87; VM-D3 open, with the server work (user's choice, 2026-10-20).** VMess AuthenticatedLength (opt 0x10) refused; security byte 5 "none" removed upstream so a shoes client with `cipher: none` fails against Xray. CONFIRMED. | `vmess_handler.rs:428-433,447-463` | M / doc |
 | VL-V2/V6/V7 | XRV flow with UDP command accepted (Xray rejects); write side holds a TLS-looking suffix across `poll_flush` so non-TLS traffic ending in 0x16 stalls; TLS 1.3 not forced for Vision. CONFIRMED. | `vless_server_handler.rs:384-410`; `vision_stream.rs:1259-1268`; `tcp_client_handler_factory.rs:169` | S each |
 | HY-D5 | "BBR" is quinn's: the pacer uses cwnd/RTT rather than BBR's pacing rate, and `initial_window` is 200×1200 vs upstream's 32 packets. The BBR spec overstates fidelity. CONFIRMED. | `quic_transport/mod.rs:144`; quinn-proto `bbr/mod.rs:534,648` | S (window) / L (pacer) |
-| WG-A2 | awgtun has no 0–334 ms handshake retransmit jitter (comment claims it). CONFIRMED, in the fork. | awgtun `timers.rs:316-319` | S |
+| WG-A2 | **Fixed in #88 (awgtun `7a78f45`).** awgtun has no 0–334 ms handshake retransmit jitter (comment claims it). CONFIRMED, in the fork. | awgtun `timers.rs:316-319` | S |
 
 ### P2 — robustness and conformance
 
@@ -185,7 +185,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | NA-N4 | `padding-type-request: 0` answered with Variant1; `fastopen` header never sent; EOF mid padded frame silent. | `naive_hyper_service.rs:289-301`; `naive_padding_stream.rs:438` |
 | ST-S4/S5 | Local handshake mode drops unauthenticated clients with RST; no relay when the handshake server negotiates TLS 1.2. | `shadow_tls_server_handler.rs` |
 | TR-7/10/11/12 | **TR-7 and TR-11 fixed in #58; TR-12 fixed in #86; TR-10 open.** WS ping >80 B or any pong payload kills the connection (RFC: ≤125, pongs may carry data), close frame ignored; TLS sniff rejects record versions 0x0300/0x0302; `write_location_to_vec` truncates >255-byte hostnames; SOCKS UDP BND.ADDR from the listener bind IP (0.0.0.0 on wildcard). | `websocket_stream.rs:291-296,324-329,339`; `sniff/tls.rs:78-82`; `socks_handler.rs:758,385` |
-| WG-A3/A4 | `jc` accepts 129–255 (kernel: ≤128), `validate_for_mtu` not invoked; decoy/initiation ordering race between the timer task and encapsulate. | `amneziawg/config.rs:99-104`; `tunnel.rs:843-864` |
+| WG-A3/A4 | **Fixed in #88.** `jc` accepts 129–255 (kernel: ≤128), `validate_for_mtu` not invoked; decoy/initiation ordering race between the timer task and encapsulate. | `amneziawg/config.rs:99-104`; `tunnel.rs:843-864` |
 | DN-D1/D2/D3 | DNS 0x20 case randomisation off; DoH/DoT bootstrap resolved once at build; system-resolver cache 1 h fixed. | `dns/builder.rs:663`; `resolver.rs:366` |
 | FI-1 | Fake IP intercepts UDP/53 only; a TCP-fallback resolver escapes. | `udp_manager.rs:133` |
 

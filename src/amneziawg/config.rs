@@ -67,6 +67,12 @@ pub fn convert_amnezia_config(awg: &AmneziaWgParams, mtu: u16) -> std::io::Resul
         s4: awg.s4,
     };
 
+    if awg.jc > MAX_JUNK_COUNT {
+        return Err(ioerr(&format!(
+            "jc {} is over {MAX_JUNK_COUNT}, the most the AmneziaWG kernel module accepts",
+            awg.jc
+        )));
+    }
     let junk = if awg.jc > 0 {
         JunkConfig::new(awg.jc, awg.jmin, awg.jmax)
             .map_err(|e| ioerr(&format!("invalid junk config: {}", e)))?
@@ -136,6 +142,10 @@ pub fn convert_amnezia_config(awg: &AmneziaWgParams, mtu: u16) -> std::io::Resul
     config
         .validate()
         .map_err(|e| ioerr(&format!("invalid AmneziaWG config: {}", e)))?;
+    config
+        .junk
+        .validate_for_mtu(largest_datagram(mtu))
+        .map_err(|e| ioerr(&format!("invalid AmneziaWG config: {}", e)))?;
 
     Ok(config)
 }
@@ -191,6 +201,17 @@ fn parse_optional_cps(s: &Option<String>) -> std::io::Result<Option<CpsChain>> {
     }
 }
 
+/// The kernel module's limit on `Jc`; amneziawg-go has none, so a config
+/// with more works against one implementation and not the other (WG-A3).
+const MAX_JUNK_COUNT: u8 = 128;
+
+/// The largest datagram this tunnel sends itself: a full transport packet,
+/// the MTU plus the 16-byte header and the 16-byte tag. A junk packet past it
+/// is one the path fragments, or drops, when nothing else is.
+fn largest_datagram(mtu: u16) -> usize {
+    usize::from(mtu) + 32
+}
+
 fn ioerr(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string())
 }
@@ -229,6 +250,33 @@ mod tests {
             random_trailers: false,
             disable_cookies: false,
         }
+    }
+
+    /// WG-A3: `jc` stops at the kernel module's 128.
+    #[test]
+    fn jc_over_128_is_refused() {
+        let mut params = empty_params();
+        params.jmin = 40;
+        params.jmax = 70;
+        params.jc = 128;
+        assert!(convert_amnezia_config(&params, 1420).is_ok());
+        params.jc = 129;
+        let err = convert_amnezia_config(&params, 1420).err().unwrap();
+        assert!(err.to_string().contains("128"), "{err}");
+    }
+
+    /// WG-A3: a junk packet may be as large as a full transport packet, the
+    /// MTU plus 32, and no larger.
+    #[test]
+    fn junk_larger_than_the_tunnels_datagrams_is_refused() {
+        let mut params = empty_params();
+        params.jc = 4;
+        params.jmin = 40;
+        params.jmax = 1452;
+        assert!(convert_amnezia_config(&params, 1420).is_ok());
+        params.jmax = 1453;
+        let err = convert_amnezia_config(&params, 1420).err().unwrap();
+        assert!(err.to_string().contains("MTU"), "{err}");
     }
 
     #[test]
