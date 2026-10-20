@@ -1562,6 +1562,28 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
     Ok(())
 }
 
+/// The fragmentation warning for `mtu` and `s4`, if full-size packets cross
+/// a 1500-byte path. The advice is checked arithmetic: `s4` is 16-bit, and
+/// one past 864 leaves no MTU at or above the 576 floor that fits, which
+/// `1440 - s4` used to answer with an underflow.
+fn amneziawg_mtu_warning(mtu: u16, s4: u16) -> Option<String> {
+    let wire_size = u32::from(mtu) + u32::from(s4) + 60;
+    if wire_size <= 1500 {
+        return None;
+    }
+    let advice = match 1440u32.checked_sub(u32::from(s4)) {
+        Some(fitting) if fitting >= 576 => format!("Lower mtu to {fitting} or reduce s4."),
+        _ => format!(
+            "No mtu of 576 or more fits beside s4 {s4}; reduce s4 to at most {}.",
+            1440 - 576
+        ),
+    };
+    Some(format!(
+        "AmneziaWG mtu {mtu} + s4 {s4} puts full-size packets at {wire_size} bytes on the wire, \
+         past a standard 1500-byte path MTU -- every large packet will fragment. {advice}"
+    ))
+}
+
 /// Keys and prefixes are checked as the config is parsed (`WgKey`,
 /// `IpPrefix`).
 fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> std::io::Result<()> {
@@ -1582,17 +1604,8 @@ fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> st
     // packet it sends (3x-ui#6376 measured the threshold byte-for-byte).
     // A warning, not an error: paths with jumbo or sub-1500 MTUs exist, and
     // only the operator knows theirs.
-    let wire_size = u32::from(config.mtu) + u32::from(config.awg.s4) + 60;
-    if wire_size > 1500 {
-        log::warn!(
-            "AmneziaWG mtu {} + s4 {} puts full-size packets at {} bytes on the wire, \
-             past a standard 1500-byte path MTU -- every large packet will fragment. \
-             Lower mtu to {} or reduce s4.",
-            config.mtu,
-            config.awg.s4,
-            wire_size,
-            1440 - u32::from(config.awg.s4),
-        );
+    if let Some(warning) = amneziawg_mtu_warning(config.mtu, config.awg.s4) {
+        log::warn!("{warning}");
     }
 
     // Parse and validate the obfuscation parameters now, so a bad H-range or a
@@ -5167,5 +5180,46 @@ mod tproxy_validation_tests {
     fn tproxy_is_refused_off_linux_by_name() {
         let err = refusal(&tproxy("127.0.0.1:51271", ""));
         assert!(err.contains("Linux"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod amneziawg_mtu_tests {
+    use super::*;
+
+    #[test]
+    fn the_warning_advises_a_fitting_mtu() {
+        assert_eq!(amneziawg_mtu_warning(1420, 20), None, "1500 exactly fits");
+        let warning = amneziawg_mtu_warning(1420, 27).unwrap();
+        assert!(warning.contains("Lower mtu to 1413"), "{warning}");
+    }
+
+    /// awgtun 0.11 widened s4 to 16 bits; past 864 no supported mtu fits,
+    /// and the advice must say so rather than underflow.
+    #[test]
+    fn a_large_s4_gets_advice_not_an_underflow() {
+        for s4 in [865u16, 1440, 2000, u16::MAX] {
+            let warning = amneziawg_mtu_warning(1420, s4).unwrap();
+            assert!(
+                warning.contains("reduce s4 to at most 864"),
+                "{s4}: {warning}"
+            );
+        }
+    }
+
+    /// Through validation, with warnings enabled so the message is built: a
+    /// config with s4 2000 is validated without a panic.
+    #[test]
+    fn validation_with_a_large_s4_does_not_panic() {
+        log::set_max_level(log::LevelFilter::Warn);
+        let config: crate::config::types::AmneziaWgClientConfig = serde_yaml::from_str(
+            "private_key: \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=\"\n\
+             peer_public_key: \"ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=\"\n\
+             local_addresses: \"10.8.0.2/32\"\n\
+             allowed_ips: \"0.0.0.0/0\"\n\
+             awg:\n  s4: 2000\n",
+        )
+        .unwrap();
+        let _ = validate_amneziawg_config(&config);
     }
 }
