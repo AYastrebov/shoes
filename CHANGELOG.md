@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+AnyTLS client sessions are pooled (plan PR 3.5b; AT-A1 to AT-A4):
+
+- **The AnyTLS client reuses sessions** the way the reference client does,
+  instead of opening a new TLS connection and session for every connection. A
+  connection takes the most recently idle session, with no new TCP connection
+  or TLS handshake, and the session goes back to the pool when the connection
+  ends. Sessions idle for 30 seconds are closed, keeping `min_idle_session` (a
+  new client option, sing-box's name, default 0). A server may refuse a client
+  that never reuses.
+- **The server's padding scheme is applied.** `UpdatePaddingScheme` used to be
+  ignored, so the server resent it on every session. It now replaces the
+  client's scheme for later packets and sessions.
+- An unknown AnyTLS command is skipped instead of ending the session, and
+  padding ranges are drawn from `[min, max)`, as the reference draws them.
+
 NaiveProxy sessions survive a dropped connection (plan PR 3.5a; NA-N1, NA-N2):
 
 - **A NaiveProxy client recovers when its connection to the server drops.**

@@ -77,17 +77,27 @@ its pool lands; NaiveProxy has no UDP.
 
 ## AnyTLS (PR 3.5b)
 
-The reference client (`sing-anytls` `client.go:70-138,201-242`):
+The reference client (`sing-anytls` `client.go`, 2026-09):
 
-- A pool of idle sessions keyed by sequence, the newest idle first.
-- Idle sessions reaped after 30 s, keeping `min_idle_session` of them.
-- `UpdatePaddingScheme` applied to the client's padding factory, as an
-  `Arc<ArcSwap<PaddingFactory>>` shared by its sessions.
-- Unknown commands skipped rather than fatal (AT-A3), and the padding range
-  draw corrected (AT-A4).
+- A connection takes the newest idle session (`takeIdleSession`), and the
+  session is in use until its stream ends. The stream's end returns it to the
+  front of the idle list (`finishStream` → `releaseSession`). Concurrent
+  connections each get their own session; sessions are reused one after
+  another, not multiplexed.
+- Idle sessions are checked every 30 s, and those idle for 30 s are closed,
+  keeping `min_idle_session` of them.
+- `UpdatePaddingScheme` replaces the client-wide padding factory, which every
+  session reads per packet.
+- Unknown commands are discarded, not fatal (AT-A3). Ranges are drawn from
+  `[min, max)` (AT-A4).
 
-`try_reuse_tcp_stream` takes the newest idle session from the pool and opens a
-stream on it. A session goes back to the pool when its stream ends.
+In shoes the pool also holds the sessions that are in use, strongly, as the
+reference's `sessions` set does. A session otherwise lives only as long as its
+streams, and dropping the last one tore it down with its FIN still queued. A
+closed session (EOF or an error in its reader) is pruned whenever the pool is
+touched. `try_reuse_tcp_stream` takes the newest idle session and opens the
+stream there. If that fails, it closes the session and answers `None`, so the
+chain dials a new one, as the reference does.
 
 ## Tests
 
@@ -101,3 +111,16 @@ stream on it. A session goes back to the pool when its stream ends.
   session being replaced in the slot.
 - Interop: shoes against sing-box's NaiveProxy inbound, including a server
   restart mid-run.
+- AnyTLS, against a shoes AnyTLS server on loopback: a finished session
+  carries the next connection over one TCP connection; the server's padding
+  scheme is adopted; idle sessions expire down to `min_idle_session`.
+
+## AnyTLS interop result (2026-10-20)
+
+sing-box 1.14.3 (native darwin-arm64), with an AnyTLS inbound over TLS and a
+custom `padding_scheme`. A shoes SOCKS listener chained TLS → AnyTLS to it.
+`curl` made five sequential small requests and then fetched 8 MiB of random
+data (MD5 compared). Result: all six succeeded and the 8 MiB arrived intact.
+sing-box logged one inbound connection, and shoes reused that session five
+times. The server's padding scheme was applied once, with no errors on
+either side.

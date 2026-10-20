@@ -403,6 +403,7 @@ pub fn create_tcp_client_handler(
             password,
             udp_enabled,
             padding_scheme,
+            min_idle_session,
         } => {
             let padding = match padding_scheme {
                 Some(lines) => {
@@ -418,6 +419,7 @@ pub fn create_tcp_client_handler(
                 password.into_inner(),
                 padding,
                 udp_enabled,
+                min_idle_session,
             ))
         }
         ClientProxyConfig::Naiveproxy {

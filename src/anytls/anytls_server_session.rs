@@ -1326,17 +1326,19 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// An undefined command is skipped, not fatal: the reference discards
+    /// the frame and the session carries on (AT-A3).
     #[test]
-    fn test_frame_unknown_command_returns_error() {
+    fn test_frame_unknown_command_is_skipped() {
         // Command byte 255 is not defined
         let mut buf = BytesMut::with_capacity(16);
         buf.extend_from_slice(&[255u8]); // unknown cmd
         buf.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
         buf.extend_from_slice(&[0, 0]); // length = 0
 
-        let result = FrameCodec::decode(&mut buf);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let result = FrameCodec::decode(&mut buf).unwrap();
+        assert!(result.is_none());
+        assert!(buf.is_empty(), "the frame was consumed");
     }
 
     #[test]

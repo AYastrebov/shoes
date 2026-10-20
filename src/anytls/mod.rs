@@ -6,6 +6,7 @@
 //! - Password authentication: SHA256-based user authentication
 
 mod anytls_client_handler;
+mod anytls_client_pool;
 mod anytls_client_session;
 mod anytls_padding;
 mod anytls_server_handler;

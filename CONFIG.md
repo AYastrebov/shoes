@@ -874,7 +874,15 @@ protocol:
   password: string             # User password
   udp_enabled: true            # Default: true (enables UDP over TCP)
   padding_scheme: [string]?    # Optional custom padding scheme
+  min_idle_session: 0          # Idle sessions kept past the 30 s idle timeout
 ```
+
+Sessions are reused the way the reference client reuses them: a connection
+takes the most recently idle session instead of opening a new TLS connection,
+and a session goes back to the pool when its connection ends. Sessions idle for
+30 seconds are closed, except for the `min_idle_session` most recent. A padding
+scheme the server sends (`UpdatePaddingScheme`) replaces the configured one for
+every later session.
 
 ### NaiveProxy Client
 ```yaml

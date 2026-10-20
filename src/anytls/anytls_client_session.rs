@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 use crate::address::NetLocation;
-use crate::anytls::anytls_padding::PaddingFactory;
+use crate::anytls::anytls_padding::{PaddingFactory, SharedPadding};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
 use crate::async_stream::AsyncStream;
@@ -77,8 +77,12 @@ pub struct AnyTlsClientSession {
     /// Session state
     is_closed: Arc<AtomicBool>,
 
-    /// Padding configuration
-    padding: Arc<PaddingFactory>,
+    /// Padding configuration, shared with the handler and its other sessions.
+    padding: SharedPadding,
+
+    /// Called when one of this session's streams finishes; the handler's
+    /// pool sets it to take the session back as idle.
+    on_stream_finished: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 
     /// Protocol version negotiation
     peer_version: AtomicU8,
@@ -132,14 +136,15 @@ impl AnyTlsClientSession {
     pub async fn new(
         mut transport: Box<dyn AsyncStream>,
         password: &str,
-        padding: Arc<PaddingFactory>,
+        padding: SharedPadding,
     ) -> io::Result<Arc<Self>> {
+        let current = Arc::clone(&padding.read());
         let hash_result = digest(&SHA256, password.as_bytes());
         let mut password_hash = [0u8; 32];
         password_hash.copy_from_slice(hash_result.as_ref());
 
         // Send authentication (this is packet 0, sent separately)
-        Self::send_auth(&mut transport, &password_hash, &padding).await?;
+        Self::send_auth(&mut transport, &password_hash, &current).await?;
 
         // Create unified channel for all outgoing messages.
         // Bounded: a closed/dead writer must backpressure, never accumulate.
@@ -147,14 +152,15 @@ impl AnyTlsClientSession {
 
         // Pre-encode Settings frame into initial buffer
         // This will be sent together with first SYN + destination as one TLS record
-        let initial_buffer = Self::create_initial_buffer(&padding);
+        let initial_buffer = Self::create_initial_buffer(&current);
 
         let session = Arc::new(Self {
             streams: RwLock::new(HashMap::new()),
             stream_id_counter: AtomicU32::new(0),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
-            padding: Arc::clone(&padding),
+            padding,
+            on_stream_finished: std::sync::OnceLock::new(),
             peer_version: AtomicU8::new(1), // Assume v1 until server confirms v2
             pending_opens: Mutex::new(HashMap::new()),
             send_padding: AtomicBool::new(true),
@@ -367,8 +373,12 @@ impl AnyTlsClientSession {
                         .await?;
                     writer.flush().await?;
 
-                    let mut streams = session.streams.write().await;
-                    streams.remove(&stream_id);
+                    // Only the FIN that ends a registered stream returns the
+                    // session: after the server's FIN has already done so,
+                    // the session may carry a newer stream.
+                    if session.streams.write().await.remove(&stream_id).is_some() {
+                        session.stream_finished();
+                    }
                 }
             }
         }
@@ -403,7 +413,8 @@ impl AnyTlsClientSession {
 
         // Increment packet counter and check if we should still pad
         let pkt = session.pkt_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let stop = session.padding.stop();
+        let padding = Arc::clone(&session.padding.read());
+        let stop = padding.stop();
 
         if pkt >= stop {
             session.send_padding.store(false, Ordering::Relaxed);
@@ -411,7 +422,7 @@ impl AnyTlsClientSession {
         }
 
         // Get padding sizes for this packet
-        let pkt_sizes = session.padding.generate_record_payload_sizes(pkt);
+        let pkt_sizes = padding.generate_record_payload_sizes(pkt);
         if pkt_sizes.is_empty() {
             return writer.write_all(data).await;
         }
@@ -597,6 +608,30 @@ impl AnyTlsClientSession {
         self.pending_opens.lock().await.clear();
     }
 
+    /// Have the handler's pool told when a stream finishes. Set once, by the
+    /// handler that created the session.
+    pub fn on_stream_finished(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_stream_finished.set(hook);
+    }
+
+    fn stream_finished(&self) {
+        if !self.is_closed()
+            && let Some(hook) = self.on_stream_finished.get()
+        {
+            hook();
+        }
+    }
+
+    /// Whether the session has ended: its transport closed or it was closed.
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Relaxed)
+    }
+
+    /// Close the session and every stream on it.
+    pub async fn shut(&self) {
+        self.close().await;
+    }
+
     /// Handle a received frame
     async fn handle_frame(&self, frame: Frame) -> io::Result<()> {
         match frame.cmd {
@@ -630,6 +665,7 @@ impl AnyTlsClientSession {
                 // Signal EOF
                 if let Some(tx) = tx {
                     let _ = tx.send(Bytes::new()).await;
+                    self.stream_finished();
                 }
             }
 
@@ -656,26 +692,20 @@ impl AnyTlsClientSession {
             }
 
             Command::UpdatePaddingScheme => {
-                // Server sent new padding scheme for censorship resistance.
-                // Per protocol: "subsequent new sessions must use the server's padding scheme"
-                //
-                // TODO: Implement UpdatePaddingScheme support:
-                // 1. Change AnyTlsClientHandler.padding from Arc<PaddingFactory> to
-                //    Arc<arc_swap::ArcSwap<PaddingFactory>> (or similar atomic wrapper)
-                // 2. Pass a reference to that atomic into AnyTlsClientSession
-                // 3. Here, parse frame.data as raw padding scheme bytes and call:
-                //    if let Ok(new_factory) = PaddingFactory::new(&frame.data) {
-                //        shared_padding.store(Arc::new(new_factory));
-                //        log::info!("AnyTLS padding scheme updated: {}", new_factory.md5());
-                //    }
-                // 4. New sessions created by the handler will automatically use the updated scheme
-                //
-                // Reference: anytls-go/proxy/session/session.go:319-332
-                // Reference: sing-anytls/session/session.go:314-327
-                log::debug!(
-                    "AnyTLS received padding scheme update ({} bytes) - not yet implemented",
-                    frame.data.len()
-                );
+                // The server's scheme replaces the client's, for this
+                // session's remaining packets and every later session
+                // (sing-anytls handleUpdatePaddingScheme). It used to be
+                // ignored, so the server resent it on every session (AT-A1).
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
+                match PaddingFactory::new(&frame.data) {
+                    Ok(factory) => {
+                        log::debug!("AnyTLS padding scheme updated: {}", factory.md5());
+                        *self.padding.write() = Arc::new(factory);
+                    }
+                    Err(e) => log::warn!("AnyTLS: ignoring an invalid padding scheme: {e}"),
+                }
             }
 
             Command::Alert => {
@@ -845,20 +875,28 @@ impl AnyTlsClientSession {
         let outgoing_tx = self.outgoing_tx.clone();
         let is_closed = Arc::clone(&self.is_closed);
         let close_notify_fwd = Arc::clone(&self.close_notify);
+        // A stream dropped with its channel full loses its FIN, so the end of
+        // the channel sends one after the queued data. Without it the session
+        // would never come back to the pool, nor be expired from it.
         tokio::spawn(async move {
+            let mut fin_sent = false;
             loop {
                 let received = tokio::select! {
                     r = stream_write_rx.recv() => r,
-                    _ = close_notify_fwd.notified() => None,
-                };
-                let Some((sid, data)) = received else {
-                    break;
+                    _ = close_notify_fwd.notified() => break,
                 };
                 if is_closed.load(Ordering::Relaxed) {
                     break;
                 }
+                let Some((sid, data)) = received else {
+                    if !fin_sent {
+                        let _ = outgoing_tx.send(OutgoingMessage::Fin { stream_id }).await;
+                    }
+                    break;
+                };
                 // Empty data signals FIN, non-empty is PSH data
                 let msg = if data.is_empty() {
+                    fin_sent = true;
                     OutgoingMessage::Fin { stream_id: sid }
                 } else {
                     OutgoingMessage::Data {
