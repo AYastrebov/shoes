@@ -134,9 +134,12 @@ impl PaddingFactory {
                     // Fixed size
                     sizes.push(min_val as i32);
                 } else {
-                    // Random size in range [min, max]
+                    // Half-open, [min, max), as the reference draws it
+                    // (`min + rand.Int(max - min)`, sing-anytls padding.go):
+                    // including max gave every range one size it never
+                    // produces (AT-A4).
                     let mut rng = rand::rng();
-                    let size = rng.random_range(min_val..=max_val);
+                    let size = rng.random_range(min_val..max_val);
                     sizes.push(size as i32);
                 }
             }
@@ -145,6 +148,12 @@ impl PaddingFactory {
         sizes
     }
 }
+
+/// The padding factory a client and all its sessions share, read per packet.
+/// A server's `UpdatePaddingScheme` replaces it, so later packets and later
+/// sessions follow the server's scheme, as the reference client's shared
+/// value does.
+pub type SharedPadding = std::sync::Arc<parking_lot::RwLock<std::sync::Arc<PaddingFactory>>>;
 
 impl Default for PaddingFactory {
     fn default() -> Self {
@@ -156,6 +165,19 @@ impl Default for PaddingFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AT-A4: a range is drawn from `[min, max)`, as the reference does.
+    #[test]
+    fn a_range_never_draws_its_maximum() {
+        let factory = PaddingFactory::new(b"stop=2\n0=10-12\n1=30-31").unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..500 {
+            let sizes = factory.generate_record_payload_sizes(0);
+            seen.insert(sizes[0]);
+            assert_eq!(factory.generate_record_payload_sizes(1), vec![30]);
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![10, 11]);
+    }
 
     #[test]
     fn test_default_factory() {

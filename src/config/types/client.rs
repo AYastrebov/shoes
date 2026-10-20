@@ -824,6 +824,10 @@ pub enum ClientProxyConfig {
         /// Each line is a key=value pair like "stop=8" or "0=30-30"
         #[serde(default, skip_serializing_if = "Option::is_none")]
         padding_scheme: Option<Vec<String>>,
+        /// Idle sessions kept open past the 30-second idle timeout, ready for
+        /// the next connection (sing-box's `min_idle_session`; default 0).
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        min_idle_session: usize,
     },
     /// NaiveProxy client protocol (HTTP/2 CONNECT with padding)
     #[serde(alias = "naive")]
@@ -1318,4 +1322,8 @@ mod named_outbound_tests {
             "unhelpful message: {err}"
         );
     }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }

@@ -170,9 +170,25 @@ pub struct FrameCodec;
 impl FrameCodec {
     /// Try to decode a frame from the buffer
     /// Returns None if not enough data available
+    ///
+    /// A frame whose command this side does not know is consumed and skipped,
+    /// as the reference's read loop discards it (`default: s.discard(length)`):
+    /// a peer one protocol revision ahead must not be able to end the session
+    /// with a frame it is entitled to send (AT-A3).
     pub fn decode(buf: &mut BytesMut) -> io::Result<Option<Frame>> {
-        if buf.len() < FRAME_HEADER_SIZE {
-            return Ok(None);
+        loop {
+            if buf.len() < FRAME_HEADER_SIZE {
+                return Ok(None);
+            }
+            let data_len = u16::from_be_bytes([buf[5], buf[6]]) as usize;
+            if Command::try_from(buf[0]).is_ok() {
+                break;
+            }
+            if buf.len() < FRAME_HEADER_SIZE + data_len {
+                return Ok(None);
+            }
+            log::debug!("AnyTLS: skipping a frame with unknown command {}", buf[0]);
+            buf.advance(FRAME_HEADER_SIZE + data_len);
         }
 
         // Peek at header to get length
@@ -247,5 +263,27 @@ mod tests {
 
         assert_eq!(parsed.get("v"), Some(&"2".to_string()));
         assert_eq!(parsed.get("client"), Some(&"test".to_string()));
+    }
+
+    /// AT-A3: an unknown command is skipped, with its payload, and the frame
+    /// after it decodes.
+    #[test]
+    fn a_frame_with_an_unknown_command_is_skipped() {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[200, 0, 0, 0, 1, 0, 3, b'x', b'y', b'z']);
+        Frame::with_data(Command::Psh, 7, Bytes::from_static(b"data")).encode_into(&mut buf);
+        let frame = FrameCodec::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.cmd, Command::Psh);
+        assert_eq!(frame.stream_id, 7);
+        assert_eq!(&frame.data[..], b"data");
+        assert!(buf.is_empty());
+    }
+
+    /// An unknown frame not yet whole waits for its bytes, like any other.
+    #[test]
+    fn a_partial_unknown_frame_waits() {
+        let mut buf = BytesMut::from(&[200u8, 0, 0, 0, 1, 0, 3, b'x'][..]);
+        assert!(FrameCodec::decode(&mut buf).unwrap().is_none());
+        assert_eq!(buf.len(), 8);
     }
 }
