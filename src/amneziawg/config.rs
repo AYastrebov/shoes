@@ -203,14 +203,14 @@ fn parse_optional_cps(s: &Option<String>) -> std::io::Result<Option<CpsChain>> {
 
 /// The kernel module's limit on `Jc`; amneziawg-go has none, so a config
 /// with more works against one implementation and not the other (WG-A3).
-const MAX_JUNK_COUNT: u8 = 128;
+const MAX_JUNK_COUNT: u16 = 128;
 
 /// The largest datagram this tunnel sends itself: a full transport packet,
 /// the MTU plus its S4 prefix, the 16-byte header and the 16-byte tag (the
 /// wire size `validate_amneziawg_config` warns about, less UDP and IP). A
 /// junk packet past it is one the path fragments, or drops, when nothing
 /// else is.
-fn largest_datagram(mtu: u16, s4: u8) -> usize {
+fn largest_datagram(mtu: u16, s4: u16) -> usize {
     usize::from(mtu) + usize::from(s4) + 32
 }
 
@@ -254,6 +254,18 @@ mod tests {
         }
     }
 
+    /// awgtun 0.11: S1-S4 are 16-bit, as the references parse them, so a
+    /// server's S2 above 255 is accepted and carried through.
+    #[test]
+    fn paddings_above_255_are_accepted() {
+        let mut params = empty_params();
+        params.s1 = 64;
+        params.s2 = 300;
+        let config = convert_amnezia_config(&params, 1420).unwrap();
+        assert_eq!(config.paddings.s1, 64);
+        assert_eq!(config.paddings.s2, 300);
+    }
+
     /// WG-A3: `jc` stops at the kernel module's 128.
     #[test]
     fn jc_over_128_is_refused() {
@@ -271,7 +283,7 @@ mod tests {
     /// MTU plus S4 plus 32, and no larger.
     #[test]
     fn junk_larger_than_the_tunnels_datagrams_is_refused() {
-        for (s4, largest) in [(0u8, 1452u16), (16, 1468)] {
+        for (s4, largest) in [(0u16, 1452u16), (16, 1468)] {
             let mut params = empty_params();
             params.s4 = s4;
             params.jc = 4;

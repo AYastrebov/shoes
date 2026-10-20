@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+awgtun 0.11.0:
+
+- **AmneziaWG `s1`-`s4` and `jc` are 16-bit**, as amneziawg-go, the kernel
+  module and amneziawg-tools parse them. A server whose `s2` is above 255
+  could not be configured before. `jc` keeps its limit of 128.
+- A padded message that does not fit its buffer is an error from awgtun
+  rather than a panic.
+
 TUIC UDP (plan PR 5.2; TU-D6, TU-D10, TU-D3):
 
 - **Two TUIC UDP associations on one connection no longer take each other's
