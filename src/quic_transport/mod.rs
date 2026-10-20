@@ -42,6 +42,30 @@ pub const BASE_MTU: u16 = 1200;
 /// <https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes>
 const SOCKET_BUFFER_SIZE: usize = 8_625_000;
 
+/// BBR's initial congestion window: 32 packets of the 1200-byte base
+/// datagram, where the Hysteria2 reference's BBR sender starts
+/// (`initialCongestionWindowPackets`).
+const BBR_INITIAL_WINDOW: u64 = 32 * BASE_MTU as u64;
+
+/// The congestion controller for `congestion`. Cubic is quinn's default too,
+/// but chosen here so that it is made where the other parameters are, and
+/// does not follow quinn's.
+fn controller_factory(
+    congestion: CongestionControl,
+) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match congestion {
+        CongestionControl::Bbr => {
+            // Upstream's BBR starts at 32 packets (HY-D5); quinn's default is
+            // 200, a burst no reference sends.
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(BBR_INITIAL_WINDOW);
+            Arc::new(bbr)
+        }
+        CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+        CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+    }
+}
+
 /// The MTU left to QUIC once an obfuscator has taken its share of every
 /// datagram.
 ///
@@ -143,15 +167,7 @@ impl QuicTransportParams {
             .enable_segmentation_offload(self.enable_segmentation_offload)
             // A lower initial estimate grows the initial window sooner.
             .initial_rtt(Duration::from_millis(100));
-        // Cubic is quinn's default too, but set here so that the choice is
-        // made where the other parameters are, and does not follow quinn's.
-        let controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
-            match self.congestion {
-                CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
-                CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
-                CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
-            };
-        transport.congestion_controller_factory(controller);
+        transport.congestion_controller_factory(controller_factory(self.congestion));
         transport
     }
 }
@@ -387,6 +403,17 @@ mod tests {
         any.downcast::<quinn::congestion::NewReno>()
             .ok()
             .map(|_| CongestionControl::NewReno)
+    }
+
+    /// HY-D5: BBR starts at the reference's 32 packets, not quinn's 200.
+    #[test]
+    fn bbr_starts_at_the_references_initial_window() {
+        let bbr =
+            controller_factory(CongestionControl::Bbr).build(std::time::Instant::now(), BASE_MTU);
+        assert_eq!(bbr.window(), 32 * 1200);
+        let cubic =
+            controller_factory(CongestionControl::Cubic).build(std::time::Instant::now(), BASE_MTU);
+        assert_ne!(cubic.window(), 32 * 1200, "only BBR changes");
     }
 
     /// The controller `build` is asked for is the one both ends of a real

@@ -165,7 +165,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | TN-T1/T2/T3 | **Fixed in #56.** TUN: SYN over `max_connections` silently dropped (apps hang 1–2 min); `icmp_enabled: false` is a no-op (stored in the builder, never read); IP fragments are neither dropped nor checksummed, so non-first fragments parse as UDP/TCP and can open bogus sessions or emit stray RSTs. CONFIRMED. | `stack_common.rs:919-925,981-984,1498-1567`; `tun_server.rs:64,278`; `udp_handler.rs:161-223` | S / S / S |
 | VM-D3/D1 | **VM-D1 documented in #87; VM-D3 open, with the server work (user's choice, 2026-10-20).** VMess AuthenticatedLength (opt 0x10) refused; security byte 5 "none" removed upstream so a shoes client with `cipher: none` fails against Xray. CONFIRMED. | `vmess_handler.rs:428-433,447-463` | M / doc |
 | VL-V2/V6/V7 | XRV flow with UDP command accepted (Xray rejects); write side holds a TLS-looking suffix across `poll_flush` so non-TLS traffic ending in 0x16 stalls; TLS 1.3 not forced for Vision. CONFIRMED. | `vless_server_handler.rs:384-410`; `vision_stream.rs:1259-1268`; `tcp_client_handler_factory.rs:169` | S each |
-| HY-D5 | "BBR" is quinn's: the pacer uses cwnd/RTT rather than BBR's pacing rate, and `initial_window` is 200×1200 vs upstream's 32 packets. The BBR spec overstates fidelity. CONFIRMED. | `quic_transport/mod.rs:144`; quinn-proto `bbr/mod.rs:534,648` | S (window) / L (pacer) |
+| HY-D5 | **Window fixed in #89; the pacer stays quinn's (spec updated).** "BBR" is quinn's: the pacer uses cwnd/RTT rather than BBR's pacing rate, and `initial_window` is 200×1200 vs upstream's 32 packets. The BBR spec overstates fidelity. CONFIRMED. | `quic_transport/mod.rs:144`; quinn-proto `bbr/mod.rs:534,648` | S (window) / L (pacer) |
 | WG-A2 | **Fixed in #88 (awgtun `7a78f45`).** awgtun has no 0–334 ms handshake retransmit jitter (comment claims it). CONFIRMED, in the fork. | awgtun `timers.rs:316-319` | S |
 
 ### P2 — robustness and conformance
@@ -177,7 +177,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | VL-V5 | Unpad `Initial` with <16 bytes discards instead of buffering (UUID straddling records). | `vision_unpad.rs:100-102` |
 | XU-X3 | **Fixed in #57.** Unknown-session Keep errors the connection; metalen unbounded (reference ≤512); no 7526-byte response cap. | `xudp/message_stream.rs:179-186,333-341,671` |
 | RE-R4/R7 | Client fails immediately on HMAC mismatch instead of x509 fallback + spider; version hardcoded 1.8.0; no alerts sent on any failure; no ServerHello sanity checks. | `reality_client_verify.rs`; `reality_client_connection.rs:183-195` |
-| TL-1 | `max_early_data_size = u32::MAX` on every TLS server config with no `early_data()` reader; a resuming client's 0-RTT header is lost. Reported independently by two reviews. SUSPECTED low exposure. | `rustls_config_util.rs:294` |
+| TL-1 | **Fixed in #89.** `max_early_data_size = u32::MAX` on every TLS server config with no `early_data()` reader; a resuming client's 0-RTT header is lost. Reported independently by two reviews. SUSPECTED low exposure. | `rustls_config_util.rs:294` |
 | HY-D7/D8/D9 | Zero-length UDP payload emitted (upstream rejects); no HTTP served after auth; 0-RTT asymmetry; `Hysteria-UDP` absent read as true. | `hysteria2/frame.rs:359-365`; `auth.rs:60-67` |
 | TU-D10 | Heartbeats per UDP session (none for TCP-only) and server-sent heartbeats the reference client logs as bad commands. | `tuic/udp.rs:303-319`; `tuic/server.rs:195-218` |
 | AT-A3/A4 | **Fixed in #85.** Unknown AnyTLS command kills the session (reference skips); range draw off by one. | `anytls_types.rs:55,167-174`; `anytls_padding.rs:133` |
@@ -186,7 +186,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | ST-S4/S5 | Local handshake mode drops unauthenticated clients with RST; no relay when the handshake server negotiates TLS 1.2. | `shadow_tls_server_handler.rs` |
 | TR-7/10/11/12 | **TR-7 and TR-11 fixed in #58; TR-12 fixed in #86; TR-10 open.** WS ping >80 B or any pong payload kills the connection (RFC: ≤125, pongs may carry data), close frame ignored; TLS sniff rejects record versions 0x0300/0x0302; `write_location_to_vec` truncates >255-byte hostnames; SOCKS UDP BND.ADDR from the listener bind IP (0.0.0.0 on wildcard). | `websocket_stream.rs:291-296,324-329,339`; `sniff/tls.rs:78-82`; `socks_handler.rs:758,385` |
 | WG-A3/A4 | **Fixed in #88.** `jc` accepts 129–255 (kernel: ≤128), `validate_for_mtu` not invoked; decoy/initiation ordering race between the timer task and encapsulate. | `amneziawg/config.rs:99-104`; `tunnel.rs:843-864` |
-| DN-D1/D2/D3 | DNS 0x20 case randomisation off; DoH/DoT bootstrap resolved once at build; system-resolver cache 1 h fixed. | `dns/builder.rs:663`; `resolver.rs:366` |
+| DN-D1/D2/D3 | **Fixed in #89.** DNS 0x20 case randomisation off; DoH/DoT bootstrap resolved once at build; system-resolver cache 1 h fixed. | `dns/builder.rs:663`; `resolver.rs:366` |
 | FI-1 | Fake IP intercepts UDP/53 only; a TCP-fallback resolver escapes. | `udp_manager.rs:133` |
 
 ### Architecture and code quality (A, Q)

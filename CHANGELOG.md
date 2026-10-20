@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+Performance fidelity and DNS (plan PR 5.1; HY-D5, TL-1, DN-D1 to DN-D3):
+
+- **Hysteria2's BBR starts at upstream's 32-packet window**, not quinn's
+  200. The first flight of a connection is no longer a burst no reference
+  sends.
+- **TLS-over-TCP servers refuse 0-RTT.** No handler read early data, so a
+  resuming client's 0-RTT bytes were accepted and lost. QUIC servers still
+  take it, since quinn reads it, so TUIC's `zero_rtt_handshake` is unchanged.
+- **DNS queries over UDP randomise the name's case** (DNS 0x20), and an
+  answer that does not echo it is dropped, which an off-path spoofer cannot
+  do without guessing the case.
+- **A busy DoH or DoT resolver is rebuilt every 10 minutes**, re-resolving
+  its server's name through the bootstrap. Only idleness rebuilt it before,
+  so a resolver in constant use kept the address it started with.
+- **Cached system-resolver answers last 5 minutes**, not an hour.
+
 AmneziaWG client parity (plan PR 3.7, AmneziaWG half; WG-A2 to WG-A4):
 
 - **Handshake retransmits carry the reference's 0-334 ms jitter.** awgtun

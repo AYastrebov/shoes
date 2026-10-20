@@ -73,12 +73,14 @@ pub fn quic_server_config(
     cert: &TestCertificate,
     alpn: &[String],
 ) -> Arc<quinn::crypto::rustls::QuicServerConfig> {
-    let server_config = Arc::new(create_server_config(
-        cert.cert_pem.as_bytes(),
-        cert.key_pem.as_bytes(),
-        vec![],
-        alpn,
-        &[],
+    let server_config = Arc::new(crate::rustls_config_util::allow_quic_early_data(
+        create_server_config(
+            cert.cert_pem.as_bytes(),
+            cert.key_pem.as_bytes(),
+            vec![],
+            alpn,
+            &[],
+        ),
     ));
     let quic: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()

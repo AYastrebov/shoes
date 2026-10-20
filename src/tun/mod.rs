@@ -1049,7 +1049,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|n| n == "tun-dns-upstream-test.internal"),
+                // DNS 0x20 randomises the case on the wire.
+                .any(|n| n.eq_ignore_ascii_case("tun-dns-upstream-test.internal")),
             "the configured upstream never saw the query; seen: {:?}",
             names.lock().unwrap()
         );
