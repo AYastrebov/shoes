@@ -38,6 +38,7 @@
     reason = "predates the lint; see the [lints] note in Cargo.toml"
 )]
 
+mod dns_tcp;
 mod stack_common;
 mod tcp_conn;
 #[cfg(unix)]
@@ -344,6 +345,7 @@ pub async fn run_tun_server(
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
         let fake_ip_pool = fake_ip.as_ref().map(|responder| responder.pool().clone());
+        let fake_ip_responder = fake_ip.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting TCP connection handler");
@@ -352,10 +354,31 @@ pub async fn run_tun_server(
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
                 let fake_ip_pool = fake_ip_pool.clone();
+                let fake_ip_responder = fake_ip_responder.clone();
                 let sniff = sniff.clone();
 
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
+
+                    // DNS over TCP gets the fake-IP answers the UDP path
+                    // gives (FI-1), matched on the port as there.
+                    if let Some(responder) = fake_ip_responder
+                        && remote_addr.port() == fake_ip::DNS_PORT
+                    {
+                        if let Err(e) = dns_tcp::handle_dns_over_tcp(
+                            new_conn.connection,
+                            NetLocation::from(remote_addr),
+                            responder,
+                            proxy_selector,
+                            resolver,
+                        )
+                        .await
+                        {
+                            debug!("DNS over TCP to {remote_addr} failed: {e}");
+                        }
+                        return;
+                    }
+
                     // Restore before routing, so hostname rules see the domain.
                     let target =
                         fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
