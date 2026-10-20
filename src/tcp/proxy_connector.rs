@@ -55,6 +55,15 @@ pub trait ProxyConnector: Send + Sync + Debug {
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
+    /// A stream on a session this hop already holds, or `None` when it needs
+    /// a transport. See `TcpClientHandler::try_reuse_tcp_stream`.
+    async fn try_reuse_tcp_stream(
+        &self,
+        _target: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        None
+    }
+
     /// Setup bidirectional UDP-over-TCP on existing stream.
     ///
     /// # Arguments

@@ -9,3 +9,6 @@ pub mod tcp_handler;
 pub mod tcp_server;
 pub mod tcp_server_handler_factory;
 pub mod terminal_connector;
+
+#[cfg(test)]
+mod session_reuse_tests;

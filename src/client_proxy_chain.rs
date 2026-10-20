@@ -422,33 +422,23 @@ impl ClientProxyChain {
                     .map(|(p, _)| p.proxy_location().into())
                     .unwrap_or_else(|| remote_location.clone());
 
-                let mut result = match entry {
-                    InitialHopEntry::Direct(socket) => {
-                        debug!(
-                            "Initial hop: Direct -> {}",
-                            first_subsequent_target.location()
-                        );
-                        let stream = socket.connect(resolver, &first_subsequent_target).await?;
-                        TcpClientSetupResult {
-                            client_stream: stream,
-                            early_data: None,
-                        }
-                    }
-                    InitialHopEntry::Proxy { socket, proxy } => {
-                        debug!(
-                            "Initial hop: Proxy {} -> {}",
-                            proxy.proxy_location(),
-                            first_subsequent_target.location()
-                        );
-                        let proxy_loc = proxy.proxy_location().into();
-                        let stream = socket.connect(resolver, &proxy_loc).await?;
-                        proxy
-                            .setup_tcp_stream(stream, &first_subsequent_target)
-                            .await?
-                    }
+                // A hop that holds a live session -- NaiveProxy's H2
+                // connection, say -- carries every hop below it already, so
+                // the chain asks, from the exit backwards, before it dials.
+                // The hops after the one that answers still run, on top of
+                // the stream it returned.
+                let reused =
+                    reuse_session(entry, &selected, &first_subsequent_target, &remote_location)
+                        .await;
+                let (mut result, first_hop_to_run) = match reused {
+                    Some((result, next)) => (result?, next),
+                    None => (
+                        dial_initial_hop(entry, resolver, &first_subsequent_target).await?,
+                        0,
+                    ),
                 };
 
-                for (i, (proxy, _)) in selected.iter().enumerate() {
+                for (i, (proxy, _)) in selected.iter().enumerate().skip(first_hop_to_run) {
                     let target: ResolvedLocation = selected
                         .get(i + 1)
                         .map(|(p, _)| p.proxy_location().into())
@@ -743,6 +733,69 @@ fn select_subsequent<'a>(
             }
         })
         .collect()
+}
+
+/// Dial the chain's first hop: a socket to the next location, or a socket
+/// to the first proxy with its protocol on top.
+async fn dial_initial_hop(
+    entry: &InitialHopEntry,
+    resolver: &Arc<dyn Resolver>,
+    first_subsequent_target: &ResolvedLocation,
+) -> std::io::Result<TcpClientSetupResult> {
+    match entry {
+        InitialHopEntry::Direct(socket) => {
+            debug!(
+                "Initial hop: Direct -> {}",
+                first_subsequent_target.location()
+            );
+            let stream = socket.connect(resolver, first_subsequent_target).await?;
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+        InitialHopEntry::Proxy { socket, proxy } => {
+            debug!(
+                "Initial hop: Proxy {} -> {}",
+                proxy.proxy_location(),
+                first_subsequent_target.location()
+            );
+            let proxy_loc = proxy.proxy_location().into();
+            let stream = socket.connect(resolver, &proxy_loc).await?;
+            proxy
+                .setup_tcp_stream(stream, first_subsequent_target)
+                .await
+        }
+    }
+}
+
+/// Ask the selected hops, from the exit backwards, for a stream on a session
+/// they already hold. The first that has one carries every hop below it, so
+/// the answer is that stream and the index of the first subsequent hop that
+/// still has to run on it; `None` means nothing is live and the chain dials.
+async fn reuse_session(
+    entry: &InitialHopEntry,
+    selected: &[(&dyn ProxyConnector, usize)],
+    first_subsequent_target: &ResolvedLocation,
+    remote_location: &ResolvedLocation,
+) -> Option<(std::io::Result<TcpClientSetupResult>, usize)> {
+    for (i, (proxy, _)) in selected.iter().enumerate().rev() {
+        let target: ResolvedLocation = selected
+            .get(i + 1)
+            .map(|(p, _)| p.proxy_location().into())
+            .unwrap_or_else(|| remote_location.clone());
+        if let Some(result) = proxy.try_reuse_tcp_stream(&target).await {
+            debug!("Chain TCP: reusing a session at hop {}", i + 1);
+            return Some((result, i + 1));
+        }
+    }
+    if let InitialHopEntry::Proxy { proxy, .. } = entry
+        && let Some(result) = proxy.try_reuse_tcp_stream(first_subsequent_target).await
+    {
+        debug!("Chain TCP: reusing a session at the initial hop");
+        return Some((result, 0));
+    }
+    None
 }
 
 /// A group of proxy chains for round-robin selection.

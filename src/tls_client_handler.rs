@@ -94,6 +94,21 @@ impl TcpClientHandler for TlsClientHandler {
         }
     }
 
+    /// A session the inner protocol holds already rides on a TLS connection
+    /// this handler made, so the question goes inward: if it has one, no new
+    /// TLS handshake happens either.
+    async fn try_reuse_tcp_stream(
+        &self,
+        remote_location: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => {
+                handler.try_reuse_tcp_stream(remote_location).await
+            }
+            TlsInnerClientHandler::VisionVless { .. } => None,
+        }
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),

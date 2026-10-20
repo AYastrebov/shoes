@@ -106,6 +106,22 @@ pub trait TcpClientHandler: Send + Sync + Debug {
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
+    /// A stream opened on a session this handler already holds, without a
+    /// new transport under it -- `None` when the caller has to dial one.
+    ///
+    /// For multiplexing protocols (NaiveProxy's H2 session, AnyTLS) the
+    /// chain asks this before it dials, so a live session means no new TCP
+    /// connection and no new TLS handshake. A session that turns out to be
+    /// dead answers `None`, and the caller dials as usual. A wrapper whose
+    /// transport the session rides on (TLS) forwards the question inward.
+    /// See `docs/specs/2026-10-19-session-reuse-without-dialling.md`.
+    async fn try_reuse_tcp_stream(
+        &self,
+        _remote_location: &ResolvedLocation,
+    ) -> Option<std::io::Result<TcpClientSetupResult>> {
+        None
+    }
+
     /// Returns true if this handler supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool {
         false
