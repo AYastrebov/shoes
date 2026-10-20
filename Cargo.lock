@@ -153,8 +153,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awgtun"
-version = "0.10.0"
-source = "git+https://github.com/AYastrebov/awgtun?rev=7a78f45ac37d3d66173daf3c1b6d2567b9abebf9#7a78f45ac37d3d66173daf3c1b6d2567b9abebf9"
+version = "0.11.0"
+source = "git+https://github.com/AYastrebov/awgtun?rev=42a7e9f5d2ae2778f486324321dc6f93f0684f46#42a7e9f5d2ae2778f486324321dc6f93f0684f46"
 dependencies = [
  "aead",
  "base64",

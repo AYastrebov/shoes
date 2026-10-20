@@ -135,20 +135,22 @@ pub struct AmneziaWgClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmneziaWgParams {
+    // `jc` and `s1`-`s4` are 16-bit, as amneziawg-go, the kernel module and
+    // amneziawg-tools parse them: servers issue `s2` above 255.
     #[serde(default)]
-    pub jc: u8,
+    pub jc: u16,
     #[serde(default)]
     pub jmin: u16,
     #[serde(default)]
     pub jmax: u16,
     #[serde(default)]
-    pub s1: u8,
+    pub s1: u16,
     #[serde(default)]
-    pub s2: u8,
+    pub s2: u16,
     #[serde(default)]
-    pub s3: u8,
+    pub s3: u16,
     #[serde(default)]
-    pub s4: u8,
+    pub s4: u16,
     /// Message-type header ranges. Omit all four for the standard WireGuard
     /// values (1, 2, 3, 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
