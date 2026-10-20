@@ -69,6 +69,17 @@ impl LengthMask {
 
         (padding, self.next_u16())
     }
+
+    /// The next padding length, without taking it.
+    fn peek_padding(&self) -> usize {
+        if !self.enable_padding {
+            return 0;
+        }
+        let mut reader = self.reader.clone();
+        let mut bytes = [0u8; 2];
+        reader.read(&mut bytes);
+        (u16::from_be_bytes(bytes) % (MAX_PADDING_LEN as u16)) as usize
+    }
 }
 
 enum ShutdownState {
@@ -1062,17 +1073,28 @@ impl AsyncWriteMessage for VmessStream {
                 }
             }
         }
+        // The length field is 16 bits and counts the tag and the padding,
+        // which the peer derives from its own shake stream, so a message that
+        // does not fit with this frame's padding is refused before that
+        // padding is taken: the masks stay in step for the next message.
+        let next_padding = this
+            .write_length_mask
+            .as_ref()
+            .map_or(0, LengthMask::peek_padding);
+        let body_len = buf.len() + this.tag_len + next_padding;
+        if body_len > u16::MAX as usize || 2 + body_len > this.write_packet.len() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a {}-byte message does not fit a VMess frame with {next_padding} bytes of padding",
+                    buf.len()
+                ),
+            )));
+        }
         let (padding_len, length_mask) = match this.write_length_mask {
             Some(ref mut mask) => mask.next_values(),
             None => (0, 0),
         };
-
-        let metadata_size = 2 + padding_len + this.tag_len;
-
-        let available_space = this.write_packet.len() - metadata_size;
-        if available_space < buf.len() {
-            return Poll::Ready(Err(std::io::Error::other("write payload is too large")));
-        }
 
         let write_packet_size = buf.len() + padding_len + this.tag_len;
         let write_packet_size = (write_packet_size as u16) ^ length_mask;
@@ -1425,6 +1447,52 @@ mod tests {
             let mut storage = vec![0u8; 65535];
             let mut buf = ReadBuf::new(&mut storage);
             // A desynced reader waits for bytes that never come.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                poll_fn(|cx| Pin::new(&mut reader).poll_read_message(cx, &mut buf)),
+            )
+            .await
+            .expect("the reader lost the chunk boundary")
+            .unwrap();
+            assert_eq!(buf.filled(), &message[..]);
+        }
+    }
+
+    /// A message too large for the 16-bit length once this frame's padding
+    /// is added is refused, instead of wrapping the length to a tiny value,
+    /// and the refusal leaves the masks in step: the largest message that
+    /// fits, and a small one after it, still arrive.
+    #[tokio::test]
+    async fn a_message_over_the_length_field_is_refused_in_step() {
+        use crate::async_stream::testing::TestStream;
+        use std::future::poll_fn;
+
+        let padding = LengthMask::new(create_shake128_reader(&[0x11u8; 16]), true).peek_padding();
+        let largest = u16::MAX as usize - ENCRYPTION_TAG_LEN - padding;
+
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let mut writer = padded_udp_stream(Box::new(TestStream(near)));
+        let mut reader = padded_udp_stream(Box::new(TestStream(far)));
+
+        let too_large = vec![7u8; largest + 1];
+        let refused = poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, &too_large)).await;
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let messages = [vec![8u8; largest], vec![9u8; 100]];
+        for message in &messages {
+            poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, message))
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut writer).poll_flush_message(cx))
+                .await
+                .unwrap();
+        }
+        for message in &messages {
+            let mut storage = vec![0u8; 65535];
+            let mut buf = ReadBuf::new(&mut storage);
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 poll_fn(|cx| Pin::new(&mut reader).poll_read_message(cx, &mut buf)),
