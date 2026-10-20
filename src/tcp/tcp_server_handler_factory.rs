@@ -618,9 +618,24 @@ fn create_websocket_server_target(
         matching_path,
         matching_headers,
         ping_type,
+        max_early_data,
+        early_data_header_name,
         protocol,
         override_rules,
     } = websocket_server_config;
+
+    // As sing-box's server: a named header is read whatever the maximum;
+    // the path is read only with a maximum set.
+    let early_data = match early_data_header_name {
+        Some(name) => Some(crate::websocket::EarlyData {
+            max: max_early_data,
+            header_name: Some(name.to_ascii_lowercase()),
+        }),
+        None => (max_early_data > 0).then_some(crate::websocket::EarlyData {
+            max: max_early_data,
+            header_name: None,
+        }),
+    };
 
     let matching_headers = matching_headers.map(|h| {
         h.into_iter()
@@ -647,6 +662,7 @@ fn create_websocket_server_target(
         matching_path,
         matching_headers,
         ping_type,
+        early_data,
         handler,
     }
 }

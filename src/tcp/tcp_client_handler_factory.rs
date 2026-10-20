@@ -367,16 +367,23 @@ pub fn create_tcp_client_handler(
                 matching_path,
                 matching_headers,
                 ping_type,
+                max_early_data,
+                early_data_header_name,
                 protocol,
             } = websocket_client_config;
 
             let handler = create_tcp_client_handler(*protocol, None, hop, resolver.clone());
+            let early_data = (max_early_data > 0).then_some(crate::websocket::EarlyData {
+                max: max_early_data,
+                header_name: early_data_header_name,
+            });
 
             Box::new(WebsocketTcpClientHandler::new(
                 hop.dialled_address.clone(),
                 matching_path,
                 matching_headers.map(|h| h.into_iter().collect()),
                 ping_type,
+                early_data,
                 handler,
             ))
         }

@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use crate::async_stream::AsyncStream;
 use crate::stream_reader::StreamReader;
 
+/// The longest request, status or header line accepted, exclusive.
+pub const MAX_LINE_LEN: usize = 4096;
+
 /// An HTTP/1.x start line plus its header block, read off a stream.
 ///
 /// Header names are lowercased; values are trimmed. The `StreamReader` is
@@ -29,7 +32,7 @@ impl ParsedHttpData {
                 break;
             }
 
-            if line.len() >= 4096 {
+            if line.len() >= MAX_LINE_LEN {
                 return Err(std::io::Error::other("http request line is too long"));
             }
 

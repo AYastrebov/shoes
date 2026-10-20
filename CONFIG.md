@@ -246,8 +246,17 @@ protocol:
         X-Custom-Header: "value"
       protocol: ServerProxyConfig
       ping_type: ping-frame    # disabled | ping-frame | empty-frame
+      max_early_data: 0        # Non-zero: accept early data in the path
+      early_data_header_name: string?  # Accept early data in this header
       override_rules: [RuleConfig]
 ```
+
+Early data is a client's first bytes, base64url-encoded in the upgrade
+request (sing-box's `max_early_data` and `early_data_header_name`). With
+`max_early_data` set and no header name, `matching_path` (default `/`) is a
+prefix and the rest of the path is the data. With a header name, the data is
+read from that header; for `Sec-WebSocket-Protocol`, which Xray uses, the
+response echoes the header.
 
 ### HTTPUpgrade
 ```yaml
@@ -833,8 +842,17 @@ protocol:
   matching_headers:
     header_name: string
   ping_type: ping-frame        # disabled | ping-frame | empty-frame
+  max_early_data: 0            # Send up to this many bytes of the first write in the request
+  early_data_header_name: string?  # Header for early data; unset, it goes in the path
   protocol: ClientProxyConfig
 ```
+
+With `max_early_data` set, the upgrade request waits for the first write and
+carries up to that many of its bytes, as sing-box's client does; the rest
+follow as WebSocket frames. The request carries no more than fits one HTTP
+line under shoes's 4096-byte limit (about 3000 bytes), so a shoes server
+can read it. Match the server's settings: sing-box defaults to
+the path, and Xray needs `early_data_header_name: Sec-WebSocket-Protocol`.
 
 The request always carries a `Host` header: a `Host` entry in
 `matching_headers` if there is one, otherwise the proxy's address as dialled

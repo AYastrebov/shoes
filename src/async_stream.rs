@@ -244,6 +244,14 @@ pub trait SocketPassthrough {
     fn original_destination(&self) -> Option<SocketAddr> {
         None
     }
+
+    /// The socket's own address, for a handler that has to tell the client
+    /// where it is (SOCKS5's UDP ASSOCIATE reply, when the listener is bound
+    /// to a wildcard). Forwarded like `original_destination` by the accept
+    /// path's wrappers; anything else answers `None`.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 pub trait AsyncStream:
@@ -312,6 +320,10 @@ impl AsyncPing for TcpStream {
 }
 
 impl SocketPassthrough for TcpStream {
+    fn local_addr(&self) -> Option<SocketAddr> {
+        TcpStream::local_addr(self).ok()
+    }
+
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
         Some(PlainTcp {
             socket: self,
@@ -418,6 +430,10 @@ impl<S: AsyncPing + Unpin> AsyncPing for PermitStream<S> {
 impl<S: AsyncStream> SocketPassthrough for PermitStream<S> {
     fn original_destination(&self) -> Option<SocketAddr> {
         self.inner.original_destination()
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.inner.local_addr()
     }
 
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
@@ -647,6 +663,10 @@ impl<T: ?Sized + AsyncStream + Unpin> SocketPassthrough for Box<T> {
         (**self).original_destination()
     }
 
+    fn local_addr(&self) -> Option<SocketAddr> {
+        (**self).local_addr()
+    }
+
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {
         (**self).plain_tcp()
     }
@@ -656,6 +676,10 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {}
 impl<T: ?Sized + AsyncStream + Unpin> SocketPassthrough for &mut T {
     fn original_destination(&self) -> Option<SocketAddr> {
         (**self).original_destination()
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        (**self).local_addr()
     }
 
     fn plain_tcp(&self) -> Option<PlainTcp<'_>> {

@@ -944,6 +944,14 @@ pub struct WebsocketClientConfig {
     pub matching_headers: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "WebsocketPingType::is_default")]
     pub ping_type: WebsocketPingType,
+    /// Up to this many bytes of the first write ride in the upgrade request
+    /// (sing-box's `max_early_data`); 0 turns early data off.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub max_early_data: usize,
+    /// The header carrying early data; unset, it is appended to the path.
+    /// Xray servers need `Sec-WebSocket-Protocol`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_data_header_name: Option<String>,
     pub protocol: Box<ClientProxyConfig>,
 }
 
@@ -1324,6 +1332,6 @@ mod named_outbound_tests {
     }
 }
 
-fn is_zero_usize(value: &usize) -> bool {
+pub(super) fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }

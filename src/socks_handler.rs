@@ -403,9 +403,26 @@ async fn handle_udp_associate(
         .map(|addr| addr.ip())
         .filter(|ip| !ip.is_unspecified());
 
+    // TR-12: on a wildcard listener, bind the relay to the address this
+    // connection arrived on, and so name it in BND.ADDR. 0.0.0.0 tells the
+    // client nothing, and a wildcard socket on a multi-homed host may answer
+    // from an address the client never sent to. A stream that cannot say
+    // (SOCKS inside TLS) keeps the wildcard.
+    // An IPv6 link-local address keeps its interface scope, without which
+    // the bind fails; an IPv4-mapped one becomes plain IPv4.
+    let udp_bind_addr = match server_stream.local_addr() {
+        Some(local) if bind_ip.is_unspecified() => match local {
+            SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
+                SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), 0, 0, v6.scope_id()))
+            }
+            local => SocketAddr::new(local.ip().to_canonical(), 0),
+        },
+        _ => SocketAddr::new(bind_ip, 0),
+    };
+    let bind_ip = udp_bind_addr.ip();
+
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-    let udp_bind_addr = SocketAddr::new(bind_ip, 0);
     let udp_socket: std::net::UdpSocket =
         match crate::socket_util::new_socket2_udp_socket_with_buffer_size(
             bind_ip.is_ipv6(),
@@ -864,6 +881,56 @@ mod tests {
             .unwrap_or(0);
         written.truncate(n);
         (written, result)
+    }
+
+    /// TR-12: a wildcard listener answers UDP ASSOCIATE with the address the
+    /// connection arrived on, never 0.0.0.0.
+    #[tokio::test]
+    async fn udp_associate_on_a_wildcard_names_the_connections_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        client
+            .write_all(&[
+                0x05,
+                0x01,
+                METHOD_NONE,
+                0x05,
+                CMD_UDP_ASSOCIATE,
+                0x00,
+                0x01,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .await
+            .unwrap();
+        let resolver = test_resolver();
+        let selector = direct_selector(resolver.clone());
+        let result = setup_socks_server_stream_inner(
+            None,
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            &selector,
+            &resolver,
+            Box::new(accepted),
+            StreamReader::new(),
+        )
+        .await;
+        assert!(matches!(result, Ok(TcpServerSetupResult::AlreadyHandled)));
+        let mut reply = [0u8; 12];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[..2], [0x05, METHOD_NONE]);
+        assert_eq!(
+            reply[2..6],
+            [VER_SOCKS5, REPLY_SUCCESS, 0x00, ADDR_TYPE_IPV4]
+        );
+        assert_eq!(reply[6..10], [127, 0, 0, 1], "BND.ADDR");
+        assert_ne!(u16::from_be_bytes([reply[10], reply[11]]), 0, "BND.PORT");
     }
 
     /// RFC 1928 section 3: no acceptable method is answered X'FF'.
