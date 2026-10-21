@@ -164,25 +164,20 @@ mod tests {
         assert!(Salamander::new(b"abcd").is_ok());
     }
 
-    /// A fixed vector so a refactor cannot silently change the transform.
-    /// The key is derived from the PSK and the salt only, so a known salt
-    /// pins the whole output.
+    /// Packets as Hysteria's own obfuscator puts them on the wire, random
+    /// salt and all (`tests/data/kat/salamander`), deobfuscate here to what
+    /// it was given. The test this replaces built its expectation with
+    /// `derive_key` itself, so a wrong key would have passed it.
     #[test]
-    fn test_known_vector() {
-        let obfs = Salamander::new(b"hysteria").unwrap();
-        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let key = obfs.derive_key(&salt);
-
-        // Deobfuscating a packet we build by hand must reproduce the payload.
-        let payload = b"hello";
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&salt);
-        for (i, byte) in payload.iter().enumerate() {
-            wire.push(byte ^ key[i % 32]);
+    fn reference_obfuscated_packets_deobfuscate() {
+        use crate::kat::{cases, hex, text, vectors};
+        let vectors = vectors("salamander");
+        let obfs = Salamander::new(text(&vectors["psk"]).as_bytes()).unwrap();
+        for case in cases(&vectors, "packets") {
+            let mut wire = hex(&case["wire"]);
+            let read = obfs.deobfuscate_in_place(&mut wire).unwrap();
+            assert_eq!(wire[..read], hex(&case["payload"]));
         }
-
-        let read = obfs.deobfuscate_in_place(&mut wire).unwrap();
-        assert_eq!(&wire[..read], payload);
     }
 
     /// The block-wise XOR against the definition, byte `i` with

@@ -494,3 +494,36 @@ mod tests {
         assert_eq!(round_trip("aes-128-gcm", &payload).await.unwrap(), payload);
     }
 }
+
+/// Against open-snell (`tests/data/kat/snell`): the reference keeps its
+/// Argon2id key to itself, so the vector is a chunk it sealed, and the key
+/// derived here must seal the same chunk to the same bytes.
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{cases, hex, text, vectors};
+    use aws_lc_rs::aead::{AES_128_GCM, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+
+    #[test]
+    fn the_session_key_matches_the_reference() {
+        let vectors = vectors("snell");
+        for case in cases(&vectors, "sealed") {
+            let (algorithm, key_len) = match text(&case["cipher"]) {
+                "aes-128-gcm" => (&AES_128_GCM, 16),
+                "chacha20-ietf-poly1305" => (&CHACHA20_POLY1305, 32),
+                other => panic!("no cipher {other}"),
+            };
+            let key =
+                SnellKey::new(text(&case["psk"]), key_len).create_session_key(&hex(&case["salt"]));
+            let mut sealed = hex(&case["plaintext"]);
+            LessSafeKey::new(UnboundKey::new(algorithm, &key).unwrap())
+                .seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key([0u8; 12]),
+                    Aad::empty(),
+                    &mut sealed,
+                )
+                .unwrap();
+            assert_eq!(sealed, hex(&case["ciphertext"]), "{}", case["cipher"]);
+        }
+    }
+}

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Known-answer vectors (plan PR 4.1, part 1):
+
+- Shadowsocks EVP_BytesToKey, its HKDF-SHA1 "ss-subkey" and the 2022 blake3
+  subkey, Snell's Argon2id key, VMess's command key, KDF, crc32 and AuthID,
+  the salamander key and mieru's PBKDF2 key are now checked against bytes the
+  reference implementations computed (`tests/data/kat/`), not only against
+  shoes' own other half. All of them already matched.
+
 Fake IP over TCP (plan PR 5.3; FI-1):
 
 - **DNS over TCP to port 53 gets fake-IP answers too.** Only UDP/53 was

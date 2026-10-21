@@ -93,6 +93,57 @@ impl AuthIdReplayFilter {
 /// Saturating because a clock still sitting near the epoch - a device with no
 /// RTC that has not synchronised yet - would otherwise wrap the subtraction
 /// into a timestamp far in the future.
+/// The command key: MD5 of the user id and VMess's fixed suffix.
+fn instruction_key(user_id: &[u8; 16]) -> [u8; 16] {
+    let mut user_id_bytes = user_id.to_vec();
+    user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+    compute_md5(&user_id_bytes)
+}
+
+/// The AuthID a client opens with: the timestamp, four random bytes and the
+/// CRC32 of both, under AES-128-ECB keyed from the command key.
+fn seal_auth_id(
+    key: &CipherEncryptingKey,
+    time_secs: u64,
+    random: [u8; 4],
+) -> std::io::Result<[u8; 16]> {
+    let mut auth_id = [0u8; 16];
+    auth_id[0..8].copy_from_slice(&time_secs.to_be_bytes());
+    auth_id[8..12].copy_from_slice(&random);
+    let checksum = super::crc32::crc32_ieee(&auth_id[0..12]);
+    auth_id[12..16].copy_from_slice(&checksum.to_be_bytes());
+    key.less_safe_encrypt(&mut auth_id, EncryptionContext::None)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AEAD auth ID encryption failed",
+            )
+        })?;
+    Ok(auth_id)
+}
+
+/// The timestamp in an AuthID whose checksum holds. Whether it is recent, or
+/// seen before, is the caller's to judge.
+fn open_auth_id(key: &CipherDecryptingKey, sealed: &[u8; 16]) -> std::io::Result<u64> {
+    let mut auth_id = *sealed;
+    key.decrypt(&mut auth_id, DecryptionContext::None)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AEAD auth ID decryption failed",
+            )
+        })?;
+    let checksum = super::crc32::crc32_ieee(&auth_id[0..12]);
+    let expected_checksum = u32::from_be_bytes(auth_id[12..16].try_into().unwrap());
+    if checksum != expected_checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "AEAD authentication failed: checksum mismatch",
+        ));
+    }
+    Ok(u64::from_be_bytes(auth_id[0..8].try_into().unwrap()))
+}
+
 fn random_auth_id_timestamp() -> std::io::Result<u64> {
     let delta: u64 = rand::rng().random_range(0..=(AUTH_ID_TIME_WINDOW_SECS * 2));
     Ok(unix_time_secs()?.saturating_sub(AUTH_ID_TIME_WINDOW_SECS) + delta)
@@ -170,9 +221,7 @@ impl VmessTcpServerHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let mut user_id_bytes = user_id.to_vec();
-        user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
+        let instruction_key = instruction_key(user_id);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
         let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
@@ -203,30 +252,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .read_slice_into(&mut server_stream, &mut cert_hash)
             .await?;
 
-        // we need to copy it over because if this is an aead request, we need the original
-        // bytes for decrypting the header.
-        let mut aead_bytes = [0u8; 16];
-        aead_bytes.copy_from_slice(&cert_hash);
-
-        self.aead_decrypting_key
-            .decrypt(&mut aead_bytes, DecryptionContext::None)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "AEAD auth ID decryption failed",
-                )
-            })?;
-        let checksum = super::crc32::crc32_ieee(&aead_bytes[0..12]);
-        let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
-
-        if checksum != expected_checksum {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "AEAD authentication failed: checksum mismatch",
-            ));
-        }
-
-        let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
+        let time_secs = open_auth_id(&self.aead_decrypting_key, &cert_hash)?;
         let current_time_secs = unix_time_secs()?;
         let time_delta = time_secs.abs_diff(current_time_secs);
         if time_delta > AUTH_ID_TIME_WINDOW_SECS {
@@ -822,9 +848,7 @@ impl std::fmt::Debug for VmessTcpClientHandler {
 
 impl VmessTcpClientHandler {
     pub fn new(cipher_name: &str, user_id: &[u8; 16], udp_enabled: bool) -> Self {
-        let mut user_id_bytes = user_id.to_vec();
-        user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
+        let instruction_key = instruction_key(user_id);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
         let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
@@ -848,26 +872,9 @@ impl TcpClientHandler for VmessTcpClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         let time_secs = random_auth_id_timestamp()?;
 
-        let mut aead_bytes = [0u8; 16];
-        let time_bytes = time_secs.to_be_bytes();
-        aead_bytes[0..8].copy_from_slice(&time_bytes);
-
-        rand::rng().fill_bytes(&mut aead_bytes[8..12]);
-
-        let checksum_value = super::crc32::crc32_ieee(&aead_bytes[0..12]);
-        let checksum = checksum_value.to_be_bytes();
-        aead_bytes[12..16].copy_from_slice(&checksum);
-
-        self.aead_encrypting_key
-            .less_safe_encrypt(&mut aead_bytes, EncryptionContext::None)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "AEAD auth ID encryption failed",
-                )
-            })?;
-
-        let cert_hash = aead_bytes;
+        let mut random = [0u8; 4];
+        rand::rng().fill_bytes(&mut random);
+        let cert_hash = seal_auth_id(&self.aead_encrypting_key, time_secs, random)?;
 
         // max length of encrypted header:
         // 41 (instructions up to addr type) + 256 (max domain name length 255 + 1 length byte) +
@@ -1128,26 +1135,9 @@ impl VmessTcpClientHandler {
 
         let time_secs = random_auth_id_timestamp()?;
 
-        let mut aead_bytes = [0u8; 16];
-        let time_bytes = time_secs.to_be_bytes();
-        aead_bytes[0..8].copy_from_slice(&time_bytes);
-
-        rand::rng().fill_bytes(&mut aead_bytes[8..12]);
-
-        let checksum_value = super::crc32::crc32_ieee(&aead_bytes[0..12]);
-        let checksum = checksum_value.to_be_bytes();
-        aead_bytes[12..16].copy_from_slice(&checksum);
-
-        self.aead_encrypting_key
-            .less_safe_encrypt(&mut aead_bytes, EncryptionContext::None)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "AEAD auth ID encryption failed",
-                )
-            })?;
-
-        let cert_hash = aead_bytes;
+        let mut random = [0u8; 4];
+        rand::rng().fill_bytes(&mut random);
+        let cert_hash = seal_auth_id(&self.aead_encrypting_key, time_secs, random)?;
 
         // max length of encrypted header (same as TCP):
         // 41 (instructions up to addr type) + 256 (max domain name length) +
@@ -1698,5 +1688,89 @@ mod tests {
     fn test_a_zero_length_read_always_succeeds() {
         let mut cursor = HeaderCursor::new(Vec::new().into_boxed_slice());
         cursor.read_slice_into(&mut []).unwrap();
+    }
+}
+
+/// Against sing-vmess (`tests/data/kat/vmess`).
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{cases, hex, number, text, vectors};
+
+    fn user_id(vectors: &serde_json::Value) -> [u8; 16] {
+        crate::uuid_util::parse_uuid(text(&vectors["user_id"]))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_command_key_matches_the_reference() {
+        let vectors = vectors("vmess");
+        assert_eq!(
+            instruction_key(&user_id(&vectors)).to_vec(),
+            hex(&vectors["cmd_key"])
+        );
+    }
+
+    #[test]
+    fn the_kdf_matches_the_reference_on_every_path() {
+        let vectors = vectors("vmess");
+        for case in cases(&vectors, "kdf") {
+            let path: Vec<Vec<u8>> = case["path"].as_array().unwrap().iter().map(hex).collect();
+            let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
+            assert_eq!(
+                super::super::sha2::kdf(&hex(&case["key"]), &path).to_vec(),
+                hex(&case["output"]),
+                "path {:?}",
+                case["path"]
+            );
+        }
+    }
+
+    #[test]
+    fn crc32_matches_the_reference() {
+        let vectors = vectors("vmess");
+        for case in cases(&vectors, "crc32") {
+            assert_eq!(
+                super::super::crc32::crc32_ieee(&hex(&case["input"]))
+                    .to_be_bytes()
+                    .to_vec(),
+                hex(&case["crc32"]),
+            );
+        }
+    }
+
+    /// A reference-sealed AuthID opens to its timestamp, and the same
+    /// plaintext seals to the same bytes here.
+    #[test]
+    fn the_auth_id_matches_the_reference_both_ways() {
+        let vectors = vectors("vmess");
+        let auth_id = &vectors["auth_id"];
+        let key = super::super::sha2::kdf(
+            &instruction_key(&user_id(&vectors)),
+            &[b"AES Auth ID Encryption"],
+        );
+        let sealed: [u8; 16] = hex(&auth_id["sealed"]).try_into().unwrap();
+        let plaintext = hex(&auth_id["plaintext"]);
+
+        let decrypting =
+            CipherDecryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key[0..16]).unwrap())
+                .unwrap();
+        assert_eq!(
+            open_auth_id(&decrypting, &sealed).unwrap(),
+            number(&auth_id["timestamp"])
+        );
+
+        let encrypting =
+            CipherEncryptingKey::ecb(UnboundCipherKey::new(&AES_128, &key[0..16]).unwrap())
+                .unwrap();
+        let random: [u8; 4] = plaintext[8..12].try_into().unwrap();
+        assert_eq!(
+            seal_auth_id(&encrypting, number(&auth_id["timestamp"]), random)
+                .unwrap()
+                .to_vec(),
+            sealed.to_vec()
+        );
     }
 }

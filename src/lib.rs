@@ -113,6 +113,9 @@ mod vmess;
 mod websocket;
 mod xudp;
 
+#[cfg(test)]
+mod kat;
+
 /// Configuration types.
 pub mod config;
 

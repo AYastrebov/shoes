@@ -357,3 +357,30 @@ mod tests {
         assert_eq!(a, b);
     }
 }
+
+/// Against mieru (`tests/data/kat/mieru`): two messages of one direction,
+/// sealed by the reference under the key of the time it recorded.
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{cases, hex, number, text, vectors};
+
+    #[test]
+    fn reference_sealed_messages_open_with_the_derived_key() {
+        let vectors = vectors("mieru");
+        let password = text(&vectors["password"]).as_bytes();
+        let username = text(&vectors["username"]).as_bytes();
+        let key = derive_key(
+            password,
+            username,
+            round_to_interval(number(&vectors["unix_time"])),
+        );
+        let mut direction = DirectionCipher::new(&key, username);
+        for case in cases(&vectors, "messages") {
+            assert_eq!(
+                direction.open(&hex(&case["sealed"])).unwrap(),
+                hex(&case["plaintext"])
+            );
+        }
+    }
+}

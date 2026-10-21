@@ -66,3 +66,40 @@ fn get_key_bytes(key: &str, cipher_key_len: usize) -> Box<[u8]> {
     ret.truncate(cipher_key_len);
     ret.into_boxed_slice()
 }
+
+/// Against sing-shadowsocks (`tests/data/kat/shadowsocks`).
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{cases, hex, number, text, vectors};
+
+    #[test]
+    fn evp_bytes_to_key_matches_the_reference() {
+        let vectors = vectors("shadowsocks");
+        for case in cases(&vectors, "evp_bytes_to_key") {
+            let key_len = number(&case["key_len"]) as usize;
+            assert_eq!(
+                get_key_bytes(text(&case["password"]), key_len).to_vec(),
+                hex(&case["key"]),
+                "password {:?}, {key_len} bytes",
+                case["password"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_ss_subkey_matches_the_reference() {
+        let vectors = vectors("shadowsocks");
+        for case in cases(&vectors, "hkdf_sha1_subkey") {
+            let key_bytes = hex(&case["key"]).into_boxed_slice();
+            let key = DefaultKey {
+                key_len: key_bytes.len(),
+                key_bytes,
+            };
+            assert_eq!(
+                key.create_session_key(&hex(&case["salt"])).to_vec(),
+                hex(&case["subkey"])
+            );
+        }
+    }
+}

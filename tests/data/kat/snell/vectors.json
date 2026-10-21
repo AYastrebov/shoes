@@ -1,0 +1,19 @@
+{
+  "sealed": [
+    {
+      "cipher": "aes-128-gcm",
+      "ciphertext": "58f57eb45638ad34eaf0a38a021a9dcd6ecb2e89787e005eaa5b1e98bfcd8f26e0d2",
+      "plaintext": "736e656c6c206b6e6f776e20616e73776572",
+      "psk": "snell psk",
+      "salt": "21282f363d444b525960676e757c838a"
+    },
+    {
+      "cipher": "chacha20-ietf-poly1305",
+      "ciphertext": "cee7fbdf3d11732f7d62c8d970914cdca3a9a9f984b52992536a9d93229ec983c083",
+      "plaintext": "736e656c6c206b6e6f776e20616e73776572",
+      "psk": "snell psk",
+      "salt": "21282f363d444b525960676e757c838a"
+    }
+  ],
+  "source": "github.com/icpz/open-snell components/aead: NewAES128GCM, NewChacha20Poly1305, Encrypter"
+}
