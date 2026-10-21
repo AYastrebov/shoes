@@ -1,0 +1,9 @@
+{
+  "password": "mieru password",
+  "payload": "666972737420666c69676874207061796c6f6164",
+  "source": "github.com/enfein/mieru/v3 v3.38.2 apis/client: NewClient, DialContext over TCP",
+  "target": "192.0.2.7:443",
+  "unix_time": 1792576587,
+  "username": "mieru-user",
+  "wire": "43794354554e3367314a333dd1a180b68d15949e723c3e06be76ae5defddc59fd1e753ab661f6f4b45ed632e0eace2c04d2bf7fc022e802e0253c12caa0e4ed5484c1d418f3bf0688a257a5eb23fdc29bbb23ec4782b2bde968c9d271b6aefde66bf97fffdd5feef7fffffff7dff7ffffbdeed7ff7fbfffaffcfffffcfbf7de7dfeffffffeddeff7fbfffb4f7ffbbfff77eff4d73fbffdfdfffefbbffffb7ffbf5f9dddff9ffd7fffffb"
+}

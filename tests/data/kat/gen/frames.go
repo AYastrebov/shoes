@@ -11,6 +11,8 @@ import (
 	"time"
 
 	anytls "github.com/anytls/sing-anytls"
+	mieruclient "github.com/enfein/mieru/v3/apis/client"
+	"github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2raywebsocket"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
@@ -18,6 +20,7 @@ import (
 	"github.com/sagernet/sing-vmess/vless"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 // flight collects what a reference client writes once `send` has run
@@ -241,5 +244,76 @@ func genFramesTLS() {
 		"anytls":          frameObject(frameTarget, payload, anytlsWire),
 		"websocket_vless": frameObject(frameTarget, payload, wsWire),
 		"vision":          frameObject(frameTarget, hello, visionWire),
+	})
+}
+
+// mieru: the reference client's first flight to a listener that answers
+// nothing. Shoes has no mieru server, so the test decodes the segments
+// with the decoder its client reads the server's with; the format is the
+// same both ways. The key comes from the time, recorded alongside.
+func genFramesMieru() {
+	const username, password = "mieru-user", "mieru password"
+	payload := []byte("first flight payload")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	must(err)
+	defer listener.Close()
+	port := int32(listener.Addr().(*net.TCPAddr).Port)
+
+	var wire bytes.Buffer
+	var mu sync.Mutex
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			mu.Lock()
+			wire.Write(buf[:n])
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	tcp := appctlpb.TransportProtocol_TCP
+	client := mieruclient.NewClient()
+	must(client.Store(&mieruclient.ClientConfig{Profile: &appctlpb.ClientProfile{
+		ProfileName: proto.String("kat"),
+		User:        &appctlpb.User{Name: proto.String(username), Password: proto.String(password)},
+		Servers: []*appctlpb.ServerEndpoint{{
+			IpAddress:    proto.String("127.0.0.1"),
+			PortBindings: []*appctlpb.PortBinding{{Port: proto.Int32(port), Protocol: &tcp}},
+		}},
+	}}))
+	must(client.Start())
+	defer client.Stop()
+
+	at := time.Now()
+	target := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 7), Port: 443}
+	go func() {
+		conn, err := client.DialContext(context.Background(), target)
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write(payload)
+	}()
+	time.Sleep(time.Second)
+	mu.Lock()
+	flight := append([]byte(nil), wire.Bytes()...)
+	mu.Unlock()
+	if time.Now().Round(2*time.Minute) != at.Round(2*time.Minute) {
+		panic("the key epoch turned over during the capture; run it again")
+	}
+
+	write("frames-mieru", "github.com/enfein/mieru/v3 v3.38.2 apis/client: NewClient, DialContext over TCP", object{
+		"username":  username,
+		"password":  password,
+		"unix_time": at.Unix(),
+		"target":    target.String(),
+		"payload":   h(payload),
+		"wire":      h(flight),
 	})
 }

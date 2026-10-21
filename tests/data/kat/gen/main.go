@@ -267,6 +267,7 @@ func main() {
 		"reality":         genReality,
 		"frames-sing":     genFrames,
 		"frames-sing-tls": genFramesTLS,
+		"frames-mieru":    genFramesMieru,
 	}
 	names := os.Args[1:]
 	if len(names) == 0 {

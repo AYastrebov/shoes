@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Reference-captured frames (plan PR 4.2, part 2):
+
+- mieru's open-session request, as the reference client sends it, decodes
+  with shoes' segment decoder to the socks5 request shoes' own client sends.
+  Hysteria2, TUIC, NaiveProxy and AmneziaWG move to the interop job (PR 4.3):
+  their references do not expose their encoders, and TUIC's authentication
+  is bound to the TLS session it was made in.
+
 Reference-captured frames (plan PR 4.2, part 1):
 
 - Client first flights from the sing references are replayed into shoes'
