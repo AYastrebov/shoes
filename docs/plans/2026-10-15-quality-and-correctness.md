@@ -475,6 +475,21 @@ container as servers and clients against shoes for one TCP and one UDP
 exchange each; failures open an issue rather than block merges. `scripts/bench`
 already has the container plumbing.
 
+Added 2026-10-21: SF-10 of `docs/specs/2026-10-21-lessons-from-steer.md` belongs
+to this PR. It covers:
+
+- a three-outcome probe result (data, closed, silent), asserted with time
+  bounds rather than error text;
+- a fixed probe corpus;
+- a slow-drip prober that tells a per-read timeout from a handshake deadline;
+- nightly cells whose skips count against the run;
+- the ClientHello shape test against the #95 capture;
+- a Vision cut property test;
+- `.srs` oracle fixtures.
+
+The fake-IP and config-loading fixes from that spec (PRs S.1 and S.2 of its
+plan) come before this PR.
+
 ### PR 4.4 — Zero-test files
 
 Bring every file in the audit's zero-test list to at least the byte-level
