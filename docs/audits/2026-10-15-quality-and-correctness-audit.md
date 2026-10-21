@@ -238,6 +238,9 @@ redirect and tproxy socket options.
 - **No reference-captured bytes decoded by shoes** for any protocol; no
   reference `.srs` fixture that mixes v4 and v6; no Go-produced mieru or
   AmneziaWG I-packet.
+  **Fixed in #96** for the sing-family client flights (SS2022, VMess, VLESS,
+  XUDP, AnyTLS, WebSocket early data, Vision); the `.srs` fixture landed in
+  #56; mieru, AmneziaWG and the QUIC protocols are PR 4.2 part 2.
 - **No probe-behaviour tests**: what a wrong-password, short, malformed or
   slow client receives and after how long — the property every fallback path
   exists for.
