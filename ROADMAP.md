@@ -38,7 +38,11 @@ and stability. The Clash API that had landed on 2026-09-11 (slice 1: the
 controller, a connection registry threaded through every inbound, Prometheus
 `/metrics`) was removed the same day, since its only consumers were the
 postponed awg-manager engine and a web panel that was never started. The
-awg-manager section below is now a note on what was postponed.
+awg-manager section below is now a note on what was postponed. Refreshed
+2026-10-21 against `mobile` at `bf5d5a6`, after a review of steer (a GPL-3.0
+C router with its own protocol clients) turned up two fake-IP bugs, two
+configs that should load and do not, and the details a Brutal spec needed;
+that review is a section of its own, with a spec and a plan behind it.
 
 ## Focus, as of 2026-10-15
 
@@ -65,6 +69,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [awg-manager engine: postponed](#awg-manager-engine-postponed)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
+- [Lessons from steer](#lessons-from-steer)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 - [Open risk: AmneziaWG upload throughput is unmeasured](#open-risk-amneziawg-upload-throughput-is-unmeasured)
@@ -843,7 +848,7 @@ fallback.
 
 | Gap | Effect |
 | --- | --- |
-| **Brutal congestion control** and the bandwidth negotiation behind it (`bandwidth.up`/`down`, `Hysteria-CC-RX` in both directions) | This is the headline feature. Brutal sends at a declared rate instead of backing off on loss, which is why Hysteria is fast on lossy intercontinental paths. Our server answers `auto` (`server.rs:176`), the value for a server that declines to set a rate, and our client declares `0` (`auth.rs:35`), meaning it does not know its own receive rate. Neither end installs Brutal either way; both run BBR, upstream's fallback, so a lossy path is no longer the collapse it was under Cubic (500 against 11 Mbit/s at 50 ms and 0.5% loss), but a fixed declared rate is still not available. Needs a `quinn` congestion controller. This row said we sent `0` in both directions and called `0` the "use ordinary congestion control" signal; both halves were wrong, and the second was the defect phase 1 fixed. |
+| **Brutal congestion control** and the bandwidth negotiation behind it (`bandwidth.up`/`down`, `Hysteria-CC-RX` in both directions) | This is the headline feature. Brutal sends at a declared rate instead of backing off on loss, which is why Hysteria is fast on lossy intercontinental paths. Our server answers `auto` (`server.rs:176`), the value for a server that declines to set a rate, and our client declares `0` (`auth.rs:35`), meaning it does not know its own receive rate. Neither end installs Brutal either way; both run BBR, upstream's fallback, so a lossy path is no longer the collapse it was under Cubic (500 against 11 Mbit/s at 50 ms and 0.5% loss), but a fixed declared rate is still not available. Needs a `quinn` congestion controller; specified as SF-9 in `docs/specs/2026-10-21-lessons-from-steer.md`, which also says why quinn's internal pacer forces a different window from apernet's 2 × BDP. This row said we sent `0` in both directions and called `0` the "use ordinary congestion control" signal; both halves were wrong, and the second was the defect phase 1 fixed. |
 | **`congestion` option** (`type: bbr \| reno`, `bbrProfile`: conservative/standard/aggressive) | We run BBR, upstream's default, with no way to choose `reno` or tune it. quinn's BBR has no profiles, so `bbrProfile` would need its own controller. |
 | **`bandwidth.disableLossCompensation`** (upstream 2.10.0) | Only meaningful once Brutal exists. |
 | **QUIC stateless resets** (upstream 2.12.1) | Server side. Without them a client holding a connection that died while the device slept waits out its idle timeout before reconnecting. Upstream called this out as most noticeable on mobile, which is this branch's entire audience. |
@@ -948,6 +953,31 @@ traffic-pattern options are the ones that matter for the protocol's purpose:
 this client reproduces the default Go client's padding behaviour, so a
 deployment using a customised pattern would look different on the wire.
 
+## Lessons from steer
+
+Spec: `docs/specs/2026-10-21-lessons-from-steer.md`. Plan:
+`docs/plans/2026-10-21-lessons-from-steer.md`. Written 2026-10-21 from a
+review of [splify2/steer](https://github.com/splify2/steer) at `07303cb`.
+steer is GPL-3.0, so what it contributes is behaviours and reasons, not code.
+
+| ID | Item | Status |
+|---|---|---|
+| SF-1 | A fake IP can be recycled while an app still holds it, so the app reaches another domain's server (`pool.rs:184`, `lookup` does not count as use) | planned, PR S.1 |
+| SF-2 | An in-pool address with no mapping is dialled as a literal 198.18.x.x and stalls (`fake_ip/mod.rs:55-72`) | planned, PR S.1 |
+| SF-3 | Local names (`.lan`, `.local`, single-label) get fake IPs and go into the tunnel | planned, PR S.1 |
+| SF-4 | REALITY with no SNI panics (`tcp_client_handler_factory.rs:271`); Xray's empty SNI can't be expressed | planned, PR S.2 |
+| SF-5 | Only UUIDv4 ids load; Xray's string ids and UUIDv7 don't (`uuid_util.rs`) | planned, PR S.2 |
+| SF-6 | No fallback when a path drops the ~1.8 kB post-quantum ClientHello | planned, PR S.4 |
+| SF-7 | AES-first cipher order on CPUs without AES instructions | planned, PR S.3 |
+| SF-8 | No User-Agent on WebSocket and HTTPUpgrade requests, which matches neither Xray nor sing-box | planned, PR S.3 |
+| SF-9 | Brutal and its `Hysteria-CC-RX` negotiation, specified against quinn's pacer | planned, PRs S.5 and S.6 |
+| SF-10 | Probe and interop test methods | folded into quality-plan PR 4.3 |
+| SF-11 | xhttp, gRPC, ECH, REALITY `pqv`, Gecko, DoQ, `.srs` logical rules | recorded, not planned |
+
+Order: S.1 and S.2 come before quality-plan PR 4.3, because they are bugs and
+configs that fail to load. S.3 and S.4 follow 4.3. Brutal (S.5, S.6) comes
+last: verifying it needs 4.3's interop rig against apernet.
+
 ## Explicitly not planned
 
 - **gRPC transport** — considerable work, and less used in practice than
@@ -989,13 +1019,13 @@ that here; it arrived with a dependency default. It should be treated as a
 property to hold deliberately rather than one to keep by luck: nothing in the
 tree pins the group list or would fail if a future rustls reordered it.
 
-Two places do not inherit it. **`src/reality/` is classical X25519 only** — the
-hand-written TLS 1.3 stack does its own `agreement::X25519`
-(`reality_server_connection.rs:513`, `reality_client_connection.rs:163`), and
-the REALITY protocol pins that construction, so this is not ours to change
-unilaterally. Xray has moved here already, signing REALITY certificates with
-ML-DSA-65 via `mldsa65Seed`, which is a protocol-level change we would have to
-follow rather than invent. And **we have no ECH at all**, where sing-box
+Two places did not inherit it. **`src/reality/`** was classical X25519 only
+until #81 (2026-10-19), which gave the client Chrome 133's X25519MLKEM768
+share (`docs/specs/2026-10-19-reality-chrome-client-hello.md`). Some paths
+drop that larger hello, which is SF-6 under "Lessons from steer". Xray has
+gone further, signing REALITY certificates with ML-DSA-65 via `mldsa65Seed`
+(the `pqv` check, SF-11), a protocol-level change we would have to follow
+rather than invent. And **we have no ECH at all**, where sing-box
 supports it and Xray now forces it whenever it is configured.
 
 ECH is the real gap of the two, and it is a fingerprinting gap rather than a
