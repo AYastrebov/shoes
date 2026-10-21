@@ -16,11 +16,19 @@ not.
 | `shadowtls` | sing-shadowtls v0.2.1: a v3 client and server over a recorded connection, Go `crypto/tls` as the handshake server | `src/shadow_tls/kat_tests.rs` |
 | `reality` | sing-box v1.14.3 `common/tls`: `NewRealityClient` (uTLS chrome), the ClientHello it sends | `src/reality/reality_server_connection.rs` |
 | `rfc8448` | RFC 8448 section 3, the simple 1-RTT handshake, by `rfc8448/extract.py` | `src/reality/reality_tls13_keys.rs` |
+| `frames-sing` | sing-shadowsocks `shadowaead_2022`, sing-vmess (VMess, VMess UDP with GlobalPadding, VLESS, XUDP): client first flights at a fixed time | `src/reference_frames.rs` |
+| `frames-sing-tls` | sing-anytls `CreateProxy`; sing-box's WebSocket client with early data carrying VLESS; VLESS Vision over Go `crypto/tls` (the plaintext the server read) | `src/reference_frames.rs` |
 
 Where a reference keeps its derived key private (Snell, salamander, mieru),
 the vector holds bytes the reference put on the wire with that key. Shoes
 must produce or open those exact bytes. That tests more than comparing keys
 would.
+
+The `frames-*` fixtures are client first flights. `src/reference_frames.rs`
+replays each one into the shoes server handler for that protocol, built from
+config. The handler must find the target and the payload the reference was
+given. The SS2022 and VMess flights carry timestamps, so they are made at a
+fixed time, and those tests pin shoes' clock to it (`util::pin_unix_time`).
 
 ShadowTLS and REALITY hide their HMACs and key shares inside the library.
 For those, the vector is a recorded connection or ClientHello, and shoes must
@@ -42,7 +50,9 @@ repository root:
 container run --rm -v "$PWD/tests/data/kat:/kat" -w /kat/gen golang:1.27 go run -tags with_utls .
 ```
 
-(`with_utls` builds sing-box's REALITY client.) The RFC 8448 vectors come from
+(`with_utls` builds sing-box's REALITY client.) Name generators after `.`
+to run only those, e.g. `go run -tags with_utls . frames-sing`, so that
+adding one does not rewrite the fixtures whose bytes are random. The RFC 8448 vectors come from
 the RFC text instead:
 
 ```sh

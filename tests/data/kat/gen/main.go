@@ -254,12 +254,31 @@ func genMieru() {
 	}
 }
 
+// Every generator by default; with arguments, only those named, so adding a
+// fixture does not rewrite the ones whose bytes are random.
 func main() {
-	genShadowsocks()
-	genSnell()
-	genVmess()
-	genSalamander()
-	genMieru()
-	genShadowTLS()
-	genReality()
+	generators := map[string]func(){
+		"shadowsocks":     genShadowsocks,
+		"snell":           genSnell,
+		"vmess":           genVmess,
+		"salamander":      genSalamander,
+		"mieru":           genMieru,
+		"shadowtls":       genShadowTLS,
+		"reality":         genReality,
+		"frames-sing":     genFrames,
+		"frames-sing-tls": genFramesTLS,
+	}
+	names := os.Args[1:]
+	if len(names) == 0 {
+		for name := range generators {
+			names = append(names, name)
+		}
+	}
+	for _, name := range names {
+		generate, ok := generators[name]
+		if !ok {
+			panic("no generator " + name)
+		}
+		generate()
+	}
 }

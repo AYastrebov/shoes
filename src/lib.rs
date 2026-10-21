@@ -115,6 +115,8 @@ mod xudp;
 
 #[cfg(test)]
 mod kat;
+#[cfg(test)]
+mod reference_frames;
 
 /// Configuration types.
 pub mod config;
