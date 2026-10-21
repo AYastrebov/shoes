@@ -44,6 +44,15 @@ where
                     None => upstream.insert(connect(&target, &proxy_selector, &resolver).await?),
                 };
                 write_message(upstream, &query).await?;
+                // A zone transfer answers in as many messages as the zone
+                // takes, with nothing saying which is the last but the
+                // records themselves. The rest of this connection is relayed
+                // untouched, so the transfer completes and nothing after it
+                // is read out of step.
+                if is_zone_transfer(&query) {
+                    tokio::io::copy_bidirectional(&mut local, upstream).await?;
+                    return Ok(());
+                }
                 read_message(upstream).await?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -57,15 +66,29 @@ where
     Ok(())
 }
 
-/// One length-prefixed message, or `None` at a clean end of stream.
+/// Whether a query asks for AXFR or IXFR, whose answer spans messages.
+fn is_zone_transfer(query: &[u8]) -> bool {
+    use hickory_resolver::proto::op::Message;
+    use hickory_resolver::proto::rr::RecordType;
+    Message::from_vec(query).is_ok_and(|message| {
+        message
+            .queries
+            .iter()
+            .any(|q| matches!(q.query_type(), RecordType::AXFR | RecordType::IXFR))
+    })
+}
+
+/// One length-prefixed message, or `None` at a clean end of stream: one
+/// before any byte of a prefix. A prefix cut after its first byte is an
+/// error, as is a message cut short.
 async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
-    let mut length = [0u8; 2];
-    match reader.read_exact(&mut length).await {
-        Ok(_) => {}
+    let high = match reader.read_u8().await {
+        Ok(byte) => byte,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
-    }
-    let mut message = vec![0u8; usize::from(u16::from_be_bytes(length))];
+    };
+    let low = reader.read_u8().await?;
+    let mut message = vec![0u8; usize::from(u16::from_be_bytes([high, low]))];
     reader.read_exact(&mut message).await?;
     Ok(Some(message))
 }
@@ -231,5 +254,69 @@ mod tests {
         let (mut near, far) = duplex(64);
         drop(far);
         assert!(read_message(&mut near).await.unwrap().is_none());
+
+        // Half a length prefix is not a clean close.
+        let (mut near, mut far) = duplex(64);
+        far.write_all(&[0]).await.unwrap();
+        drop(far);
+        assert!(read_message(&mut near).await.is_err());
+    }
+
+    /// A zone transfer's answer spans several messages: all of them reach
+    /// the client, and a query after it gets its own answer, not a leftover.
+    #[tokio::test]
+    async fn a_zone_transfer_completes_and_framing_holds_after_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Some(query) = read_message(&mut stream).await.unwrap() {
+                let request = Message::from_vec(&query).unwrap();
+                let frames = if is_zone_transfer(&query) { 3 } else { 1 };
+                for _ in 0..frames {
+                    let response =
+                        Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                    write_message(&mut stream, &response.to_vec().unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+                serde_yaml::from_str("- masks: 0.0.0.0/0\n  action: allow\n").unwrap(),
+                resolver.clone(),
+            ),
+        );
+        let (near, mut far) = duplex(65536);
+        let task = tokio::spawn(handle_dns_over_tcp(
+            near,
+            NetLocation::from(upstream_addr),
+            responder(),
+            selector,
+            resolver,
+        ));
+
+        write_message(&mut far, &query(7, "example.com.", RecordType::AXFR))
+            .await
+            .unwrap();
+        for frame in 0..3 {
+            let answer =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_message(&mut far))
+                    .await
+                    .unwrap_or_else(|_| panic!("transfer frame {frame} never arrived"))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 7);
+        }
+        write_message(&mut far, &query(8, "example.com.", RecordType::TXT))
+            .await
+            .unwrap();
+        let after = Message::from_vec(&read_message(&mut far).await.unwrap().unwrap()).unwrap();
+        assert_eq!(after.metadata.id, 8, "its own answer, not a leftover");
+
+        drop(far);
+        task.await.unwrap().unwrap();
     }
 }

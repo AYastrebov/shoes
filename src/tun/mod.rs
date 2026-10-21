@@ -360,14 +360,21 @@ pub async fn run_tun_server(
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
 
+                    // Restore before routing, so hostname rules see the domain.
+                    let target =
+                        fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
+
                     // DNS over TCP gets the fake-IP answers the UDP path
-                    // gives (FI-1), matched on the port as there.
+                    // gives (FI-1), matched on the port as there. Counted as
+                    // traffic like any other connection, and forwarded to the
+                    // restored target: a resolver whose own name went through
+                    // fake IP is reached by name, not by its pool address.
                     if let Some(responder) = fake_ip_responder
                         && remote_addr.port() == fake_ip::DNS_PORT
                     {
                         if let Err(e) = dns_tcp::handle_dns_over_tcp(
-                            new_conn.connection,
-                            NetLocation::from(remote_addr),
+                            traffic::TrafficCountingStream::new(new_conn.connection),
+                            target,
                             responder,
                             proxy_selector,
                             resolver,
@@ -378,10 +385,6 @@ pub async fn run_tun_server(
                         }
                         return;
                     }
-
-                    // Restore before routing, so hostname rules see the domain.
-                    let target =
-                        fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
 
                     debug!("Handling TCP connection to {:?}", target);
 
