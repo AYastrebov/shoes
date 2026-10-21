@@ -33,7 +33,7 @@ mod pool;
 mod responder;
 
 pub use bypass::BypassList;
-pub use pool::{DEFAULT_MAX_ENTRIES, FakeIpNetwork, FakeIpPool};
+pub use pool::{DEFAULT_MAX_ENTRIES, FakeIpNetwork, FakeIpPool, MIN_REUSE_AGE};
 pub use responder::{DnsDecision, FakeIpResponder};
 
 /// The port a DNS query arrives on. Traffic to this port is offered to the
@@ -44,6 +44,11 @@ pub const DNS_PORT: u16 = 53;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use log::debug;
+use parking_lot::Mutex;
 
 use crate::address::{Address, NetLocation};
 
@@ -53,22 +58,56 @@ use crate::address::{Address, NetLocation};
 /// This is the counterpart to the DNS side, and it runs *before* routing rules
 /// are applied, so hostname rules match traffic that arrived over the TUN. With
 /// no pool configured it is the plain address conversion.
+///
+/// `None` is an address inside the pool that stands for no domain: one handed
+/// out before a restart, or recycled since. Dialled as itself it would go
+/// nowhere and stall until the app gave up, so the caller refuses it at once
+/// (SF-2), and the app resolves again. The refusal is counted here.
 pub fn destination_to_net_location(
     addr: SocketAddr,
     pool: Option<&Arc<FakeIpPool>>,
-) -> NetLocation {
+) -> Option<NetLocation> {
     if let std::net::IpAddr::V4(v4) = addr.ip()
         && let Some(pool) = pool
-        && let Some(domain) = pool.lookup(v4)
+        && pool.is_fake_ip(v4)
     {
-        return NetLocation::new(Address::Hostname(domain.to_string()), addr.port());
+        let Some(domain) = pool.lookup(v4) else {
+            note_unmapped(addr);
+            return None;
+        };
+        return Some(NetLocation::new(
+            Address::Hostname(domain.to_string()),
+            addr.port(),
+        ));
     }
 
     let address = match addr.ip() {
         std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
         std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
     };
-    NetLocation::new(address, addr.port())
+    Some(NetLocation::new(address, addr.port()))
+}
+
+/// Connections and datagrams refused for an unmapped pool address.
+static UNMAPPED_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// When a refusal was last logged; a page of stale addresses after a restart
+/// is one line a second, not one per packet.
+static UNMAPPED_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn unmapped_refused() -> u64 {
+    UNMAPPED_REFUSED.load(Ordering::Relaxed)
+}
+
+/// Count, and now and then log, a refusal of `addr`.
+pub fn note_unmapped(addr: SocketAddr) {
+    let total = UNMAPPED_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = Instant::now();
+    let mut logged = UNMAPPED_LOGGED.lock();
+    if logged.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+        *logged = Some(now);
+        debug!("Refused {addr}: a fake IP with no mapping ({total} refused so far)");
+    }
 }
 
 #[cfg(test)]
@@ -82,10 +121,10 @@ mod tests {
     #[test]
     fn restores_the_domain_behind_a_fake_address() {
         let pool = pool();
-        let ip = pool.assign("example.com");
+        let ip = pool.assign("example.com").unwrap();
         let addr = SocketAddr::from((ip, 443));
 
-        let location = destination_to_net_location(addr, Some(&pool));
+        let location = destination_to_net_location(addr, Some(&pool)).unwrap();
         assert_eq!(
             location.address(),
             &Address::Hostname("example.com".to_string())
@@ -97,38 +136,43 @@ mod tests {
     fn leaves_real_addresses_alone() {
         let pool = pool();
         let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        let location = destination_to_net_location(addr, Some(&pool));
+        let location = destination_to_net_location(addr, Some(&pool)).unwrap();
         assert_eq!(
             location.address(),
             &Address::Ipv4("1.1.1.1".parse().unwrap())
         );
     }
 
-    /// An address inside the pool range that was never handed out, or whose
-    /// mapping has been recycled, must stay an address rather than becoming
-    /// some other domain.
+    /// SF-2: an address inside the pool range that was never handed out, or
+    /// whose mapping has been recycled, is refused: dialled as itself it goes
+    /// nowhere, and as some other domain it would be misrouted.
     #[test]
-    fn leaves_unmapped_pool_addresses_alone() {
+    fn refuses_unmapped_pool_addresses() {
         let pool = pool();
         let addr: SocketAddr = "198.18.9.9:443".parse().unwrap();
-        let location = destination_to_net_location(addr, Some(&pool));
-        assert_eq!(
-            location.address(),
-            &Address::Ipv4("198.18.9.9".parse().unwrap())
-        );
+        let before = unmapped_refused();
+        assert_eq!(destination_to_net_location(addr, Some(&pool)), None);
+        assert!(unmapped_refused() > before);
+    }
+
+    /// Without fake IP the pool's range is an ordinary range.
+    #[test]
+    fn without_a_pool_a_pool_range_address_is_dialled() {
+        let addr: SocketAddr = "198.18.9.9:443".parse().unwrap();
+        assert!(destination_to_net_location(addr, None).is_some());
     }
 
     #[test]
     fn without_a_pool_it_is_the_plain_conversion() {
         let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        let location = destination_to_net_location(addr, None);
+        let location = destination_to_net_location(addr, None).unwrap();
         assert_eq!(
             location.address(),
             &Address::Ipv4("1.1.1.1".parse().unwrap())
         );
 
         let v6: SocketAddr = "[2606:4700::1111]:443".parse().unwrap();
-        let location = destination_to_net_location(v6, None);
+        let location = destination_to_net_location(v6, None).unwrap();
         assert_eq!(
             location.address(),
             &Address::Ipv6("2606:4700::1111".parse().unwrap())

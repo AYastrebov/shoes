@@ -340,6 +340,9 @@ pub async fn run_tun_server(
 
     let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
     tcp_stack.set_new_conn_tx(tcp_conn_tx);
+    if let Some(responder) = &fake_ip {
+        tcp_stack.set_fake_ip_pool(responder.pool().clone());
+    }
 
     let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
@@ -361,8 +364,14 @@ pub async fn run_tun_server(
                     let remote_addr = new_conn.remote_addr;
 
                     // Restore before routing, so hostname rules see the domain.
-                    let target =
-                        fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
+                    // The stack thread resets a SYN to an unmapped fake IP
+                    // before it gets here (SF-2); one whose mapping went
+                    // between the SYN and now is closed instead.
+                    let Some(target) =
+                        fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref())
+                    else {
+                        return;
+                    };
 
                     // DNS over TCP gets the fake-IP answers the UDP path
                     // gives (FI-1), matched on the port as there. Counted as
@@ -686,13 +695,14 @@ pub async fn start_tun_server(
 fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpResponder>> {
     let network = FakeIpNetwork::parse(&config.network)?;
     let pool = Arc::new(FakeIpPool::new(network, config.max_entries)?);
-    let bypass = BypassList::new(config.bypass_domains.iter());
+    let bypass = BypassList::new(config.bypass_domains.iter(), config.bypass_defaults);
 
     info!(
-        "Fake IP enabled: network={}, capacity={}, bypass_patterns={}",
+        "Fake IP enabled: network={}, capacity={}, bypass_patterns={}, local names bypassed={}",
         network,
         pool.capacity(),
-        config.bypass_domains.len()
+        config.bypass_domains.len(),
+        config.bypass_defaults
     );
 
     Ok(Arc::new(FakeIpResponder::new(pool, bypass)))

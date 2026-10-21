@@ -6,12 +6,15 @@
 //! this file unit-testable without a socket, a runtime, or a network.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hickory_resolver::proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata};
 
+use log::{info, warn};
+
 use super::bypass::BypassList;
-use super::pool::FakeIpPool;
+use super::pool::{FakeIpPool, MIN_REUSE_AGE};
 
 /// TTL handed out with a fake address, in seconds.
 ///
@@ -36,11 +39,18 @@ pub enum DnsDecision {
 pub struct FakeIpResponder {
     pool: Arc<FakeIpPool>,
     bypass: BypassList,
+    /// Set while the pool has nothing it may recycle, so the warning is
+    /// logged once per episode rather than once per query.
+    exhausted: AtomicBool,
 }
 
 impl FakeIpResponder {
     pub fn new(pool: Arc<FakeIpPool>, bypass: BypassList) -> Self {
-        Self { pool, bypass }
+        Self {
+            pool,
+            bypass,
+            exhausted: AtomicBool::new(false),
+        }
     }
 
     pub fn pool(&self) -> &Arc<FakeIpPool> {
@@ -94,7 +104,13 @@ impl FakeIpResponder {
         response.add_query(query.clone());
 
         if record_type == RecordType::A {
-            let ip = self.pool.assign(&domain);
+            let Some(ip) = self.assign(&domain) else {
+                // Fail open (SF-1): the real answer costs this name its
+                // domain rule for the connection that follows, where
+                // recycling a live address would send another domain's
+                // traffic to this one.
+                return DnsDecision::Forward;
+            };
             response.add_answer(Record::from_rdata(
                 query.name().clone(),
                 FAKE_IP_TTL_SECS,
@@ -113,6 +129,26 @@ impl FakeIpResponder {
             // does, forwarding still resolves the name.
             Err(_) => DnsDecision::Forward,
         }
+    }
+}
+
+impl FakeIpResponder {
+    fn assign(&self, domain: &str) -> Option<std::net::Ipv4Addr> {
+        let ip = self.pool.assign(domain);
+        match ip {
+            None if !self.exhausted.swap(true, Ordering::Relaxed) => warn!(
+                "Fake IP pool exhausted: all {} addresses used within the last {} s; \
+                 answering with real addresses until one frees up. Raise max_entries \
+                 to avoid this.",
+                self.pool.capacity(),
+                MIN_REUSE_AGE.as_secs()
+            ),
+            Some(_) if self.exhausted.swap(false, Ordering::Relaxed) => {
+                info!("Fake IP pool has addresses again")
+            }
+            _ => {}
+        }
+        ip
     }
 }
 
@@ -141,7 +177,7 @@ mod tests {
         let pool = Arc::new(
             FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 8192).unwrap(),
         );
-        FakeIpResponder::new(pool, BypassList::new(bypass.iter().copied()))
+        FakeIpResponder::new(pool, BypassList::new(bypass.iter().copied(), false))
     }
 
     fn query_bytes(name: &str, record_type: RecordType) -> Vec<u8> {
@@ -343,6 +379,47 @@ mod tests {
             responder.handle_query(&two.to_vec().unwrap()),
             DnsDecision::Forward
         );
+    }
+
+    /// SF-1: with every address in use, the query gets the real answer
+    /// rather than a recycled address.
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_pool_forwards_the_query() {
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 1).unwrap());
+        let responder = FakeIpResponder::new(pool, BypassList::new(Vec::<String>::new(), false));
+        assert!(matches!(
+            responder.handle_query(&query_bytes("a.example.", RecordType::A)),
+            DnsDecision::Answer(_)
+        ));
+        assert_eq!(
+            responder.handle_query(&query_bytes("b.example.", RecordType::A)),
+            DnsDecision::Forward
+        );
+        assert!(responder.exhausted.load(Ordering::Relaxed));
+
+        tokio::time::advance(MIN_REUSE_AGE).await;
+        assert!(matches!(
+            responder.handle_query(&query_bytes("b.example.", RecordType::A)),
+            DnsDecision::Answer(_)
+        ));
+        assert!(!responder.exhausted.load(Ordering::Relaxed));
+    }
+
+    /// SF-3: local names resolve for real by default.
+    #[test]
+    fn local_names_are_forwarded_by_default() {
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+        let responder = FakeIpResponder::new(pool, BypassList::new(Vec::<String>::new(), true));
+        for name in ["printer.", "nas.lan.", "_ipp._tcp.local."] {
+            assert_eq!(
+                responder.handle_query(&query_bytes(name, RecordType::A)),
+                DnsDecision::Forward,
+                "{name}"
+            );
+        }
+        assert_eq!(responder.pool().entry_count(), 0);
     }
 
     #[test]

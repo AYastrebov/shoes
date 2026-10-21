@@ -525,6 +525,7 @@ fake_ip:
   network: string              # IPv4 CIDR, prefix 8-30. Default: "198.18.0.0/16"
   max_entries: int             # Live mapping ceiling. Default: 8192
   bypass_domains: [string]     # Globs that must resolve for real. Default: none
+  bypass_defaults: bool        # Local names resolve for real too. Default: true
 
 # DNS for this TUN session (optional; see "DNS" below for the full shape)
 dns:
@@ -613,7 +614,8 @@ system settings.
 | `A` | Answered with an address from `network`, TTL 1 |
 | `AAAA` | NODATA (`NOERROR`, no answers), so the client falls back to `A` |
 | `HTTPS`/`SVCB`, `SRV`, `TXT`, `MX`, everything else | Forwarded, so it gets a real answer |
-| Any type for a `bypass_domains` match | Forwarded |
+| Any type for a `bypass_domains` match, or a local name (below) | Forwarded |
+| `A` when every address was used in the last 10 minutes | Forwarded (see below) |
 
 Notes:
 
@@ -623,9 +625,20 @@ Notes:
   goes to the resolver it addressed over one connection the rules judge.
 - `network` must be a range that is not routed for real. The default sits in
   `198.18.0.0/15`, reserved for benchmarking by RFC 2544.
-- Past `max_entries` the least recently used mapping is recycled. The 1-second
-  answer TTL keeps active domains being refreshed, so they are not recycled
-  while in use.
+- Past `max_entries` the least recently used mapping is recycled, but only
+  one unused for 10 minutes. A query and a connection both count as use, so
+  an address an app keeps connecting to is never handed to another domain.
+  If every mapping was used more recently than that, the query gets the real
+  answer, and the connection that follows misses its domain rule. A warning
+  is logged once when this starts; raise `max_entries` if it does.
+- A connection to an address inside `network` that stands for no domain (one
+  handed out before a restart, or recycled since) is refused: TCP gets a
+  reset, UDP is dropped. The app then resolves the name again.
+- With `bypass_defaults` on, these resolve for real ahead of
+  `bypass_domains`: single-label names (`printer`), names at or under
+  `local`, `lan`, `home.arpa`, `internal`, `localhost` and `home`, and the
+  reverse zones `in-addr.arpa` and `ip6.arpa`. Set it to `false` only if
+  such names really are served at the far end of the tunnel.
 - `bypass_domains` patterns are globs matched case-insensitively, where `*`
   spans dots: `*.local`, `captive.apple.com`, `time.*.apple.com`. Use it for
   anything that must reach a host outside the tunnel — captive-portal probes,

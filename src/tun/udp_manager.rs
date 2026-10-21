@@ -378,7 +378,13 @@ async fn session_task(
                     break;
                 };
 
-                let dest = fake_ip::destination_to_net_location(dest_addr, fake_ip_pool.as_ref());
+                // An unmapped fake IP has nowhere to go: drop the datagram
+                // (SF-2), and the app's retry resolves again.
+                let Some(dest) =
+                    fake_ip::destination_to_net_location(dest_addr, fake_ip_pool.as_ref())
+                else {
+                    continue;
+                };
 
                 // Remove dead destination entry so we recreate below
                 if let Some(entry) = destinations.get(&dest)

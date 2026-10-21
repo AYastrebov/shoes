@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+Fake IP safety (steer plan PR S.1):
+
+- **Behaviour change: local names are no longer tunnelled.** With fake IP
+  on, single-label names and names under `.local`, `.lan`, `.home.arpa`,
+  `.internal`, `.localhost` and `.home`, plus the reverse zones, now resolve
+  for real instead of getting a fake address that sent them into the
+  tunnel, where they could not resolve. `bypass_defaults: false` restores
+  the old behaviour (SF-3).
+- **Behaviour change: an unmapped fake IP is refused.** A connection to an
+  address in the pool that stands for no domain (after a restart, or a
+  recycle) used to be dialled as that address and stall until the app gave
+  up. TCP now gets a reset at the SYN and UDP is dropped, so the app
+  resolves again (SF-2).
+- An address in use is no longer recycled. Connections now count as use
+  alongside DNS answers, and an address is only reused after 10 minutes
+  unused. Before, a domain the app kept connecting to without asking DNS
+  again could lose its address to another domain, and the next connection
+  reached that domain's server. When nothing can be recycled, the query
+  gets the real answer and a warning is logged (SF-1).
+
 Reference-captured frames (plan PR 4.2, part 2):
 
 - mieru's open-session request, as the reference client sends it, decodes
