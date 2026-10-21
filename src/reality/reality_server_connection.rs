@@ -1188,3 +1188,87 @@ mod tests {
         assert!(!conn.wants_write());
     }
 }
+
+/// Against sing-box's REALITY client (`tests/data/kat/reality`): a
+/// ClientHello it sent for a server key made by the generator.
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{hex, text, vectors};
+
+    fn config(vectors: &serde_json::Value, short_id: [u8; 8]) -> RealityServerConfig {
+        RealityServerConfig {
+            private_key: hex(&vectors["server_private_key"]).try_into().unwrap(),
+            short_ids: vec![short_id],
+            dest: NetLocation::from_str(&format!("{}:443", text(&vectors["server_name"])), None)
+                .unwrap(),
+            // The capture's timestamp is fixed; time is not what is checked.
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: vec![],
+        }
+    }
+
+    fn short_id(vectors: &serde_json::Value) -> [u8; 8] {
+        hex(&vectors["short_id"]).try_into().unwrap()
+    }
+
+    #[test]
+    fn the_server_accepts_the_reference_client_hello() {
+        let vectors = vectors("reality");
+        let client_hello = hex(&vectors["client_hello"]);
+
+        let mut server =
+            RealityServerConnection::new(config(&vectors, short_id(&vectors))).unwrap();
+        server
+            .process_client_hello_validation(&client_hello)
+            .unwrap();
+
+        let mut other = short_id(&vectors);
+        other[0] ^= 1;
+        let mut server = RealityServerConnection::new(config(&vectors, other)).unwrap();
+        assert_eq!(
+            server
+                .process_client_hello_validation(&client_hello)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+            "a short id the client did not seal is refused"
+        );
+    }
+
+    /// The SessionId the server opens seals back to the reference's bytes
+    /// here: the client half's AuthKey, nonce and AAD are the reference's.
+    #[test]
+    fn the_session_id_seals_to_the_reference_bytes() {
+        let vectors = vectors("reality");
+        let client_hello = hex(&vectors["client_hello"]);
+        let random = extract_client_random(&client_hello).unwrap();
+        let sealed: [u8; 32] = extract_session_id_slice(&client_hello)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let shared = perform_ecdh(
+            &hex(&vectors["server_private_key"]).try_into().unwrap(),
+            &extract_client_public_key(&client_hello).unwrap(),
+        )
+        .unwrap();
+        let auth_key = derive_auth_key(&shared, &random[0..20], b"REALITY").unwrap();
+        let mut aad = client_hello[TLS_RECORD_HEADER_SIZE..].to_vec();
+        aad[39..39 + 32].fill(0);
+
+        let plaintext = decrypt_session_id(&sealed, &auth_key, &random[20..32], &aad).unwrap();
+        assert_eq!(plaintext[8..16], short_id(&vectors));
+        assert_eq!(
+            super::super::reality_auth::encrypt_session_id(
+                &plaintext,
+                &auth_key,
+                &random[20..32],
+                &aad
+            )
+            .unwrap(),
+            sealed
+        );
+    }
+}

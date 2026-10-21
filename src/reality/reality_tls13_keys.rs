@@ -601,3 +601,96 @@ mod tests {
         assert_eq!(result.unwrap().len(), 32);
     }
 }
+
+/// RFC 8448 section 3, the simple 1-RTT handshake, end to end through this
+/// module (`tests/data/kat/rfc8448`). The tests above check single steps
+/// against a second implementation of the RFC 8446 formulas; this checks the
+/// whole schedule against published bytes.
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{hex, vectors};
+
+    #[test]
+    fn the_key_schedule_matches_rfc_8448() {
+        let v = vectors("rfc8448");
+        let suite = CipherSuite::AES_128_GCM_SHA256;
+
+        let handshake = derive_handshake_keys(
+            suite,
+            &hex(&v["shared_secret"]),
+            &[],
+            &hex(&v["hello_hash"]),
+        )
+        .unwrap();
+        assert_eq!(
+            handshake.client_handshake_traffic_secret,
+            hex(&v["client_handshake_traffic_secret"])
+        );
+        assert_eq!(
+            handshake.server_handshake_traffic_secret,
+            hex(&v["server_handshake_traffic_secret"])
+        );
+        assert_eq!(handshake.master_secret, hex(&v["master_secret"]));
+
+        let (key, iv) =
+            derive_traffic_keys(&handshake.server_handshake_traffic_secret, suite).unwrap();
+        assert_eq!(
+            (key, iv),
+            (
+                hex(&v["server_handshake_key"]),
+                hex(&v["server_handshake_iv"])
+            )
+        );
+        let (key, iv) =
+            derive_traffic_keys(&handshake.client_handshake_traffic_secret, suite).unwrap();
+        assert_eq!(
+            (key, iv),
+            (
+                hex(&v["client_handshake_key"]),
+                hex(&v["client_handshake_iv"])
+            )
+        );
+
+        assert_eq!(
+            compute_finished_verify_data(
+                suite,
+                &handshake.server_handshake_traffic_secret,
+                &hex(&v["server_finished_hash"])
+            )
+            .unwrap(),
+            hex(&v["server_finished"])
+        );
+        assert_eq!(
+            compute_finished_verify_data(
+                suite,
+                &handshake.client_handshake_traffic_secret,
+                &hex(&v["handshake_hash"])
+            )
+            .unwrap(),
+            hex(&v["client_finished"])
+        );
+
+        let (client, server) =
+            derive_application_secrets(suite, &handshake.master_secret, &hex(&v["handshake_hash"]))
+                .unwrap();
+        assert_eq!(client, hex(&v["client_application_traffic_secret"]));
+        assert_eq!(server, hex(&v["server_application_traffic_secret"]));
+        let (key, iv) = derive_traffic_keys(&server, suite).unwrap();
+        assert_eq!(
+            (key, iv),
+            (
+                hex(&v["server_application_key"]),
+                hex(&v["server_application_iv"])
+            )
+        );
+        let (key, iv) = derive_traffic_keys(&client, suite).unwrap();
+        assert_eq!(
+            (key, iv),
+            (
+                hex(&v["client_application_key"]),
+                hex(&v["client_application_iv"])
+            )
+        );
+    }
+}

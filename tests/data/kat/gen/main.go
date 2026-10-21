@@ -260,4 +260,6 @@ func main() {
 	genVmess()
 	genSalamander()
 	genMieru()
+	genShadowTLS()
+	genReality()
 }

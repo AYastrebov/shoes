@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Known-answer vectors (plan PR 4.1, part 2):
+
+- ShadowTLS v3's ClientHello tag and data-frame HMACs are checked against a
+  connection recorded between sing-shadowtls' own client and server.
+  REALITY's AuthKey and SessionId seal are checked against a ClientHello from
+  sing-box's client. The Reality TLS 1.3 key schedule is checked end to end
+  against RFC 8448. All of them already matched.
+
 Known-answer vectors (plan PR 4.1, part 1):
 
 - Shadowsocks EVP_BytesToKey, its HKDF-SHA1 "ss-subkey" and the 2022 blake3

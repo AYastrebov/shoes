@@ -234,7 +234,7 @@ redirect and tproxy socket options.
   2022 subkey, Argon2id (Snell), VMess KDF/AuthID/crc32, salamander key (its
   "known vector" test derives the expectation with the code under test),
   mieru PBKDF2, ShadowTLS HMACs. Every one is a self round-trip today.
-  **Fixed in #94** for all but the ShadowTLS HMACs (PR 4.1 part 2).
+  **Fixed in #94**; the ShadowTLS HMACs **fixed in #95**.
 - **No reference-captured bytes decoded by shoes** for any protocol; no
   reference `.srs` fixture that mixes v4 and v6; no Go-produced mieru or
   AmneziaWG I-packet.
@@ -250,7 +250,8 @@ redirect and tproxy socket options.
   `snell_fixed_target_stream.rs`, `trojan_handler.rs`, `socks_handler.rs`
   address helpers, `stream_reader.rs`, `ffi/android.rs`.
 - **No end-to-end Reality handshake test** (the client's Finished is never
-  checked by a server in any test), no RFC 8448 vector.
+  checked by a server in any test), no RFC 8448 vector. The RFC 8448 vector
+  is **fixed in #95**; the end-to-end handshake test is not.
 - **No scripted-device TUN tests** for `icmp_enabled`, fragments, or a SYN
   past the cap; no test that two tunnels emit different sender indices.
 - **Shell**: no property-based config round trip (the one round-trip test
