@@ -962,9 +962,9 @@ steer is GPL-3.0, so what it contributes is behaviours and reasons, not code.
 
 | ID | Item | Status |
 |---|---|---|
-| SF-1 | A fake IP can be recycled while an app still holds it, so the app reaches another domain's server (`pool.rs:184`, `lookup` does not count as use) | planned, PR S.1 |
-| SF-2 | An in-pool address with no mapping is dialled as a literal 198.18.x.x and stalls (`fake_ip/mod.rs:55-72`) | planned, PR S.1 |
-| SF-3 | Local names (`.lan`, `.local`, single-label) get fake IPs and go into the tunnel | planned, PR S.1 |
+| SF-1 | A fake IP can be recycled while an app still holds it, so the app reaches another domain's server (`pool.rs:184`, `lookup` does not count as use) | fixed in #99 |
+| SF-2 | An in-pool address with no mapping is dialled as a literal 198.18.x.x and stalls (`fake_ip/mod.rs:55-72`) | fixed in #99 |
+| SF-3 | Local names (`.lan`, `.local`, single-label) get fake IPs and go into the tunnel | fixed in #99 |
 | SF-4 | REALITY with no SNI panics (`tcp_client_handler_factory.rs:271`); Xray's empty SNI can't be expressed | planned, PR S.2 |
 | SF-5 | Only UUIDv4 ids load; Xray's string ids and UUIDv7 don't (`uuid_util.rs`) | planned, PR S.2 |
 | SF-6 | No fallback when a path drops the ~1.8 kB post-quantum ClientHello | planned, PR S.4 |

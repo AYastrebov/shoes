@@ -32,6 +32,8 @@ Each finding has an ID, SF-n. The plan
 
 ## SF-1 — fake-IP recycling
 
+**Fixed in #99.**
+
 **Today.** When the pool is full, `FakeIpPool::assign` reuses the address of
 the least recently *assigned* domain (`src/dns/fake_ip/pool.rs:184-215`). Only
 `assign`, which DNS answers call, counts as use. `lookup`, which the connect
@@ -64,6 +66,8 @@ no wall clock.
 
 ## SF-2 — an in-pool address with no mapping
 
+**Fixed in #99.**
+
 **Today.** `destination_to_net_location` (`src/dns/fake_ip/mod.rs:55-72`)
 falls through to the literal address when `lookup` returns `None`. That
 happens after a restart (the table is in memory) or after a recycle. The
@@ -89,6 +93,8 @@ if a device run shows apps that do not re-resolve after a reset.
 reset, and no outbound dial is made. A mapped address still connects.
 
 ## SF-3 — local names bypass fake IP by default
+
+**Fixed in #99.**
 
 **Today.** `bypass_domains` is empty unless configured (`src/tun/mod.rs:689`).
 `printer`, `nas.lan` and `_ipp._tcp.local` get fake IPs and are routed into
