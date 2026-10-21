@@ -12,3 +12,6 @@ pub use shadow_tls_client_handler::ShadowTlsClientHandler;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kat_tests;
