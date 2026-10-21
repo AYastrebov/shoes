@@ -520,3 +520,51 @@ mod tests {
         assert_eq!(request[3], 0x01, "address type is ipv4");
     }
 }
+
+/// Against the mieru client (`tests/data/kat/frames-mieru`). Shoes has no
+/// mieru server, so the reference's first flight is decoded with the
+/// segment decoder shoes' client reads the server with: the format is the
+/// same both ways.
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{hex, number, text, vectors};
+    use crate::mieru::crypto::{DirectionCipher, derive_key, round_to_interval};
+    use crate::mieru::frame::decode_segment;
+    use crate::mieru::metadata::{Metadata, OPEN_SESSION_REQUEST};
+
+    #[test]
+    fn the_reference_open_session_request_decodes_to_shoes_own_request() {
+        let v = vectors("frames-mieru");
+        let username = text(&v["username"]).as_bytes();
+        let unix_time = number(&v["unix_time"]);
+        let key = derive_key(
+            text(&v["password"]).as_bytes(),
+            username,
+            round_to_interval(unix_time),
+        );
+        let mut cipher = DirectionCipher::new(&key, username);
+        let wire = hex(&v["wire"]);
+
+        let (meta, payload, used) = decode_segment(&mut cipher, &wire).unwrap().unwrap();
+        assert_eq!(used, wire.len(), "one segment, padding included");
+        let Metadata::Session(session) = meta else {
+            panic!("not a session segment: {meta:?}");
+        };
+        assert_eq!(session.protocol, OPEN_SESSION_REQUEST);
+        assert_eq!(session.seq, 0);
+        assert!(
+            (session.timestamp_minutes as u64).abs_diff(unix_time / 60) <= 1,
+            "stamped with the capture's minute"
+        );
+
+        // The standard handshake waits for the server's answer before data,
+        // so the open request carries only the socks5 request -- the one
+        // shoes' client sends for the same target.
+        let target = crate::address::NetLocation::from_str(text(&v["target"]), None).unwrap();
+        assert_eq!(
+            payload,
+            encode_socks5_request(SOCKS5_CONNECT, &target).unwrap()
+        );
+    }
+}

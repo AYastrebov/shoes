@@ -18,6 +18,7 @@ not.
 | `rfc8448` | RFC 8448 section 3, the simple 1-RTT handshake, by `rfc8448/extract.py` | `src/reality/reality_tls13_keys.rs` |
 | `frames-sing` | sing-shadowsocks `shadowaead_2022`, sing-vmess (VMess, VMess UDP with GlobalPadding, VLESS, XUDP): client first flights at a fixed time | `src/reference_frames.rs` |
 | `frames-sing-tls` | sing-anytls `CreateProxy`; sing-box's WebSocket client with early data carrying VLESS; VLESS Vision over Go `crypto/tls` (the plaintext the server read) | `src/reference_frames.rs` |
+| `frames-mieru` | mieru v3.38.2 `apis/client`: the first flight to a listener that answers nothing | `src/mieru/client.rs` (shoes has no mieru server; decoded with its segment decoder) |
 
 Where a reference keeps its derived key private (Snell, salamander, mieru),
 the vector holds bytes the reference put on the wire with that key. Shoes

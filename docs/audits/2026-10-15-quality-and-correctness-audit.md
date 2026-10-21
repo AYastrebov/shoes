@@ -240,7 +240,8 @@ redirect and tproxy socket options.
   AmneziaWG I-packet.
   **Fixed in #96** for the sing-family client flights (SS2022, VMess, VLESS,
   XUDP, AnyTLS, WebSocket early data, Vision); the `.srs` fixture landed in
-  #56; mieru, AmneziaWG and the QUIC protocols are PR 4.2 part 2.
+  #56; the mieru open request **fixed in #97**; AmneziaWG and the QUIC
+  protocols move to the interop job (PR 4.3).
 - **No probe-behaviour tests**: what a wrong-password, short, malformed or
   slow client receives and after how long — the property every fallback path
   exists for.
