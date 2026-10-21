@@ -88,6 +88,7 @@ async fn every_wrapper_forwards_the_reuse_question() {
             [0u8; 8],
             "example.com".to_string(),
             Vec::new(),
+            None,
             inner(),
         ),
     )

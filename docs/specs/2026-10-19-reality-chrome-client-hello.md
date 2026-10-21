@@ -111,8 +111,12 @@ neither happens against sing-box.
 ## Not in this spec's first PR
 
 - RE-R4/R7: an HMAC mismatch falls back to x509 verification and the spider
-  behaviour instead of failing, the version in the session id is not
-  hardcoded, and alerts are sent on failure. These are part 2.
+  behaviour instead of failing, alerts are sent on failure, and the
+  ServerHello is sanity-checked. These are part 2. The version in the
+  session id is no longer hardcoded: that fix went ahead of part 2 on its
+  own (`client_version`, defaulting to Xray-core's latest stable release),
+  because Xray v26.7.28 refuses the fixed 1.8.0 by default and the Amnezia
+  app installs that Xray.
 - ST-S1: a ShadowTLS v3 client built on the same ClientHello and key-schedule
   code. Part 3.
 - The shoes Reality **server** accepting an X25519MLKEM768-only client
@@ -157,5 +161,5 @@ key schedule refused a 64-byte (EC)DHE secret. It now takes 32 or 64 bytes.
 1. Chrome 133 ClientHello plus the hybrid key exchange, together. Offering
    0x11ec without being able to complete it would break every connection
    whose decoy picks it.
-2. RE-R4/R7: x509 fallback and spider, the version, alerts.
+2. RE-R4/R7: x509 fallback and spider, alerts, ServerHello sanity checks.
 3. ST-S1 on the same primitives.

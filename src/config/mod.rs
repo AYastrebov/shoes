@@ -324,6 +324,38 @@ mod nested_error_tests {
         assert!(!err.contains("did not match any variant"), "{err}");
     }
 
+    fn reality_hop(extra: &str) -> String {
+        format!(
+            "            type: reality\n            public_key: \"{}\"\n            sni_hostname: example.com\n{extra}            protocol:\n                type: vless\n                user_id: \"b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4\"\n",
+            "A".repeat(43)
+        )
+    }
+
+    #[test]
+    fn a_reality_client_version_with_three_parts_is_accepted() {
+        load_config_str(&server_with_hop(&reality_hop(
+            "            client_version: [26, 3, 27]\n",
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_reality_client_version_with_two_parts_is_refused() {
+        let err = error_of(&server_with_hop(&reality_hop(
+            "            client_version: [26, 3]\n",
+        )));
+        assert!(err.contains("length 2"), "{err}");
+        assert!(err.contains("length 3"), "{err}");
+    }
+
+    #[test]
+    fn a_reality_client_version_part_over_255_is_refused() {
+        let err = error_of(&server_with_hop(&reality_hop(
+            "            client_version: [26, 3, 300]\n",
+        )));
+        assert!(err.contains("300"), "{err}");
+    }
+
     #[test]
     fn an_empty_mask_list_says_it_is_empty() {
         let err = error_of(

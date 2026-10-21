@@ -21,6 +21,8 @@ mod reality_util;
 
 #[cfg(test)]
 mod post_handshake_tests;
+#[cfg(test)]
+mod tests;
 
 pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
 // generate_keypair is used by binary, not by library's public API

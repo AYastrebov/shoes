@@ -322,6 +322,7 @@ mod tests {
             short_id: [0u8; 8],
             server_name: "test.example.com".to_string(),
             cipher_suites: Vec::new(),
+            client_version: None,
         };
         let reality_client = RealityClientConnection::new(client_config).unwrap();
         let client_conn = CryptoConnection::new_reality_client(reality_client);

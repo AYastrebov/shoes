@@ -860,6 +860,7 @@ protocol:
   short_id: string             # Your client ID (hex, 0-16 chars)
   sni_hostname: string         # SNI to send (must match server's reality_targets key)
   cipher_suites: [string]      # Optional TLS 1.3 cipher suites (see below)
+  client_version: [26, 3, 27]  # Optional [major, minor, patch] (default: 26.3.27, see below)
   vision: false                # Enable Vision (requires VLESS inner protocol)
   protocol: ClientProxyConfig  # Inner protocol (typically VLESS)
 ```
@@ -871,6 +872,8 @@ name, for a server whose names include `""`. An IP address is sent the same
 way, since a server name cannot carry one.
 
 **Reality cipher suites:** Valid values are `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. If not specified, all three are offered/supported.
+
+**Reality client version:** the version the client reports in its session ID, which the server compares against its `min_client_version` / `max_client_version` (the same `[major, minor, patch]` format; each part is 0-255). The default is Xray-core's latest stable release, 26.3.27 (checked 21 October 2026). Xray v26.7.28 refuses anything below 26.3.27 when its config sets no minimum, and the Amnezia app installs exactly that Xray version, so every XRay server it creates would otherwise refuse the client. A refused client is not told so: the server forwards it to its decoy site, and the connection fails with a certificate error, as if the server were a plain website. Set this only when a server pins a range that excludes the default.
 
 ### ShadowTLS Client
 ```yaml

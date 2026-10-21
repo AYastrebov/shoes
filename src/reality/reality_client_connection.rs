@@ -159,6 +159,17 @@ fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io
     Ok(previous_len)
 }
 
+/// The client version the REALITY client reports when its config sets none:
+/// Xray-core's latest stable release.
+///
+/// Checked on 21 October 2026 against the releases of `XTLS/Xray-core`:
+/// v26.3.27 is the latest release not marked as a pre-release. A server
+/// compares this against its `minClientVer` and `maxClientVer`, and Xray
+/// v26.7.28 (the version the Amnezia app installs) sets the minimum to
+/// 26.3.27 when its config gives none (`infra/conf/transport_security.go`,
+/// commit `af7eb68`), so an older version is sent to the decoy site.
+const LATEST_STABLE_XRAY_CORE_VERSION: [u8; 3] = [26, 3, 27];
+
 /// Configuration for REALITY client connections
 #[derive(Clone)]
 pub struct RealityClientConfig {
@@ -170,6 +181,9 @@ pub struct RealityClientConfig {
     pub server_name: String,
     /// Supported TLS 1.3 cipher suites (empty = use defaults)
     pub cipher_suites: Vec<CipherSuite>,
+    /// The client version reported in the session ID
+    /// (`None` = `LATEST_STABLE_XRAY_CORE_VERSION`)
+    pub client_version: Option<[u8; 3]>,
 }
 
 /// Handshake state machine for REALITY client
@@ -296,10 +310,12 @@ impl RealityClientConnection {
         let timestamp = crate::util::unix_time_secs()?;
 
         let mut session_id_plaintext = [0u8; 16];
-        session_id_plaintext[0] = 1; // Protocol version major
-        session_id_plaintext[1] = 8; // Protocol version minor
-        session_id_plaintext[2] = 0; // Protocol version patch
-        session_id_plaintext[3] = 0; // Padding byte
+        // Client version [major, minor, patch], then a zero padding byte
+        let client_version = self
+            .config
+            .client_version
+            .unwrap_or(LATEST_STABLE_XRAY_CORE_VERSION);
+        session_id_plaintext[0..3].copy_from_slice(&client_version);
         // Timestamp (4 bytes as uint32, in seconds)
         session_id_plaintext[4..8].copy_from_slice(&(timestamp as u32).to_be_bytes());
         // Short ID (8 bytes)
@@ -1192,23 +1208,63 @@ mod tests {
         assert_eq!(accumulated.len(), MAX_HANDSHAKE_PLAINTEXT);
     }
 
-    #[test]
-    fn client_hello_transcript_bytes_use_encrypted_session_id() {
-        let server_private = [0x42u8; 32];
+    const SERVER_PRIVATE: [u8; 32] = [0x42u8; 32];
+
+    fn client(client_version: Option<[u8; 3]>) -> RealityClientConnection {
         let server_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &server_private).unwrap();
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &SERVER_PRIVATE).unwrap();
         let server_public_key = server_private_key.compute_public_key().unwrap();
         let mut server_public = [0u8; 32];
         server_public.copy_from_slice(server_public_key.as_ref());
 
-        let config = RealityClientConfig {
+        RealityClientConnection::new(RealityClientConfig {
             public_key: server_public,
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             server_name: "example.com".to_string(),
             cipher_suites: vec![],
+            client_version,
+        })
+        .unwrap()
+    }
+
+    /// The session ID the client sealed into its ClientHello, opened the way
+    /// the server opens it.
+    fn sealed_session_id(client_version: Option<[u8; 3]>) -> [u8; 16] {
+        use super::super::common::TLS_RECORD_HEADER_SIZE;
+        use super::super::reality_auth::decrypt_session_id;
+        use super::super::reality_util::{
+            extract_client_public_key, extract_client_random, extract_session_id_slice,
         };
 
-        let mut conn = RealityClientConnection::new(config).unwrap();
+        let mut wire = Vec::new();
+        client(client_version).write_tls(&mut wire).unwrap();
+
+        let random = extract_client_random(&wire).unwrap();
+        let sealed: [u8; 32] = extract_session_id_slice(&wire).unwrap().try_into().unwrap();
+        let shared =
+            perform_ecdh(&SERVER_PRIVATE, &extract_client_public_key(&wire).unwrap()).unwrap();
+        let auth_key = derive_auth_key(&shared, &random[0..20], b"REALITY").unwrap();
+        let mut aad = wire[TLS_RECORD_HEADER_SIZE..].to_vec();
+        aad[39..39 + 32].fill(0);
+        decrypt_session_id(&sealed, &auth_key, &random[20..32], &aad).unwrap()
+    }
+
+    #[test]
+    fn the_session_id_carries_the_configured_version() {
+        let plaintext = sealed_session_id(Some([26, 9, 8]));
+        assert_eq!(plaintext[0..3], [26, 9, 8]);
+        assert_eq!(plaintext[3], 0, "the byte after the version is padding");
+    }
+
+    /// Xray-core's latest stable release at the time of writing, 26.3.27.
+    #[test]
+    fn the_session_id_carries_the_latest_stable_xray_version_by_default() {
+        assert_eq!(sealed_session_id(None)[0..3], [26, 3, 27]);
+    }
+
+    #[test]
+    fn client_hello_transcript_bytes_use_encrypted_session_id() {
+        let mut conn = client(None);
         let stored_client_hello = match &conn.handshake_state {
             HandshakeState::AwaitingServerHello {
                 client_hello_bytes, ..

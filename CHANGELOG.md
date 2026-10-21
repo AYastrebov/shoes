@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+REALITY client version (the version part of RE-R4/R7):
+
+- **The REALITY client reports Xray-core's latest stable release, 26.3.27,
+  instead of a fixed 1.8.0.** Xray v26.7.28 refuses clients below 26.3.27
+  unless its config says otherwise, and the Amnezia app installs exactly
+  that version, so every server it creates handed shoes to its decoy site
+  and the client failed with a certificate error. A new `client_version:
+  [major, minor, patch]` on the Reality client sets the version explicitly.
+
 Probe harness (plan PR 4.3, part 2; SF-10):
 
 - What every TCP server shows a client that is not one is now a test.
