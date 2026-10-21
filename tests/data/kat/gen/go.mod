@@ -3,6 +3,7 @@ module shoes-kat-gen
 go 1.27
 
 require (
+	github.com/anytls/sing-anytls v0.0.11
 	github.com/apernet/hysteria/extras/v2 v2.13.0
 	github.com/enfein/mieru/v3 v3.38.2
 	github.com/gofrs/uuid/v5 v5.5.1
@@ -23,6 +24,8 @@ require (
 	github.com/florianl/go-nfqueue/v2 v2.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/gobwas/httphead v0.1.0 // indirect
+	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
@@ -44,6 +47,7 @@ require (
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
 	github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237 // indirect
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca // indirect
+	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect

@@ -12,10 +12,35 @@ use tokio::io::AsyncWriteExt;
 /// so an error says the same thing and says it usefully.
 #[inline]
 pub fn unix_time_secs() -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(secs) = UNIX_TIME_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(secs);
+    }
     SystemTime::UNIX_EPOCH
         .elapsed()
         .map(|since_epoch| since_epoch.as_secs())
         .map_err(|e| std::io::Error::other(format!("system clock is before the Unix epoch: {e}")))
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNIX_TIME_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pins `unix_time_secs` on this thread until the guard drops, for a test
+/// that replays a handshake recorded at a known time. `#[tokio::test]` runs
+/// on one thread, so the handler under test sees it and no other test does.
+#[cfg(test)]
+#[must_use]
+pub fn pin_unix_time(secs: u64) -> impl Drop {
+    struct Unpin;
+    impl Drop for Unpin {
+        fn drop(&mut self) {
+            UNIX_TIME_OVERRIDE.with(|time| time.set(None));
+        }
+    }
+    UNIX_TIME_OVERRIDE.with(|time| time.set(Some(secs)));
+    Unpin
 }
 
 /// A zeroed buffer of `len` bytes.

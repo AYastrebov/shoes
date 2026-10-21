@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Reference-captured frames (plan PR 4.2, part 1):
+
+- Client first flights from the sing references are replayed into shoes'
+  servers: SS2022, VMess (TCP, and UDP with GlobalPadding), VLESS, XUDP New
+  then Keep, AnyTLS, VLESS over sing-box's WebSocket with early data in the
+  path, and VLESS Vision's first padded frame. Each yields the target and
+  payload the reference was given. All of them already did.
+
 Known-answer vectors (plan PR 4.1, part 2):
 
 - ShadowTLS v3's ClientHello tag and data-frame HMACs are checked against a
