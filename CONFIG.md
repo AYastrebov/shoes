@@ -617,7 +617,10 @@ system settings.
 
 Notes:
 
-- Requires `udp_enabled: true`; DNS arrives over UDP.
+- Requires `udp_enabled: true`; DNS arrives over UDP. A query a resolver
+  sends over TCP to port 53 instead (a truncated answer, or a resolver set to
+  TCP) is answered the same way, message by message, and what is forwarded
+  goes to the resolver it addressed over one connection the rules judge.
 - `network` must be a range that is not routed for real. The default sits in
   `198.18.0.0/15`, reserved for benchmarking by RFC 2544.
 - Past `max_entries` the least recently used mapping is recycled. The 1-second

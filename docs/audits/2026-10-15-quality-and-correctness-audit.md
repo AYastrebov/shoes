@@ -187,7 +187,7 @@ consumer; **P2** is robustness or spec conformance without a known consumer;
 | TR-7/10/11/12 | **TR-7 and TR-11 fixed in #58; TR-12 fixed in #86; TR-10 open.** WS ping >80 B or any pong payload kills the connection (RFC: ≤125, pongs may carry data), close frame ignored; TLS sniff rejects record versions 0x0300/0x0302; `write_location_to_vec` truncates >255-byte hostnames; SOCKS UDP BND.ADDR from the listener bind IP (0.0.0.0 on wildcard). | `websocket_stream.rs:291-296,324-329,339`; `sniff/tls.rs:78-82`; `socks_handler.rs:758,385` |
 | WG-A3/A4 | **Fixed in #88.** `jc` accepts 129–255 (kernel: ≤128), `validate_for_mtu` not invoked; decoy/initiation ordering race between the timer task and encapsulate. | `amneziawg/config.rs:99-104`; `tunnel.rs:843-864` |
 | DN-D1/D2/D3 | **Fixed in #89.** DNS 0x20 case randomisation off; DoH/DoT bootstrap resolved once at build; system-resolver cache 1 h fixed. | `dns/builder.rs:663`; `resolver.rs:366` |
-| FI-1 | Fake IP intercepts UDP/53 only; a TCP-fallback resolver escapes. | `udp_manager.rs:133` |
+| FI-1 | **Fixed in #92.** Fake IP intercepts UDP/53 only; a TCP-fallback resolver escapes. | `udp_manager.rs:133` |
 
 ### Architecture and code quality (A, Q)
 

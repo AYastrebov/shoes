@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Fake IP over TCP (plan PR 5.3; FI-1):
+
+- **DNS over TCP to port 53 gets fake-IP answers too.** Only UDP/53 was
+  intercepted, so a resolver that fell back to TCP got real addresses and
+  the domain rules never saw the name. Each TCP DNS message is now offered to
+  the same responder; what it does not answer reaches the resolver the app
+  addressed, through the rules, over one connection.
+
 Dependencies and CI:
 
 - rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10, for
