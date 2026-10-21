@@ -234,6 +234,7 @@ redirect and tproxy socket options.
   2022 subkey, Argon2id (Snell), VMess KDF/AuthID/crc32, salamander key (its
   "known vector" test derives the expectation with the code under test),
   mieru PBKDF2, ShadowTLS HMACs. Every one is a self round-trip today.
+  **Fixed in #94** for all but the ShadowTLS HMACs (PR 4.1 part 2).
 - **No reference-captured bytes decoded by shoes** for any protocol; no
   reference `.srs` fixture that mixes v4 and v6; no Go-produced mieru or
   AmneziaWG I-packet.
