@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Dependencies and CI:
+
+- rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10, for
+  RUSTSEC-2026-0381, -0382 and -0383 (distrusted intermediates).
+- The root tproxy tests give their `setcap` copy of shoes a directory under
+  `/var/tmp`: Ubuntu 26.04, now `ubuntu-latest`, mounts `/tmp` `nosuid`,
+  which drops file capabilities.
+
 awgtun 0.11.0:
 
 - **AmneziaWG `s1`-`s4` and `jc` are 16-bit**, as amneziawg-go, the kernel

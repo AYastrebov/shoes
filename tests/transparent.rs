@@ -116,6 +116,13 @@ fn spawn_shoes(config: &Path) -> Child {
     )
 }
 
+/// A scratch directory where a file capability takes effect. Ubuntu 26.04
+/// mounts `/tmp` as tmpfs with `nosuid`, under which the kernel ignores
+/// file capabilities, so the `setcap` copy must live elsewhere.
+fn capable_dir() -> tempfile::TempDir {
+    tempfile::tempdir_in("/var/tmp").unwrap()
+}
+
 /// shoes as `nobody`, from a copy in `dir`: `target/` usually sits under a
 /// home directory `nobody` cannot traverse. With `transparent` the copy gets
 /// `CAP_NET_RAW`, the narrower of the two capabilities the kernel accepts
@@ -130,6 +137,7 @@ fn spawn_shoes_as_nobody(dir: &Path, config: &Path, transparent: bool) -> Child 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
     if transparent {
+        // In a directory from `capable_dir`, or the capability is ignored.
         run(&format!("setcap cap_net_raw+ep {}", bin.display()));
     }
     Child(
@@ -389,7 +397,7 @@ async fn tproxy_delivers_a_datagram_and_spoofs_the_reply_source() {
         .unwrap();
 
     let listener_port = free_port();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = capable_dir();
     let config = write_tproxy_config(
         dir.path(),
         listener_port,
@@ -471,7 +479,7 @@ async fn tproxy_relays_a_client_on_another_interface() {
     let remote: SocketAddr = "198.51.100.8:5353".parse().unwrap();
 
     let listener_port = free_port();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = capable_dir();
     let config = write_tproxy_config(
         dir.path(),
         listener_port,
