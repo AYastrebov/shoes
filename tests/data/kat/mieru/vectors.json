@@ -1,0 +1,16 @@
+{
+  "messages": [
+    {
+      "plaintext": "6669727374206d69657275206d657373616765",
+      "sealed": "4807dd3ed9f7cd6f5eb55822bea1ff9d2c52826f944addbe702be42992532167687736888fad55aa3e2bc10d682c977707f3f275231ef0cb665121"
+    },
+    {
+      "plaintext": "7365636f6e64",
+      "sealed": "0d3afa8342b33aab0df4ff53e7818abc9e1edd077907"
+    }
+  ],
+  "password": "mieru password",
+  "source": "github.com/enfein/mieru/v3/pkg/cipher: HashPassword, BlockCipherFromPassword (implicit nonce)",
+  "unix_time": 1792571259,
+  "username": "mieru-user"
+}

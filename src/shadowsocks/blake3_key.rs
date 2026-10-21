@@ -39,3 +39,26 @@ impl ShadowsocksKey for Blake3Key {
         session_key.into_boxed_slice()
     }
 }
+
+/// Against sing-shadowsocks' `shadowaead_2022.SessionKey`
+/// (`tests/data/kat/shadowsocks`).
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::kat::{cases, hex, vectors};
+
+    #[test]
+    fn the_2022_session_subkey_matches_the_reference() {
+        let vectors = vectors("shadowsocks");
+        for case in cases(&vectors, "blake3_session_subkey") {
+            let psk = hex(&case["psk"]);
+            let len = psk.len();
+            assert_eq!(
+                Blake3Key::new(psk.into_boxed_slice(), len)
+                    .create_session_key(&hex(&case["salt"]))
+                    .to_vec(),
+                hex(&case["subkey"])
+            );
+        }
+    }
+}

@@ -1,0 +1,49 @@
+{
+  "blake3_session_subkey": [
+    {
+      "psk": "10171e252c333a41484f565d646b7279",
+      "salt": "40474e555c636a71787f868d949ba2a9",
+      "subkey": "60794144faef9e6a06b649ca0d3eaae9"
+    },
+    {
+      "psk": "10171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9",
+      "salt": "40474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b1219",
+      "subkey": "de9396d5400651f2d2eecac2bfcf673131ca0565ddadbd273a64049c9266ce74"
+    }
+  ],
+  "evp_bytes_to_key": [
+    {
+      "key": "d41d8cd98f00b204e9800998ecf8427e",
+      "key_len": 16,
+      "password": ""
+    },
+    {
+      "key": "5f4dcc3b5aa765d61d8327deb882cf99",
+      "key_len": 16,
+      "password": "password"
+    },
+    {
+      "key": "5f4dcc3b5aa765d61d8327deb882cf992b95990a9151374abd8ff8c5a7a0fe08",
+      "key_len": 32,
+      "password": "password"
+    },
+    {
+      "key": "bd183fd9afde04034f7f75770d8e68f86e624d4e10d00a2c8a649bee021670a2",
+      "key_len": 32,
+      "password": "a much longer password, past one digest"
+    }
+  ],
+  "hkdf_sha1_subkey": [
+    {
+      "key": "5f4dcc3b5aa765d61d8327deb882cf99",
+      "salt": "40474e555c636a71787f868d949ba2a9",
+      "subkey": "36619c0ddde568b02b97d6fcea5fc596"
+    },
+    {
+      "key": "5f4dcc3b5aa765d61d8327deb882cf992b95990a9151374abd8ff8c5a7a0fe08",
+      "salt": "40474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b1219",
+      "subkey": "146b94576c1a119e03277d24cea661034f473e1c618e894ca3072cf7d07ac13c"
+    }
+  ],
+  "source": "github.com/sagernet/sing-shadowsocks: shadowsocks.Key, shadowaead.Kdf, shadowaead_2022.SessionKey"
+}

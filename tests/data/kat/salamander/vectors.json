@@ -1,0 +1,22 @@
+{
+  "packets": [
+    {
+      "payload": "01",
+      "wire": "f0f580b2d90e4b57e8"
+    },
+    {
+      "payload": "20272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9",
+      "wire": "2964393c091ed25959c95b6687e3942ceae9af2f4339d4606e56c44e241faccc2f9c58506fc68df5"
+    },
+    {
+      "payload": "21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01",
+      "wire": "2790dbe7b258a02ca80145413d3df2c3b8767d2beabad8d17eddbabcf9937cd633857f82b3e6a74388"
+    },
+    {
+      "payload": "646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b1219",
+      "wire": "182e339cfc98d2ad75cb0ce81e26fcecb3f6d6267c678739d94a8251f634301fbc5466c5d0ef240955eb2cc8fec61c0c53d6f6065c47e759b92aa271d61410ff5cb486e5f0cf0429358b4ca8dee63c2c733616e6bca7c779990ac211b67470df7c94a605102fe4c915ab6c88"
+    }
+  ],
+  "psk": "salamander psk",
+  "source": "github.com/apernet/hysteria/extras/v2/obfs: WrapPacketConnSalamander"
+}
