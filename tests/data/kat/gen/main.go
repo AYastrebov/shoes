@@ -254,6 +254,23 @@ func genMieru() {
 	}
 }
 
+// VLESS and VMess user ids that are names, not UUIDs: sing-vmess's
+// NewClient falls back to uuid.NewV5(uuid.Nil, name) for any id its parser
+// refuses, which is Xray's common/uuid ParseString rule for 1 to 30 bytes.
+func genUserID() {
+	var cases []object
+	for _, name := range []string{
+		"a",
+		"TMG_74317ba5f91",
+		"user@example.com",
+		"naïve-café",
+		"012345678901234567890123456789",
+	} {
+		cases = append(cases, object{"name": name, "uuid": uuid.NewV5(uuid.Nil, name).String()})
+	}
+	write("user-id", "gofrs/uuid v5.5.1 NewV5(Nil, name), as sing-vmess v0.2.9 vless.NewClient and NewClient call it", object{"cases": cases})
+}
+
 // Every generator by default; with arguments, only those named, so adding a
 // fixture does not rewrite the ones whose bytes are random.
 func main() {
@@ -268,6 +285,7 @@ func main() {
 		"frames-sing":     genFrames,
 		"frames-sing-tls": genFramesTLS,
 		"frames-mieru":    genFramesMieru,
+		"user-id":         genUserID,
 	}
 	names := os.Args[1:]
 	if len(names) == 0 {

@@ -263,14 +263,10 @@ pub fn create_tcp_client_handler(
             // Determine SNI hostname
             let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
             let inner_hop = hop.under_tls(sni_hostname.clone());
-            let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s)
-                    .unwrap()
-                    .to_owned(),
-                None => {
-                    panic!("REALITY client requires sni_hostname to be specified");
-                }
-            };
+            // `""` and an IP address send no server_name (SF-4). A missing
+            // one is refused by config validation (`validate_reality_sni`).
+            let server_name =
+                sni_hostname.expect("REALITY sni_hostname is checked by config validation");
 
             let cipher_suites = cipher_suites.into_vec();
 

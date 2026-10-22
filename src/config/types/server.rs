@@ -776,6 +776,7 @@ pub enum ServerProxyConfig {
     },
     #[serde(alias = "tuic")]
     TuicV5 {
+        #[serde(deserialize_with = "Uuid::deserialize_hex")]
         uuid: Uuid,
         password: Redacted<String>,
         /// Enable 0-RTT (0.5-RTT for server) handshake for faster connection establishment.

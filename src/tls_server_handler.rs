@@ -94,6 +94,24 @@ impl TlsServerHandler {
     }
 }
 
+/// The target for a ClientHello's server name. A hello with none goes to the
+/// target keyed `""` when there is one, as Xray and sing-box REALITY servers
+/// match an absent name against `""` in their server names (SF-4), and
+/// otherwise to the default target.
+fn select_target<'a, T>(
+    sni_targets: &'a FxHashMap<String, T>,
+    default_target: Option<&'a T>,
+    requested: Option<&str>,
+) -> std::io::Result<&'a T> {
+    let found = sni_targets.get(requested.unwrap_or("")).or(default_target);
+    found.ok_or_else(|| match requested {
+        None => std::io::Error::other("No default target for unspecified SNI"),
+        Some(hostname) => {
+            std::io::Error::other(format!("No default target for unknown SNI: {hostname}"))
+        }
+    })
+}
+
 #[async_trait]
 impl TcpServerHandler for TlsServerHandler {
     async fn setup_server_stream(
@@ -102,27 +120,11 @@ impl TcpServerHandler for TlsServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         let parsed_client_hello = read_client_hello(&mut server_stream).await?;
 
-        let target = match parsed_client_hello.requested_server_name.as_ref() {
-            None => match self.default_target {
-                Some(ref t) => t,
-                None => {
-                    return Err(std::io::Error::other(
-                        "No default target for unspecified SNI",
-                    ));
-                }
-            },
-            Some(hostname) => match self.sni_targets.get(hostname) {
-                Some(t) => t,
-                None => match self.default_target {
-                    Some(ref t) => t,
-                    None => {
-                        return Err(std::io::Error::other(format!(
-                            "No default target for unknown SNI: {hostname}"
-                        )));
-                    }
-                },
-            },
-        };
+        let target = select_target(
+            &self.sni_targets,
+            self.default_target.as_ref(),
+            parsed_client_hello.requested_server_name.as_deref(),
+        )?;
 
         match target {
             TlsServerTarget::Tls {
@@ -226,5 +228,45 @@ impl TcpServerHandler for TlsServerHandler {
                 .await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets() -> FxHashMap<String, &'static str> {
+        [("example.com", "named"), ("", "no-sni")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    #[test]
+    fn a_hello_without_a_name_takes_the_empty_key() {
+        let targets = targets();
+        assert_eq!(
+            *select_target(&targets, Some(&"default"), None).unwrap(),
+            "no-sni"
+        );
+        assert_eq!(
+            *select_target(&targets, Some(&"default"), Some("example.com")).unwrap(),
+            "named"
+        );
+        assert_eq!(
+            *select_target(&targets, Some(&"default"), Some("other.com")).unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn without_an_empty_key_a_nameless_hello_takes_the_default() {
+        let mut targets = targets();
+        targets.remove("");
+        assert_eq!(
+            *select_target(&targets, Some(&"default"), None).unwrap(),
+            "default"
+        );
+        assert!(select_target(&targets, None, None).is_err());
     }
 }

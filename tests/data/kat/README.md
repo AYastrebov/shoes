@@ -19,6 +19,7 @@ not.
 | `frames-sing` | sing-shadowsocks `shadowaead_2022`, sing-vmess (VMess, VMess UDP with GlobalPadding, VLESS, XUDP): client first flights at a fixed time | `src/reference_frames.rs` |
 | `frames-sing-tls` | sing-anytls `CreateProxy`; sing-box's WebSocket client with early data carrying VLESS; VLESS Vision over Go `crypto/tls` (the plaintext the server read) | `src/reference_frames.rs` |
 | `frames-mieru` | mieru v3.38.2 `apis/client`: the first flight to a listener that answers nothing | `src/mieru/client.rs` (shoes has no mieru server; decoded with its segment decoder) |
+| `user-id` | gofrs/uuid v5.5.1 `NewV5(Nil, name)`, which sing-vmess's VLESS and VMess clients call for an id that is not a UUID (Xray `common/uuid` computes the same for 1 to 30 bytes) | `src/uuid_util.rs` |
 
 Where a reference keeps its derived key private (Snell, salamander, mieru),
 the vector holds bytes the reference put on the wire with that key. Shoes

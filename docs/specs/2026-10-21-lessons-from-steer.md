@@ -147,6 +147,13 @@ extension. steer reports a real subscription that depends on this
   nothing else changes. Check that `reality_client_verify.rs` doesn't
   compare against it.
 
+**Server side.** shoes' REALITY server looked a hello without a name up as
+"no SNI" and went straight to `default_tls_target`. It now tries the target
+keyed `""` first (`tls_server_handler.rs` `select_target`), as both servers look the name up in their names map, and Go's parsed
+hello has `serverName == ""` when the extension is absent: XTLS/REALITY
+`tls.go` (`config.ServerNames[hs.clientHello.serverName]`), and
+metacubex/utls v1.8.7 `reality.go:385`, which sing-box uses.
+
 **Tests.** The config error. A hello built with `""` has no extension type 0,
 and the rest of the hello is unchanged. The server test from #95 accepts a
 hello without SNI when its `server_names` contains `""`; this needs that
@@ -176,6 +183,23 @@ before implementing):
 **Tests.** A known-answer vector for the string rule, from the KAT generator
 (`tests/data/kat/gen`) calling the reference's own function. A UUIDv7 loads.
 The 31-character case is rejected.
+
+**What the references do (checked 2026-10-22).**
+
+- Xray `common/uuid/uuid.go` `ParseString`: an id of 32 to 36 bytes is
+  parsed as hex groups 8-4-4-4-12, each optionally preceded by a dash. One
+  of 1 to 30 bytes is `SHA-1(uuid.Nil ‖ name)[:16]`, with
+  `u[6] = u[6]&0x0f | 0x50` and `u[8] = u[8]&0x3f | 0x80`. 0, 31 or more
+  than 36 bytes is an error. Lengths are in bytes, so a non-ASCII name
+  reaches the limit sooner.
+- sing-vmess `vless/client.go` and `client.go` `NewClient`:
+  `uuid.FromString(id)`, and on any error `uuid.NewV5(uuid.Nil, id)` (gofrs
+  uuid). That is the same id for the same name, with **no length limit**: a
+  31-byte or 40-byte name loads in sing-box and is refused by Xray.
+
+shoes follows Xray's limits. A name only sing-box accepts would not work
+against an Xray server. The `user-id` vector comes from gofrs `NewV5` in the
+KAT generator, and includes a non-ASCII name.
 
 ## SF-6 — fall back from the post-quantum ClientHello
 

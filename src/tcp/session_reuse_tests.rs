@@ -86,7 +86,7 @@ async fn every_wrapper_forwards_the_reuse_question() {
         &crate::reality_client_handler::RealityClientHandler::new(
             [7u8; 32],
             [0u8; 8],
-            server_name(),
+            "example.com".to_string(),
             Vec::new(),
             inner(),
         ),

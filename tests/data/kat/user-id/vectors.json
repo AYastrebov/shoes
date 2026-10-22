@@ -1,0 +1,25 @@
+{
+  "cases": [
+    {
+      "name": "a",
+      "uuid": "35b65f33-a679-5e76-af3c-273ea349ede4"
+    },
+    {
+      "name": "TMG_74317ba5f91",
+      "uuid": "dd4748e6-1f48-5b36-bbc6-656b42ccfd75"
+    },
+    {
+      "name": "user@example.com",
+      "uuid": "4c37d34f-d96f-5502-ade5-e0106ac38f54"
+    },
+    {
+      "name": "naïve-café",
+      "uuid": "4f135e19-3bfd-5207-bc44-706d3a9b0123"
+    },
+    {
+      "name": "012345678901234567890123456789",
+      "uuid": "f419e679-3adc-5ca0-8896-f8785ab48bf9"
+    }
+  ],
+  "source": "gofrs/uuid v5.5.1 NewV5(Nil, name), as sing-vmess v0.2.9 vless.NewClient and NewClient call it"
+}
