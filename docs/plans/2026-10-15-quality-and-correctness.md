@@ -42,6 +42,25 @@ weeks of it and carry most of the value.
 
 ---
 
+## Status, 2026-10-22
+
+| Phase | State | PRs |
+|---|---|---|
+| 0 | Done; released as v0.6.0 | 0.1 #55, 0.2 #56, 0.3 #57, 0.4 #58, 0.5 #59 |
+| 1 | Done | 1.1 #60, 1.2 #61, 1.3 #62, 1.4 #63–#69, 1.5 #70–#71, 1.6 #72–#77 (with #74 and #76 as fixes on the way) |
+| 2 | **Not started.** Deferred after Phase 1, by choice: servers are off the current focus. The probe harness (4.3, part 2) now pins what each server does today, so each 2.x PR shows as changed matrix cells. | — |
+| 3 | Done except 3.1 and 3.3's parts 2–3 | 3.1 deferred with tests (#78); 3.2 #79–#80; 3.3 part 1 #81 (parts 2 RE-R4/R7 and 3 ST-S1 not scheduled); 3.4 #83; 3.5 #84–#85; 3.6 #86; 3.7 #87–#88 |
+| 4 | 4.1 and 4.2 done; 4.3 parts 1–2 done, part 3 left; 4.4 not started | 4.1 #94–#95; 4.2 #96–#97; 4.3 part 1 #101, part 2 #102 |
+| 5 | Done | 5.1 #89, 5.2 #91, 5.3 #92 |
+
+Releases: v0.6.0 after Phase 0 (#59), v0.7.0 after Phase 1 and 3.3 part 1
+(#82). Nothing has been released since #82.
+
+The steer plan (`docs/plans/2026-10-21-lessons-from-steer.md`) runs
+alongside this one: S.1 #99, S.2 #100; S.3 to S.6 are next.
+
+---
+
 ## Phase 0 — nothing aborts, nothing lies (strictly ordered, ~2 weeks)
 
 Every item here is either a reachable process abort, a stream corruption, or

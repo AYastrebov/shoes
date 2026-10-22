@@ -43,6 +43,10 @@ awg-manager section below is now a note on what was postponed. Refreshed
 C router with its own protocol clients) turned up two fake-IP bugs, two
 configs that should load and do not, and the details a Brutal spec needed;
 that review is a section of its own, with a spec and a plan behind it.
+Refreshed 2026-10-22 against `mobile` at `83775cd`, nineteen PRs after
+v0.7.0: the steer table caught up with S.1 and S.2, the quality plan got
+a section of its own, and the fingerprinting risk now records that
+sing-box's REALITY client sends no post-quantum share.
 
 ## Focus, as of 2026-10-15
 
@@ -57,8 +61,33 @@ from the removed code.
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
 
+## Quality and correctness plan
+
+The work since 2026-10-15 follows
+[docs/plans/2026-10-15-quality-and-correctness.md](./docs/plans/2026-10-15-quality-and-correctness.md),
+sequenced from
+[the audit](./docs/audits/2026-10-15-quality-and-correctness-audit.md);
+the plan's status table says which PR closed what.
+
+- **Done:** Phases 0 and 1, most of Phase 3, and Phase 5.
+- **Phase 4:** known-answer vectors and reference-captured frames are
+  done, as are the reference checks and the probe harness (PR 4.3, parts
+  1 and 2). The nightly interop job against the reference binaries is left.
+- **Phase 2 (servers that fail like the reference) has not started.** It
+  was deferred because servers are off the current focus. The probe harness
+  (`src/probe_tests.rs`, spec
+  [docs/specs/2026-10-22-probe-harness.md](./docs/specs/2026-10-22-probe-harness.md))
+  now records what every TCP server shows a prober. That is where Phase 2's
+  work is visible: REALITY and ShadowTLS close on the malformed first
+  flights the references relay (RE-R1, ST-S2). Three cells the audit had
+  missed are recorded there too:
+  - PH-1: Trojan waits for 56 bytes;
+  - PH-2: a TLS listener with no default target refuses an unknown name;
+  - PH-3: the HTTP proxy is silent on an origin-form `GET`.
+
 ## Table of Contents
 
+- [Quality and correctness plan](#quality-and-correctness-plan)
 - [Where we already compete](#where-we-already-compete)
 - [Where we do not](#where-we-do-not)
 - [Tier 1 — closes most of the gap](#tier-1--closes-most-of-the-gap)
@@ -72,7 +101,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Lessons from steer](#lessons-from-steer)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
-- [Open risk: AmneziaWG upload throughput is unmeasured](#open-risk-amneziawg-upload-throughput-is-unmeasured)
+- [Resolved: AmneziaWG upload was capped by the send window, and the drop was the outbound channel](#resolved-amneziawg-upload-was-capped-by-the-send-window-and-the-drop-was-the-outbound-channel)
 - [Open risk: Android's receive window is extrapolated from macOS](#open-risk-androids-receive-window-is-extrapolated-from-macos)
 
 ## Where we already compete
@@ -935,15 +964,23 @@ What is still worth doing, in order:
 
 - **A `mita` run in CI.** The verification above was manual and is not
   repeated on any commit, so the next protocol change is unguarded. This
-  needs a Go toolchain in the workflow and a server process to manage.
+  is now part of quality-plan PR 4.3, part 3, the nightly interop job.
 - **A mieru server here.** It would turn the scripted peer into a real
   interoperability test, the way the Hysteria2 and TUIC servers do for their
   clients, and cost roughly a third more work than the client did.
-- **Read the reference for the remaining codecs.** Only the UDP encapsulation
-  has been compared line by line against upstream
-  (`apis/common/packet_over_stream.go`). The segment codec, the metadata
-  offsets and the key derivation now have a working handshake behind them,
-  which is strong evidence but not the same thing.
+- **Read the reference for the remaining codecs** — mostly done.
+  - The UDP encapsulation was compared line by line against upstream
+    (`apis/common/packet_over_stream.go`).
+  - The key derivation is pinned by vectors that mieru's own
+    `cipher.HashPassword` and `BlockCipherFromPassword` computed (#94).
+  - The reference client's first flight decodes with shoes' segment
+    decoder to the request shoes sends (#97).
+  - Padding, the open payload and the close handshake follow the Go client,
+    checked against mita 3.38.1 (#83).
+
+  What remains is the segment codec's less common paths: data segments
+  after the first, and acknowledgements under loss. Only a live peer
+  exercises those, which is the nightly job again.
 
 Unimplemented, and refused in configuration rather than ignored: mieru's UDP
 transport, session multiplexing, the low entropy encoding, port ranges, the
@@ -965,18 +1002,19 @@ steer is GPL-3.0, so what it contributes is behaviours and reasons, not code.
 | SF-1 | A fake IP can be recycled while an app still holds it, so the app reaches another domain's server (`pool.rs:184`, `lookup` does not count as use) | fixed in #99 |
 | SF-2 | An in-pool address with no mapping is dialled as a literal 198.18.x.x and stalls (`fake_ip/mod.rs:55-72`) | fixed in #99 |
 | SF-3 | Local names (`.lan`, `.local`, single-label) get fake IPs and go into the tunnel | fixed in #99 |
-| SF-4 | REALITY with no SNI panics (`tcp_client_handler_factory.rs:271`); Xray's empty SNI can't be expressed | planned, PR S.2 |
-| SF-5 | Only UUIDv4 ids load; Xray's string ids and UUIDv7 don't (`uuid_util.rs`) | planned, PR S.2 |
+| SF-4 | REALITY with no SNI panics (`tcp_client_handler_factory.rs:271`); Xray's empty SNI can't be expressed | fixed in #100 |
+| SF-5 | Only UUIDv4 ids load; Xray's string ids and UUIDv7 don't (`uuid_util.rs`) | fixed in #100 |
 | SF-6 | No fallback when a path drops the ~1.8 kB post-quantum ClientHello | planned, PR S.4 |
 | SF-7 | AES-first cipher order on CPUs without AES instructions | planned, PR S.3 |
 | SF-8 | No User-Agent on WebSocket and HTTPUpgrade requests, which matches neither Xray nor sing-box | planned, PR S.3 |
 | SF-9 | Brutal and its `Hysteria-CC-RX` negotiation, specified against quinn's pacer | planned, PRs S.5 and S.6 |
-| SF-10 | Probe and interop test methods | folded into quality-plan PR 4.3 |
+| SF-10 | Probe and interop test methods | quality-plan PR 4.3: reference checks #101, probe harness #102; the nightly job is left |
 | SF-11 | xhttp, gRPC, ECH, REALITY `pqv`, Gecko, DoQ, `.srs` logical rules | recorded, not planned |
 
-Order: S.1 and S.2 come before quality-plan PR 4.3, because they are bugs and
-configs that fail to load. S.3 and S.4 follow 4.3. Brutal (S.5, S.6) comes
-last: verifying it needs 4.3's interop rig against apernet.
+Order: S.1 and S.2 came first, because they were bugs and configs that
+failed to load; both are in. S.3 and S.4 come next. Brutal (S.5, S.6) comes
+last: verifying it needs 4.3's interop rig against apernet, which is the
+part of 4.3 still to do.
 
 ## Explicitly not planned
 
@@ -1022,7 +1060,13 @@ tree pins the group list or would fail if a future rustls reordered it.
 Two places did not inherit it. **`src/reality/`** was classical X25519 only
 until #81 (2026-10-19), which gave the client Chrome 133's X25519MLKEM768
 share (`docs/specs/2026-10-19-reality-chrome-client-hello.md`). Some paths
-drop that larger hello, which is SF-6 under "Lessons from steer". Xray has
+drop that larger hello, which is SF-6 under "Lessons from steer". The
+reference clients disagree about sending it at all. Xray's REALITY client
+sends the hybrid share. sing-box's strips X25519MLKEM768 from both
+supported_groups and key_share before the handshake
+(`common/tls/reality_client.go:148-159` in v1.14.3; found by the shape test
+in #101). So shoes' hello matches Xray's, not sing-box's, and that is the
+starting point for S.4's `post_quantum` default. Xray has
 gone further, signing REALITY certificates with ML-DSA-65 via `mldsa65Seed`
 (the `pqv` check, SF-11), a protocol-level change we would have to follow
 rather than invent. And **we have no ECH at all**, where sing-box

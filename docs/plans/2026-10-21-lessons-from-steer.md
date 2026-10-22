@@ -17,6 +17,17 @@ Per-PR rules, as in the quality plan:
 - mark the spec's SF row "**Fixed in #N.**" in a follow-up commit on the same
   PR.
 
+## Status, 2026-10-22
+
+S.1 merged as #99 and S.2 as #100. Quality-plan 4.3: parts 1 (#101) and 2
+(#102) are done; part 3, the nightly job, is left. S.3 is next.
+
+One finding changes S.4's starting point. #101 found that sing-box's
+REALITY client strips X25519MLKEM768 from its hello
+(`common/tls/reality_client.go:148-159` in v1.14.3), while shoes offers it
+as Xray's client does. The `auto` default should be weighed against that:
+a sing-box-shaped hello carries no hybrid share at all.
+
 ## Order
 
 | Step | PR | Findings | Before or after quality-plan 4.3 |

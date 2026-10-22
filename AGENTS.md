@@ -331,15 +331,19 @@ Open findings from the 2026-08-20 audit, none of them fixed yet:
   counter, the accumulated length, and the address to reply to) that the shared
   table deliberately does not.
 - One deliberate item not recorded elsewhere:
-  - `src/vless/vision_stream.rs` and
-    `src/shadow_tls/shadow_tls_server_handler.rs` have no tests at all. These
-    are data paths, so covering them means designing the tests, not adding a
-    few. `vmess_handler.rs`, `shadowsocks_stream.rs` and
-    `routing/udp_router.rs` were on this list until each got tests; the first
-    two surfaced real defects, which is the argument for doing the rest. The
-    router's tests drive `run_udp_routing` end to end through a scripted
-    server-side stream against real loopback echo sockets - reuse that double
-    rather than inventing another.
+  - The data-path files that had no tests now have them, and most of them
+    surfaced real defects, which is the argument for writing them:
+    - `vmess_handler.rs`, `shadowsocks_stream.rs`, `routing/udp_router.rs`
+      (the router's tests drive `run_udp_routing` end to end through a
+      scripted server-side stream against real loopback echo sockets;
+      reuse that double rather than inventing another);
+    - `vless/vision_stream.rs`: end to end over real TLS (`vless/tests.rs`,
+      #80), and the unpadder at every cut (#101), which found dropped
+      bytes;
+    - `shadow_tls/shadow_tls_server_handler.rs`: `shadow_tls/tests.rs`
+      (#78), and a row in the probe matrix (`src/probe_tests.rs`, #102).
+
+    The rest of the audit's zero-test list is quality-plan PR 4.4.
 - `src/quic_server.rs::start_quic_server`, the generic QUIC listener behind
   VLESS and the other TCP protocols, still builds its own endpoint and sets no
   transport parameters at all — there is a TODO in it proposing some. It was
