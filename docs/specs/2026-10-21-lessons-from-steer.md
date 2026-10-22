@@ -420,6 +420,8 @@ one boolean that pins `ack_rate` to 1.0, so it comes with this work. The
 **Part 1 done (4.3 part 1):** the ClientHello shape test, the Vision cut
 property and the `.srs` oracle. The probe outcomes, corpus, slow drip and
 loud skips come with the harness (part 2) and the nightly job (part 3).
+Part 2 landed the outcomes, the corpus and the slow drip
+(`docs/specs/2026-10-22-probe-harness.md`). Loud skips stay with part 3.
 
 What part 1 found:
 

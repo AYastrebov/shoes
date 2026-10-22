@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Probe harness (plan PR 4.3, part 2; SF-10):
+
+- What every TCP server shows a client that is not one is now a test.
+  Five probes (a foreign ClientHello, an HTTP `GET`, 16 bytes then
+  silence, random bytes, and shoes' own client with the wrong key) go to
+  eleven servers on real loopback sockets. Each ends as data, a close or
+  silence within a time bound. The table pins today's behaviour and names
+  the reference family each cell matches. The cells that match none are
+  REALITY and ShadowTLS closing where the references relay, plus three new
+  findings recorded in `docs/specs/2026-10-22-probe-harness.md`.
+- A slow drip of one byte every 5 s holds a connection open past every
+  gap and is still cut at the 60 s setup deadline.
+
 Checks against the references (plan PR 4.3, part 1; SF-10):
 
 - shoes' REALITY ClientHello is compared with the one sing-box's REALITY

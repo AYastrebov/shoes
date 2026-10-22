@@ -245,6 +245,9 @@ redirect and tproxy socket options.
 - **No probe-behaviour tests**: what a wrong-password, short, malformed or
   slow client receives and after how long — the property every fallback path
   exists for.
+  **Covered by the probe harness in plan PR 4.3, part 2**
+  (`src/probe_tests.rs`, spec `docs/specs/2026-10-22-probe-harness.md`). It
+  pins today's behaviour; the XF-1 fixes are still open.
 - **Zero-test files on the data path**: `vision_stream.rs`, `vision_pad.rs`,
   `vless_{client,server}_handler.rs`, `vless_message_stream.rs`,
   `vless_response_stream.rs`, `xudp/message_stream.rs`, all four
