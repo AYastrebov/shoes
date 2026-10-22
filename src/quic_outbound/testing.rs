@@ -129,6 +129,30 @@ pub fn reserve_udp_port() -> SocketAddr {
     panic!("the operating system offered no unused ephemeral port in {ATTEMPTS} attempts");
 }
 
+/// Reserve a loopback TCP port and release it, as `reserve_udp_port` does
+/// for UDP and with the same set: a port is never issued twice in one
+/// process, so servers whose ports are chosen before any of them binds
+/// cannot be handed the same one.
+pub fn reserve_tcp_port() -> SocketAddr {
+    const ATTEMPTS: usize = 64;
+
+    for _ in 0..ATTEMPTS {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("binding a probe socket");
+        let addr = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        if ISSUED_PORTS
+            .lock()
+            .expect("the issued-port set is never held across a panic")
+            .insert(addr.port())
+        {
+            return addr;
+        }
+    }
+
+    panic!("the operating system offered no unused ephemeral port in {ATTEMPTS} attempts");
+}
+
 /// An echo server on a fresh TCP port. Returns its address.
 pub async fn spawn_tcp_echo() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

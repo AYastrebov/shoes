@@ -28,7 +28,7 @@ use crate::address::NetLocation;
 use crate::async_stream::{AsyncPing, AsyncStream, SocketPassthrough};
 use crate::config::ClientProxyConfig;
 use crate::connections::ConnectionSet;
-use crate::quic_outbound::testing::{generate_certificate, test_resolver};
+use crate::quic_outbound::testing::{generate_certificate, reserve_tcp_port, test_resolver};
 use crate::tcp::tcp_client_handler_factory::{HopContext, create_tcp_client_handler};
 
 /// A close this soon after the probe's last write is "at once".
@@ -61,6 +61,16 @@ struct Log {
     last_write: Option<Instant>,
 }
 
+impl Log {
+    fn closed(&mut self) {
+        self.closed_at.get_or_insert_with(Instant::now);
+    }
+
+    fn concluded(&self) -> bool {
+        self.received > 0 || self.closed_at.is_some()
+    }
+}
+
 /// The prober's socket, recording what the server sent and when it closed.
 /// A client handler reads through it, so a wrong-key probe made by shoes'
 /// own client is judged by the same bytes as a raw one.
@@ -85,9 +95,7 @@ impl AsyncRead for Tap {
                 let new = &buf.filled()[before..];
                 log.first.extend_from_slice(&new[..room.min(new.len())]);
             }
-            Poll::Ready(_) => {
-                log.closed_at.get_or_insert_with(Instant::now);
-            }
+            Poll::Ready(_) => log.closed(),
             Poll::Pending => {}
         }
         poll
@@ -101,14 +109,23 @@ impl AsyncWrite for Tap {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
-            self.log.lock().unwrap().last_write = Some(Instant::now());
+        match &poll {
+            Poll::Ready(Ok(n)) if *n > 0 => {
+                self.log.lock().unwrap().last_write = Some(Instant::now());
+            }
+            // A reset can surface on a write before any read sees it.
+            Poll::Ready(Err(_)) => self.log.lock().unwrap().closed(),
+            _ => {}
         }
         poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(poll, Poll::Ready(Err(_))) {
+            self.log.lock().unwrap().closed();
+        }
+        poll
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -161,30 +178,51 @@ fn judge(log: &Log, started: Instant) -> Outcome {
     }
 }
 
-async fn tap(addr: SocketAddr) -> (Tap, Arc<Mutex<Log>>) {
-    let inner = TcpStream::connect(addr).await.unwrap();
+/// A tapped connection to `addr`, and a second handle to the same socket.
+/// A client that errors drops its tap; the second handle keeps the
+/// connection open so the probe can go on watching it.
+async fn tap(addr: SocketAddr) -> (Tap, TcpStream, Arc<Mutex<Log>>) {
+    let inner = TcpStream::connect(addr).await.unwrap().into_std().unwrap();
+    let observer = TcpStream::from_std(inner.try_clone().unwrap()).unwrap();
+    let inner = TcpStream::from_std(inner).unwrap();
     let log = Arc::new(Mutex::new(Log::default()));
     (
         Tap {
             inner,
             log: log.clone(),
         },
+        observer,
         log,
     )
+}
+
+/// Read `socket` until the server sends, closes, or `deadline`, unless the
+/// log already says which.
+async fn watch(socket: &mut TcpStream, log: &Mutex<Log>, deadline: tokio::time::Instant) {
+    if log.lock().unwrap().concluded() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    match tokio::time::timeout_at(deadline, socket.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let mut log = log.lock().unwrap();
+            log.received += n;
+            log.first.extend_from_slice(&buf[..n.min(16)]);
+        }
+        Ok(_) => log.lock().unwrap().closed(),
+        Err(_) => {}
+    }
 }
 
 /// Send `bytes`, then read until the server sends, closes, or the bound.
 pub(crate) async fn probe_raw(addr: SocketAddr, bytes: &[u8]) -> Seen {
     let started = Instant::now();
-    let (mut tap, log) = tap(addr).await;
-    tap.write_all(bytes).await.unwrap();
-    tap.flush().await.unwrap();
-    let _ = tokio::time::timeout(BOUND, async {
-        let mut buf = [0u8; 4096];
-        // One byte is enough to say Data; a close or error ends the read.
-        matches!(tap.read(&mut buf).await, Ok(n) if n > 0)
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + BOUND;
+    let (mut tap, mut observer, log) = tap(addr).await;
+    // A write the server already refused is a close, which the tap records.
+    let _ = tap.write_all(bytes).await;
+    let _ = tap.flush().await;
+    watch(&mut observer, &log, deadline).await;
     seen(&log.lock().unwrap(), started)
 }
 
@@ -197,9 +235,10 @@ pub(crate) async fn probe_client(addr: SocketAddr, client: &str) -> Seen {
     let server = NetLocation::from_ip_addr(addr.ip(), addr.port());
     let handler =
         create_tcp_client_handler(config, None, &HopContext::new(&server), test_resolver());
-    let (tap, log) = tap(addr).await;
+    let (tap, mut observer, log) = tap(addr).await;
+    let deadline = tokio::time::Instant::now() + BOUND;
     let target = NetLocation::from_str("192.0.2.1:80", None).unwrap();
-    let _ = tokio::time::timeout(BOUND, async {
+    let _ = tokio::time::timeout_at(deadline, async {
         let Ok(setup) = handler
             .setup_client_tcp_stream(Box::new(tap), target.into())
             .await
@@ -217,18 +256,12 @@ pub(crate) async fn probe_client(addr: SocketAddr, client: &str) -> Seen {
         }
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf).await;
-        // Keep the stream (and so the socket) open until the bound: a
-        // client error is not the server closing.
-        std::future::pending::<()>().await;
     })
     .await;
+    // However the client ended, the verdict is the socket's: a client error
+    // is not the server closing, and a reset it consumed is in the log.
+    watch(&mut observer, &log, deadline).await;
     seen(&log.lock().unwrap(), started)
-}
-
-/// A free loopback port, for a server whose address goes into its config.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 /// A stand-in for a real site: answers `decoy\n` to the first bytes it gets.
@@ -667,7 +700,7 @@ async fn every_server_answers_every_probe_as_recorded() {
     let mut yaml = String::new();
     let mut addrs = Vec::new();
     for server in SERVERS {
-        let port = free_port();
+        let port = reserve_tcp_port().port();
         yaml.push_str(
             &server
                 .config
@@ -829,4 +862,66 @@ async fn a_slow_drip_is_held_to_the_setup_deadline_and_no_shorter() {
     );
     let err = server.await.unwrap().unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
+
+async fn resetting_listener() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            socket2::SockRef::from(&socket)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(socket);
+        }
+    });
+    addr
+}
+
+/// A reset can reach the prober only as a failed write. That alone is a
+/// close, with no read to see it.
+#[tokio::test]
+async fn a_write_the_server_refused_is_a_close() {
+    let started = Instant::now();
+    let (mut tap, _observer, log) = tap(resetting_listener().await).await;
+    let mut refused = false;
+    for _ in 0..50 {
+        if tap.write_all(&[0u8; 1024]).await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused, "the reset never reached a write");
+    assert_eq!(
+        seen(&log.lock().unwrap(), started).outcome,
+        Outcome::ClosedAtOnce
+    );
+}
+
+/// A client that errors drops its tap before reading. The probe's second
+/// handle keeps the socket, so the verdict is still the server's.
+#[tokio::test]
+async fn a_probe_outlives_a_client_that_gave_up() {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + BOUND;
+    let (tap, mut observer, log) = tap(resetting_listener().await).await;
+    drop(tap);
+    watch(&mut observer, &log, deadline).await;
+    assert_eq!(
+        seen(&log.lock().unwrap(), started).outcome,
+        Outcome::ClosedAtOnce
+    );
+}
+
+/// End to end: shoes' own client against a server that resets at once.
+#[tokio::test]
+async fn a_client_against_a_resetting_server_sees_a_close() {
+    let addr = resetting_listener().await;
+    let seen = probe_client(
+        addr,
+        "{type: vless, user_id: b831381d-6324-4d53-ad4f-8cda48b30811}",
+    )
+    .await;
+    assert_eq!(seen.outcome, Outcome::ClosedAtOnce);
 }
