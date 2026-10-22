@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Checks against the references (plan PR 4.3, part 1; SF-10):
+
+- shoes' REALITY ClientHello is compared with the one sing-box's REALITY
+  client sent (the #95 capture): cipher list, every extension's body,
+  groups, signature algorithms and key-share layout. They differ in one
+  place, which the test now asserts: sing-box removes X25519MLKEM768 from
+  its REALITY hello, and shoes offers it, as Xray's client does.
+- A Vision stream reads the same however it is cut, at every offset and
+  every pair of offsets. The check found that a first read of fewer than
+  16 bytes was dropped. It is now returned as plain data, as is a first
+  read too short to hold the UUID and a frame header, matching Xray's
+  `XtlsUnpadding`.
+- Rule-set matching is checked against `sing-box rule-set match` on 34
+  cases across the fixtures, and corrupt files against what sing-box
+  refuses. A version-0 `.srs` file is now refused, as sing-box refuses it.
+  shoes still refuses a file whose zlib checksum is wrong or missing, which
+  sing-box loads.
+
 Configs that should load (steer plan PR S.2):
 
 - VLESS and VMess user ids load as Xray and sing-box read them: a UUID of

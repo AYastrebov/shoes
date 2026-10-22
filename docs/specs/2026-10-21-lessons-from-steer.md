@@ -417,6 +417,22 @@ one boolean that pins `ack_rate` to 1.0, so it comes with this work. The
 
 ## SF-10 — test methods for PR 4.3
 
+**Part 1 done (4.3 part 1):** the ClientHello shape test, the Vision cut
+property and the `.srs` oracle. The probe outcomes, corpus, slow drip and
+loud skips come with the harness (part 2) and the nightly job (part 3).
+
+What part 1 found:
+
+- sing-box's REALITY client strips X25519MLKEM768 from its hello. shoes
+  offers it. That is input for S.4.
+- Vision dropped a first read shorter than 16 bytes. Xray's
+  `XtlsUnpadding` (`proxy/proxy.go:556-562`) treats any first read without
+  the UUID and a whole frame header (21 bytes) as plain data. shoes now
+  does the same.
+- shoes accepted a version-0 `.srs` file, and sing-box does not
+  (`option/rule_set.go:344-351`). sing-box also does not check the zlib
+  trailer. shoes keeps checking it.
+
 These fold into PR 4.3's probe harness and nightly job (plan,
 `docs/plans/2026-10-15-quality-and-correctness.md`). They are not separate
 work.

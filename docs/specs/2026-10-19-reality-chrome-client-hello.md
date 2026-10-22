@@ -18,6 +18,15 @@ with a ClientHello (`metacubex/utls@v1.8.7/reality.go`):
   unless the decoy answered with X25519 (32-byte share) or X25519MLKEM768
   (`1088 + 32`-byte share) (lines 519-523).
 
+**Correction (2026-10-22).** sing-box's REALITY *client* does not send the
+uTLS Chrome hello unchanged. It removes X25519MLKEM768 from
+supported_groups and key_share before the handshake
+(`common/tls/reality_client.go:148-159` in v1.14.3), so the #95 capture
+carries X25519 alone. Xray's client sends the hybrid share. shoes offers
+it, and `the_hello_has_the_shape_of_sing_boxs_reality_hello` asserts that as
+the one difference from sing-box. Whether to offer it is the
+`post_quantum` option of PR S.4 (`docs/plans/2026-10-21-lessons-from-steer.md`).
+
 So shoes's X25519-only client works against these servers today. RE-R2's
 failure ("forwarded to the decoy") is Xray's REALITY, which requires the
 X25519MLKEM768 share. This spec is about looking like Chrome, and it also

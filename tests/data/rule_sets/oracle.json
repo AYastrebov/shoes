@@ -1,0 +1,213 @@
+{
+  "source": "sing-box version 1.14.3: rule-set match -f binary",
+  "cases": [
+    {
+      "file": "geosite-google.srs",
+      "target": "google.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "www.google.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "mail.google.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "notgoogle.com",
+      "matched": false
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "google.com.example.org",
+      "matched": false
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "r1---sn-2x3abcde.googlevideo.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-google.srs",
+      "target": "example.org",
+      "matched": false
+    },
+    {
+      "file": "geosite-telegram.srs",
+      "target": "telegram.org",
+      "matched": true
+    },
+    {
+      "file": "geosite-telegram.srs",
+      "target": "web.telegram.org",
+      "matched": true
+    },
+    {
+      "file": "geosite-telegram.srs",
+      "target": "t.me",
+      "matched": true
+    },
+    {
+      "file": "geosite-telegram.srs",
+      "target": "telegram.org.example.org",
+      "matched": false
+    },
+    {
+      "file": "geosite-telegram.srs",
+      "target": "example.org",
+      "matched": false
+    },
+    {
+      "file": "geosite-cloudflare.srs",
+      "target": "cloudflare.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-cloudflare.srs",
+      "target": "dash.cloudflare.com",
+      "matched": true
+    },
+    {
+      "file": "geosite-cloudflare.srs",
+      "target": "notcloudflare.com",
+      "matched": false
+    },
+    {
+      "file": "geosite-cloudflare.srs",
+      "target": "1.1.1.1",
+      "matched": false
+    },
+    {
+      "file": "geosite-category-ads-all.srs",
+      "target": "doubleclick.net",
+      "matched": true
+    },
+    {
+      "file": "geosite-category-ads-all.srs",
+      "target": "ad.doubleclick.net",
+      "matched": true
+    },
+    {
+      "file": "geosite-category-ads-all.srs",
+      "target": "example.org",
+      "matched": false
+    },
+    {
+      "file": "geoip-ru.srs",
+      "target": "77.88.8.8",
+      "matched": true
+    },
+    {
+      "file": "geoip-ru.srs",
+      "target": "8.8.8.8",
+      "matched": false
+    },
+    {
+      "file": "geoip-ru.srs",
+      "target": "2a02:6b8::feed:0ff",
+      "matched": true
+    },
+    {
+      "file": "geoip-ru.srs",
+      "target": "2001:4860:4860::8888",
+      "matched": false
+    },
+    {
+      "file": "geoip-ru.srs",
+      "target": "yandex.ru",
+      "matched": false
+    },
+    {
+      "file": "geoip-us.srs",
+      "target": "8.8.8.8",
+      "matched": true
+    },
+    {
+      "file": "geoip-us.srs",
+      "target": "77.88.8.8",
+      "matched": false
+    },
+    {
+      "file": "geoip-us.srs",
+      "target": "2001:4860:4860::8888",
+      "matched": true
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "10.1.2.3",
+      "matched": true
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "192.168.7.7",
+      "matched": true
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "11.0.0.1",
+      "matched": false
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "::1",
+      "matched": true
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "::2",
+      "matched": false
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "64:ff9b::808:808",
+      "matched": true
+    },
+    {
+      "file": "mixed-v4-v6.srs",
+      "target": "64:ff9c::1",
+      "matched": false
+    }
+  ],
+  "corrupt": [
+    {
+      "file": "corrupt/bad-magic.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/version-0.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/version-255.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/truncated-header.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/truncated-body.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/no-checksum.srs",
+      "loads": true
+    },
+    {
+      "file": "corrupt/bad-checksum.srs",
+      "loads": true
+    },
+    {
+      "file": "corrupt/garbage-body.srs",
+      "loads": false
+    },
+    {
+      "file": "corrupt/garbage-payload.srs",
+      "loads": false
+    }
+  ]
+}

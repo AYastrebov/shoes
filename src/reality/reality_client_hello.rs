@@ -574,4 +574,149 @@ mod tests {
         let record = client_hello_record(&hello());
         assert_eq!(&record[..3], &[0x16, 0x03, 0x01]);
     }
+
+    /// What a ClientHello looks like once the per-connection randomness is
+    /// set aside: GREASE values become one marker, the shuffled middle
+    /// extensions are sorted, and the GREASE ECH, whose payload length is
+    /// drawn per connection, keeps only its type.
+    #[derive(Debug, PartialEq)]
+    struct Shape {
+        suites: Vec<u16>,
+        grease_first_and_last: bool,
+        /// (type, body) for every middle extension but key_share and ECH;
+        /// supported_groups and supported_versions with GREASE as 0x0a0a.
+        extensions: Vec<(u16, Vec<u8>)>,
+        /// (group, share length), GREASE as 0x0a0a.
+        key_shares: Vec<(u16, usize)>,
+    }
+
+    const GREASE: u16 = 0x0a0a;
+
+    fn degrease(list: &[u8]) -> Vec<u8> {
+        list.chunks(2)
+            .flat_map(|c| {
+                let v = u16::from_be_bytes([c[0], c[1]]);
+                if is_grease(v) { GREASE } else { v }.to_be_bytes()
+            })
+            .collect()
+    }
+
+    fn shape(hello: &[u8], without_group: Option<u16>) -> Shape {
+        let parsed = parse(hello);
+        let types: Vec<u16> = parsed.extensions.iter().map(|(t, _)| *t).collect();
+        let mut extensions = Vec::new();
+        let mut key_shares = Vec::new();
+        for (ty, body) in &parsed.extensions[1..parsed.extensions.len() - 1] {
+            match *ty {
+                EXT_KEY_SHARE => {
+                    let mut at = 2;
+                    while at < body.len() {
+                        let group = u16::from_be_bytes([body[at], body[at + 1]]);
+                        let len = u16::from_be_bytes([body[at + 2], body[at + 3]]) as usize;
+                        if Some(group) != without_group {
+                            key_shares.push((if is_grease(group) { GREASE } else { group }, len));
+                        }
+                        at += 4 + len;
+                    }
+                }
+                EXT_ENCRYPTED_CLIENT_HELLO => extensions.push((*ty, Vec::new())),
+                EXT_SUPPORTED_GROUPS => {
+                    let groups: Vec<u8> = degrease(&body[2..])
+                        .chunks(2)
+                        .filter(|c| Some(u16::from_be_bytes([c[0], c[1]])) != without_group)
+                        .flatten()
+                        .copied()
+                        .collect();
+                    extensions.push((*ty, groups));
+                }
+                EXT_SUPPORTED_VERSIONS => {
+                    let mut versions = vec![body[0]];
+                    versions.extend(degrease(&body[1..]));
+                    extensions.push((*ty, versions));
+                }
+                _ => extensions.push((*ty, body.clone())),
+            }
+        }
+        extensions.sort();
+        Shape {
+            suites: parsed
+                .suites
+                .iter()
+                .map(|&s| if is_grease(s) { GREASE } else { s })
+                .collect(),
+            grease_first_and_last: is_grease(types[0]) && is_grease(*types.last().unwrap()),
+            extensions,
+            key_shares,
+        }
+    }
+
+    /// sing-box's REALITY client (the #95 capture, `tests/data/kat/reality`)
+    /// and shoes' hello have the same shape, with one difference, asserted
+    /// here so that it cannot change unnoticed. sing-box filters
+    /// X25519MLKEM768 out of supported_groups and key_share for REALITY
+    /// (sing-box v1.14.3 `common/tls/reality_client.go:148-159`). shoes
+    /// offers it, as Xray's client and Chrome do. Whether it should is the
+    /// `post_quantum` option of the steer plan, PR S.4.
+    #[test]
+    fn the_hello_has_the_shape_of_sing_boxs_reality_hello() {
+        let vectors = crate::kat::vectors("reality");
+        let record = crate::kat::hex(&vectors["client_hello"]);
+        assert_eq!(&record[..3], &[0x16, 0x03, 0x01]);
+        let reference = &record[5..];
+        let name = crate::kat::text(&vectors["server_name"]);
+
+        let ours = hello_for(name);
+        assert_eq!(
+            shape(&ours, Some(GROUP_X25519_MLKEM768)),
+            shape(reference, None)
+        );
+
+        // The one difference: shoes offers the hybrid group, first after
+        // GREASE, with a 1216-byte share; the reference offers neither.
+        let ours = shape(&ours, None);
+        let reference = shape(reference, None);
+        assert_eq!(ours.key_shares[1], (GROUP_X25519_MLKEM768, 1216));
+        assert!(
+            !reference
+                .key_shares
+                .iter()
+                .any(|(g, _)| *g == GROUP_X25519_MLKEM768)
+        );
+        let groups = |s: &Shape| {
+            s.extensions
+                .iter()
+                .find(|(t, _)| *t == EXT_SUPPORTED_GROUPS)
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(groups(&ours)[2..4], GROUP_X25519_MLKEM768.to_be_bytes());
+        assert!(
+            !groups(&reference)
+                .chunks(2)
+                .any(|c| c == GROUP_X25519_MLKEM768.to_be_bytes())
+        );
+    }
+
+    /// The GREASE ECH's length is drawn per connection, from the sizes
+    /// BoringSSL uses; the reference's is one of them.
+    #[test]
+    fn the_grease_ech_length_is_one_boringssl_draws() {
+        let allowed: Vec<usize> = [128, 160, 192, 224].iter().map(|p| 42 + p + 16).collect();
+        let vectors = crate::kat::vectors("reality");
+        let record = crate::kat::hex(&vectors["client_hello"]);
+        let ech_len = |hello: &[u8]| {
+            parse(hello)
+                .extensions
+                .iter()
+                .find(|(t, _)| *t == EXT_ENCRYPTED_CLIENT_HELLO)
+                .unwrap()
+                .1
+                .len()
+        };
+        assert!(allowed.contains(&ech_len(&record[5..])));
+        for _ in 0..32 {
+            assert!(allowed.contains(&ech_len(&hello())));
+        }
+    }
 }
