@@ -6,9 +6,11 @@ Fake IP safety (steer plan PR S.1):
 
 - **Behaviour change: local names are no longer tunnelled.** With fake IP
   on, single-label names and names under `.local`, `.lan`, `.home.arpa`,
-  `.internal`, `.localhost` and `.home`, plus the reverse zones, now resolve
-  for real instead of getting a fake address that sent them into the
-  tunnel, where they could not resolve. `bypass_defaults: false` restores
+  `.internal`, `.localhost`, `.localdomain` and `.home`, plus the reverse
+  zones, now resolve for real instead of getting a fake address that sent
+  them into the tunnel, where they could not resolve. The query follows the
+  rules for the resolver it was sent to, so reaching LAN hosts still needs
+  a direct rule for the private ranges. `bypass_defaults: false` restores
   the old behaviour (SF-3).
 - **Behaviour change: an unmapped fake IP is refused.** A connection to an
   address in the pool that stands for no domain (after a restart, or a

@@ -134,8 +134,8 @@ impl FakeIpResponder {
 
 impl FakeIpResponder {
     fn assign(&self, domain: &str) -> Option<std::net::Ipv4Addr> {
-        let ip = self.pool.assign(domain);
-        match ip {
+        let assigned = self.pool.assign_tracked(domain);
+        match assigned {
             None if !self.exhausted.swap(true, Ordering::Relaxed) => warn!(
                 "Fake IP pool exhausted: all {} addresses used within the last {} s; \
                  answering with real addresses until one frees up. Raise max_entries \
@@ -143,12 +143,16 @@ impl FakeIpResponder {
                 self.pool.capacity(),
                 MIN_REUSE_AGE.as_secs()
             ),
-            Some(_) if self.exhausted.swap(false, Ordering::Relaxed) => {
+            // A domain that already had an address says nothing about room
+            // in the pool; only a new allocation ends the episode.
+            Some(assigned)
+                if assigned.allocated && self.exhausted.swap(false, Ordering::Relaxed) =>
+            {
                 info!("Fake IP pool has addresses again")
             }
             _ => {}
         }
-        ip
+        assigned.map(|assigned| assigned.ip)
     }
 }
 
@@ -396,6 +400,14 @@ mod tests {
             responder.handle_query(&query_bytes("b.example.", RecordType::A)),
             DnsDecision::Forward
         );
+        assert!(responder.exhausted.load(Ordering::Relaxed));
+
+        // A name that already has its address is still answered, and does
+        // not end the episode: nothing was freed.
+        assert!(matches!(
+            responder.handle_query(&query_bytes("a.example.", RecordType::A)),
+            DnsDecision::Answer(_)
+        ));
         assert!(responder.exhausted.load(Ordering::Relaxed));
 
         tokio::time::advance(MIN_REUSE_AGE).await;

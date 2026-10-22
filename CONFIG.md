@@ -636,9 +636,16 @@ Notes:
   reset, UDP is dropped. The app then resolves the name again.
 - With `bypass_defaults` on, these resolve for real ahead of
   `bypass_domains`: single-label names (`printer`), names at or under
-  `local`, `lan`, `home.arpa`, `internal`, `localhost` and `home`, and the
-  reverse zones `in-addr.arpa` and `ip6.arpa`. Set it to `false` only if
-  such names really are served at the far end of the tunnel.
+  `local`, `lan`, `home.arpa`, `internal`, `localhost`, `localdomain` and
+  `home`, and the reverse zones `in-addr.arpa` and `ip6.arpa`. Set it to
+  `false` only if such names really are served at the far end of the tunnel.
+- A bypassed query, built in or listed, is forwarded like any other query:
+  along the rules for the resolver address it was sent to. Behind a
+  catch-all proxy rule, a query for `nas.lan` sent to the router goes to the
+  router's address *from the proxy*, as the connection to `nas.lan` would.
+  To reach LAN hosts, route the private ranges direct (as
+  `examples/tun_fake_ip.yaml` does); that carries the query to the router
+  and the connection after it.
 - `bypass_domains` patterns are globs matched case-insensitively, where `*`
   spans dots: `*.local`, `captive.apple.com`, `time.*.apple.com`. Use it for
   anything that must reach a host outside the tunnel — captive-portal probes,

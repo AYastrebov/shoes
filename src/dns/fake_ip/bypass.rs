@@ -10,14 +10,20 @@
 ///
 /// `local` is mDNS (RFC 6762), `home.arpa` the home-network zone (RFC 8375),
 /// `internal` ICANN's 2024 private-use reservation, and the reverse zones are
-/// what a local resolver answers PTR-style questions from. `lan` and `home`
-/// are unregistered but what home routers hand out.
+/// what a local resolver answers PTR-style questions from. `lan`, `home` and
+/// `localdomain` are unregistered but what home routers and DHCP hand out.
+///
+/// Bypassing only stops a fake address being made up: the query is forwarded
+/// like any other, along the rules for the resolver it was sent to. Reaching
+/// the LAN takes a direct rule for its ranges, which carries the query to
+/// the router and the connection after it alike.
 const LOCAL_SUFFIXES: &[&str] = &[
     "local",
     "lan",
     "home.arpa",
     "internal",
     "localhost",
+    "localdomain",
     "home",
     "in-addr.arpa",
     "ip6.arpa",
@@ -221,6 +227,7 @@ mod tests {
             "router.home.arpa",
             "db.internal",
             "app.localhost",
+            "host.localdomain",
             "box.home",
             "1.0.168.192.in-addr.arpa",
             "b.a.9.8.ip6.arpa",

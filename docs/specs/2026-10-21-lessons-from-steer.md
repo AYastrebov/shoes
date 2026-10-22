@@ -100,13 +100,23 @@ reset, and no outbound dial is made. A mapped address still connects.
 `printer`, `nas.lan` and `_ipp._tcp.local` get fake IPs and are routed into
 the tunnel, where they cannot resolve.
 
-**Required behaviour.** With fake IP on, these always go to the local
-resolver, before the user's list is consulted:
+**Required behaviour.** With fake IP on, these always resolve for real,
+before the user's list is consulted:
 
 - single-label names;
-- names ending in `.local`, `.lan`, `.home.arpa`, `.internal`, `.localhost`
-  or `.home`;
+- names ending in `.local`, `.lan`, `.home.arpa`, `.internal`, `.localhost`,
+  `.localdomain` or `.home`;
 - `in-addr.arpa` and `ip6.arpa`.
+
+"Resolve for real" means what a `bypass_domains` match already means: the
+query is forwarded along the rules for the resolver address it was sent to.
+It is not forced direct. steer runs beside the router's dnsmasq and can
+always hand these to it; shoes on a phone does not know the LAN's
+resolver, and forcing only the query direct would produce an answer whose
+connection then follows the rules anyway. Reaching LAN hosts takes a direct
+rule for the private ranges, which carries the query to the router and the
+connection after it. CONFIG.md and `examples/tun_fake_ip.yaml` say so
+(review on #99).
 
 The user's `bypass_domains` adds to this list. `bypass_defaults: false` turns
 the built-in list off for anyone who really wants these names tunnelled.

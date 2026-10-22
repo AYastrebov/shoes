@@ -129,6 +129,14 @@ impl std::fmt::Display for FakeIpNetwork {
     }
 }
 
+/// What [`FakeIpPool::assign_tracked`] handed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assigned {
+    pub ip: Ipv4Addr,
+    /// True if the mapping was made by this call rather than found.
+    pub allocated: bool,
+}
+
 /// A domain's address and when either side last used it.
 struct Mapping {
     ip: Ipv4Addr,
@@ -202,6 +210,13 @@ impl FakeIpPool {
     /// mapping is younger than that: the pool is exhausted for now, and the
     /// caller answers with the real address.
     pub fn assign(&self, domain: &str) -> Option<Ipv4Addr> {
+        self.assign_tracked(domain).map(|assigned| assigned.ip)
+    }
+
+    /// [`assign`](Self::assign), also saying whether the address was newly
+    /// allocated. Only a new allocation shows the pool has room again; a hit
+    /// on an existing mapping succeeds even while it is exhausted.
+    pub fn assign_tracked(&self, domain: &str) -> Option<Assigned> {
         let now = Instant::now();
         let mut state = self.state.lock();
 
@@ -210,7 +225,10 @@ impl FakeIpPool {
         // recycled out from under a live connection.
         if let Some(mapping) = state.domain_to_ip.get_mut(domain) {
             mapping.last_used = now;
-            return Some(mapping.ip);
+            return Some(Assigned {
+                ip: mapping.ip,
+                allocated: false,
+            });
         }
 
         let offset = if state.next_offset <= state.max_offset {
@@ -236,7 +254,10 @@ impl FakeIpPool {
             .put(Arc::clone(&domain), Mapping { ip, last_used: now });
         state.ip_to_domain.insert(ip, domain);
 
-        Some(ip)
+        Some(Assigned {
+            ip,
+            allocated: true,
+        })
     }
 
     /// Recover the domain a fake address stands for, and mark the mapping

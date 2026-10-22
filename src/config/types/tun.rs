@@ -204,7 +204,8 @@ pub struct FakeIpConfig {
 
     /// Whether local-network names resolve for real ahead of
     /// `bypass_domains`: single-label names, `.local`, `.lan`, `.home.arpa`,
-    /// `.internal`, `.localhost`, `.home` and the reverse zones. On by
+    /// `.internal`, `.localhost`, `.localdomain`, `.home` and the reverse
+    /// zones. On by
     /// default; a fake address for `nas.lan` sends it into the tunnel, where
     /// it cannot resolve.
     #[serde(default = "default_true")]
