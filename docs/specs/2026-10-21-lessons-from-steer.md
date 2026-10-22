@@ -129,6 +129,8 @@ off; a user entry still works with the defaults on.
 
 ## SF-4 — REALITY SNI: missing, empty, or an IP address
 
+**Fixed in #100.**
+
 **Today.** A REALITY client with no `sni_hostname` panics at config build
 (`src/tcp/tcp_client_handler_factory.rs:271`). An empty string reaches an
 `unwrap` on `ServerName::try_from`. Xray's REALITY server allows `""` in
@@ -160,6 +162,8 @@ hello without SNI when its `server_names` contains `""`; this needs that
 server-side option if it doesn't exist yet.
 
 ## SF-5 — user ids beyond UUIDv4
+
+**Fixed in #100.**
 
 **Today.** `parse_uuid` (`src/uuid_util.rs:14-58`) accepts only hex and
 refuses any version but 4. `config/types/uuid.rs` applies it to VLESS,
