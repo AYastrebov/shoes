@@ -16,7 +16,7 @@
 use std::{
     collections::HashMap,
     io, mem,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
     sync::{
@@ -45,6 +45,7 @@ use smoltcp::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 
+use crate::dns::fake_ip::{self, FakeIpPool};
 use crate::util::smol_now;
 
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
@@ -471,6 +472,10 @@ pub struct SharedState {
     pub udp_response_rx: Option<tokio::sync::mpsc::Receiver<PacketBuffer>>,
     /// Channel for notifying tokio about new TCP connections
     pub new_conn_tx: Option<UnboundedSender<NewTcpConnection>>,
+    /// The session's fake-IP pool, if it has one. A SYN to an address in it
+    /// that stands for no domain is reset here, before a socket exists
+    /// (SF-2).
+    pub fake_ip_pool: Option<Arc<FakeIpPool>>,
 }
 
 pub const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
@@ -647,6 +652,7 @@ impl StackHandle {
         let shared_state = Arc::new(Mutex::new(SharedState {
             udp_response_rx: None,
             new_conn_tx: None,
+            fake_ip_pool: None,
         }));
 
         let thread_handle = {
@@ -717,6 +723,14 @@ impl StackHandle {
             state.new_conn_tx = Some(tx);
         }
         self.notifier.notify();
+    }
+
+    /// Give the stack the session's fake-IP pool, so a SYN to an unmapped
+    /// address in it draws a reset.
+    pub fn set_fake_ip_pool(&mut self, pool: Arc<FakeIpPool>) {
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.fake_ip_pool = Some(pool);
+        }
     }
 
     /// Check if the stack thread is still running.
@@ -934,6 +948,15 @@ pub fn run_stack_loop<D: StackDevice>(
                                         "Connection limit reached ({}), resetting SYN from {}",
                                         max_connections, src_addr
                                     );
+                                } else if is_syn
+                                    && slot.is_none()
+                                    && is_unmapped_fake_ip(&shared_state, dst_addr)
+                                {
+                                    // Also left to smoltcp's reset: the app
+                                    // fails at once and resolves again,
+                                    // where a dial to the literal address
+                                    // would stall it until its timeout.
+                                    fake_ip::note_unmapped(dst_addr);
                                 } else if is_syn && slot.is_none() {
                                     // debug, not info: one line per connection
                                     // at info level fills a mobile log file
@@ -1382,6 +1405,18 @@ pub fn run_stack_loop<D: StackDevice>(
 struct CreateConnectionResult {
     handle: SocketHandle,
     new_tcp_conn: NewTcpConnection,
+}
+
+/// True if `dst` is in the session's fake-IP pool and stands for no domain.
+fn is_unmapped_fake_ip(shared_state: &Mutex<SharedState>, dst: SocketAddr) -> bool {
+    let IpAddr::V4(v4) = dst.ip() else {
+        return false;
+    };
+    shared_state
+        .lock()
+        .ok()
+        .and_then(|state| state.fake_ip_pool.clone())
+        .is_some_and(|pool| pool.is_unmapped(v4))
 }
 
 /// Create a new TCP connection in the smoltcp stack.
@@ -1968,6 +2003,14 @@ mod tests {
         }
 
         fn spawn_with_options(options: TcpStackOptions, tcp_timeout: Option<SmolDuration>) -> Self {
+            Self::spawn_with_pool(options, tcp_timeout, None)
+        }
+
+        fn spawn_with_pool(
+            options: TcpStackOptions,
+            tcp_timeout: Option<SmolDuration>,
+            fake_ip_pool: Option<Arc<FakeIpPool>>,
+        ) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
@@ -1986,6 +2029,7 @@ mod tests {
             let shared_state = Arc::new(Mutex::new(SharedState {
                 udp_response_rx: Some(udp_response_rx),
                 new_conn_tx: Some(conn_tx),
+                fake_ip_pool,
             }));
 
             // The scripted device's `wait` sleeps on the script channel, which
@@ -2200,6 +2244,47 @@ mod tests {
             })
         });
         assert!(harness.conn_rx.try_recv().is_err(), "no second connection");
+        harness.stop();
+    }
+
+    /// SF-2: a SYN to a fake IP that stands for no domain is reset by the
+    /// stack and never becomes a connection, so nothing is dialled; once the
+    /// address is mapped, the same SYN connects.
+    #[test]
+    fn a_syn_to_an_unmapped_fake_ip_draws_a_reset() {
+        let _guard = counter_guard();
+        // The scripted packets are addressed to 93.184.216.34.
+        let pool = Arc::new(
+            FakeIpPool::new(
+                fake_ip::FakeIpNetwork::parse("93.184.216.0/24").unwrap(),
+                64,
+            )
+            .unwrap(),
+        );
+        let mut harness = Harness::spawn_with_pool(Harness::options(), None, Some(pool.clone()));
+
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20301)))
+            .unwrap();
+        harness.wait_for_written("a RST for the unmapped address", |w| {
+            w.iter().any(|p| {
+                segment_from_server(p).is_some_and(|s| s.rst)
+                    && TcpPacket::new_checked(&p[20..]).is_ok_and(|t| t.dst_port() == 20301)
+            })
+        });
+        assert!(harness.conn_rx.try_recv().is_err(), "no connection to dial");
+
+        let target = std::net::Ipv4Addr::new(93, 184, 216, 34);
+        while pool.lookup(target).is_none() {
+            pool.assign(&format!("host{}.example", pool.entry_count()));
+        }
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20302)))
+            .unwrap();
+        let conn = recv_within(&mut harness.conn_rx, "the mapped connection");
+        assert_eq!(conn.remote_addr, SocketAddr::from((target, 443)));
         harness.stop();
     }
 

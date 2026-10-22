@@ -3787,6 +3787,7 @@ mod tests {
             network: network.to_string(),
             max_entries: 1024,
             bypass_domains: NoneOrSome::Unspecified,
+            bypass_defaults: true,
         }
     }
 

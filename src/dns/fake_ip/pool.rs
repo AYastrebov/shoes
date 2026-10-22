@@ -9,10 +9,12 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use tokio::time::Instant;
 
 /// Default ceiling on live mappings.
 ///
@@ -21,6 +23,16 @@ use rustc_hash::FxHashMap;
 /// working set of a phone is far smaller than the pool, so cap the map and let
 /// the LRU recycle. Raise it with `max_entries` if you have the headroom.
 pub const DEFAULT_MAX_ENTRIES: usize = 8192;
+
+/// How long an address must go unused before it may stand for another domain
+/// (SF-1).
+///
+/// An app may cache an answer well past its 1-second TTL and connect to it
+/// later. If the address had been handed to another domain meanwhile, that
+/// connection would reach the other domain's server, through the other
+/// domain's rule. Ten minutes outlasts the caches seen in practice; a pool
+/// that cannot honour it answers with the real address instead.
+pub const MIN_REUSE_AGE: Duration = Duration::from_secs(600);
 
 /// The smallest prefix accepted. Anything wider is almost certainly a typo, and
 /// the pool would reserve a quarter of the IPv4 space.
@@ -117,10 +129,24 @@ impl std::fmt::Display for FakeIpNetwork {
     }
 }
 
+/// What [`FakeIpPool::assign_tracked`] handed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assigned {
+    pub ip: Ipv4Addr,
+    /// True if the mapping was made by this call rather than found.
+    pub allocated: bool,
+}
+
+/// A domain's address and when either side last used it.
+struct Mapping {
+    ip: Ipv4Addr,
+    last_used: Instant,
+}
+
 /// The two maps, kept as exact inverses of each other.
 struct PoolState {
     /// Recency order lives here; eviction pops from this side.
-    domain_to_ip: LruCache<Arc<str>, Ipv4Addr>,
+    domain_to_ip: LruCache<Arc<str>, Mapping>,
     /// The reverse direction, read once per outbound connection.
     ip_to_domain: FxHashMap<Ipv4Addr, Arc<str>>,
     /// Next never-used offset, walking up until the pool is full.
@@ -180,15 +206,29 @@ impl FakeIpPool {
     /// Return the address for `domain`, allocating one if it has none.
     ///
     /// Allocating recycles the least recently used mapping once the pool is
-    /// full, so this never fails.
-    pub fn assign(&self, domain: &str) -> Ipv4Addr {
+    /// full, but only one unused for [`MIN_REUSE_AGE`]. `None` means every
+    /// mapping is younger than that: the pool is exhausted for now, and the
+    /// caller answers with the real address.
+    pub fn assign(&self, domain: &str) -> Option<Ipv4Addr> {
+        self.assign_tracked(domain).map(|assigned| assigned.ip)
+    }
+
+    /// [`assign`](Self::assign), also saying whether the address was newly
+    /// allocated. Only a new allocation shows the pool has room again; a hit
+    /// on an existing mapping succeeds even while it is exhausted.
+    pub fn assign_tracked(&self, domain: &str) -> Option<Assigned> {
+        let now = Instant::now();
         let mut state = self.state.lock();
 
-        // `get` rather than `peek`: this is also what marks the domain as
+        // `get_mut` rather than `peek_mut`: this is also what marks the domain as
         // recently used, which is what keeps an active domain from being
         // recycled out from under a live connection.
-        if let Some(ip) = state.domain_to_ip.get(domain) {
-            return *ip;
+        if let Some(mapping) = state.domain_to_ip.get_mut(domain) {
+            mapping.last_used = now;
+            return Some(Assigned {
+                ip: mapping.ip,
+                allocated: false,
+            });
         }
 
         let offset = if state.next_offset <= state.max_offset {
@@ -196,29 +236,36 @@ impl FakeIpPool {
             state.next_offset += 1;
             offset
         } else {
-            match state.domain_to_ip.pop_lru() {
-                Some((_evicted_domain, evicted_ip)) => {
-                    state.ip_to_domain.remove(&evicted_ip);
-                    self.network.offset_of(evicted_ip)
-                }
-                // Unreachable in practice: next_offset only passes max_offset
-                // after that many insertions. Recycling offset 1 is still a
-                // consistent state, so prefer it to a panic in a VPN data path.
-                None => 1,
+            let (_, oldest) = state.domain_to_ip.peek_lru()?;
+            if now.duration_since(oldest.last_used) < MIN_REUSE_AGE {
+                return None;
             }
+            let (_evicted_domain, evicted) = state.domain_to_ip.pop_lru()?;
+            state.ip_to_domain.remove(&evicted.ip);
+            self.network.offset_of(evicted.ip)
         };
 
         let ip = self.network.address_at(offset);
         let domain: Arc<str> = Arc::from(domain);
 
         // Both maps hold the same Arc, so a domain is stored once.
-        state.domain_to_ip.put(Arc::clone(&domain), ip);
+        state
+            .domain_to_ip
+            .put(Arc::clone(&domain), Mapping { ip, last_used: now });
         state.ip_to_domain.insert(ip, domain);
 
-        ip
+        Some(Assigned {
+            ip,
+            allocated: true,
+        })
     }
 
-    /// Recover the domain a fake address stands for.
+    /// Recover the domain a fake address stands for, and mark the mapping
+    /// used.
+    ///
+    /// The connect side calls this, so a domain whose address is in steady
+    /// use stays at the young end of the LRU even if the app never asks DNS
+    /// again (SF-1).
     ///
     /// Returns `None` for an address outside the pool, or one whose mapping has
     /// been recycled.
@@ -226,8 +273,19 @@ impl FakeIpPool {
         if !self.is_fake_ip(ip) {
             return None;
         }
-        let state = self.state.lock();
-        state.ip_to_domain.get(&ip).cloned()
+        let mut state = self.state.lock();
+        let domain = state.ip_to_domain.get(&ip).cloned()?;
+        if let Some(mapping) = state.domain_to_ip.get_mut(domain.as_ref()) {
+            mapping.last_used = Instant::now();
+        }
+        Some(domain)
+    }
+
+    /// True if `ip` is in the pool's range but stands for no domain: never
+    /// handed out in this session, or recycled. A connection to one has
+    /// nowhere to go (SF-2). Leaves recency alone.
+    pub fn is_unmapped(&self, ip: Ipv4Addr) -> bool {
+        self.is_fake_ip(ip) && !self.state.lock().ip_to_domain.contains_key(&ip)
     }
 
     /// Live mapping count. Assertions only — nothing in the data path needs it,
@@ -297,8 +355,14 @@ mod tests {
     #[test]
     fn assigns_sequentially_from_one() {
         let pool = pool("198.18.0.0/16", 8192);
-        assert_eq!(pool.assign("example.com"), Ipv4Addr::new(198, 18, 0, 1));
-        assert_eq!(pool.assign("example.org"), Ipv4Addr::new(198, 18, 0, 2));
+        assert_eq!(
+            pool.assign("example.com"),
+            Some(Ipv4Addr::new(198, 18, 0, 1))
+        );
+        assert_eq!(
+            pool.assign("example.org"),
+            Some(Ipv4Addr::new(198, 18, 0, 2))
+        );
     }
 
     #[test]
@@ -313,7 +377,7 @@ mod tests {
     #[test]
     fn round_trips_domain_through_address() {
         let pool = pool("198.18.0.0/16", 8192);
-        let ip = pool.assign("example.com");
+        let ip = pool.assign("example.com").unwrap();
         assert_eq!(pool.lookup(ip).as_deref(), Some("example.com"));
     }
 
@@ -323,6 +387,18 @@ mod tests {
         pool.assign("example.com");
         assert_eq!(pool.lookup("8.8.8.8".parse().unwrap()), None);
         assert_eq!(pool.lookup("198.19.0.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn unmapped_means_in_range_with_no_domain() {
+        let pool = pool("198.18.0.0/16", 8192);
+        let ip = pool.assign("example.com").unwrap();
+        assert!(!pool.is_unmapped(ip));
+        assert!(pool.is_unmapped("198.18.9.9".parse().unwrap()));
+        assert!(
+            !pool.is_unmapped("8.8.8.8".parse().unwrap()),
+            "outside the pool"
+        );
     }
 
     #[test]
@@ -339,12 +415,13 @@ mod tests {
         assert_eq!(pool.capacity(), 100);
     }
 
-    #[test]
-    fn recycles_the_least_recently_used_mapping_when_full() {
+    #[tokio::test(start_paused = true)]
+    async fn recycles_the_least_recently_used_mapping_when_full() {
         let pool = pool("198.18.0.0/16", 2);
 
         let first = pool.assign("first.example");
         let second = pool.assign("second.example");
+        tokio::time::advance(MIN_REUSE_AGE).await;
 
         // Touching `second` makes `first` the least recently used.
         assert_eq!(pool.assign("second.example"), second);
@@ -353,7 +430,10 @@ mod tests {
         assert_eq!(third, first, "the recycled address should be reused");
 
         // The old mapping is gone in both directions, not just the LRU side.
-        assert_eq!(pool.lookup(third).as_deref(), Some("third.example"));
+        assert_eq!(
+            pool.lookup(third.unwrap()).as_deref(),
+            Some("third.example")
+        );
         assert_eq!(
             pool.entry_count(),
             2,
@@ -361,13 +441,66 @@ mod tests {
         );
     }
 
+    /// SF-1: the connect side's `lookup` keeps an address in use, as a DNS
+    /// answer does, so an app connecting to a cached answer is not handed
+    /// another domain's server.
+    #[tokio::test(start_paused = true)]
+    async fn a_looked_up_address_is_not_recycled() {
+        let pool = pool("198.18.0.0/16", 4);
+        let a = pool.assign("a.example").unwrap();
+        let b = pool.assign("b.example").unwrap();
+        pool.assign("c.example");
+        pool.assign("d.example");
+
+        tokio::time::advance(MIN_REUSE_AGE).await;
+        assert_eq!(pool.lookup(a).as_deref(), Some("a.example"));
+
+        assert_eq!(pool.assign("e.example"), Some(b), "b, not a, is recycled");
+        assert_eq!(pool.lookup(a).as_deref(), Some("a.example"));
+        assert_eq!(pool.lookup(b).as_deref(), Some("e.example"));
+    }
+
+    /// SF-1: a full pool whose every mapping was used within
+    /// `MIN_REUSE_AGE` reports exhaustion rather than recycle a live address.
+    #[tokio::test(start_paused = true)]
+    async fn a_pool_of_young_mappings_is_exhausted() {
+        let pool = pool("198.18.0.0/16", 2);
+        let a = pool.assign("a.example").unwrap();
+        let b = pool.assign("b.example").unwrap();
+
+        tokio::time::advance(MIN_REUSE_AGE - Duration::from_secs(1)).await;
+        assert_eq!(pool.assign("c.example"), None);
+        assert_eq!(pool.lookup(a).as_deref(), Some("a.example"));
+        assert_eq!(pool.lookup(b).as_deref(), Some("b.example"));
+
+        // Both lookups just used them again, so a full MIN_REUSE_AGE on from
+        // here one can go.
+        tokio::time::advance(MIN_REUSE_AGE).await;
+        assert_eq!(pool.assign("c.example"), Some(a));
+    }
+
+    /// A recycled address carries nothing of its previous domain.
+    #[tokio::test(start_paused = true)]
+    async fn a_recycled_address_forgets_its_old_domain() {
+        let pool = pool("198.18.0.0/16", 1);
+        let ip = pool.assign("old.example").unwrap();
+        tokio::time::advance(MIN_REUSE_AGE).await;
+        assert_eq!(pool.assign("new.example"), Some(ip));
+
+        assert_eq!(pool.lookup(ip).as_deref(), Some("new.example"));
+        let state = pool.state.lock();
+        assert!(state.domain_to_ip.peek("old.example").is_none());
+        assert_eq!(state.ip_to_domain.len(), 1);
+    }
+
     /// The reverse map is what the connect path reads. If eviction ever left a
     /// stale entry there, a connection would be routed to the wrong domain.
-    #[test]
-    fn both_maps_stay_exact_inverses_under_churn() {
+    #[tokio::test(start_paused = true)]
+    async fn both_maps_stay_exact_inverses_under_churn() {
         let pool = pool("198.18.0.0/24", 16);
 
         for i in 0..200 {
+            tokio::time::advance(MIN_REUSE_AGE / 8).await;
             pool.assign(&format!("host{}.example", i));
         }
 
@@ -375,21 +508,22 @@ mod tests {
         assert_eq!(state.domain_to_ip.len(), state.ip_to_domain.len());
         assert!(state.ip_to_domain.len() <= 16);
 
-        for (domain, ip) in state.domain_to_ip.iter() {
+        for (domain, mapping) in state.domain_to_ip.iter() {
             assert_eq!(
-                state.ip_to_domain.get(ip).map(|d| d.as_ref()),
+                state.ip_to_domain.get(&mapping.ip).map(|d| d.as_ref()),
                 Some(domain.as_ref()),
                 "domain_to_ip and ip_to_domain disagree about {}",
-                ip
+                mapping.ip
             );
         }
     }
 
-    #[test]
-    fn every_assigned_address_stays_inside_the_network() {
+    #[tokio::test(start_paused = true)]
+    async fn every_assigned_address_stays_inside_the_network() {
         let pool = pool("198.18.0.0/24", 64);
         for i in 0..500 {
-            let ip = pool.assign(&format!("host{}.example", i));
+            tokio::time::advance(MIN_REUSE_AGE / 32).await;
+            let ip = pool.assign(&format!("host{}.example", i)).unwrap();
             assert!(pool.is_fake_ip(ip), "{} escaped the pool range", ip);
             assert_ne!(ip, Ipv4Addr::new(198, 18, 0, 0), "network address issued");
             assert_ne!(

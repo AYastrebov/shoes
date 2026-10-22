@@ -198,6 +198,11 @@ impl TcpStackDirect {
         self.handle.set_new_conn_tx(tx)
     }
 
+    /// Give the stack the session's fake-IP pool (see `StackHandle`).
+    pub fn set_fake_ip_pool(&mut self, pool: std::sync::Arc<crate::dns::fake_ip::FakeIpPool>) {
+        self.handle.set_fake_ip_pool(pool)
+    }
+
     /// Check if the stack thread is still running.
     pub fn is_running(&self) -> bool {
         self.handle.is_running()

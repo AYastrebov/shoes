@@ -201,6 +201,15 @@ pub struct FakeIpConfig {
     /// probes, NTP, STUN, and names the tunnel does not carry.
     #[serde(default, skip_serializing_if = "NoneOrSome::is_unspecified")]
     pub bypass_domains: NoneOrSome<String>,
+
+    /// Whether local-network names resolve for real ahead of
+    /// `bypass_domains`: single-label names, `.local`, `.lan`, `.home.arpa`,
+    /// `.internal`, `.localhost`, `.localdomain`, `.home` and the reverse
+    /// zones. On by
+    /// default; a fake address for `nas.lan` sends it into the tunnel, where
+    /// it cannot resolve.
+    #[serde(default = "default_true")]
+    pub bypass_defaults: bool,
 }
 
 /// A TUN device name this platform's validation accepts.
@@ -241,3 +250,17 @@ pub(crate) const TEST_OWNED_DEVICE_NAME: Option<&str> = if cfg!(target_os = "mac
 /// route, and routes stay the host's.
 #[cfg(test)]
 pub(crate) const TEST_ACCEPTS_DESTINATION: bool = !cfg!(windows);
+
+#[cfg(test)]
+mod tests {
+    use super::FakeIpConfig;
+
+    #[test]
+    fn local_names_bypass_unless_turned_off() {
+        let config: FakeIpConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(config.bypass_defaults);
+
+        let config: FakeIpConfig = serde_yaml::from_str("bypass_defaults: false").unwrap();
+        assert!(!config.bypass_defaults);
+    }
+}

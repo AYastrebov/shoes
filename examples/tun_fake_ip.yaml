@@ -34,11 +34,10 @@
     # Domains that must resolve for real. A fake address is useless to anything
     # that has to reach the host outside the tunnel, or that compares the answer
     # against something. Globs are matched case-insensitively; `*` spans dots.
+    #
+    # Local names (single-label, .local, .lan, .home.arpa and the like) are
+    # bypassed already, unless `bypass_defaults: false`.
     bypass_domains:
-      # Names the tunnel does not carry
-      - "*.local"
-      - "*.lan"
-      - "*.home.arpa"
       # Captive portal detection
       - "captive.apple.com"
       - "connectivitycheck.gstatic.com"
@@ -48,6 +47,14 @@
       - "time.*.apple.com"
 
   rules:
+    # The LAN goes direct: a bypassed local name is resolved by the router
+    # and reached at its real address, and both follow this rule.
+    - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+
     # Fake IP restores the domain before rules are evaluated, so this matches
     # even though the client connected to 198.18.x.x.
     - masks: "example.com"

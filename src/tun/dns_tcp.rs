@@ -153,7 +153,7 @@ mod tests {
         );
         Arc::new(FakeIpResponder::new(
             pool,
-            BypassList::new(std::iter::empty::<&str>()),
+            BypassList::new(std::iter::empty::<&str>(), false),
         ))
     }
 
