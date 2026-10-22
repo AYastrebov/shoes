@@ -166,7 +166,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<RawRule>> {
         return Err(Error::other("bad magic, expected \"SRS\""));
     }
     let version = bytes[3];
-    if version > MAX_VERSION {
+    // Versions start at 1: sing-box refuses any other value when it upgrades
+    // what it read (option/rule_set.go, PlainRuleSetCompat.Upgrade).
+    if version == 0 || version > MAX_VERSION {
         return Err(Error::other(format!(
             "unsupported format version {version}, expected 1 through {MAX_VERSION}"
         )));
@@ -387,6 +389,12 @@ mod tests {
         bytes[0] = b'X';
         let err = decode(&bytes).unwrap_err();
         assert!(err.to_string().contains("magic"), "{err}");
+    }
+
+    #[test]
+    fn rejects_version_zero() {
+        let err = decode(&container(0, &[0x00])).unwrap_err();
+        assert!(err.to_string().contains("version 0"), "{err}");
     }
 
     #[test]

@@ -64,6 +64,9 @@ enum UnpadState {
     Done,
 }
 
+/// The UUID and one frame header, which the first padded read carries whole.
+const UNPAD_HEADER_LEN: usize = 16 + 5;
+
 #[derive(Debug, Clone)]
 pub struct VisionUnpadder {
     state: UnpadState,
@@ -97,13 +100,13 @@ impl VisionUnpadder {
         loop {
             match &mut self.state {
                 UnpadState::Initial { expected_uuid } => {
-                    if data.len() < 16 {
-                        return Ok(UnpadResult::default()); // Need more data
-                    }
-
-                    // Check if this is XTLS padding data
-                    if &data[..16] != expected_uuid {
-                        // Not XTLS padding data
+                    // Padded data starts with the UUID and the first frame's
+                    // 5-byte header in one read. Anything else is plain data,
+                    // returned as it is, and the next read is checked again:
+                    // Xray's XtlsUnpadding initial state (proxy/proxy.go:556-
+                    // 562). A read shorter than 16 bytes used to be answered
+                    // with "need more data" and lost.
+                    if data.len() < UNPAD_HEADER_LEN || &data[..16] != expected_uuid {
                         return Ok(UnpadResult {
                             content: data.to_vec(),
                             command: None,
@@ -424,10 +427,16 @@ mod tests {
         let user_uuid = [0u8; 16];
         let mut state = VisionUnpadder::new(user_uuid);
 
-        // Data that's less than 16 bytes (too short to check UUID)
+        // A read too short to hold the UUID and a frame header is plain
+        // data, returned whole rather than held back and lost
         let short_data = [1, 2, 3, 4, 5];
         let result = state.unpad(&short_data[..]).unwrap();
-        assert!(result.content.is_empty()); // Need more data
+        assert_eq!(result.content, short_data);
+        assert!(result.command.is_none());
+
+        // So is the UUID alone: Xray needs the first frame's header with it
+        let result = state.unpad(&user_uuid[..]).unwrap();
+        assert_eq!(result.content, user_uuid);
         assert!(result.command.is_none());
 
         // Data that's exactly 16 bytes but doesn't match UUID
@@ -467,27 +476,28 @@ mod tests {
         let user_uuid = [3u8; 16];
         let mut state = VisionUnpadder::new(user_uuid);
 
-        // First chunk: UUID + partial command
+        // First chunk: UUID, the whole header, and part of the content. The
+        // first read always holds the header; Xray's reader takes a shorter
+        // one as plain data.
         let chunk1 = {
             let mut d = vec![3u8; 16];
-            d.extend_from_slice(&[1, 0, 3]); // command (End), content_len high byte, partial
+            d.extend_from_slice(&[1, 0, 3, 0, 2]); // End, content length 3, padding length 2
+            d.push(10);
             d
         };
 
         let result1 = state.unpad(&chunk1[..]).unwrap();
-        assert!(result1.content.is_empty()); // Not enough data yet
-        assert!(result1.command.is_none());
+        assert_eq!(result1.content, vec![10]); // Content is returned as it arrives
         assert!(!matches!(state.state, UnpadState::Done));
 
-        // Second chunk: rest of command + content + padding
+        // Second chunk: the rest of the content and the padding
         let chunk2 = [
-            0, 2, // rest of content length (=3), padding length = 2
-            10, 11, 12, // content
+            11, 12, // content
             0, 0, // padding
         ];
 
         let result2 = state.unpad(&chunk2[..]).unwrap();
-        assert_eq!(result2.content, vec![10, 11, 12]);
+        assert_eq!(result2.content, vec![11, 12]);
         assert_eq!(result2.command, Some(UnpadCommand::End));
         assert!(matches!(state.state, UnpadState::Done));
     }
@@ -575,5 +585,100 @@ mod tests {
         assert!(result2.content.is_empty()); // Content already returned in result1
         assert_eq!(result2.command, Some(UnpadCommand::End));
         assert!(matches!(state.state, UnpadState::Done));
+    }
+
+    const UUID: [u8; 16] = [0x5a; 16];
+
+    fn frame(out: &mut Vec<u8>, command: u8, content: &[u8], padding: usize) {
+        out.push(command);
+        out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(padding as u16).to_be_bytes());
+        out.extend_from_slice(content);
+        out.extend((0..padding).map(|i| 0xa0 ^ i as u8));
+    }
+
+    /// What a reader of the stream sees: every content byte, and the command
+    /// that ended the padding. After End or Direct the stream reads raw, as
+    /// `VisionStream` does, so the rest is appended unparsed.
+    fn read_in(pieces: &[&[u8]]) -> (Vec<u8>, Option<UnpadCommand>) {
+        let mut unpadder = VisionUnpadder::new(UUID);
+        let mut content = Vec::new();
+        let mut ended = None;
+        for piece in pieces {
+            if ended.is_some() {
+                content.extend_from_slice(piece);
+                continue;
+            }
+            let result = unpadder.unpad(piece).unwrap();
+            content.extend_from_slice(&result.content);
+            if let Some(command @ (UnpadCommand::End | UnpadCommand::Direct)) = result.command {
+                ended = Some(command);
+            }
+        }
+        (content, ended)
+    }
+
+    /// Every cut after the first `UNPAD_HEADER_LEN` bytes, which the
+    /// reference's writer never splits and its reader reads as plain data
+    /// when they are split (`a_short_first_read_is_plain_data`).
+    fn every_cut_reads_the_same(stream: &[u8], pairs: bool) {
+        let whole = read_in(&[stream]);
+        for a in UNPAD_HEADER_LEN..=stream.len() {
+            let (x, y) = stream.split_at(a);
+            assert_eq!(read_in(&[x, y]), whole, "cut at {a}");
+            if pairs {
+                for b in a..=stream.len() {
+                    let (y, z) = stream.split_at(b);
+                    assert_eq!(
+                        read_in(&[&y[..a], &y[a..], z]),
+                        whole,
+                        "cuts at {a} and {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SF-10: the bytes a padded stream yields cannot depend on where the
+    /// transport cut it.
+    #[test]
+    fn every_cut_of_a_padded_stream_reads_the_same() {
+        for end in [1u8, 2] {
+            let mut stream = UUID.to_vec();
+            frame(&mut stream, 0, b"hello", 3);
+            frame(&mut stream, 0, b"", 2);
+            frame(&mut stream, 0, b"vision", 0);
+            frame(&mut stream, end, b"last", 5);
+            stream.extend_from_slice(b"raw after");
+
+            let (content, ended) = read_in(&[&stream]);
+            assert_eq!(content, b"hellovisionlastraw after");
+            assert_eq!(ended, UnpadCommand::try_from(end).ok());
+            every_cut_reads_the_same(&stream, true);
+        }
+    }
+
+    #[test]
+    fn a_short_first_read_is_plain_data() {
+        let mut stream = UUID.to_vec();
+        frame(&mut stream, 1, b"x", 0);
+        for cut in 1..UNPAD_HEADER_LEN {
+            let mut unpadder = VisionUnpadder::new(UUID);
+            let result = unpadder.unpad(&stream[..cut]).unwrap();
+            assert_eq!(result.content, &stream[..cut], "cut at {cut}");
+            assert_eq!(result.command, None);
+        }
+    }
+
+    /// The same for what shoes' own padder writes, at every single cut.
+    #[test]
+    fn every_cut_of_a_padder_written_stream_reads_the_same() {
+        use crate::vless::vision_pad::{pad_with_command, pad_with_uuid_and_command};
+        let mut stream = pad_with_uuid_and_command(b"client hello", &UUID, 0, true).to_vec();
+        stream.extend_from_slice(&pad_with_command(b"more", 0, false));
+        stream.extend_from_slice(&pad_with_command(b"done", 1, false));
+        stream.extend_from_slice(b"tail");
+        assert_eq!(read_in(&[&stream]).0, b"client hellomoredonetail");
+        every_cut_reads_the_same(&stream, false);
     }
 }

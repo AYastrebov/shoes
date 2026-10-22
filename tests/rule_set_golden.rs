@@ -125,3 +125,66 @@ fn a_set_mixing_ipv4_with_low_ipv6_ranges_loads_and_matches() {
     assert!(set.matches(&v6("64:ff9b::808:808")));
     assert!(!set.matches(&v6("::2")));
 }
+
+/// sing-box's own verdicts (`tests/data/rule_sets/oracle.json`, written by
+/// `record-oracle.py` from `sing-box rule-set match`). A matcher checked only
+/// against expectations written by hand shares its author's misreadings.
+fn oracle() -> serde_json::Value {
+    let text = std::fs::read_to_string(fixture("oracle.json")).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+fn oracle_target(text: &str) -> MatchTarget<'_> {
+    match text.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => MatchTarget {
+            domain: None,
+            ip: Some(u128::from(v4.to_ipv6_mapped())),
+        },
+        Ok(std::net::IpAddr::V6(v6)) => MatchTarget {
+            domain: None,
+            ip: Some(u128::from(v6)),
+        },
+        Err(_) => domain_target(text),
+    }
+}
+
+#[test]
+fn every_match_agrees_with_sing_box() {
+    let oracle = oracle();
+    let cases = oracle["cases"].as_array().unwrap();
+    assert!(cases.len() >= 30, "the oracle lost its cases");
+    let mut disagreements = Vec::new();
+    for case in cases {
+        let file = case["file"].as_str().unwrap();
+        let target = case["target"].as_str().unwrap();
+        let expected = case["matched"].as_bool().unwrap();
+        if load(file).matches(&oracle_target(target)) != expected {
+            disagreements.push(format!("{file} {target}: sing-box says {expected}"));
+        }
+    }
+    assert!(disagreements.is_empty(), "{disagreements:#?}");
+}
+
+/// Every file sing-box refuses, shoes refuses, with an error rather than a
+/// panic. One difference is deliberate: sing-box does not check the zlib
+/// trailer, so it loads a file whose Adler-32 is wrong or missing. shoes
+/// refuses those, since a short payload would be a quietly wrong matcher
+/// (`rule_set/srs.rs`, `inflate`).
+#[test]
+fn every_corrupt_file_sing_box_refuses_is_refused() {
+    let oracle = oracle();
+    let corrupt = oracle["corrupt"].as_array().unwrap();
+    assert!(corrupt.len() >= 9, "the oracle lost its corruption cases");
+    for case in corrupt {
+        let file = case["file"].as_str().unwrap();
+        let sing_box_loads = case["loads"].as_bool().unwrap();
+        let shoes_loads = RuleSet::load(file, &fixture(file)).is_ok();
+        let checksum = file.contains("checksum");
+        if checksum {
+            assert!(sing_box_loads, "{file}: sing-box now checks the trailer");
+            assert!(!shoes_loads, "{file}: shoes must refuse a bad trailer");
+        } else {
+            assert_eq!(shoes_loads, sing_box_loads, "{file}");
+        }
+    }
+}

@@ -490,6 +490,15 @@ to this PR. It covers:
 The fake-IP and config-loading fixes from that spec (PRs S.1 and S.2 of its
 plan) come before this PR.
 
+Split, 2026-10-22, since `tests/probe_*.rs` never landed (Phase 2 was
+deferred):
+
+1. The harness-free checks: the ClientHello shape test, the Vision cut
+   property, the `.srs` oracle.
+2. The probe harness: three outcomes with time bounds, the probe corpus,
+   the slow-drip prober, against shoes' own servers in-process.
+3. The nightly interop job, with loud skips.
+
 ### PR 4.4 — Zero-test files
 
 Bring every file in the audit's zero-test list to at least the byte-level
