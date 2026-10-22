@@ -116,6 +116,8 @@ mod xudp;
 #[cfg(test)]
 mod kat;
 #[cfg(test)]
+mod probe_tests;
+#[cfg(test)]
 mod reference_frames;
 
 /// Configuration types.
