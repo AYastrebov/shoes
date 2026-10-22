@@ -20,7 +20,9 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 pub struct RealityClientHandler {
     public_key: [u8; 32],
     short_id: [u8; 8],
-    server_name: rustls::pki_types::ServerName<'static>,
+    /// What the ClientHello's server_name carries; `""` or an IP address
+    /// leaves the extension out.
+    server_name: String,
     cipher_suites: Vec<CipherSuite>,
     handler: RealityInnerClientHandler,
 }
@@ -35,7 +37,7 @@ impl RealityClientHandler {
     pub fn new(
         public_key: [u8; 32],
         short_id: [u8; 8],
-        server_name: rustls::pki_types::ServerName<'static>,
+        server_name: String,
         cipher_suites: Vec<CipherSuite>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
@@ -50,7 +52,7 @@ impl RealityClientHandler {
     pub fn new_vision_vless(
         public_key: [u8; 32],
         short_id: [u8; 8],
-        server_name: rustls::pki_types::ServerName<'static>,
+        server_name: String,
         cipher_suites: Vec<CipherSuite>,
         user_id: Box<[u8]>,
         udp_enabled: bool,
@@ -71,27 +73,11 @@ impl RealityClientHandler {
         &self,
         mut client_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
-        let server_name_str = match &self.server_name {
-            rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
-            rustls::pki_types::ServerName::IpAddress(ip) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("REALITY requires DNS name, got IP address: {:?}", ip),
-                ));
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "REALITY requires DNS name",
-                ));
-            }
-        };
-
         log::debug!("REALITY CLIENT: Creating buffered RealityClientConnection");
         let reality_config = RealityClientConfig {
             public_key: self.public_key,
             short_id: self.short_id,
-            server_name: server_name_str.to_string(),
+            server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
         };
 

@@ -69,10 +69,13 @@ impl HopContext {
         }
     }
 
+    /// An empty server name (REALITY's `sni_hostname: ""`, which sends none)
+    /// is no name for the layers above either, so HTTPUpgrade falls back to
+    /// the dialled address rather than sending an empty `Host`.
     fn under_tls(&self, server_name: Option<String>) -> Self {
         Self {
             dialled_address: self.dialled_address.clone(),
-            tls_server_name: server_name,
+            tls_server_name: server_name.filter(|name| !name.is_empty()),
         }
     }
 }
@@ -263,14 +266,10 @@ pub fn create_tcp_client_handler(
             // Determine SNI hostname
             let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
             let inner_hop = hop.under_tls(sni_hostname.clone());
-            let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s)
-                    .unwrap()
-                    .to_owned(),
-                None => {
-                    panic!("REALITY client requires sni_hostname to be specified");
-                }
-            };
+            // `""` and an IP address send no server_name (SF-4). A missing
+            // one is refused by config validation (`validate_reality_sni`).
+            let server_name =
+                sni_hostname.expect("REALITY sni_hostname is checked by config validation");
 
             let cipher_suites = cipher_suites.into_vec();
 
@@ -500,5 +499,12 @@ mod tests {
             .under_tls(Some("cdn.example.com".to_string()));
         assert_eq!(hop.dialled_address, "1.2.3.4:443");
         assert_eq!(hop.tls_server_name.as_deref(), Some("cdn.example.com"));
+    }
+
+    #[test]
+    fn an_empty_server_name_is_no_name_for_the_layers_above() {
+        let hop = HopContext::new(&NetLocation::from_str("1.2.3.4:443", None).unwrap())
+            .under_tls(Some(String::new()));
+        assert_eq!(hop.tls_server_name, None);
     }
 }

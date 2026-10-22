@@ -5,12 +5,16 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A version 4, RFC 4122 UUID: what VLESS, VMess and TUIC name a user by.
+/// The 16-byte id VLESS, VMess and TUIC name a user by.
 ///
 /// Parsed when the config is deserialized, so a malformed one is a config
 /// error at load and every consumer gets the bytes, rather than each handler
 /// parsing the string again and unwrapping on the assumption that validation
 /// already did.
+///
+/// It parses as a VLESS or VMess user id: a UUID of any version, or a name of
+/// up to 30 characters (`uuid_util::parse_user_id`). TUIC's fields take only
+/// the UUID form, through [`Uuid::deserialize_hex`], as sing-box's TUIC does.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Uuid([u8; 16]);
 
@@ -18,17 +22,24 @@ impl Uuid {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    /// A UUID's hex form only, any version: `#[serde(deserialize_with)]` for
+    /// TUIC, whose references parse strictly.
+    pub fn deserialize_hex<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let bytes = crate::uuid_util::parse_uuid(&s).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("Invalid uuid"))?;
+        Ok(Self(bytes))
+    }
 }
 
 impl FromStr for Uuid {
     type Err = std::io::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = crate::uuid_util::parse_uuid(s)?;
-        let bytes: [u8; 16] = bytes
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid uuid"))?;
-        Ok(Self(bytes))
+        crate::uuid_util::parse_user_id(s).map(Self)
     }
 }
 
@@ -77,11 +88,30 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_uuid_is_a_parse_error_naming_it() {
-        let err = serde_yaml::from_str::<Uuid>("\"test-uuid\"").unwrap_err();
-        assert!(err.to_string().contains("Invalid uuid: test-uuid"), "{err}");
-        let err =
-            serde_yaml::from_str::<Uuid>("\"123e4567-e89b-12d3-a456-426614174000\"").unwrap_err();
-        assert!(err.to_string().contains("not version 4"), "{err}");
+    fn a_malformed_id_is_a_parse_error_that_does_not_repeat_it() {
+        let id = "not-a-uuid-and-longer-than-thirty";
+        let err = serde_yaml::from_str::<Uuid>(&format!("\"{id}\"")).unwrap_err();
+        assert!(err.to_string().contains("Invalid uuid"), "{err}");
+        assert!(!err.to_string().contains(id), "{err}");
+    }
+
+    #[test]
+    fn a_uuidv7_and_a_name_load() {
+        let v7: Uuid = serde_yaml::from_str("\"01890a5d-ac96-774b-bcce-b302099a8057\"").unwrap();
+        assert_eq!(v7.to_string(), "01890a5d-ac96-774b-bcce-b302099a8057");
+        let name: Uuid = serde_yaml::from_str("\"TMG_74317ba5f91\"").unwrap();
+        assert_eq!(name.as_bytes()[6] >> 4, 5);
+    }
+
+    #[test]
+    fn the_hex_form_refuses_a_name() {
+        #[derive(Debug, Deserialize)]
+        struct Tuic {
+            #[serde(deserialize_with = "Uuid::deserialize_hex")]
+            #[allow(dead_code, reason = "only the parse is under test")]
+            uuid: Uuid,
+        }
+        assert!(serde_yaml::from_str::<Tuic>("uuid: TMG_74317ba5f91").is_err());
+        assert!(serde_yaml::from_str::<Tuic>("uuid: 01890a5d-ac96-774b-bcce-b302099a8057").is_ok());
     }
 }

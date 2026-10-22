@@ -139,6 +139,18 @@ fn grease_ech(rng: &mut impl Rng) -> std::io::Result<Vec<u8>> {
     Ok(extension(EXT_ENCRYPTED_CLIENT_HELLO, &body))
 }
 
+/// The name the server_name extension carries, if any. An empty name sends
+/// none, which Xray's REALITY server accepts when its `serverNames` holds
+/// `""`; nor does an IP address, which RFC 6066 section 3 keeps out of the
+/// extension and Chrome leaves out (SF-4).
+fn sni_host_name(server_name: &str) -> Option<&str> {
+    if server_name.is_empty() || server_name.parse::<std::net::IpAddr>().is_ok() {
+        None
+    } else {
+        Some(server_name)
+    }
+}
+
 /// Build the ClientHello handshake message (no record header).
 ///
 /// `tls13_suites` replaces Chrome's three TLS 1.3 suites when the config
@@ -163,8 +175,8 @@ pub fn construct_chrome_client_hello(
     // The extensions between the two GREASE ones, which Chrome shuffles per
     // connection (ShuffleChromeTLSExtensions).
     let mut middle: Vec<Vec<u8>> = Vec::with_capacity(16);
-    {
-        let name = server_name.as_bytes();
+    if let Some(name) = sni_host_name(server_name) {
+        let name = name.as_bytes();
         let mut body = Vec::with_capacity(5 + name.len());
         push_u16(&mut body, (3 + name.len()) as u16);
         body.push(0x00); // host_name
@@ -331,6 +343,10 @@ mod tests {
     }
 
     fn hello() -> Vec<u8> {
+        hello_for("www.example.com")
+    }
+
+    fn hello_for(server_name: &str) -> Vec<u8> {
         let ek = vec![0x5a; MLKEM768_ENCAPSULATION_KEY_LEN];
         let x25519 = [0x42; 32];
         construct_chrome_client_hello(
@@ -340,7 +356,7 @@ mod tests {
                 x25519_public: &x25519,
                 mlkem768_encapsulation_key: &ek,
             },
-            "www.example.com",
+            server_name,
             &[0x1301, 0x1302, 0x1303],
             &["h2", "http/1.1"],
         )
@@ -387,6 +403,31 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(middle, expected, "Chrome 133's set, no padding");
+    }
+
+    #[test]
+    fn an_empty_name_or_an_ip_address_sends_no_server_name() {
+        let sorted_types = |hello: &[u8]| {
+            let mut types: Vec<u16> = parse(hello)
+                .extensions
+                .iter()
+                .map(|(t, _)| *t)
+                .filter(|t| !is_grease(*t))
+                .collect();
+            types.sort_unstable();
+            types
+        };
+        let with_name = sorted_types(&hello());
+        assert!(with_name.contains(&EXT_SERVER_NAME));
+        for name in ["", "203.0.113.7", "2001:db8::1"] {
+            let types = sorted_types(&hello_for(name));
+            let expected: Vec<u16> = with_name
+                .iter()
+                .copied()
+                .filter(|t| *t != EXT_SERVER_NAME)
+                .collect();
+            assert_eq!(types, expected, "{name:?}: only server_name goes");
+        }
     }
 
     #[test]

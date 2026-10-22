@@ -1004,10 +1004,17 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
 
-        // Externally close the fd to produce EBADF on both read and select.
-        // SAFETY: the test owns `client_fd` and closes it once, to cause EBADF.
-        unsafe { libc::close(client_fd) };
-        // Also drop the writer so there's no other holder.
+        // Make every read fail, in place: a directory over the descriptor
+        // reads as EISDIR. Closing it instead freed the number while the
+        // stack thread still polled it, and a socket another test opened in
+        // that window took the number, so the stack read that test's bytes
+        // (a VLESS test then waited out its 30 s; both failed together on
+        // macOS CI). The POLLNVAL path is `a_closed_descriptor_polls_as_ebadf`.
+        let dir = std::fs::File::open(".").expect("open a directory");
+        // SAFETY: both are open descriptors; dup2 swaps what `client_fd`
+        // names without ever freeing the number.
+        assert!(unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&dir), client_fd) } >= 0);
+        drop(dir);
         drop(server);
 
         let start = std::time::Instant::now();
@@ -1020,12 +1027,21 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // Safe to drop only because the stack was told the descriptor is not
-        // its own. Closing it twice would let a concurrent test's OwnedFd take
-        // the freed number in between and then lose it, which aborts the whole
-        // test binary ("IO Safety violation: owned file descriptor already
-        // closed") rather than failing one test.
+        // The stack was told the descriptor is not its own, so it is closed
+        // once, here, after the stack thread has stopped using it.
         drop(stack);
+        // SAFETY: `client_fd` is open (the directory's duplicate) and nothing
+        // else holds it now.
+        unsafe { libc::close(client_fd) };
+    }
+
+    #[test]
+    fn a_closed_descriptor_polls_as_ebadf() {
+        // poll reports a closed descriptor with POLLNVAL and no errno. A
+        // number this high is never handed out in the test process, so no
+        // concurrent test can own it.
+        let err = wait_readable(1 << 20, -1, Some(SmolDuration::from_millis(0))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
     }
 
     /// Resident bytes this process is using, from `ps`.

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Configs that should load (steer plan PR S.2):
+
+- VLESS and VMess user ids load as Xray and sing-box read them: a UUID of
+  any version, so UUIDv7 ids work, or a name of up to 30 bytes, which
+  stands for its version-5 UUID. Before, only version-4 UUIDs loaded. TUIC
+  keeps the UUID form, of any version. A refused id is no longer repeated in
+  the error (SF-5).
+- A REALITY client with no `sni_hostname` and no hostname to fall back on
+  is a config error instead of a panic. `sni_hostname: ""` and an IP
+  address send a ClientHello with no server name, and a REALITY server
+  answers such a hello from its `""` target (SF-4).
+
 Fake IP safety (steer plan PR S.1):
 
 - **Behaviour change: local names are no longer tunnelled.** With fake IP

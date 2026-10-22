@@ -400,6 +400,7 @@ pub struct MieruClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuicClientConfig {
+    #[serde(deserialize_with = "Uuid::deserialize_hex")]
     pub uuid: Uuid,
     pub password: Redacted<String>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]

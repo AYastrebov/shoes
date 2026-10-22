@@ -18,6 +18,10 @@ use crate::address::{Address, NetLocation};
 const SHORT_ID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 fn handshaken_pair() -> (RealityClientConnection, RealityServerConnection) {
+    handshaken_pair_for("example.com")
+}
+
+fn handshaken_pair_for(server_name: &str) -> (RealityClientConnection, RealityServerConnection) {
     let server_private = [0x42u8; 32];
     let public = agreement::PrivateKey::from_private_key(&agreement::X25519, &server_private)
         .unwrap()
@@ -26,7 +30,7 @@ fn handshaken_pair() -> (RealityClientConnection, RealityServerConnection) {
     let mut client = RealityClientConnection::new(RealityClientConfig {
         public_key: public.as_ref().try_into().unwrap(),
         short_id: SHORT_ID,
-        server_name: "example.com".to_string(),
+        server_name: server_name.to_string(),
         cipher_suites: vec![],
     })
     .unwrap();
@@ -70,6 +74,15 @@ fn client_to_server(
     client.write_tls(&mut wire)?;
     server.read_tls(&mut io::Cursor::new(wire))?;
     server.process_new_packets().map(drop)
+}
+
+/// Authentication and the certificate check do not depend on the name, so
+/// a hello without one completes (SF-4).
+#[test]
+fn a_hello_without_a_server_name_completes() {
+    for name in ["", "203.0.113.7"] {
+        handshaken_pair_for(name);
+    }
 }
 
 /// KeyUpdate(update_not_requested).

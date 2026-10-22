@@ -142,9 +142,16 @@ protocol:
 protocol:
   type: vmess
   cipher: string               # aes-128-gcm, chacha20-poly1305, none
-  user_id: string              # UUID
+  user_id: string              # UUID, or a name (see "User ids" below)
   udp_enabled: true            # Default: true (enables XUDP)
 ```
+
+**User ids** (VMess and VLESS, server and client): a UUID of any version,
+with or without dashes, or a name of 1 to 30 bytes, such as the ids some
+panels issue (`TMG_74317ba5f91`). A name stands for its version-5 UUID in the
+nil namespace, which is how Xray and sing-box read it, so the same string
+works on both ends. 31 bytes, or more than 36, is refused, as Xray refuses it.
+TUIC's `uuid` takes only the UUID form.
 
 **Note:** VMess AEAD mode is always enabled. The legacy `force_aead` field is deprecated and non-AEAD mode is no longer supported.
 
@@ -152,7 +159,7 @@ protocol:
 ```yaml
 protocol:
   type: vless
-  user_id: string              # UUID
+  user_id: string              # UUID, or a name (see "User ids" under VMess)
   udp_enabled: true            # Default: true (enables XUDP)
   fallback: string?            # Optional fallback destination for failed auth (e.g., "127.0.0.1:80")
 ```
@@ -200,7 +207,8 @@ protocol:
     key: string
     # ... same fields as tls_targets
 
-  # Reality targets (by SNI)
+  # Reality targets (by SNI). The key "" takes a ClientHello that carries
+  # no server name, as Xray's serverNames does.
   reality_targets:
     "www.cloudflare.com":
       private_key: string      # X25519 private key (base64url)
@@ -855,6 +863,12 @@ protocol:
   vision: false                # Enable Vision (requires VLESS inner protocol)
   protocol: ClientProxyConfig  # Inner protocol (typically VLESS)
 ```
+
+**Reality `sni_hostname`:** required, unless REALITY is the outermost layer
+and the outbound's `address` is a hostname, which is then used. A missing
+one is a config error. `sni_hostname: ""` sends a ClientHello with no server
+name, for a server whose names include `""`. An IP address is sent the same
+way, since a server name cannot carry one.
 
 **Reality cipher suites:** Valid values are `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. If not specified, all three are offered/supported.
 

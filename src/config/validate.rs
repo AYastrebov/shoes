@@ -1283,10 +1283,48 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
     Ok(())
 }
 
+/// A REALITY hop names the server it imitates. Only the outermost hop falls
+/// back to the outbound's address, and only when that is a hostname; any
+/// other REALITY hop without `sni_hostname` used to panic when the chain was
+/// built (SF-4). `sni_hostname: ""` is the way to send no name.
+fn validate_reality_sni(
+    config: &ClientProxyConfig,
+    address_is_a_hostname: bool,
+) -> std::io::Result<()> {
+    match config {
+        ClientProxyConfig::Reality {
+            sni_hostname,
+            protocol,
+            ..
+        } => {
+            if sni_hostname.is_none() && !address_is_a_hostname {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "REALITY client needs sni_hostname: the server name it imitates, which must \
+                     match a key of the server's reality_targets. The outbound's address is used \
+                     only when it is a hostname and REALITY is the outermost layer. Set \
+                     sni_hostname: \"\" to send no server name.",
+                ));
+            }
+            validate_reality_sni(protocol, false)
+        }
+        ClientProxyConfig::Tls(tls_config) => validate_reality_sni(&tls_config.protocol, false),
+        ClientProxyConfig::ShadowTls { protocol, .. } => validate_reality_sni(protocol, false),
+        ClientProxyConfig::Websocket(ws_config) => validate_reality_sni(&ws_config.protocol, false),
+        ClientProxyConfig::HttpUpgrade(config) => validate_reality_sni(&config.protocol, false),
+        _ => Ok(()),
+    }
+}
+
 fn validate_client_config(
     client_config: &mut ClientConfig,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    validate_reality_sni(
+        &client_config.protocol,
+        client_config.address.address().hostname().is_some(),
+    )?;
+
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1766,7 +1804,11 @@ fn validate_server_proxy_config(
                         // passing through a rule, so it has to be expanded
                         // here or it is expanded nowhere: its outbounds would
                         // be missing from the set, and a group reference in it
-                        // would panic in chain_builder.
+                        // would panic in chain_builder. Its inline hops are
+                        // validated first, as a rule's are.
+                        for hop in remote_handshake.client_chain.iter_mut() {
+                            validate_client_chain_hop(hop, client_groups, named_pems)?;
+                        }
                         expand_client_chain(
                             &mut remote_handshake.client_chain,
                             client_groups,
@@ -1824,6 +1866,9 @@ fn validate_server_proxy_config(
                 if !reality_config.dest_client_chain.is_empty() {
                     let mut hops: OneOrSome<ClientChainHop> =
                         OneOrSome::Some(reality_config.dest_client_chain.clone().into_vec());
+                    for hop in hops.iter_mut() {
+                        validate_client_chain_hop(hop, client_groups, named_pems)?;
+                    }
                     expand_client_chain(&mut hops, client_groups, outbounds)?;
                     reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
                 }
@@ -5222,5 +5267,131 @@ mod amneziawg_mtu_tests {
         )
         .unwrap();
         let _ = validate_amneziawg_config(&config);
+    }
+}
+
+#[cfg(test)]
+mod reality_sni_validation_tests {
+    use crate::config::load_config_str;
+
+    fn validate(address: &str, reality: &str) -> std::io::Result<()> {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: "{address}"
+        protocol:
+{reality}
+"#
+        );
+        let configs = load_config_str(&yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    const REALITY: &str = r#"          type: reality
+          public_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+          short_id: "01ab"
+          protocol:
+            type: vless
+            user_id: "b831381d-6324-4d53-ad4f-8cda48b30811""#;
+
+    #[test]
+    fn a_missing_sni_with_an_ip_address_is_a_config_error() {
+        let err = validate("203.0.113.7:443", REALITY)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_sni_falls_back_to_a_hostname_address() {
+        validate("reality.example.com:443", REALITY).unwrap();
+    }
+
+    #[test]
+    fn an_empty_sni_loads() {
+        let reality = format!("{REALITY}\n          sni_hostname: \"\"");
+        validate("203.0.113.7:443", &reality).unwrap();
+    }
+
+    #[test]
+    fn a_nested_reality_gets_no_fallback() {
+        let nested = format!(
+            "          type: websocket\n          protocol:\n{}",
+            REALITY
+                .lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let err = validate("reality.example.com:443", &nested)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
+    }
+
+    fn load(yaml: &str) -> std::io::Result<()> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    /// The hop a fallback chain carries: REALITY at an IP address, no name.
+    const NAMELESS_HOP: &str = r#"
+            address: "203.0.113.7:443"
+            protocol:
+              type: reality
+              public_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+              short_id: "01ab"
+              protocol:
+                type: vless
+                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811""#;
+
+    #[test]
+    fn a_reality_dest_chain_hop_is_validated() {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    reality_targets:
+      example.com:
+        private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        short_ids: ["01ab"]
+        dest: "example.com:443"
+        dest_client_chain:
+          -{NAMELESS_HOP}
+        protocol:
+          type: socks
+"#
+        );
+        let err = load(&yaml).unwrap_err().to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
+    }
+
+    #[test]
+    fn a_shadowtls_handshake_chain_hop_is_validated() {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    shadowtls_targets:
+      example.com:
+        password: "shadowtls-password"
+        handshake:
+          address: "example.com:443"
+          client_chain:
+          -{NAMELESS_HOP}
+        protocol:
+          type: socks
+"#
+        );
+        let err = load(&yaml).unwrap_err().to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
     }
 }
