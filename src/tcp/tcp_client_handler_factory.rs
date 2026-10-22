@@ -69,10 +69,13 @@ impl HopContext {
         }
     }
 
+    /// An empty server name (REALITY's `sni_hostname: ""`, which sends none)
+    /// is no name for the layers above either, so HTTPUpgrade falls back to
+    /// the dialled address rather than sending an empty `Host`.
     fn under_tls(&self, server_name: Option<String>) -> Self {
         Self {
             dialled_address: self.dialled_address.clone(),
-            tls_server_name: server_name,
+            tls_server_name: server_name.filter(|name| !name.is_empty()),
         }
     }
 }
@@ -496,5 +499,12 @@ mod tests {
             .under_tls(Some("cdn.example.com".to_string()));
         assert_eq!(hop.dialled_address, "1.2.3.4:443");
         assert_eq!(hop.tls_server_name.as_deref(), Some("cdn.example.com"));
+    }
+
+    #[test]
+    fn an_empty_server_name_is_no_name_for_the_layers_above() {
+        let hop = HopContext::new(&NetLocation::from_str("1.2.3.4:443", None).unwrap())
+            .under_tls(Some(String::new()));
+        assert_eq!(hop.tls_server_name, None);
     }
 }

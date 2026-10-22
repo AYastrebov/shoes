@@ -1804,7 +1804,11 @@ fn validate_server_proxy_config(
                         // passing through a rule, so it has to be expanded
                         // here or it is expanded nowhere: its outbounds would
                         // be missing from the set, and a group reference in it
-                        // would panic in chain_builder.
+                        // would panic in chain_builder. Its inline hops are
+                        // validated first, as a rule's are.
+                        for hop in remote_handshake.client_chain.iter_mut() {
+                            validate_client_chain_hop(hop, client_groups, named_pems)?;
+                        }
                         expand_client_chain(
                             &mut remote_handshake.client_chain,
                             client_groups,
@@ -1862,6 +1866,9 @@ fn validate_server_proxy_config(
                 if !reality_config.dest_client_chain.is_empty() {
                     let mut hops: OneOrSome<ClientChainHop> =
                         OneOrSome::Some(reality_config.dest_client_chain.clone().into_vec());
+                    for hop in hops.iter_mut() {
+                        validate_client_chain_hop(hop, client_groups, named_pems)?;
+                    }
                     expand_client_chain(&mut hops, client_groups, outbounds)?;
                     reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
                 }
@@ -5325,6 +5332,66 @@ mod reality_sni_validation_tests {
         let err = validate("reality.example.com:443", &nested)
             .unwrap_err()
             .to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
+    }
+
+    fn load(yaml: &str) -> std::io::Result<()> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    /// The hop a fallback chain carries: REALITY at an IP address, no name.
+    const NAMELESS_HOP: &str = r#"
+            address: "203.0.113.7:443"
+            protocol:
+              type: reality
+              public_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+              short_id: "01ab"
+              protocol:
+                type: vless
+                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811""#;
+
+    #[test]
+    fn a_reality_dest_chain_hop_is_validated() {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    reality_targets:
+      example.com:
+        private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        short_ids: ["01ab"]
+        dest: "example.com:443"
+        dest_client_chain:
+          -{NAMELESS_HOP}
+        protocol:
+          type: socks
+"#
+        );
+        let err = load(&yaml).unwrap_err().to_string();
+        assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
+    }
+
+    #[test]
+    fn a_shadowtls_handshake_chain_hop_is_validated() {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    shadowtls_targets:
+      example.com:
+        password: "shadowtls-password"
+        handshake:
+          address: "example.com:443"
+          client_chain:
+          -{NAMELESS_HOP}
+        protocol:
+          type: socks
+"#
+        );
+        let err = load(&yaml).unwrap_err().to_string();
         assert!(err.contains("REALITY client needs sni_hostname"), "{err}");
     }
 }
