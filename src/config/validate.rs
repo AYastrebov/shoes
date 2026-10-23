@@ -1076,14 +1076,19 @@ fn validate_tproxy_listener(
             ),
         ));
     }
-    // Zero would expire every session as it opened. The upper bound is the
-    // router's timer, which panics on a duration it cannot hold (about two
-    // years); a day is far past any UDP flow worth keeping.
-    if udp_timeout == 0 || udp_timeout > MAX_TPROXY_UDP_TIMEOUT_SECS {
+    validate_udp_timeout("tproxy", udp_timeout)
+}
+
+/// Zero would expire every session as it opened (a TUIC association was
+/// reaped on the first sweep). The upper bound is the router's timer, which
+/// panics on a duration it cannot hold (about two years); a day is far past
+/// any UDP flow worth keeping.
+fn validate_udp_timeout(protocol: &str, udp_timeout: u64) -> std::io::Result<()> {
+    if udp_timeout == 0 || udp_timeout > MAX_UDP_TIMEOUT_SECS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "tproxy udp_timeout must be between 1 and {MAX_TPROXY_UDP_TIMEOUT_SECS} seconds, \
+                "{protocol} udp_timeout must be between 1 and {MAX_UDP_TIMEOUT_SECS} seconds, \
                  not {udp_timeout}"
             ),
         ));
@@ -1091,7 +1096,7 @@ fn validate_tproxy_listener(
     Ok(())
 }
 
-const MAX_TPROXY_UDP_TIMEOUT_SECS: u64 = 86400;
+const MAX_UDP_TIMEOUT_SECS: u64 = 86400;
 const MAX_TPROXY_UDP_NAT_MAX: usize = 1 << 20;
 
 /// A sniff block that is on but can never sniff anything is a typo, not a
@@ -1261,6 +1266,11 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
     match config {
         ClientProxyConfig::Tls(tls_config) => {
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
+            let sni_hostname = match &tls_config.sni_hostname {
+                crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
+                _ => None,
+            };
+            validate_tls_server_name("TLS", sni_hostname)?;
             validate_client_proxy_structure(&tls_config.protocol)?;
         }
         ClientProxyConfig::Reality {
@@ -1269,7 +1279,12 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
             validate_client_proxy_structure(protocol)?;
         }
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
+        ClientProxyConfig::ShadowTls {
+            protocol,
+            sni_hostname,
+            ..
+        } => {
+            validate_tls_server_name("ShadowTLS", sni_hostname.as_deref())?;
             validate_client_proxy_structure(protocol)?;
         }
         ClientProxyConfig::Websocket(ws_config) => {
@@ -1281,6 +1296,27 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         _ => {}
     }
     Ok(())
+}
+
+/// A TLS or ShadowTLS `sni_hostname` rustls cannot hold -- a name with a
+/// space, say -- used to panic when the chain was built, after the config
+/// had loaded. `""` is accepted and sends no server name, as it does for
+/// REALITY (SF-4).
+fn validate_tls_server_name(layer: &str, sni_hostname: Option<&str>) -> std::io::Result<()> {
+    match sni_hostname {
+        Some(name) if !name.is_empty() => rustls::pki_types::ServerName::try_from(name.to_string())
+            .map(|_| ())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{layer} client sni_hostname is not a server name ({e}); \
+                             set it to a hostname or an IP address, or \"\" to send none"
+                    ),
+                )
+            }),
+        _ => Ok(()),
+    }
 }
 
 /// A REALITY hop names the server it imitates. Only the outermost hop falls
@@ -1984,6 +2020,9 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 "Snell does not support shadowsocks 2022 ciphers",
             ));
+        }
+        ServerProxyConfig::TuicV5 { udp_timeout, .. } => {
+            validate_udp_timeout("tuic", *udp_timeout)?;
         }
         _ => (),
     }
@@ -5206,6 +5245,41 @@ mod tproxy_validation_tests {
         .expect("a disabled sniff block asks for nothing");
     }
 
+    /// A TUIC server with the given extra protocol fields. The PEMs are
+    /// named inline data, so nothing is read from disk; their content is
+    /// not parsed at validation time.
+    fn tuic(fields: &str) -> String {
+        format!(
+            r#"
+- pem: quic-cert
+  data: "-----BEGIN CERTIFICATE-----\nTEST CERT CONTENT\n-----END CERTIFICATE-----"
+- pem: quic-key
+  data: "-----BEGIN PRIVATE KEY-----\nTEST KEY CONTENT\n-----END PRIVATE KEY-----"
+- address: "127.0.0.1:51273"
+  transport: quic
+  quic_settings:
+    cert: quic-cert
+    key: quic-key
+  protocol:
+    type: tuic
+    uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
+    password: secret{fields}
+"#
+        )
+    }
+
+    /// TU-D3's `udp_timeout` is bounded like tproxy's: zero reaped every
+    /// association on the first sweep, and it used to load.
+    #[test]
+    fn tuic_udp_timeout_out_of_range_is_refused() {
+        validate(&tuic("")).unwrap();
+        validate(&tuic("\n    udp_timeout: 86400")).unwrap();
+        for fields in ["\n    udp_timeout: 0", "\n    udp_timeout: 86401"] {
+            let err = refusal(&tuic(fields));
+            assert!(err.contains("tuic udp_timeout"), "{fields}: {err}");
+        }
+    }
+
     #[test]
     fn tproxy_as_an_inner_protocol_is_refused() {
         let err = refusal(
@@ -5317,6 +5391,33 @@ mod reality_sni_validation_tests {
     fn an_empty_sni_loads() {
         let reality = format!("{REALITY}\n          sni_hostname: \"\"");
         validate("203.0.113.7:443", &reality).unwrap();
+    }
+
+    const TLS_VMESS: &str = r#"          type: tls
+          protocol:
+            type: vmess
+            cipher: aes-128-gcm
+            user_id: "b831381d-6324-4d53-ad4f-8cda48b30811""#;
+
+    /// A plain TLS hop used to reach rustls's `ServerName` unwrap with
+    /// `""`; now it loads and sends no name, and a name rustls refuses is
+    /// a config error rather than a panic later.
+    #[test]
+    fn a_tls_sni_is_checked_when_the_config_loads() {
+        let empty = format!("{TLS_VMESS}\n          sni_hostname: \"\"");
+        validate("203.0.113.7:443", &empty).unwrap();
+        let ip = format!("{TLS_VMESS}\n          sni_hostname: \"203.0.113.9\"");
+        validate("203.0.113.7:443", &ip).unwrap();
+
+        let bad = format!("{TLS_VMESS}\n          sni_hostname: \"not a name\"");
+        let err = validate("203.0.113.7:443", &bad).unwrap_err().to_string();
+        assert!(err.contains("TLS client sni_hostname"), "{err}");
+
+        let shadowtls = "          type: shadowtls\n          password: secret\n          sni_hostname: \"not a name\"\n          protocol:\n            type: vmess\n            cipher: aes-128-gcm\n            user_id: \"b831381d-6324-4d53-ad4f-8cda48b30811\"";
+        let err = validate("203.0.113.7:443", shadowtls)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ShadowTLS client sni_hostname"), "{err}");
     }
 
     #[test]

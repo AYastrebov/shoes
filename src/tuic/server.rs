@@ -414,6 +414,22 @@ struct UdpSession {
     cancel_token: CancellationToken,
 }
 
+/// Drop every association that has been silent longer than `udp_timeout`,
+/// ending its reply loop. Both relay loops run this every
+/// `CLEANUP_INTERVAL`; the timeout is the server's `udp_timeout` (TU-D3).
+fn sweep_idle_sessions(sessions: &DashMap<u16, UdpSession>, udp_timeout: Duration) {
+    sessions.retain(|assoc_id, session| {
+        if session.last_activity.elapsed() > udp_timeout {
+            // Cancel the session's background task before removing
+            session.cancel_token.cancel();
+            debug!("Removing inactive UDP session {assoc_id}");
+            false
+        } else {
+            true
+        }
+    });
+}
+
 struct FragmentedPacket {
     fragment_count: u8,
     fragment_received: u8,
@@ -872,16 +888,7 @@ async fn run_unidirectional_loop(
                     break;
                 }
                 _ = interval.tick() => {
-                    cleanup_session_map.retain(|assoc_id, session| {
-                        if session.last_activity.elapsed() > udp_timeout {
-                            // Cancel the session's background task before removing
-                            session.cancel_token.cancel();
-                            debug!("Removing inactive UDP session {assoc_id}");
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    sweep_idle_sessions(&cleanup_session_map, udp_timeout);
                 }
             }
         }
@@ -1231,16 +1238,7 @@ async fn run_datagram_loop(
     loop {
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
-            udp_session_map.retain(|assoc_id, session| {
-                if session.last_activity.elapsed() > udp_timeout {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
-                    debug!("Removing inactive UDP session {assoc_id}");
-                    false
-                } else {
-                    true
-                }
-            });
+            sweep_idle_sessions(&udp_session_map, udp_timeout);
             last_cleanup = now;
         }
 
@@ -1440,6 +1438,60 @@ mod transport_tests {
                 congestion
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// A session with no connection behind it, idle for `idle` already.
+    fn detached_session(parent: &CancellationToken, idle: Duration) -> UdpSession {
+        let socket = crate::socket_util::new_udp_socket(true, None).unwrap();
+        let location = NetLocation::from_str("127.0.0.1:9", None).unwrap();
+        UdpSession {
+            send_socket: Arc::new(socket),
+            route: UdpRouteCache::new(location, "127.0.0.1:9".parse().unwrap()),
+            last_activity: std::time::Instant::now()
+                .checked_sub(idle)
+                .expect("an idle time the clock can hold"),
+            cancel_token: parent.child_token(),
+        }
+    }
+
+    /// TU-D3: an association lives `udp_timeout` idle, no shorter and no
+    /// longer, and the reaped one's reply loop is ended with it.
+    #[tokio::test]
+    async fn the_sweep_reaps_only_the_association_past_udp_timeout() {
+        let parent = CancellationToken::new();
+        let sessions: DashMap<u16, UdpSession> = DashMap::new();
+        sessions.insert(1, detached_session(&parent, Duration::from_secs(100)));
+        sessions.insert(2, detached_session(&parent, Duration::from_secs(10)));
+        let idle_token = sessions.get(&1).unwrap().cancel_token.clone();
+        let live_token = sessions.get(&2).unwrap().cancel_token.clone();
+
+        sweep_idle_sessions(&sessions, Duration::from_secs(60));
+
+        assert!(!sessions.contains_key(&1), "100 s idle is past the timeout");
+        assert!(sessions.contains_key(&2), "10 s idle is inside it");
+        assert!(
+            idle_token.is_cancelled(),
+            "the reaped session must be ended"
+        );
+        assert!(!live_token.is_cancelled(), "the live one must be untouched");
+    }
+
+    /// The default: a session quiet for a minute, which the old 60 s sweep
+    /// dropped, survives under the 300 s default.
+    #[tokio::test]
+    async fn a_minute_of_silence_is_inside_the_default_timeout() {
+        let parent = CancellationToken::new();
+        let sessions: DashMap<u16, UdpSession> = DashMap::new();
+        sessions.insert(1, detached_session(&parent, Duration::from_secs(61)));
+
+        sweep_idle_sessions(&sessions, Duration::from_secs(300));
+
+        assert!(sessions.contains_key(&1));
     }
 }
 

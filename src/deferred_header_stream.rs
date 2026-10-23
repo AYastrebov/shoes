@@ -29,10 +29,27 @@ pub const HEADER_ALONE_AFTER: Duration = Duration::from_millis(300);
 /// the SS2022 request header; the rest of a large write follows normally.
 const FIRST_PAYLOAD_MAX: usize = 8 * 1024;
 
+/// The header while it waits: ready bytes, or a builder that is given the
+/// length of the payload it will ride with (0 when it goes alone), for a
+/// header whose shape depends on that -- SS2022's padding.
+enum Header {
+    Ready(Vec<u8>),
+    Build(Box<dyn FnOnce(usize) -> Vec<u8> + Send + Sync>),
+}
+
+impl Header {
+    fn build(self, payload_len: usize) -> Vec<u8> {
+        match self {
+            Header::Ready(header) => header,
+            Header::Build(build) => build(payload_len),
+        }
+    }
+}
+
 enum State {
     /// The header, not yet written, and the timer for sending it alone.
     Holding {
-        header: Vec<u8>,
+        header: Header,
         timer: Option<Pin<Box<tokio::time::Sleep>>>,
     },
     /// Bytes accepted from the caller but not yet written to the inner
@@ -55,6 +72,19 @@ pub struct DeferredHeaderStream<S> {
 
 impl<S> DeferredHeaderStream<S> {
     pub fn new(inner: S, header: Vec<u8>) -> Self {
+        Self::with_header(inner, Header::Ready(header))
+    }
+
+    /// A header built once the first payload's length is known; `build` gets
+    /// 0 when the header goes out alone (the timer, or a shutdown).
+    pub fn new_with(
+        inner: S,
+        build: impl FnOnce(usize) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_header(inner, Header::Build(Box::new(build)))
+    }
+
+    fn with_header(inner: S, header: Header) -> Self {
         Self {
             inner,
             state: State::Holding {
@@ -75,7 +105,8 @@ impl<S: AsyncWrite + Unpin> DeferredHeaderStream<S> {
     /// on a server-first connection never reaches the server.
     fn release(&mut self, payload: &[u8], then_flush: bool) {
         if let State::Holding { header, .. } = &mut self.state {
-            let mut pending = std::mem::take(header);
+            let header = std::mem::replace(header, Header::Ready(Vec::new()));
+            let mut pending = header.build(payload.len());
             pending.extend_from_slice(payload);
             self.state = State::Draining {
                 pending,
@@ -349,6 +380,23 @@ mod tests {
             stream.inner.writes,
             vec![b"HDRGET / HTTP/1.1\r\n".to_vec(), b"more".to_vec()]
         );
+    }
+
+    /// A built header is given the length of the payload it rides with, and
+    /// 0 when it goes alone, so a header shaped by its payload (SS2022's
+    /// padding) sees the real one.
+    #[tokio::test(start_paused = true)]
+    async fn a_built_header_is_given_the_first_payloads_length() {
+        let build = |len: usize| format!("HDR{len}").into_bytes();
+        let mut stream = DeferredHeaderStream::new_with(Recorder::default(), build);
+        stream.write_all(b"12345").await.unwrap();
+        assert_eq!(stream.inner.writes, vec![b"HDR512345".to_vec()]);
+
+        let mut alone = DeferredHeaderStream::new_with(Recorder::default(), build);
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(HEADER_ALONE_AFTER * 2, alone.read(&mut buf));
+        assert!(read.await.is_err(), "nothing to read");
+        assert_eq!(alone.inner.writes, vec![b"HDR0".to_vec()]);
     }
 
     /// A large first write is split: a bounded payload joins the header and

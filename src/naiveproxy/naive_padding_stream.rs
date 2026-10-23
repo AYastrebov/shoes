@@ -222,7 +222,7 @@ impl<S> NaivePaddingStream<S> {
             && payload_len > MEDIUM_PAYLOAD_LOW
             && payload_len < MEDIUM_PAYLOAD_HIGH
         {
-            // Fragment medium-sized server writes to 200-300 bytes
+            // Fragment medium-sized server writes into 100-200-byte pieces
             let limit = rand::rng().random_range(FRAGMENT_SIZE_MIN..=FRAGMENT_SIZE_MAX);
             remaining.min(limit)
         } else {

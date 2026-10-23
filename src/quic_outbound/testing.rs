@@ -41,6 +41,27 @@ pub fn test_resolver() -> Arc<dyn Resolver> {
     Arc::new(NativeResolver::new())
 }
 
+/// A resolver that answers every name with 127.0.0.1, for a test that
+/// names a loopback target by hostname and must not depend on what the
+/// host's resolver says about `localhost` (`::1` first, on some).
+#[derive(Debug)]
+pub struct LoopbackResolver;
+
+impl Resolver for LoopbackResolver {
+    fn resolve_location(
+        &self,
+        location: &crate::address::NetLocation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+    {
+        let port = location.port();
+        Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+    }
+}
+
+pub fn loopback_resolver() -> Arc<dyn Resolver> {
+    Arc::new(LoopbackResolver)
+}
+
 /// A selector that allows everything and dials it directly.
 ///
 /// This is the same construction the real server startup uses, so the tests
@@ -192,7 +213,15 @@ pub async fn udp_echo_exchange(
     stream: &mut Box<dyn AsyncMessageStream>,
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+    udp_echo_exchange_on(&mut **stream, payload).await
+}
+
+/// `udp_echo_exchange` on a concrete stream, for a test that needs the
+/// stream's own type afterwards.
+pub async fn udp_echo_exchange_on<S: AsyncMessageStream + Unpin + ?Sized>(
+    stream: &mut S,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
     use std::pin::Pin;
     use tokio::time::{Instant, timeout_at};
 

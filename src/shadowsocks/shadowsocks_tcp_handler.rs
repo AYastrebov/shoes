@@ -314,6 +314,27 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
     }
 }
 
+/// The most padding an SS2022 request carries, and the payload length from
+/// which it carries none: sing-shadowsocks `shadowaead_2022/protocol.go`
+/// `MaxPaddingLength`, drawn as `Intn(900) + 1` only when
+/// `len(payload) < MaxPaddingLength`. A request with a large first payload
+/// used to be padded as well, which no sing client does.
+const MAX_REQUEST_PADDING: usize = 900;
+
+/// Append the SS2022 request's padding length and padding to `header`, for
+/// a request whose first payload is `payload_len` bytes.
+fn append_request_padding(header: &mut Vec<u8>, payload_len: usize) {
+    let padding_len = if payload_len < MAX_REQUEST_PADDING {
+        rand::rng().random_range(1..=MAX_REQUEST_PADDING)
+    } else {
+        0
+    };
+    header.extend_from_slice(&(padding_len as u16).to_be_bytes());
+    let start = header.len();
+    header.resize(start + padding_len, 0);
+    rand::rng().fill_bytes(&mut header[start..]);
+}
+
 #[async_trait]
 impl TcpClientHandler for ShadowsocksTcpHandler {
     async fn setup_client_tcp_stream(
@@ -336,29 +357,26 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             self.salt_checker.clone(),
         ));
 
-        let mut location_vec = write_location_to_vec(remote_location.location())?;
-
-        if self.aead2022 {
-            let location_len = location_vec.len();
-
-            let mut rng = rand::rng();
-            let padding_len: usize = rng.random_range(1..=900);
-            location_vec.resize(location_len + padding_len + 2, 0);
-
-            let padding_len_bytes = (padding_len as u16).to_be_bytes();
-            location_vec[location_len..location_len + 2].copy_from_slice(&padding_len_bytes);
-
-            rng.fill_bytes(&mut location_vec[location_len + 2..]);
-        }
+        let location_vec = write_location_to_vec(remote_location.location())?;
+        let aead2022 = self.aead2022;
 
         // Sent with the first payload, as the reference clients do -- for
         // SS2022 that makes the payload part of the request's variable-length
-        // header, as SIP022 lays it out (SS-D7).
+        // header, as SIP022 lays it out (SS-D7). The padding is drawn once
+        // the payload's length is known, since its presence depends on it.
         Ok(TcpClientSetupResult {
-            client_stream: Box::new(crate::deferred_header_stream::DeferredHeaderStream::new(
-                client_stream,
-                location_vec,
-            )),
+            client_stream: Box::new(
+                crate::deferred_header_stream::DeferredHeaderStream::new_with(
+                    client_stream,
+                    move |payload_len| {
+                        let mut header = location_vec;
+                        if aead2022 {
+                            append_request_padding(&mut header, payload_len);
+                        }
+                        header
+                    },
+                ),
+            ),
             early_data: None,
         })
     }
@@ -418,5 +436,33 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         let message_stream = UotV2Stream::new(client_stream);
 
         Ok(Box::new(message_stream))
+    }
+}
+
+#[cfg(test)]
+mod request_padding_tests {
+    use super::*;
+
+    fn padding_len(payload_len: usize) -> usize {
+        let mut header = vec![0xAA; 7];
+        append_request_padding(&mut header, payload_len);
+        let len = usize::from(u16::from_be_bytes([header[7], header[8]]));
+        assert_eq!(header.len(), 9 + len, "the padding follows its length");
+        len
+    }
+
+    /// sing-shadowsocks pads the request only when the first payload is
+    /// under `MaxPaddingLength` (900); a request with a larger payload
+    /// carries a zero length and no padding.
+    #[test]
+    fn a_request_is_padded_only_under_the_references_payload_limit() {
+        for _ in 0..64 {
+            let len = padding_len(0);
+            assert!((1..=MAX_REQUEST_PADDING).contains(&len), "{len}");
+            let len = padding_len(MAX_REQUEST_PADDING - 1);
+            assert!((1..=MAX_REQUEST_PADDING).contains(&len), "{len}");
+        }
+        assert_eq!(padding_len(MAX_REQUEST_PADDING), 0);
+        assert_eq!(padding_len(8 * 1024), 0);
     }
 }

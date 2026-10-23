@@ -16,6 +16,11 @@
           - matching_path: /vmess
             matching_headers:
               X-Secret-Key: "secret"
+            # Accept up to this many bytes of early data in the upgrade
+            # request (0, the default, accepts none); with
+            # early_data_header_name unset it is read from the path, as
+            # sing-box sends it.
+            max_early_data: 2048
             protocol:
               type: vmess
               # allow any cipher, which means: none, aes-128-gcm, or chacha20-poly1305.

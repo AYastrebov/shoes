@@ -11,6 +11,29 @@ REALITY client version (the version part of RE-R4/R7):
   and the client failed with a certificate error. A new `client_version:
   [major, minor, patch]` on the Reality client sets the version explicitly.
 
+Review of the fix wave (`docs/audits/2026-10-22-fix-wave-review.md`, #105):
+
+- Every fix claimed since v0.7.0 was checked against the code and the
+  reference sources; all 37 are present and tested. The gaps found beside
+  them are closed here.
+- **A TUIC server's `udp_timeout` is bounded, 1 to 86400 seconds.** `0`
+  loaded and reaped every association on the first sweep.
+- **A TLS or ShadowTLS client with `sni_hostname: ""` sends no server
+  name** instead of panicking when the chain is built, as REALITY has since
+  S.2; a name rustls cannot hold is a config error. With no name sent and
+  `verify: true`, the certificate is checked against the address dialled
+  (hostname or IP) rather than against a placeholder no certificate has.
+- **The SS2022 request is padded only when its first payload is under 900
+  bytes**, as sing-shadowsocks pads it. A large first write used to carry a
+  header no sing client sends.
+- **A DNS group mixing the system resolver with a DoH/DoT one is rebuilt**
+  on the same 10-minute policy as a pure group; it was built once and kept.
+- Examples carry every option added since v0.7.0, and CONFIG.md documents
+  the WireGuard and AmneziaWG clients, which it never had.
+- Inbound checksums on a TUN stay unverified, on purpose: every inbound
+  packet is the local kernel's, and Linux offload hands over unfinished
+  ones. The audit row says so now.
+
 Probe harness (plan PR 4.3, part 2; SF-10):
 
 - What every TCP server shows a client that is not one is now a test.
