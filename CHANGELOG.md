@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Agent guidelines reorganised along `agents.md` and Android's AI-tools
+guides:
+
+- `AGENTS.md` keeps only what applies to almost every change: orientation,
+  the commands CI runs, code style, testing, security, the configuration
+  surface, and commits. It is a third of its former length.
+- Subtrees with their own build and contract carry their own `AGENTS.md`:
+  `src/ffi/`, `src/bin/shoesd/`, `swift/`, `android/`.
+- Procedures only some tasks need are Agent Skills under `.agent/skills/`:
+  `implementing-a-protocol`, `adding-a-config-option`, `live-interop-check`.
+- The recorded debt moved from `AGENTS.md` to `ROADMAP.md`, "Recorded debt".
+
 ## v0.8.0
 
 The rest of Phase 3 and all of Phases 4 and 5 of the 2026-10-15 quality plan
