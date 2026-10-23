@@ -32,7 +32,7 @@ goes through `ct_eq`, and no presented credential reaches a log or error.
 What the review found is at the edges of the fixes — a new option without
 bounds, a sibling path the fix did not reach, a test weaker than its
 finding — and in the documents. Everything that is code is closed in the
-PR this document lands with; what is deliberately left is written down.
+PR this document lands with, #105; what is deliberately left is written down.
 
 ## The findings, one by one
 

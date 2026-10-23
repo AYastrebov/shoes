@@ -72,7 +72,7 @@ the plan's status table says which PR closed what.
 - **Done:** Phases 0 and 1, most of Phase 3, and Phase 5. A 2026-10-22
   review ([docs/audits/2026-10-22-fix-wave-review.md](./docs/audits/2026-10-22-fix-wave-review.md))
   checked every fix claimed since v0.7.0 against the code and the
-  references: all present; the gaps beside them were closed with it.
+  references: all present; the gaps beside them were closed in #105.
 - **Phase 4:** known-answer vectors and reference-captured frames are
   done, as are the reference checks and the probe harness (PR 4.3, parts
   1 and 2). The nightly interop job against the reference binaries is left.

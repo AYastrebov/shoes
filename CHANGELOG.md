@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Review of the fix wave (`docs/audits/2026-10-22-fix-wave-review.md`):
+Review of the fix wave (`docs/audits/2026-10-22-fix-wave-review.md`, #105):
 
 - Every fix claimed since v0.7.0 was checked against the code and the
   reference sources; all 37 are present and tested. The gaps found beside
