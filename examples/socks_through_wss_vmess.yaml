@@ -25,6 +25,12 @@
             type: ws
             # The path to the websocket server
             matching_path: /ws
+            # Carry up to this many bytes of the first write in the upgrade
+            # request, as sing-box's client does (0, the default, sends none).
+            # The server must expect it: sing-box reads it from the path,
+            # Xray from the Sec-WebSocket-Protocol header.
+            max_early_data: 2048
+            early_data_header_name: Sec-WebSocket-Protocol
             protocol:
               type: vmess
               cipher: aes-128-gcm

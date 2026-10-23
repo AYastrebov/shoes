@@ -189,7 +189,9 @@ pub fn create_tcp_client_handler(
                 }
                 default_sni_hostname
             } else {
-                sni_hostname.into_option()
+                // `""` sends no server name, as it does for REALITY (SF-4);
+                // rustls has no ServerName for it.
+                sni_hostname.into_option().filter(|s| !s.is_empty())
             };
             let inner_hop = hop.under_tls(sni_hostname.clone());
 
@@ -211,7 +213,9 @@ pub fn create_tcp_client_handler(
             ));
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
+                // Checked by `validate_tls_server_name` when the config loads.
+                Some(s) => rustls::pki_types::ServerName::try_from(s)
+                    .expect("validated when loading config"),
                 // This is unused, since enable_sni is false, but connect_with still requires a
                 // parameter.
                 None => "example.com".try_into().unwrap(),
@@ -310,11 +314,16 @@ pub fn create_tcp_client_handler(
             sni_hostname,
             protocol,
         } => {
-            let sni_hostname = sni_hostname.or(default_sni_hostname);
+            // `""` sends no server name, as for TLS and REALITY.
+            let sni_hostname = sni_hostname
+                .or(default_sni_hostname)
+                .filter(|s| !s.is_empty());
             let enable_sni = sni_hostname.is_some();
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
+                // Checked by `validate_tls_server_name` when the config loads.
+                Some(s) => rustls::pki_types::ServerName::try_from(s)
+                    .expect("validated when loading config"),
                 None => "example.com".try_into().unwrap(), // Fallback
             };
 

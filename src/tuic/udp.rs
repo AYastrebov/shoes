@@ -190,6 +190,56 @@ pub struct TuicUdpSession {
     writer: Option<tokio::task::JoinHandle<()>>,
     /// Counted by the connection's heartbeat while the session lives.
     _task: LiveTask,
+    /// The address the last reply was labelled with, for the test that
+    /// checks the server labels replies with their real source (HY-D2).
+    #[cfg(test)]
+    last_reply_address: Option<NetLocation>,
+}
+
+#[cfg(test)]
+impl TuicUdpSession {
+    /// Send the next packets to `target`: an association talks to many
+    /// targets, which the production stream has no need to do.
+    pub(crate) fn retarget(&mut self, target: NetLocation) {
+        self.target = target;
+    }
+
+    pub(crate) fn last_reply_address(&self) -> Option<&NetLocation> {
+        self.last_reply_address.as_ref()
+    }
+}
+
+/// The address a Packet command carries, decoded for the test above; the
+/// production path only skips it (`parse_packet_command`).
+#[cfg(test)]
+fn packet_address(command: &[u8]) -> Option<NetLocation> {
+    let body = command.get(2..)?;
+    let port = |at: usize| Some(u16::from_be_bytes([*body.get(at)?, *body.get(at + 1)?]));
+    match *body.get(8)? {
+        0x00 => {
+            let len = usize::from(*body.get(9)?);
+            let name = std::str::from_utf8(body.get(10..10 + len)?).ok()?;
+            Some(NetLocation::new(
+                crate::address::Address::from(name).ok()?,
+                port(10 + len)?,
+            ))
+        }
+        0x01 => {
+            let octets: [u8; 4] = body.get(9..13)?.try_into().ok()?;
+            Some(NetLocation::new(
+                crate::address::Address::Ipv4(octets.into()),
+                port(13)?,
+            ))
+        }
+        0x02 => {
+            let octets: [u8; 16] = body.get(9..25)?.try_into().ok()?;
+            Some(NetLocation::new(
+                crate::address::Address::Ipv6(octets.into()),
+                port(25)?,
+            ))
+        }
+        _ => None,
+    }
 }
 
 impl std::fmt::Debug for TuicUdpSession {
@@ -255,6 +305,8 @@ impl TuicUdpSession {
             outgoing,
             writer,
             _task: task,
+            #[cfg(test)]
+            last_reply_address: None,
         }
     }
 }
@@ -360,6 +412,10 @@ impl AsyncReadMessage for TuicUdpSession {
                 }
                 Poll::Pending => return Poll::Pending,
             };
+            #[cfg(test)]
+            {
+                this.last_reply_address = packet_address(&command);
+            }
             // A fragment that does not complete a packet yet: read the next.
             let Some(payload) = push_command(&mut this.fragments, &command) else {
                 continue;

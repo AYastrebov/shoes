@@ -340,8 +340,11 @@ mod tests {
     const SERVER_PASSWORD: &str = "test password";
 
     async fn spawn_server() -> SocketAddr {
+        spawn_server_with(test_resolver()).await
+    }
+
+    async fn spawn_server_with(resolver: Arc<dyn Resolver>) -> SocketAddr {
         let cert = generate_certificate();
-        let resolver = test_resolver();
         let bind_address = reserve_udp_port();
 
         let uuid: &'static [u8] = Box::leak(
@@ -671,6 +674,60 @@ mod tests {
             "the old connection's association must not count on the new one"
         );
         drop(held);
+    }
+
+    /// HY-D2, TUIC's half: an association's packets each go to the target
+    /// they name ("Full Cone"), and every reply is labelled with its real
+    /// source. The server used to pin an association to its first target's
+    /// address and label replies with the name the client used.
+    #[tokio::test]
+    async fn test_one_association_reaches_two_targets_and_replies_carry_their_source() {
+        let server = spawn_server_with(loopback_resolver()).await;
+        let first = spawn_udp_echo().await;
+        let second = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+        let (connection, router) = connector
+            .connection
+            .get_with_datagrams(&resolver)
+            .await
+            .unwrap();
+        let (assoc_id, incoming) = router.register().unwrap();
+        let task = LiveTask::new(&connector.live.of(&connection));
+        let mut session = crate::tuic::udp::TuicUdpSession::new(
+            connection,
+            router,
+            u16::try_from(assoc_id).unwrap(),
+            incoming,
+            NetLocation::from_str(&first.to_string(), None).unwrap(),
+            TuicUdpRelayMode::Native,
+            task,
+        );
+
+        let reply = udp_echo_exchange_on(&mut session, b"to the first")
+            .await
+            .unwrap();
+        assert_eq!(reply, b"to the first");
+        assert_eq!(
+            session.last_reply_address(),
+            Some(&NetLocation::from_str(&first.to_string(), None).unwrap())
+        );
+
+        // Named, not addressed: the server resolves it (to loopback, by the
+        // resolver it was given) and must label the reply with the address
+        // the reply came from, not with the name.
+        session.retarget(
+            NetLocation::from_str(&format!("echo.test:{}", second.port()), None).unwrap(),
+        );
+        let reply = udp_echo_exchange_on(&mut session, b"to the second")
+            .await
+            .unwrap();
+        assert_eq!(reply, b"to the second");
+        assert_eq!(
+            session.last_reply_address(),
+            Some(&NetLocation::from_str(&second.to_string(), None).unwrap()),
+            "the reply is labelled with its real source"
+        );
     }
 
     #[tokio::test]

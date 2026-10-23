@@ -39,6 +39,23 @@ pub struct Hysteria2UdpSession {
     next_packet_id: AtomicU16,
     incoming: mpsc::Receiver<Bytes>,
     fragments: Defragmenter,
+    /// The address the last reply was labelled with, for the test that
+    /// checks the server labels replies with their real source (HY-D2).
+    #[cfg(test)]
+    last_reply_address: Option<String>,
+}
+
+#[cfg(test)]
+impl Hysteria2UdpSession {
+    /// Send the next datagrams to `address`: a session talks to many
+    /// targets, which the production stream has no need to do.
+    pub(crate) fn retarget(&mut self, address: String) {
+        self.address = address;
+    }
+
+    pub(crate) fn last_reply_address(&self) -> Option<&str> {
+        self.last_reply_address.as_deref()
+    }
 }
 
 impl std::fmt::Debug for Hysteria2UdpSession {
@@ -72,6 +89,8 @@ impl Hysteria2UdpSession {
             next_packet_id: AtomicU16::new(0),
             incoming,
             fragments: Defragmenter::new(),
+            #[cfg(test)]
+            last_reply_address: None,
         })
     }
 }
@@ -139,6 +158,10 @@ impl AsyncReadMessage for Hysteria2UdpSession {
             let Some(parsed) = parse_datagram(&datagram) else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                this.last_reply_address = Some(parsed.address.to_string());
+            }
             let Some(payload) = this.fragments.push(
                 parsed.packet_id,
                 parsed.fragment_id,

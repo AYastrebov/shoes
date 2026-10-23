@@ -27,7 +27,7 @@ fn ascii_run_len() -> usize {
 /// mieru's `rng.Intn` (`pkg/rng/rng.go:34-36`, `scaleDown` at the end of the
 /// file): a uniform draw from `[0, n]` scaled by `sqrt(u^3)` for a uniform
 /// `u` in `[0, 1)`. Every padding length goes through it, which skews them
-/// small -- a mean of about `0.4 n`, where a plain uniform draw gives `0.5 n`
+/// small -- a mean of about `0.2 n`, where a plain uniform draw gives `0.5 n`
 /// and the padding was visibly longer than the Go client's (MI-M1).
 pub(crate) fn intn(n: usize) -> usize {
     let mut rng = rand::rng();
@@ -408,8 +408,8 @@ mod tests {
         longest
     }
 
-    /// MI-M1: mieru's `rng.Intn(n)` averages about `0.4 n` -- a uniform
-    /// draw times `sqrt(u^3)`, whose mean is 2/5 -- where a plain uniform
+    /// MI-M1: mieru's `rng.Intn(n)` averages about `0.2 n` -- a uniform
+    /// draw (mean `n/2`) times `sqrt(u^3)` (mean 2/5) -- where a plain uniform
     /// draw gives `0.5 n`. Data padding over its 255-byte range therefore
     /// averages about 51 bytes, not 128.
     #[test]

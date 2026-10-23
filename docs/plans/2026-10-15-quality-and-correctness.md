@@ -56,6 +56,11 @@ weeks of it and carry most of the value.
 Releases: v0.6.0 after Phase 0 (#59), v0.7.0 after Phase 1 and 3.3 part 1
 (#82). Nothing has been released since #82.
 
+Reviewed 2026-10-22 (`docs/audits/2026-10-22-fix-wave-review.md`): every
+fix claimed above is present and tested; the gaps found beside them (TUIC
+`udp_timeout` bounds, TLS `sni_hostname: ""`, SS2022 padding rule, mixed
+DNS groups, missing tests and docs) were closed before v0.8.0.
+
 The steer plan (`docs/plans/2026-10-21-lessons-from-steer.md`) runs
 alongside this one: S.1 #99, S.2 #100; S.3 to S.6 are next.
 

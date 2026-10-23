@@ -36,7 +36,9 @@
     # against something. Globs are matched case-insensitively; `*` spans dots.
     #
     # Local names (single-label, .local, .lan, .home.arpa and the like) are
-    # bypassed already, unless `bypass_defaults: false`.
+    # bypassed by default; `false` gives them fake addresses too.
+    bypass_defaults: true
+
     bypass_domains:
       # Captive portal detection
       - "captive.apple.com"

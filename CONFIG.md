@@ -454,7 +454,7 @@ protocol:
   password: string
   zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
   congestion_control: cubic    # Default: cubic. One of 'cubic', 'new_reno', 'bbr'
-  udp_timeout: 300             # Default: 300. Seconds a UDP association may sit idle
+  udp_timeout: 300             # Default: 300. Seconds a UDP association may sit idle, 1-86400
 ```
 
 A UDP association ends when the client dissociates or the connection closes,
@@ -566,6 +566,11 @@ Two TUN-specific rules:
   socket — UDP, TCP, DoT, DoH, DoQ — goes through the same socket-protector
   path as the proxy connection itself, so on Android/iOS a query cannot
   route into the TUN it is resolving for.
+
+Any group with a UDP, TCP, DoT or DoH resolver in it is rebuilt after 10
+minutes of use or a minute idle, asking its `bootstrap_url` again, so a
+resolver whose server has moved follows it; a group of only `system` has
+nothing to rebuild.
 
 ### Memory
 
@@ -852,6 +857,10 @@ protocol:
   protocol: ClientProxyConfig
 ```
 
+`sni_hostname` unset sends the outbound's hostname, if it has one; `null`
+or `""` sends no server name at all. A name rustls cannot hold (one with a
+space, say) is refused when the config loads.
+
 ### Reality Client
 ```yaml
 protocol:
@@ -877,7 +886,7 @@ way, since a server name cannot carry one.
 protocol:
   type: shadowtls
   password: string
-  sni_hostname: string?        # Optional SNI override
+  sni_hostname: string?        # Optional SNI override; "" sends no server name
   protocol: ClientProxyConfig
 ```
 
@@ -1070,6 +1079,67 @@ transport, session multiplexing, the low entropy encoding, port ranges and the
 0-RTT handshake mode. `transport` must be `tcp` — mieru defines exactly two
 transports and carrying its TCP framing over QUIC produces bytes no mieru
 server understands.
+
+### WireGuard Client
+```yaml
+protocol:
+  type: wireguard
+  private_key: string          # This peer's key, base64
+  peer_public_key: string      # The server's key, base64
+  preshared_key: string?       # Optional, base64
+  local_addresses: [string]    # This peer's tunnel addresses, with prefix length
+  allowed_ips: [string]        # What goes into the tunnel
+  persistent_keepalive: int?   # Seconds; unset sends none
+  mtu: 1280                    # Default: 1280
+```
+
+A user-space WireGuard tunnel (via awgtun). It owns its transport, so it
+must be the only hop in its chain, and `transport` is rejected. The
+endpoint's hostname is resolved by the TUN's `dns:` group when there is
+one, and again whenever the tunnel is rebuilt.
+
+### AmneziaWG Client
+```yaml
+protocol:
+  type: amneziawg
+  # The WireGuard fields above, and:
+  awg:
+    jc: int                    # Junk packets before the handshake, 0-128
+    jmin: int                  # Junk packet size range, bytes
+    jmax: int                  #   jmax at most mtu + s4 + 32
+    s1: int                    # Random padding before each message type, bytes
+    s2: int                    #   0-65535 each
+    s3: int
+    s4: int
+    h1: string?                # Message types replacing WireGuard's 1-4:
+    h2: string?                #   a number or an inclusive range ("1000-1999");
+    h3: string?                #   omit all four for the standard types
+    h4: string?
+    i1: string?                # Signature packets (CPS strings), i1-i5
+    # 3.0, each optional; setting any runs the tunnel as 3.0
+    header_protection_key: string?   # base64 or 64 hex; needs s1-s4 >= 12
+    content_padding_addition: string?  # bytes, number or range
+    rekey_after_time: string?        # seconds, number or range
+    rekey_timeout: string?
+    reject_after_time: string?
+    keepalive_timeout: string?
+    max_handshake_attempts: string?  # a count
+    persistent_keepalive_interval: string?
+    # 3.1
+    random_trailers: false     # Must match the server
+    disable_cookies: false     # Local to this peer
+```
+
+Every value that shapes the wire format (`h1`-`h4`, `s1`-`s4`, the junk
+parameters, the header protection key, the content padding,
+`random_trailers`) must match the server exactly; a mismatch is not
+reported, the handshake simply never completes. `jc` over 128 (the kernel
+module's limit) and `jmax` larger than the tunnel's own datagrams are
+refused when the config loads; `s1`-`s4` are 16-bit, as the reference
+parses them. A full-size packet reaches the wire at `mtu + s4 + 60` bytes,
+so keep `mtu <= 1440 - s4` on a 1500-byte path (shoes warns when it is not).
+README.md walks through the 2.0, 3.0 and 3.1 generations with examples, and
+`examples/amneziawg_client.yaml` has one of each.
 
 ### QUIC-native outbounds
 
