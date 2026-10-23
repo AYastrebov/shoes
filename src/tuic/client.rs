@@ -699,7 +699,10 @@ mod tests {
             router,
             u16::try_from(assoc_id).unwrap(),
             incoming,
-            NetLocation::from_str(&first.to_string(), None).unwrap(),
+            // The association opens on a name, the case HY-D2 pinned: the
+            // server resolves it (to loopback, by the resolver it was given)
+            // and must label the reply with the address it came from.
+            NetLocation::from_str(&format!("first.test:{}", first.port()), None).unwrap(),
             TuicUdpRelayMode::Native,
             task,
         );
@@ -710,14 +713,13 @@ mod tests {
         assert_eq!(reply, b"to the first");
         assert_eq!(
             session.last_reply_address(),
-            Some(&NetLocation::from_str(&first.to_string(), None).unwrap())
+            Some(&NetLocation::from_str(&first.to_string(), None).unwrap()),
+            "the reply is labelled with its real source, not the name"
         );
 
-        // Named, not addressed: the server resolves it (to loopback, by the
-        // resolver it was given) and must label the reply with the address
-        // the reply came from, not with the name.
+        // A second target, named too, through the same association.
         session.retarget(
-            NetLocation::from_str(&format!("echo.test:{}", second.port()), None).unwrap(),
+            NetLocation::from_str(&format!("second.test:{}", second.port()), None).unwrap(),
         );
         let reply = udp_echo_exchange_on(&mut session, b"to the second")
             .await

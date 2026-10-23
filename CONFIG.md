@@ -859,7 +859,10 @@ protocol:
 
 `sni_hostname` unset sends the outbound's hostname, if it has one; `null`
 or `""` sends no server name at all. A name rustls cannot hold (one with a
-space, say) is refused when the config loads.
+space, say) is refused when the config loads. With `verify: true` the
+certificate is checked against the name sent, or, when none is sent,
+against the address dialled: a hostname, or an IP that the certificate
+must carry as an IP SAN.
 
 ### Reality Client
 ```yaml

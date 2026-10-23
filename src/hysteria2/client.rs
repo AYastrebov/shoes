@@ -943,9 +943,15 @@ mod tests {
             .get_with_datagrams(&resolver)
             .await
             .unwrap();
-        let mut session =
-            crate::hysteria2::udp::Hysteria2UdpSession::new(connection, router, first.to_string())
-                .unwrap();
+        // The session opens on a name, the case HY-D2 pinned: the server
+        // resolves it (to loopback, by the resolver it was given) and must
+        // label the reply with the address it came from, not the name.
+        let mut session = crate::hysteria2::udp::Hysteria2UdpSession::new(
+            connection,
+            router,
+            format!("first.test:{}", first.port()),
+        )
+        .unwrap();
 
         let reply = udp_echo_exchange_on(&mut session, b"to the first")
             .await
@@ -953,13 +959,12 @@ mod tests {
         assert_eq!(reply, b"to the first");
         assert_eq!(
             session.last_reply_address(),
-            Some(first.to_string().as_str())
+            Some(first.to_string().as_str()),
+            "the reply is labelled with its real source, not the name"
         );
 
-        // Named, not addressed: the server resolves it (to loopback, by the
-        // resolver it was given) and must label the reply with the address
-        // the reply came from, not with the name.
-        session.retarget(format!("echo.test:{}", second.port()));
+        // A second target, named too, through the same session.
+        session.retarget(format!("second.test:{}", second.port()));
         let reply = udp_echo_exchange_on(&mut session, b"to the second")
             .await
             .unwrap();

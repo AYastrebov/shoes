@@ -51,7 +51,7 @@ finding; **partial** names the part that was not covered.
 | VM-D2 | verified | |
 | RS-1 | verified | Against the sing-box-compiled fixture. |
 | TR-2 | verified | |
-| HY-D2 | verified; **e2e test added** | Only `UdpRouteCache`'s unit test covered it. Now one Hysteria2 session and one TUIC association each reach two targets, the second named by hostname, and each reply is checked to carry its real source (`hysteria2/client.rs`, `tuic/client.rs`). The test fails when the server labels replies with the first source. |
+| HY-D2 | verified; **e2e test added** | Only `UdpRouteCache`'s unit test covered it. Now one Hysteria2 session and one TUIC association each open on a hostname (the case the defect pinned), reach a second named target, and each reply is checked to carry its real numeric source (`hysteria2/client.rs`, `tuic/client.rs`). The tests fail when the server labels replies with the first target's name, and when it labels them with the first source. |
 | WG-A1 | verified | The test builds `Tunn` itself; both production sites visibly call `session_index()`. |
 | TU-D4 | verified | |
 | TR-5/6 | verified | |

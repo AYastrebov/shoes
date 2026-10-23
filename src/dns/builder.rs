@@ -147,7 +147,16 @@ impl HickoryResolverPlan {
                             hostname, e
                         ))
                     })?;
-                Some(addrs[0].ip())
+                // A lookup can succeed with nothing in it (an answer of only
+                // unspecified addresses is filtered to none). On a rebuild
+                // that is an error the refreshing resolver keeps the working
+                // resolver over, not an index to panic on.
+                let first = addrs.first().ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "bootstrap lookup returned no addresses for '{hostname}'"
+                    ))
+                })?;
+                Some(first.ip())
             }
             None => None,
         };
@@ -1119,6 +1128,36 @@ mod tests {
             "incompatible specs should fall back to CompositeResolver, got: {}",
             debug
         );
+    }
+
+    /// A bootstrap that answers with nothing is an error on a rebuild, not a
+    /// panic: the refreshing resolver keeps the resolver it has.
+    #[tokio::test]
+    async fn an_empty_bootstrap_answer_is_an_error_not_a_panic() {
+        #[derive(Debug)]
+        struct Nothing;
+        impl Resolver for Nothing {
+            fn resolve_location(
+                &self,
+                _: &crate::address::NetLocation,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>
+                        + Send,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+        let mut registry = DnsRegistry::new();
+        registry.register("empty".to_string(), Arc::new(Nothing));
+        let mut spec = make_spec("https://dns.example/dns-query");
+        spec.bootstrap = Some(DnsBootstrap::Group("empty".to_string()));
+        let err = match build_entry_and_plan(&spec, &registry).await {
+            Ok(_) => panic!("an entry was built with no address"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no addresses"), "{err}");
     }
 
     /// DN-D2: a group that puts the system resolver beside a hickory-backed

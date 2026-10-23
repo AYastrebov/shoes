@@ -11,7 +11,9 @@ Review of the fix wave (`docs/audits/2026-10-22-fix-wave-review.md`, #105):
   loaded and reaped every association on the first sweep.
 - **A TLS or ShadowTLS client with `sni_hostname: ""` sends no server
   name** instead of panicking when the chain is built, as REALITY has since
-  S.2; a name rustls cannot hold is a config error.
+  S.2; a name rustls cannot hold is a config error. With no name sent and
+  `verify: true`, the certificate is checked against the address dialled
+  (hostname or IP) rather than against a placeholder no certificate has.
 - **The SS2022 request is padded only when its first payload is under 900
   bytes**, as sing-shadowsocks pads it. A large first write used to carry a
   header no sing client sends.
