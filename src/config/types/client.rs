@@ -778,6 +778,13 @@ pub enum ClientProxyConfig {
         )]
         cipher_suites: NoneOrSome<crate::reality::CipherSuite>,
 
+        /// The client version [major, minor, patch] reported in the session ID,
+        /// which the server checks against its `min_client_version` and
+        /// `max_client_version`. Without it, the latest stable Xray-core
+        /// release is reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_version: Option<[u8; 3]>,
+
         /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
         /// When enabled, the inner protocol MUST be VLESS.
         #[serde(default, skip_serializing_if = "is_false")]

@@ -24,6 +24,8 @@ pub struct RealityClientHandler {
     /// leaves the extension out.
     server_name: String,
     cipher_suites: Vec<CipherSuite>,
+    /// The version reported to the server; `None` reports the default.
+    client_version: Option<[u8; 3]>,
     handler: RealityInnerClientHandler,
 }
 
@@ -39,6 +41,7 @@ impl RealityClientHandler {
         short_id: [u8; 8],
         server_name: String,
         cipher_suites: Vec<CipherSuite>,
+        client_version: Option<[u8; 3]>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
@@ -46,6 +49,7 @@ impl RealityClientHandler {
             short_id,
             server_name,
             cipher_suites,
+            client_version,
             handler: RealityInnerClientHandler::Default(handler),
         }
     }
@@ -54,6 +58,7 @@ impl RealityClientHandler {
         short_id: [u8; 8],
         server_name: String,
         cipher_suites: Vec<CipherSuite>,
+        client_version: Option<[u8; 3]>,
         user_id: Box<[u8]>,
         udp_enabled: bool,
     ) -> Self {
@@ -62,6 +67,7 @@ impl RealityClientHandler {
             short_id,
             server_name,
             cipher_suites,
+            client_version,
             handler: RealityInnerClientHandler::VisionVless {
                 uuid: user_id,
                 udp_enabled,
@@ -79,6 +85,7 @@ impl RealityClientHandler {
             short_id: self.short_id,
             server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
+            client_version: self.client_version,
         };
 
         let reality_conn = RealityClientConnection::new(reality_config)?;

@@ -279,6 +279,7 @@ pub fn create_tcp_client_handler(
             short_id,
             sni_hostname,
             cipher_suites,
+            client_version,
             vision,
             protocol,
         } => {
@@ -316,6 +317,7 @@ pub fn create_tcp_client_handler(
                         short_id_bytes,
                         server_name,
                         cipher_suites,
+                        client_version,
                         user_id_bytes,
                         *udp_enabled,
                     ),
@@ -328,6 +330,7 @@ pub fn create_tcp_client_handler(
                     short_id_bytes,
                     server_name,
                     cipher_suites,
+                    client_version,
                     inner_handler,
                 ))
             }

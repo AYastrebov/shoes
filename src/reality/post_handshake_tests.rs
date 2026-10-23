@@ -32,6 +32,7 @@ fn handshaken_pair_for(server_name: &str) -> (RealityClientConnection, RealitySe
         short_id: SHORT_ID,
         server_name: server_name.to_string(),
         cipher_suites: vec![],
+        client_version: None,
     })
     .unwrap();
     let mut server = RealityServerConnection::new(RealityServerConfig {
