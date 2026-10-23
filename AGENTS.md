@@ -1,352 +1,171 @@
-# Working in this repository
+# shoes
 
-Instructions for anyone — human or agent — adding to or maintaining this code.
+A multi-protocol proxy in Rust: one crate (`src/lib.rs`) behind the `shoes`
+binary, the `shoesd` privileged daemon (`src/bin/shoesd/`), and the mobile
+libraries that embed it (`src/ffi/`, `android/`, `swift/`). Configuration is
+YAML, documented in `CONFIG.md`.
 
-Every rule below exists because something went wrong once. Where that is the
-case the incident is named, because a rule whose reason is missing gets dropped
-the first time it is inconvenient.
-
-## Table of Contents
-
-- [Orientation](#orientation)
-- [The verification gate](#the-verification-gate)
-- [Traps in this codebase](#traps-in-this-codebase)
-- [Security rules](#security-rules)
-- [Packet paths](#packet-paths)
-- [Testing](#testing)
-- [Implementing a protocol](#implementing-a-protocol)
-- [Configuration surface](#configuration-surface)
-- [Commits and documentation](#commits-and-documentation)
-- [Where the known debt is written down](#where-the-known-debt-is-written-down)
+This file holds the rules that apply to almost every change. Each rule's
+reason is one clause, because a rule whose reason is missing gets dropped the
+first time it is inconvenient. Procedures that only some tasks need are
+skills in `.agent/skills/`; subtrees with their own build and contract have
+their own `AGENTS.md`.
 
 ## Orientation
 
-Read before changing anything substantial:
-
-| File | What it tells you |
+| Read | For |
 | --- | --- |
-| [ROADMAP.md](./ROADMAP.md) | What is deliberately missing and what each gap costs |
-| [CONFIG.md](./CONFIG.md) | Every configuration option; the reference users read |
-| [MOBILE.md](./MOBILE.md) | Mobile/FFI contracts and the defects recorded against them |
-| `docs/specs/` | Design documents for shipped work, with sources cited |
-| `docs/plans/` | Step-by-step implementation plans, kept in sync with reality |
+| `ROADMAP.md` | What is deliberately missing, what each gap costs, and the recorded debt |
+| `CONFIG.md` | Every configuration option, with its default |
+| `MOBILE.md` | The FFI, lifecycle and threading contracts, and the mobile defects |
+| `docs/specs/` | Design documents for shipped work, with the reference sources cited |
+| `docs/plans/` | Implementation plans, kept in sync with what landed |
+| `docs/audits/` | Audits and reviews; findings carry IDs that commits and the changelog cite |
+| `CHANGELOG.md` | One entry per PR under `## Unreleased`, in the voice of the existing ones |
 
-For anything larger than a bug fix, write a spec in `docs/specs/` before code.
-The two most recent ones show the expected shape: problem, scope, what the
-reference implementations do with file-level citations, error handling, testing,
-and an explicit list of what is deliberately out of scope.
+For anything larger than a bug fix, write a spec in `docs/specs/` first, in
+the shape of the most recent one: problem, scope, what the references do with
+file-level citations, error handling, testing, and what is out of scope.
 
-## The verification gate
+## Commands
 
-Run all of this before claiming anything works:
+Build and run:
 
 ```bash
-cargo fmt --all
-cargo fmt --all -- --check
+cargo build --locked --bin shoes
+shoes --dry-run examples/<name>.yaml     # parse a config without starting
+```
+
+The gate, before claiming anything works. CI (`.github/workflows/lint.yml`,
+`test.yml`) runs the same commands, and every configuration is clean and
+stays that way; `--tests` is in on purpose, since it catches what the other
+passes cannot see.
+
+```bash
+cargo fmt --all && cargo fmt --all -- --check
 cargo clippy --locked --lib --bins --tests -- -D warnings
-cargo test --lib
-cargo test --bins
-cargo test --test '*'
+cargo clippy --locked --features desktop --lib --bins --tests -- -D warnings
+cargo clippy --locked --features daemon --bins --tests -- -D warnings
+cargo clippy --locked --features ffi,control-stats --lib --tests -- -D warnings
+cargo test --locked
+cargo test --locked --features desktop
+cargo test --locked --features daemon
 ```
 
-There are no exclusions. Every clippy configuration is clean and is expected to
-stay that way:
+When you touch `src/tun/`, `src/socket_protector.rs`, `src/config/mod.rs` or
+`src/ffi/`, also run the mobile targets; those paths are behind
+`cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))`, so the
+default build does not compile them at all (see `src/ffi/AGENTS.md`).
 
-```bash
-cargo clippy --locked --features ffi --lib --tests -- -D warnings
-cargo clippy --locked --features ffi --bins -- -D warnings
-```
+## Code style
 
-`--tests` is in the gate on purpose. It catches a class the other passes cannot
-see — `err().expect()` instead of `expect_err`, a lock held across an await, an
-assertion whose value is a constant, a test double nothing constructs. It was
-excluded until the backlog behind it was cleared; putting anything back on that
-list means fixing it instead.
-
-**Run the FFI configurations whenever you touch `src/tun/`,
-`src/socket_protector.rs`, `src/config/mod.rs` or `src/ffi/`.** Those are partly
-gated behind `cfg(any(target_os = "android", target_os = "ios", feature =
-"ffi"))`, so the default build does not compile them at all. Moving the socket
-protector out of `tun::platform` left duplicate definitions and a stale test
-import behind, and the ordinary gate stayed green throughout.
-
-The binary links the library (`src/main.rs` declares no modules of its own), so
-code is dead or alive the same way in every build: an item with no caller in a
-configuration is reported there. A narrow allow with the reason -- "called only
-from the FFI" -- is the shape for an item whose caller is compiled out of some
-configuration.
-
-## Traps in this codebase
-
-### Config re-exports are part of the public surface
-
-`src/config/types/mod.rs` re-exports config types for the library's users.
-Follow the neighbouring pattern rather than deleting a re-export.
-
-### The socket constructors protect outbound sockets for you
-
-`socket_util::new_tcp_socket` and `new_udp_socket` exclude the socket from the
-VPN route. The `new_socket2_udp_socket*` functions are the listener-side
-primitives and deliberately do not.
-
-**If you build an outbound socket by other means, call
-`socket_util::protect_outbound` yourself.** Three places do: the AmneziaWG
-endpoint and both DNS paths. Getting this wrong on Android means the socket is
-captured by the tunnel it is meant to feed.
-
-This rule exists because for a long time exactly one socket in the program was
-protected. The protector sat behind a mobile-only `cfg` inside the TUN module,
-so calling it meant repeating that gate at every site, and five sites did not.
-
-## Security rules
-
-### Compare secrets in constant time
-
-`subtle::ConstantTimeEq` is already a dependency. Use it for passwords, tokens,
-hashes and any other value an attacker is trying to guess:
-
-```rust
-if presented.as_bytes().ct_eq(configured.as_bytes()).unwrap_u8() == 0 {
-    return Err(/* ... */);
-}
-```
-
-Read several values before judging any of them, so the rejection does not say
-which one was wrong — `src/tuic/server.rs` does this for the UUID and token.
-
-Three authentication paths had drifted to plain `!=` while four others did it
-correctly a few files away. Ordinary equality stops at the first differing byte.
-
-### Never put a presented credential in a log line or an error
-
-An attempt worth logging may well be a valid credential for somewhere else, and
-it ends up in the log either way. Say that authentication failed; do not say
-what was sent.
-
-`Redacted<T>` (`src/config/types/redacted.rs`) keeps configured secrets out of
-`Debug` output. Use it for every new secret-bearing config field.
-
-### Nothing from a live test enters the repository
-
-Testing against a real server means handling someone's working credentials.
-They do not go into a config in the tree, a test fixture, an example, a commit
-message or a documentation snippet — not even a redacted-looking one. Put the
-config in a temporary file outside the working tree and delete it. Check `git
-status` before committing anything from a session that involved a live server.
-
-### Do not hand back something the platform refused
-
-If a security-relevant step fails — protecting a socket, verifying a
-certificate — fail the operation. Returning the object anyway turns a loud
-failure into a silent leak.
-
-## Packet paths
-
-Anything that runs once per packet is a different kind of code. In
-`src/quic_outbound/obfs/`, `src/hysteria2/udp.rs`, `src/tuic/udp.rs`,
-`src/routing/`, `src/tun/`:
-
-- **No allocation per packet** where the work can be done in place or into a
-  reusable buffer. The obfuscated socket transforms in place; its send path
-  uses a thread-local scratch buffer rather than a lock or a fresh `Vec`.
-- **No task spawn per packet.** Use one worker per session fed by a bounded
-  channel. A task per packet grows without bound under a fast sender and lets
-  packets overtake each other.
-- **Bound every queue**, and decide what a full one does. For UDP, dropping is
-  correct and matches what a full socket buffer does; say so in a comment.
-- **Reject rather than truncate** when a limit is exceeded — a payload needing
-  more than 255 fragments is an error, not something to silently cut.
+- `rustfmt` default settings; clippy at `-D warnings` in every configuration.
+- `unwrap`/`expect` warn outside tests (`clippy.toml` allows them in tests). A
+  file that still uses them carries a file-level allow naming the plan PR
+  that removes them.
+- The binary links the library, so an item with no caller in some
+  configuration is reported there. The shape for an item whose caller is
+  compiled out is a narrow allow with the reason, e.g. "called only from the
+  FFI".
+- `src/config/types/mod.rs` re-exports config types for library users; follow
+  the neighbouring pattern rather than deleting a re-export.
+- `socket_util::new_tcp_socket` and `new_udp_socket` exclude outbound sockets
+  from the VPN route. If you build an outbound socket any other way, call
+  `socket_util::protect_outbound` yourself; the AmneziaWG endpoint and both
+  DNS paths do. Five sites once did not, and on Android such a socket is
+  captured by the tunnel it feeds.
+- Per-packet code (`src/quic_outbound/obfs/`, `src/hysteria2/udp.rs`,
+  `src/tuic/udp.rs`, `src/routing/`, `src/tun/`): no allocation per packet
+  where in-place or a reusable buffer works, no task spawn per packet (one
+  worker per session on a bounded channel), every queue bounded with a
+  comment saying what a full one does (for UDP, drop), and reject rather than
+  truncate when a limit is exceeded.
 
 ## Testing
 
-### Run the real thing, in-process
+- Test against this repository's own server, in-process:
+  `src/quic_outbound/testing.rs` starts it, generates a certificate and spawns
+  echo servers. Build the selector with `create_tcp_client_proxy_selector`,
+  the function server startup uses, so tests exercise the real routing path.
+- Prove a new test can fail. Watch it fail first for the reason you expect.
+  For a test that covers a defect, put the defect back afterwards and confirm
+  that exactly that test goes red: copy the file aside, plant the defect, run
+  the one test, restore the copy. Two real bugs were caught this way that
+  reading the code had missed, and one "fix" was shown to be tested by nothing.
+- Global state is process-wide: tests run as threads of one process. Scope the
+  effect instead of serialising with a mutex (the protector doubles in
+  `src/socket_util.rs` act only on the installing thread).
+- Keep the suite fast: over 1800 library tests run in about 13 seconds. Bound
+  a wait to what proves the point; never wait out a network timeout.
+- `assert!(!err.contains(secret))` is a real test: error text gets rewritten
+  casually, and a credential creeps back in unnoticed.
+- The reuse these tests offer: the UDP router's scripted server-side stream
+  (`src/routing/udp_router.rs` tests), the probe matrix (`src/probe_tests.rs`),
+  and the KAT fixtures (`tests/data/kat/`, generated by `tests/data/kat/gen/`).
 
-`src/quic_outbound/testing.rs` starts this repository's own server, generates a
-certificate and spawns echo servers. Protocol work is tested against it, so a
-change to either side that breaks the pairing fails a test rather than waiting
-for a user.
+## Security
 
-Build the selector the way production builds it — the harness calls
-`create_tcp_client_proxy_selector`, the same function server startup uses — so
-the tests exercise the real routing path rather than a stand-in that can drift.
-
-### Prove a new test can fail
-
-Write the test first and watch it fail for the reason you expect. When a test
-covers a specific defect, reintroduce the defect afterwards and confirm that
-**exactly that test** goes red. Two real bugs were caught this way that reading
-the code had missed, and one "fix" was shown to be tested by nothing.
-
-### Global state in tests is process-wide
-
-Tests run in parallel threads in one process. A test that installs something
-global — the socket protector is the example — affects every other test running
-at that moment.
-
-Serialising your own tests with a mutex is not enough: the rest of the suite is
-not holding it. Scope the effect instead. The protector doubles in
-`src/socket_util.rs` act only for the thread that installed them, which is what
-a test body runs on. Before that guard existed, a refusing protector failed
-unrelated tests at random.
-
-### Keep the suite fast
-
-Over a thousand library tests run in about two seconds. A test that waits out a
-network timeout
-costs that on every run forever. Bound the wait to what proves the point: for
-"this must not succeed", a short timeout and an assertion on the observable
-state is enough.
-
-### Test what a rejection does not contain
-
-`assert!(!err.contains(secret))` is a real test. Error text gets rewritten
-casually, and a credential creeps back in without anyone noticing.
-
-## Implementing a protocol
-
-### Read the upstream source, do not recall it
-
-Constants, byte layouts and framing rules go into a spec with the file they came
-from. Three examples of why:
-
-- Salamander's constants were verified against
-  `apernet/hysteria`, `extras/obfs/salamander.go`. They matched memory, but a
-  wrong byte there is silent incompatibility with everything.
-- TUIC's command layout and token derivation came from `EAimTY/tuic`, `SPEC.md`.
-  It said two things memory would not have: the server never answers `Connect`,
-  and heartbeats are sent only while a relay task is in flight.
-- The `quic` UDP relay mode was fixed by reading `packet_quic` in
-  `tuic-quinn/src/lib.rs`, which settled that it is one stream per fragment
-  carrying a full command header.
-
-Our own servers are authoritative for interoperating with us. The specification
-is authoritative for interoperating with the world. When they disagree, the
-specification wins and our server has a bug.
-
-### An outbound that owns its transport is a `TerminalConnector`
-
-Most outbounds are a `SocketConnector` plus a `ProxyConnector`, so they compose
-into a chain. WireGuard, AmneziaWG, Hysteria2 and TUIC cannot be expressed that
-way: they bring their own transport and are always the only hop. They implement
-`TerminalConnector` (`src/tcp/terminal_connector.rs`) instead, and
-`ClientProxyConfig::owns_transport()` is the predicate that routes a config down
-that path.
-
-If a new protocol carries its own transport, add it there rather than bending it
-into the chaining traits. Configuration validation must then reject putting it
-mid-chain, because the type system will not.
-
-### The client and the server share one codec
-
-`src/hysteria2/frame.rs` and `src/tuic/frame.rs` hold the encoders and parsers
-both sides use. Do not write a second copy for the other direction; if the
-server needs a different input shape, add a variant that shares the layout —
-`encode_packet_header_with_address` exists because the server has the address
-already serialized.
-
-### QUIC transport parameters are part of the fingerprint
-
-Copy the values our servers use rather than inventing plausible ones. Hysteria
-pins its transport parameters as part of imitating Chrome, so novel values are a
-signature that buys nothing.
-
-One of them is not a preference: **`max_concurrent_uni_streams` must not be
-zero on a client.** It bounds what the server may open toward us, and HTTP/3
-needs its control and QPACK streams before Hysteria2's authentication can
-finish. Zero produces a handshake that hangs rather than an error.
+- Compare secrets in constant time with `subtle::ConstantTimeEq` (`ct_eq`),
+  and read every presented value before judging any, so the rejection does not
+  say which one was wrong (`src/tuic/server.rs` does this for UUID and token).
+  Three authentication paths had drifted to `!=` while four others were right.
+- Never put a presented credential in a log line or an error: say that
+  authentication failed, not what was sent. Configured secrets go in
+  `Redacted<T>` (`src/config/types/redacted.rs`) so `Debug` cannot print them.
+- Nothing from a live test enters the repository: no real server's config,
+  key, password or address in a fixture, example, commit message or doc, not
+  even redacted-looking. Check `git status` before committing after a live
+  run (see `.agent/skills/live-interop-check/`).
+- Do not hand back something the platform refused. If protecting a socket or
+  verifying a certificate fails, fail the operation; returning the object
+  turns a loud failure into a silent leak.
 
 ## Configuration surface
 
-### Refuse loudly rather than ignoring
+- An option that is accepted but not implemented is rejected in
+  `src/config/validate.rs` with a message that says so. A user who asks for
+  `zero_rtt_handshake` and silently gets none believes something false.
+- Limits from a reference implementation go in validation with the source
+  named (an obfuscation password under four bytes is refused because
+  `smPSKMinLen` upstream refuses it).
+- Every option reaches `CONFIG.md`, a config in `examples/` that parses, and,
+  if it needs no certificate, the smoke loop in `.github/workflows/build.yml`.
+  Procedure: `.agent/skills/adding-a-config-option/`.
 
-If a configuration option is accepted but not implemented, reject it in
-`src/config/validate.rs` with a message that says so. A user who asks for
-`zero_rtt_handshake` and silently gets an ordinary handshake believes something
-false about their setup.
+## Commits and pull requests
 
-### Validate what the reference validates
+- Subject: `area: imperative summary`, lowercase. Body: why, in prose; the
+  diff says what changed, the message says what was wrong, what was
+  considered, and what was deliberately not done. End with a
+  `Co-Authored-By:` line naming the agent and model that wrote it.
+- Author email: the one `git config user.email` gives in this clone.
+- Commit signing is flaky. `1Password: failed to fill whole buffer` or
+  `agent returned an error` means run the same command again; the files stay
+  staged. Never work around it by disabling signing.
+- When a change closes something in `ROADMAP.md`, `MOBILE.md` or an audit
+  table, update that record in the same commit; when it opens something,
+  write it down there with what is broken, what fixing it touches, and what
+  leaving it costs.
+- PRs target `mobile`. Run the gate before opening one; the PR body states
+  what was verified and how.
+- A live check tests the binary, not the source: rebuild before running one.
+  A stale binary once reported a stub error for a feature already implemented.
 
-Limits from an upstream implementation belong in validation, with the source
-named — an obfuscation password shorter than four bytes is rejected because
-`smPSKMinLen` upstream rejects it.
+## Skills
 
-### Every option reaches the documentation and an example
+Procedures that only some tasks need, in the
+[Agent Skills](https://agentskills.io/specification) format under
+`.agent/skills/`. Claude Code reads `.claude/skills/`, which is ignored by
+git; `ln -s ../.agent/skills .claude/skills` once per clone.
 
-`CONFIG.md` gets the field and its default. `examples/` gets a config that
-parses, and `.github/workflows/build.yml` gets that example added to the
-`Smoke test binary` loop, so a release binary parses it end to end every build.
-Only cert-free examples can go in that loop — the rest reference PEM files the
-repository does not carry.
+| Skill | Use when |
+| --- | --- |
+| `implementing-a-protocol` | Adding or changing a protocol, transport or obfuscation, client or server side |
+| `adding-a-config-option` | Adding, renaming or bounding a configuration field |
+| `live-interop-check` | Testing against a reference implementation or a real server |
 
-Say the things a user would otherwise learn painfully. A Hysteria2 password is
-one opaque string, so a `userpass` server wants `<username>:<password>`. A
-mismatched obfuscation password produces no error at all and looks exactly like
-an unreachable server.
+## Where the debt is written down
 
-## Commits and documentation
-
-Subject: `area: imperative summary`, lowercase. Body: why, in prose. The diff
-already says what changed; the message explains what the reader cannot see —
-what was wrong, what was considered, what was deliberately not done.
-
-End every message with:
-
-```
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-```
-
-**Commit signing is flaky.** A commit failing with
-`1Password: failed to fill whole buffer` needs the same command run again;
-the files stay staged. Never work around it by disabling signing.
-
-**A live check tests the binary, not the source.** Rebuild before running one.
-A stale binary once reported a stub error for a feature that was already
-implemented.
-
-When a fix closes something recorded in `ROADMAP.md` or `MOBILE.md`, update that
-record in the same commit. When it opens something new, write it down there with
-enough detail to act on: what is broken, what fixing it touches, and what it
-costs to leave.
-
-## Where the known debt is written down
-
-Open findings from the 2026-08-20 audit, none of them fixed yet:
-
-- **Dependabot alerts are still off.** The other half of this entry is done:
-  `cargo audit --deny warnings` now also runs on a daily `schedule:` trigger
-  in `lint.yml` (the non-audit jobs skip scheduled ticks), added after the
-  chacha20 yank demonstrated the gap by failing the first push that came
-  along instead of the day it was published.
-- `MOBILE.md` says its line references were last checked against `037018e`;
-  the branch has moved far since, so trust symbol names over line numbers
-  until someone re-verifies them.
-
-- `ROADMAP.md`, "Hysteria: the rest of the surface" — every unimplemented part
-  of Hysteria2, grouped by whether it costs reachability, speed or visibility.
-- `MOBILE.md` — mobile defects, numbered, with a suggested order at the end.
-- `src/tuic/server.rs` still reassembles fragments with its own
-  `FragmentedPacket` and `LruCache` pair rather than
-  `quic_transport::fragments::Defragmenter`, which `src/hysteria2/server.rs`
-  moved to. It is already bounded, so there is no defect to fix — it carries
-  extra per-packet state (a received counter, the accumulated length, and the
-  address to reply to) that the shared type deliberately does not.
-- One deliberate item not recorded elsewhere:
-  - The data-path files that had no tests now have them, and most of them
-    surfaced real defects, which is the argument for writing them:
-    - `vmess_handler.rs`, `shadowsocks_stream.rs`, `routing/udp_router.rs`
-      (the router's tests drive `run_udp_routing` end to end through a
-      scripted server-side stream against real loopback echo sockets;
-      reuse that double rather than inventing another);
-    - `vless/vision_stream.rs`: end to end over real TLS (`vless/tests.rs`,
-      #80), and the unpadder at every cut (#101), which found dropped
-      bytes;
-    - `shadow_tls/shadow_tls_server_handler.rs`: `shadow_tls/tests.rs`
-      (#78), and a row in the probe matrix (`src/probe_tests.rs`, #102).
-
-    The rest of the audit's zero-test list is quality-plan PR 4.4.
-- `src/quic_server.rs::start_quic_server`, the generic QUIC listener behind
-  VLESS and the other TCP protocols, still builds its own endpoint and sets no
-  transport parameters at all — there is a TODO in it proposing some. It was
-  deliberately left out of the `quic_transport` consolidation: it binds with a
-  different socket buffer size, and giving it the shared parameters would change
-  behaviour for every QUIC inbound rather than remove a duplicate.
+`ROADMAP.md`, section "Recorded debt", lists what is known and deliberately
+left; `MOBILE.md` lists the mobile defects, numbered, with a suggested order
+at the end.

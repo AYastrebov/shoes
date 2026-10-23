@@ -88,6 +88,40 @@ the plan's status table says which PR closed what.
   - PH-2: a TLS listener with no default target refuses an unknown name;
   - PH-3: the HTTP proxy is silent on an origin-form `GET`.
 
+## Recorded debt
+
+Known and deliberately left, so that nobody rediscovers it as a surprise.
+Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
+
+- **Dependabot alerts are still off** (2026-08-20 audit). The other half of
+  that entry is done: `cargo audit --deny warnings` runs on a daily
+  `schedule:` trigger in `lint.yml`, added after the chacha20 yank failed
+  the first push that came along instead of the day it was published.
+- **`MOBILE.md`'s line references were last checked against `037018e`**;
+  the branch has moved far since. Trust symbol names over line numbers until
+  someone re-verifies them.
+- **`src/tuic/server.rs` reassembles fragments with its own
+  `FragmentedPacket` and `LruCache` pair** rather than
+  `quic_transport::fragments::Defragmenter`, which `src/hysteria2/server.rs`
+  moved to. It is already bounded, so there is no defect; it carries extra
+  per-packet state (a received counter, the accumulated length, the reply
+  address) that the shared type deliberately does not.
+- **`src/quic_server.rs::start_quic_server`**, the generic QUIC listener
+  behind VLESS and the other TCP protocols, builds its own endpoint and sets
+  no transport parameters; a TODO in it proposes some. It was left out of the
+  `quic_transport` consolidation on purpose: it binds with a different socket
+  buffer size, and the shared parameters would change behaviour for every
+  QUIC inbound rather than remove a duplicate.
+- **The 2026-08-20 audit's zero-test list.** The data-path files that had no
+  tests now have them, and most surfaced real defects: `vmess_handler.rs`,
+  `shadowsocks_stream.rs`, `routing/udp_router.rs` (its tests drive
+  `run_udp_routing` end to end through a scripted server-side stream against
+  real loopback echo sockets; reuse that double), `vless/vision_stream.rs`
+  (end to end over TLS in `vless/tests.rs`, #80; the unpadder at every cut,
+  #101, which found dropped bytes), and
+  `shadow_tls/shadow_tls_server_handler.rs` (`shadow_tls/tests.rs`, #78; a
+  probe-matrix row, #102). The rest of the list is quality-plan PR 4.4.
+
 ## Table of Contents
 
 - [Quality and correctness plan](#quality-and-correctness-plan)
