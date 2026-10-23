@@ -1,6 +1,66 @@
 # Changelog
 
-## Unreleased
+## v0.8.0
+
+The rest of Phase 3 and all of Phases 4 and 5 of the 2026-10-15 quality plan
+(`docs/plans/2026-10-15-quality-and-correctness.md`): every client is now
+checked against its reference for what it sends and when (#83-#88), the
+known-answer vectors and reference-captured frames pin the cryptography and
+first flights (#94-#97), the probe harness pins what every server shows a
+stranger (#101, #102), and the sessions and UDP paths that lost data under
+load are fixed (#89-#92). The steer plan's first two PRs (#99, #100) make
+fake IP safe and let configs from other clients load. A review of the whole
+wave (#105, `docs/audits/2026-10-22-fix-wave-review.md`) found every claimed
+fix present and tested and closed the gaps beside them. The REALITY client
+now reports a version current Xray servers accept (#104). The audit IDs
+closed are MI-M1 to MI-M5 (#83); NA-N1, NA-N2 (#84); AT-A1 to AT-A4 (#85);
+TR-3, TR-12 (#86); VM-D1, VM-D5 (#87); WG-A2 to WG-A4 (#88); HY-D5, TL-1,
+DN-D1 to DN-D3 (#89); TU-D3, TU-D6, TU-D10 (#91); FI-1 (#92); VL-V5 (#101);
+the version part of RE-R4/R7 (#104); and SF-1 to SF-5 and SF-10 of the steer
+spec (#99-#102).
+
+Behaviour changes to know before upgrading:
+
+- **The REALITY client reports Xray-core 26.3.27, not 1.8.0** (#104). Xray
+  v26.7.28 sends anything older to the decoy, which is what every Amnezia-
+  installed server did to shoes. A server pinning `max_client_version` below
+  26.3.27 now needs `client_version` set on the client.
+- **With fake IP on, local names are no longer tunnelled** (#99):
+  single-label names and `.local`, `.lan`, `.home.arpa`, `.internal`,
+  `.localhost`, `.localdomain`, `.home` and the reverse zones resolve for
+  real. `bypass_defaults: false` restores the old behaviour. **An unmapped
+  fake IP is refused** rather than dialled: TCP gets a reset, UDP is dropped.
+- **TLS-over-TCP servers refuse 0-RTT** (#89); nothing read the early data.
+  QUIC servers are unchanged.
+- **UDP DNS answers that do not echo the query's randomised case are
+  dropped** (#89). A resolver that lowercases names will time out; point
+  `dns` at one that does not.
+- **The TUIC server sends no heartbeats and keeps an idle association for
+  `udp_timeout` seconds, 300 by default** (#91), bounded 1 to 86400 (#105).
+  The client sends one heartbeat per connection, not one per association.
+- **AnyTLS and NaiveProxy clients reuse sessions** (#84, #85). A reused
+  session means no new TCP connection or TLS handshake per proxied
+  connection; AnyTLS closes sessions idle for 30 s and keeps
+  `min_idle_session` (new, default 0).
+- **The VMess client asks for global padding** (#87) and **mieru's open
+  request carries the socks5 request, with the Go client's padding
+  distribution** (#83): both now look like their reference clients on the
+  wire.
+- **AmneziaWG `s1`-`s4` and `jc` are 16-bit** (#88, #90); `jc` over 128 or
+  junk larger than the tunnel's datagrams is refused at config load.
+- A version-0 `.srs` rule set is refused, as sing-box refuses it (#101).
+- `sni_hostname: ""` on a TLS, ShadowTLS or REALITY client sends no server
+  name (#100, #105); with `verify: true` the certificate is checked against
+  the address dialled. A REALITY client with no name and no hostname to
+  fall back on is a config error instead of a panic.
+- VLESS and VMess user ids load as a UUID of any version or a name of up to
+  30 bytes (#100); only version-4 UUIDs loaded before.
+- DNS over TCP to port 53 gets fake-IP answers, as UDP did (#92).
+
+No change to the C or JNI surface or the `shoesd` protocol. New config
+options, all documented in CONFIG.md with an example: `max_early_data` and
+`early_data_header_name` (#86), `min_idle_session` (#85), TUIC `udp_timeout`
+(#91), `bypass_defaults` (#99), REALITY `client_version` (#104).
 
 REALITY client version (the version part of RE-R4/R7):
 
