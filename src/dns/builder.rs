@@ -117,10 +117,64 @@ struct HickoryResolverPlan {
     chain_key: String,
     bootstrap_key: Option<String>,
     options: HickoryResolverOptions,
+    timeout_secs: u32,
+    connect_timeout_secs: u32,
     description: String,
 }
 
 impl HickoryResolverPlan {
+    fn is_system(&self) -> bool {
+        matches!(self.parsed_url, ParsedDnsUrl::System)
+    }
+
+    /// The entry this plan describes, its server's name resolved now through
+    /// the bootstrap, so that a rebuild follows a server that has moved
+    /// (DN-D2). A `system` plan's entry needs no lookup.
+    async fn entry(&self) -> std::io::Result<ParsedDnsServerEntry> {
+        let resolved_ip = match self.parsed_url.hostname() {
+            Some(hostname) => {
+                let location = crate::address::NetLocation::new(
+                    crate::address::Address::Hostname(hostname.to_string()),
+                    0,
+                );
+                let addrs = self
+                    .bootstrap_resolver
+                    .resolve_location(&location)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "failed to resolve DNS server hostname '{}': {}",
+                            hostname, e
+                        ))
+                    })?;
+                // A lookup can succeed with nothing in it (an answer of only
+                // unspecified addresses is filtered to none). On a rebuild
+                // that is an error the refreshing resolver keeps the working
+                // resolver over, not an index to panic on.
+                let first = addrs.first().ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "bootstrap lookup returned no addresses for '{hostname}'"
+                    ))
+                })?;
+                Some(first.ip())
+            }
+            None => None,
+        };
+        let server = self
+            .parsed_url
+            .to_parsed_server(resolved_ip)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(ParsedDnsServerEntry::new(
+            server,
+            self.chain_group.clone(),
+            self.bootstrap_resolver.clone(),
+            self.options.ip_strategy,
+            self.timeout_secs,
+            self.connect_timeout_secs,
+            self.options.attempts,
+        ))
+    }
+
     fn is_pool_compatible_with(&self, other: &Self) -> bool {
         self.chain_key == other.chain_key
             && self.bootstrap_key == other.bootstrap_key
@@ -537,50 +591,59 @@ async fn build_resolver_from_specs(
     }
 
     let mut entries: Vec<ParsedDnsServerEntry> = Vec::with_capacity(specs.len());
-    let mut plans: Vec<HickoryResolverPlan> = Vec::new();
-    let mut has_system = false;
+    let mut plans: Vec<HickoryResolverPlan> = Vec::with_capacity(specs.len());
 
     for spec in specs {
         let (entry, plan) = build_entry_and_plan(spec, registry).await?;
-        if matches!(entry.server, ParsedDnsServer::System) {
-            has_system = true;
-        }
-        if let Some(p) = plan {
-            plans.push(p);
-        }
+        plans.push(plan);
         entries.push(entry);
     }
 
-    // Wrap in RefreshingResolver only if we have hickory-backed resolvers
-    // and no system resolver (mixed groups stay as-is for simplicity).
-    if !plans.is_empty() && !has_system {
-        let description = group_name.to_string();
-        let plans = plans.clone();
-        let factory: ResolverFactory = Arc::new(move || {
+    // A group with no hickory-backed resolver has nothing to rebuild.
+    if plans.iter().all(HickoryResolverPlan::is_system) {
+        return build_resolver(entries);
+    }
+
+    // Rebuilt by a RefreshingResolver on its policy, asking the bootstrap
+    // again each time (DN-D2). A group of hickory resolvers alone is
+    // rebuilt from its plans, which pools them; one with a system resolver
+    // among them is rebuilt entry by entry, since the system resolver
+    // cannot be pooled. Mixed groups used to be built once and kept.
+    let factory: ResolverFactory = if plans.iter().any(HickoryResolverPlan::is_system) {
+        Arc::new(move || {
+            let plans = plans.clone();
+            Box::pin(async move {
+                let mut entries = Vec::with_capacity(plans.len());
+                for plan in &plans {
+                    entries.push(plan.entry().await?);
+                }
+                build_resolver(entries)
+            })
+        })
+    } else {
+        Arc::new(move || {
             let plans = plans.clone();
             Box::pin(async move { build_hickory_resolver_group(&plans).await })
-        });
+        })
+    };
 
-        let policy = RefreshPolicy {
-            max_idle: Duration::from_secs(60),
-            max_age: Duration::from_secs(10 * 60),
-            retry_after_failure: Duration::from_secs(30),
-            retry_once_after_refresh: true,
-        };
+    let policy = RefreshPolicy {
+        max_idle: Duration::from_secs(60),
+        max_age: Duration::from_secs(10 * 60),
+        retry_after_failure: Duration::from_secs(30),
+        retry_once_after_refresh: true,
+    };
 
-        let refreshing = RefreshingResolver::new(factory, policy, description).await?;
-        Ok(Arc::new(refreshing))
-    } else {
-        build_resolver(entries)
-    }
+    let refreshing = RefreshingResolver::new(factory, policy, group_name.to_string()).await?;
+    Ok(Arc::new(refreshing))
 }
 
-/// Build a ParsedDnsServerEntry and optionally a HickoryResolverPlan from an expanded spec.
-/// The plan is returned for non-system resolvers so they can be rebuilt on refresh.
+/// Build a ParsedDnsServerEntry and the HickoryResolverPlan that can rebuild
+/// it on refresh from an expanded spec.
 async fn build_entry_and_plan(
     spec: &ExpandedDnsSpec,
     registry: &DnsRegistry,
-) -> std::io::Result<(ParsedDnsServerEntry, Option<HickoryResolverPlan>)> {
+) -> std::io::Result<(ParsedDnsServerEntry, HickoryResolverPlan)> {
     // Parsed during config expansion.
     let parsed_url = spec.parsed_url.clone();
 
@@ -636,61 +699,21 @@ async fn build_entry_and_plan(
         attempts: spec.attempts,
     };
 
-    // Build plan for hickory-backed resolvers (not system)
-    let plan = if !matches!(parsed_url, ParsedDnsUrl::System) {
-        Some(HickoryResolverPlan {
-            parsed_url: parsed_url.clone(),
-            chain_group: chain_group.clone(),
-            bootstrap_resolver: bootstrap_resolver.clone(),
-            chain_key: serde_yaml::to_string(&spec.client_chains).map_err(|e| {
-                std::io::Error::other(format!("failed to serialize client_chains: {e}"))
-            })?,
-            bootstrap_key: spec.bootstrap.as_ref().map(|b| b.as_str().to_string()),
-            options,
-            description: spec.url.clone(),
-        })
-    } else {
-        None
-    };
-
-    // Resolve hostname if URL contains one
-    let resolved_ip = match parsed_url.hostname() {
-        Some(hostname) => {
-            let location = crate::address::NetLocation::new(
-                crate::address::Address::Hostname(hostname.to_string()),
-                0,
-            );
-
-            let addrs = bootstrap_resolver
-                .resolve_location(&location)
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!(
-                        "failed to resolve DNS server hostname '{}': {}",
-                        hostname, e
-                    ))
-                })?;
-
-            Some(addrs[0].ip())
-        }
-        None => None,
-    };
-
-    // Convert to ParsedDnsServer with resolved IP
-    let server = parsed_url
-        .to_parsed_server(resolved_ip)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    let entry = ParsedDnsServerEntry::new(
-        server,
+    let plan = HickoryResolverPlan {
+        parsed_url,
         chain_group,
         bootstrap_resolver,
-        spec.ip_strategy,
-        spec.timeout_secs,
-        spec.connect_timeout_secs,
-        spec.attempts,
-    );
+        chain_key: serde_yaml::to_string(&spec.client_chains).map_err(|e| {
+            std::io::Error::other(format!("failed to serialize client_chains: {e}"))
+        })?,
+        bootstrap_key: spec.bootstrap.as_ref().map(|b| b.as_str().to_string()),
+        options,
+        timeout_secs: spec.timeout_secs,
+        connect_timeout_secs: spec.connect_timeout_secs,
+        description: spec.url.clone(),
+    };
 
+    let entry = plan.entry().await?;
     Ok((entry, plan))
 }
 
@@ -1071,7 +1094,7 @@ mod tests {
 
         let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
         let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
-        let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
+        let plans = vec![plan_a, plan_b];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();
         let debug = format!("{:?}", resolver);
@@ -1096,7 +1119,7 @@ mod tests {
 
         let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
         let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
-        let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
+        let plans = vec![plan_a, plan_b];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();
         let debug = format!("{:?}", resolver);
@@ -1105,5 +1128,57 @@ mod tests {
             "incompatible specs should fall back to CompositeResolver, got: {}",
             debug
         );
+    }
+
+    /// A bootstrap that answers with nothing is an error on a rebuild, not a
+    /// panic: the refreshing resolver keeps the resolver it has.
+    #[tokio::test]
+    async fn an_empty_bootstrap_answer_is_an_error_not_a_panic() {
+        #[derive(Debug)]
+        struct Nothing;
+        impl Resolver for Nothing {
+            fn resolve_location(
+                &self,
+                _: &crate::address::NetLocation,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>
+                        + Send,
+                >,
+            > {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+        let mut registry = DnsRegistry::new();
+        registry.register("empty".to_string(), Arc::new(Nothing));
+        let mut spec = make_spec("https://dns.example/dns-query");
+        spec.bootstrap = Some(DnsBootstrap::Group("empty".to_string()));
+        let err = match build_entry_and_plan(&spec, &registry).await {
+            Ok(_) => panic!("an entry was built with no address"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no addresses"), "{err}");
+    }
+
+    /// DN-D2: a group that puts the system resolver beside a hickory-backed
+    /// one is rebuilt on the same policy as a pure hickory group, bootstrap
+    /// included. It used to be built once and kept for the process's life.
+    /// A group of only the system resolver has nothing to rebuild.
+    #[tokio::test]
+    async fn a_mixed_group_is_rebuilt_like_a_pure_one() {
+        let registry = DnsRegistry::new();
+        let mixed = [make_spec("udp://8.8.8.8"), make_spec("system")];
+        let resolver = build_resolver_from_specs(&mixed, &registry, "mixed")
+            .await
+            .unwrap();
+        let debug = format!("{resolver:?}");
+        assert!(debug.contains("RefreshingResolver"), "{debug}");
+
+        let system = [make_spec("system")];
+        let resolver = build_resolver_from_specs(&system, &registry, "system")
+            .await
+            .unwrap();
+        let debug = format!("{resolver:?}");
+        assert!(!debug.contains("RefreshingResolver"), "{debug}");
     }
 }

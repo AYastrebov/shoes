@@ -73,7 +73,7 @@
     type: tls
     reality_targets:
       "www.microsoft.com":
-        private_key: "YOUR_PRIVATE_KEY_HERE"
+        private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"  # replace with your key
         short_ids: ["0123456789abcdef", ""]
         dest: "www.microsoft.com:443"
         protocol:
@@ -99,3 +99,6 @@
             type: anytls
             password: "secret123"
             udp_enabled: true
+            # Sessions are pooled and reused; idle ones close after 30 s,
+            # except for this many (default 0), kept for the next connection.
+            min_idle_session: 1

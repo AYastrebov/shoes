@@ -648,3 +648,62 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
     std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_flush_message(cx)).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::fake_ip::FakeIpNetwork;
+    use crate::quic_outbound::testing::{direct_selector, loopback_resolver, spawn_udp_echo};
+
+    /// SF-2, the UDP leg: a datagram to a pool address that stands for no
+    /// domain is dropped and counted, and nothing is dialled for it; the
+    /// same session then carries a mapped address, whose reply comes back
+    /// from the address the app sent to.
+    #[tokio::test]
+    async fn a_datagram_to_an_unmapped_fake_ip_is_dropped() {
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+        let resolver = loopback_resolver();
+        let (tx, rx) = mpsc::channel(8);
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let peer: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let session = tokio::spawn(session_task(
+            peer,
+            rx,
+            response_tx,
+            direct_selector(resolver.clone()),
+            resolver,
+            Some(pool.clone()),
+        ));
+
+        let unmapped: SocketAddr = "198.18.9.9:53".parse().unwrap();
+        let before = fake_ip::unmapped_refused();
+        tx.send((unmapped, b"ping".to_vec())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake_ip::unmapped_refused() == before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the datagram is refused and counted");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), response_rx.recv())
+                .await
+                .is_err(),
+            "nothing answers an unmapped address"
+        );
+
+        let echo = spawn_udp_echo().await;
+        let ip = pool.assign("echo.test").unwrap();
+        let mapped = SocketAddr::from((ip, echo.port()));
+        tx.send((mapped, b"ping".to_vec())).await.unwrap();
+        let (payload, src, dst) = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
+            .await
+            .expect("a reply through the mapped address")
+            .unwrap();
+        assert_eq!(payload, b"ping");
+        assert_eq!(src, mapped, "the reply comes from the address the app used");
+        assert_eq!(dst, peer);
+        session.abort();
+    }
+}

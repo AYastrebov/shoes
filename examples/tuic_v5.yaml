@@ -14,5 +14,9 @@
     # Controls what the server sends, so its clients' download. One of cubic
     # (default), new_reno or bbr; bbr for a lossy or long-distance path.
     congestion_control: cubic
+    # Seconds a UDP association may sit idle before it is freed; sing-box's
+    # default. Between 1 and 86400. A quiet tunnel inside TUIC (QUIC or
+    # WireGuard) keeps its NAT mapping for this long between packets.
+    udp_timeout: 300
   rules:
     - allow-all-direct

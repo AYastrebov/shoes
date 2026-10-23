@@ -78,6 +78,29 @@ impl HopContext {
             tls_server_name: server_name.filter(|name| !name.is_empty()),
         }
     }
+
+    /// The identity a server certificate is checked against when no server
+    /// name is sent: the hop as dialled. `sni_hostname: ""` turns the SNI
+    /// extension off, and so does dialling by address with no name
+    /// configured, but neither turns WebPKI's name check off, so rustls has
+    /// to be handed the name the certificate is expected to carry rather
+    /// than a placeholder. For a dialled address that is an IP, that is the
+    /// IP, which a certificate carries as an IP SAN.
+    fn verification_identity(&self) -> rustls::pki_types::ServerName<'static> {
+        use crate::address::Address;
+        let dialled = crate::address::NetLocation::from_str(&self.dialled_address, None).ok();
+        match dialled.as_ref().map(|location| location.address()) {
+            Some(Address::Ipv4(ip)) => Some(rustls::pki_types::ServerName::IpAddress((*ip).into())),
+            Some(Address::Ipv6(ip)) => Some(rustls::pki_types::ServerName::IpAddress((*ip).into())),
+            Some(Address::Hostname(name)) => {
+                rustls::pki_types::ServerName::try_from(name.clone()).ok()
+            }
+            None => None,
+        }
+        // Unreachable for a hop built by `HopContext::new`; rustls still
+        // needs some name.
+        .unwrap_or_else(|| "example.com".try_into().expect("a literal name"))
+    }
 }
 
 pub fn create_tcp_client_handler(
@@ -189,7 +212,9 @@ pub fn create_tcp_client_handler(
                 }
                 default_sni_hostname
             } else {
-                sni_hostname.into_option()
+                // `""` sends no server name, as it does for REALITY (SF-4);
+                // rustls has no ServerName for it.
+                sni_hostname.into_option().filter(|s| !s.is_empty())
             };
             let inner_hop = hop.under_tls(sni_hostname.clone());
 
@@ -211,10 +236,12 @@ pub fn create_tcp_client_handler(
             ));
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
-                // This is unused, since enable_sni is false, but connect_with still requires a
-                // parameter.
-                None => "example.com".try_into().unwrap(),
+                // Checked by `validate_tls_server_name` when the config loads.
+                Some(s) => rustls::pki_types::ServerName::try_from(s)
+                    .expect("validated when loading config"),
+                // No SNI goes out, but the certificate is still checked
+                // against a name when `verify` is on.
+                None => hop.verification_identity(),
             };
 
             if vision {
@@ -310,12 +337,19 @@ pub fn create_tcp_client_handler(
             sni_hostname,
             protocol,
         } => {
-            let sni_hostname = sni_hostname.or(default_sni_hostname);
+            // `""` sends no server name, as for TLS and REALITY.
+            let sni_hostname = sni_hostname
+                .or(default_sni_hostname)
+                .filter(|s| !s.is_empty());
             let enable_sni = sni_hostname.is_some();
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
-                None => "example.com".try_into().unwrap(), // Fallback
+                // Checked by `validate_tls_server_name` when the config loads.
+                Some(s) => rustls::pki_types::ServerName::try_from(s)
+                    .expect("validated when loading config"),
+                // ShadowTLS never verifies the certificate, so this name is
+                // only what rustls insists on being given.
+                None => hop.verification_identity(),
             };
 
             // Create TLS config for ShadowTLS - must be TLS 1.3 only.
@@ -481,6 +515,90 @@ pub fn create_tcp_client_proxy_selector(
 mod tests {
     use super::*;
     use crate::address::NetLocation;
+
+    /// When no server name goes out, the certificate is checked against the
+    /// hop as dialled, not against a placeholder that no certificate has.
+    #[test]
+    fn the_verification_identity_is_the_dialled_hop() {
+        use rustls::pki_types::ServerName;
+        let hop = |s: &str| HopContext::new(&NetLocation::from_str(s, None).unwrap());
+        assert_eq!(
+            hop("proxy.example.com:8443").verification_identity(),
+            ServerName::try_from("proxy.example.com").unwrap()
+        );
+        assert_eq!(
+            hop("1.2.3.4:443").verification_identity(),
+            ServerName::IpAddress(std::net::Ipv4Addr::new(1, 2, 3, 4).into())
+        );
+        assert_eq!(
+            hop("[2001:db8::1]:443").verification_identity(),
+            ServerName::IpAddress("2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().into())
+        );
+    }
+
+    /// A TLS client built from config, handshaking with a rustls server that
+    /// reports the name it was sent. `sni_hostname: ""` sends none and the
+    /// handshake still completes; a name is sent as given.
+    async fn sni_seen_by_the_server(sni_line: &str) -> Option<String> {
+        use crate::crypto::{CryptoConnection, perform_crypto_handshake};
+        use crate::rustls_config_util::create_server_config;
+
+        let certified = rcgen::generate_simple_self_signed(vec!["tls.test".to_string()]).unwrap();
+        let server_config = Arc::new(create_server_config(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+            vec![],
+            &[],
+            &[],
+        ));
+        let client_config: ClientProxyConfig = serde_yaml::from_str(&format!(
+            "type: tls\nverify: false\n{sni_line}protocol:\n    type: portforward\n"
+        ))
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let hop = HopContext::new(&NetLocation::from_str("tls.test:443", None).unwrap());
+        let client = create_tcp_client_handler(client_config, None, &hop, resolver);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (accepted, _) = listener.accept().await.unwrap();
+            let mut stream: Box<dyn crate::async_stream::AsyncStream> = Box::new(accepted);
+            let mut connection = CryptoConnection::new_rustls_server(
+                rustls::ServerConnection::new(server_config).unwrap(),
+            );
+            perform_crypto_handshake(&mut connection, &mut stream, 16384)
+                .await
+                .unwrap();
+            match connection {
+                CryptoConnection::RustlsServer(conn) => conn.server_name().map(str::to_string),
+                _ => unreachable!("a rustls server was built"),
+            }
+        });
+        let connected = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let target = NetLocation::from_str("example.org:80", None).unwrap();
+        client
+            .setup_client_tcp_stream(Box::new(connected), target.into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), server)
+            .await
+            .expect("the server finished its handshake")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_empty_sni_hostname_sends_no_server_name() {
+        assert_eq!(sni_seen_by_the_server("sni_hostname: \"\"\n").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_configured_sni_hostname_is_sent() {
+        assert_eq!(
+            sni_seen_by_the_server("sni_hostname: tls.test\n").await,
+            Some("tls.test".to_string())
+        );
+    }
 
     #[test]
     fn the_dialled_address_brackets_an_ipv6_host() {

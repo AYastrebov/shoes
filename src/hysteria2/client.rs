@@ -250,8 +250,14 @@ mod tests {
     }
 
     async fn spawn_server(obfs: Option<Arc<dyn Obfuscator>>) -> (SocketAddr, TestCertificate) {
+        spawn_server_with(obfs, test_resolver()).await
+    }
+
+    async fn spawn_server_with(
+        obfs: Option<Arc<dyn Obfuscator>>,
+        resolver: Arc<dyn Resolver>,
+    ) -> (SocketAddr, TestCertificate) {
         let cert = generate_certificate();
-        let resolver = test_resolver();
         let bind_address = reserve_udp_port();
 
         crate::hysteria2::start_hysteria2_server(
@@ -918,6 +924,56 @@ mod tests {
                 "session {label} did not get its own eight back"
             );
         }
+    }
+
+    /// HY-D2: a session's datagrams each go to the target they name, and
+    /// every reply is labelled with its real source. The server used to pin
+    /// a session to its first target's address and label replies with the
+    /// name the client used, so a second target named by hostname was
+    /// unreachable and its replies came back as the name.
+    #[tokio::test]
+    async fn test_one_session_reaches_two_targets_and_replies_carry_their_source() {
+        let (server, _cert) = spawn_server_with(None, loopback_resolver()).await;
+        let first = spawn_udp_echo().await;
+        let second = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+        let (connection, router) = connector
+            .connection
+            .get_with_datagrams(&resolver)
+            .await
+            .unwrap();
+        // The session opens on a name, the case HY-D2 pinned: the server
+        // resolves it (to loopback, by the resolver it was given) and must
+        // label the reply with the address it came from, not the name.
+        let mut session = crate::hysteria2::udp::Hysteria2UdpSession::new(
+            connection,
+            router,
+            format!("first.test:{}", first.port()),
+        )
+        .unwrap();
+
+        let reply = udp_echo_exchange_on(&mut session, b"to the first")
+            .await
+            .unwrap();
+        assert_eq!(reply, b"to the first");
+        assert_eq!(
+            session.last_reply_address(),
+            Some(first.to_string().as_str()),
+            "the reply is labelled with its real source, not the name"
+        );
+
+        // A second target, named too, through the same session.
+        session.retarget(format!("second.test:{}", second.port()));
+        let reply = udp_echo_exchange_on(&mut session, b"to the second")
+            .await
+            .unwrap();
+        assert_eq!(reply, b"to the second");
+        assert_eq!(
+            session.last_reply_address(),
+            Some(second.to_string().as_str()),
+            "the reply is labelled with its real source"
+        );
     }
 
     #[tokio::test]
