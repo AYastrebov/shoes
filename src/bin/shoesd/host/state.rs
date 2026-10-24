@@ -150,16 +150,24 @@ impl AppliedState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{DnsState, Via, route_for_test};
+    use crate::host::{DnsState, InterfaceAddress, Via, route_for_test};
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
 
+    /// Every field set, so the round trip below covers each of them -- the
+    /// address in particular: a restart's cleanup reads it back to remove the
+    /// ULA from the device, and a record that forgot it would leave the
+    /// address behind on every crash.
     fn populated() -> AppliedState {
         AppliedState {
-            addresses: Vec::new(),
+            addresses: vec![InterfaceAddress {
+                interface: "utun4".to_string(),
+                address: ip("fd00:6b76:6e00::2"),
+                prefix: 64,
+            }],
             interface: Some("utun4".to_string()),
             routes: vec![
                 route_for_test("0.0.0.0", 1, Via::Interface("utun4".into())),
@@ -182,6 +190,11 @@ mod tests {
 
         let read = AppliedState::load(&path).unwrap().expect("it was written");
         assert_eq!(read, state);
+        assert_eq!(
+            read.addresses.len(),
+            1,
+            "the tunnel address must come back for the revert"
+        );
     }
 
     /// The ordinary case on a machine that has never crashed, and it must not
