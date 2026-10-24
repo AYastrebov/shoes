@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+tokio 1.54.1, for RUSTSEC-2026-0386: `AsyncFd::new` took any `AsRawFd`, a
+bare descriptor nobody owned included, and is deprecated in favour of the
+unsafe `AsyncFd::register`, whose contract is that the descriptor stays open
+and the same for the `AsyncFd`'s life. The TPROXY UDP listener is the one
+caller; it moves an owned `socket2::Socket` in, which already met that
+contract, and now says so in a `SAFETY` comment. No behaviour change. The
+scheduled audit went red on this on 2026-10-24, and `cargo audit --deny
+warnings` also runs on every push and pull request.
+
 `shoesd` carries IPv6 on Linux and macOS. The two v6 halves (`::/1`,
 `8000::/1`) are routed via the tunnel device instead of being rejected, the
 device gets a ULA (`fd00:6b76:6e00::2/64`) from the host arm so the kernel
