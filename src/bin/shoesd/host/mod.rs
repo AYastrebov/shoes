@@ -49,19 +49,54 @@ use serde::{Deserialize, Serialize};
 /// listens on it. The v4 counterpart is the engine's own `10.0.0.2`, set
 /// through the TUN config; this one is host policy, like the routes, and is
 /// recorded and reverted like them.
+///
+/// Being a ULA decides which connections use it. RFC 6724's destination
+/// selection prefers a destination whose label matches its source's (rule
+/// 5), and in the default policy table -- glibc's `gai.conf`, and Apple's --
+/// a `fc00::/7` source matches no global destination while a v4 source
+/// matches a v4 one. So a dual-stack name still connects over v4 through the
+/// tunnel, exactly as it did while v6 was rejected, and what this address
+/// changes is that a v6-only destination, or a v6 literal, now gets through.
+/// A source that looked global (`2000::/3`) would flip that preference and
+/// send every dual-stack connection over v6, at the price of squatting on a
+/// prefix that is someone's. Left as a ULA; recorded in `ROADMAP.md`.
 pub const TUNNEL_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6b76, 0x6e00, 0, 0, 0, 0, 2);
 pub const TUNNEL_IPV6_PREFIX: u8 = 64;
 
-/// Whether this build's host arm can give the device an IPv6 address, and so
-/// route v6 into the tunnel rather than reject it.
+/// Whether this host can give the device an IPv6 address, and so route v6
+/// into the tunnel rather than reject it.
 ///
-/// One function, read by the supervisor (which builds the plan) and by
-/// `Hello` (which tells the client), so the two cannot disagree -- a session
-/// whose `Hello` promised v6 while its routes rejected it would report
-/// RUNNING with every v6 connection failing. Windows stays out until wintun's
-/// configuration path can express an IPv6 address (`src/tun/mod.rs`).
+/// One function, read by the supervisor (which builds the plan), by `Hello`
+/// (which tells the client) and by the `Start` door (which admits a v6
+/// resolver), so the three cannot disagree -- a session whose `Hello`
+/// promised v6 while its routes rejected it would report RUNNING with every
+/// v6 connection failing.
+///
+/// The build answers part of it: Windows stays out until wintun's
+/// configuration path can express an IPv6 address (`src/tun/mod.rs`). On
+/// Linux the host answers the rest. A hardened host sets
+/// `net.ipv6.conf.{all,default}.disable_ipv6 = 1`, and the kernel then refuses
+/// an address on a device created afterwards (`EACCES`) while still accepting
+/// the reject routes -- so that host started fine before the daemon carried
+/// v6, and a capability promised from the build alone would turn it into a
+/// `Start` that fails every time. The probe runs once and the answer is kept
+/// for the life of the process: a client told `ipv6` at `Hello` must not be
+/// refused it at `Start` because a sysctl moved in between, and the plan and
+/// the promise have to come from one reading.
 pub fn carries_ipv6() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    #[cfg(target_os = "linux")]
+    {
+        static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PROBED.get_or_init(linux::ipv6_enabled)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 /// An address the daemon put on the tunnel device and must remove again.

@@ -123,7 +123,10 @@ impl Daemon for DaemonService {
         let exclude = parse_addresses(&request.exclude, "exclude")?;
         refuse_ipv6(&exclude, "exclude", EXCLUDE_STAYS_IPV4)?;
         let dns = parse_addresses(&request.dns, "dns")?;
-        if !self.capabilities.iter().any(|c| c == CAPABILITY_IPV6) {
+        // From the function the plan is built from, not from the capability
+        // list: that list also carries what `main` learned at startup, and a
+        // string in it is a weaker guarantee than the one reading.
+        if !crate::host::carries_ipv6() {
             refuse_ipv6(&dns, "dns", DNS_BEHIND_REJECTS)?;
         }
 
@@ -1121,10 +1124,24 @@ mod tests {
         };
         let status = client.start(dns).await.unwrap_err_or_else_panic("dns");
         if crate::host::carries_ipv6() {
-            assert!(
-                !status.message().contains("IPv6"),
-                "a carrying arm takes a v6 resolver; the failure must be the empty config, got {}",
-                status.message()
+            // A carrying arm takes the v6 resolver, so the request fails on
+            // its empty config -- which is also an InvalidArgument. The
+            // control is the same request with a v4 resolver: the two must
+            // fail identically, or the resolver's family changed the outcome.
+            let control = proto::StartRequest {
+                yaml: "---\n[]\n".into(),
+                exclude: vec![],
+                dns: vec!["10.0.0.1".into()],
+            };
+            let expected = client
+                .start(control)
+                .await
+                .unwrap_err_or_else_panic("the v4 control");
+            assert_eq!(status.code(), expected.code());
+            assert_eq!(
+                status.message(),
+                expected.message(),
+                "a carrying arm must fail a v6 resolver exactly as it fails a v4 one"
             );
         } else {
             assert_eq!(status.code(), tonic::Code::InvalidArgument);

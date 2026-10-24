@@ -7,12 +7,22 @@
 device gets a ULA (`fd00:6b76:6e00::2/64`) from the host arm so the kernel
 accepts the routes and picks a v6 source, and `Hello.capabilities` gains
 `"ipv6"` where that is so -- a client then generates a config that proxies v6.
-`Start.dns` takes a v6 resolver on a carrying arm; `Start.exclude` stays
-IPv4-only on every arm, because the exclusion route goes through the IPv4
-default gateway. The address is recorded in `AppliedState` and reverted
-after the routes; records from older builds load with none. Windows keeps
-the rejects and does not advertise the capability until wintun can take a
-v6 address. Design: `docs/specs/2026-10-24-daemon-carries-ipv6.md`.
+What gets through that did not: v6-only destinations and v6 literals. A
+dual-stack name still connects over v4, because RFC 6724 ranks a v4
+destination above a v6 one whose only source is a ULA. `Start.dns` takes a
+v6 resolver on a carrying arm; `Start.exclude` stays IPv4-only on every arm,
+because the exclusion route goes through the IPv4 default gateway. On Linux
+the capability is probed once at startup from
+`net.ipv6.conf.{all,default}.disable_ipv6`: a host that disables IPv6 keeps
+the rejects and starts as before, rather than failing every `Start` on an
+address the kernel refuses. The macOS arm reads `ifconfig <utun> inet6`
+before adding the address, because `alias` of one already there exits 0
+silently and would otherwise record someone else's address as ours. The
+address is recorded in `AppliedState` and reverted after the routes; records
+from older builds load with none. Windows keeps the rejects and does not
+advertise the capability until wintun can take a v6 address. Design:
+`docs/specs/2026-10-24-daemon-carries-ipv6.md`; the three gaps left are in
+`ROADMAP.md`, "Recorded debt".
 
 Agent guidelines reorganised along `agents.md` and Android's AI-tools
 guides:

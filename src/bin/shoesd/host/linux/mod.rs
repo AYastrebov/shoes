@@ -40,12 +40,47 @@ impl LinuxHost {
     pub fn with_dns(dns: dns::Dns) -> std::io::Result<Self> {
         let routes = routes::Routes::locate()?;
         log::info!(
-            "host network: ip at {}, DNS through {}",
+            "host network: ip at {}, DNS through {}, IPv6 {}",
             routes.program().display(),
-            dns.backend_name()
+            dns.backend_name(),
+            if super::carries_ipv6() {
+                "carried"
+            } else {
+                "rejected (disable_ipv6 is set)"
+            }
         );
         Ok(Self { routes, dns })
     }
+}
+
+/// The sysctls that decide whether a device created later can take an IPv6
+/// address. `default` is what a new device inherits; `all` is what a
+/// hardening guide sets, and the kernel copies a write to it into `default`
+/// and every existing device. Read separately because they can be set apart.
+const DISABLE_IPV6_ALL: &str = "/proc/sys/net/ipv6/conf/all/disable_ipv6";
+const DISABLE_IPV6_DEFAULT: &str = "/proc/sys/net/ipv6/conf/default/disable_ipv6";
+
+/// Whether this host will accept an IPv6 address on the tunnel device.
+///
+/// The kernel's own check is per device (`addrconf_add_dev` answers `EACCES`
+/// when `disable_ipv6` is set on it), and the device does not exist yet when
+/// `Hello` has to answer -- so the two files a new device is configured from
+/// are read instead. Called once, from [`crate::host::carries_ipv6`], which
+/// keeps the answer.
+pub fn ipv6_enabled() -> bool {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    ipv6_enabled_from(
+        read(DISABLE_IPV6_ALL).as_deref(),
+        read(DISABLE_IPV6_DEFAULT).as_deref(),
+    )
+}
+
+/// The decision, from the two files' contents. `None` is a file that is not
+/// there, which is a kernel without IPv6 (`ipv6.disable=1`, or not built in)
+/// and so a host that cannot carry it either.
+fn ipv6_enabled_from(all: Option<&str>, default: Option<&str>) -> bool {
+    let enabled = |contents: Option<&str>| contents.is_some_and(|c| c.trim() == "0");
+    enabled(all) && enabled(default)
 }
 
 impl HostNetwork for LinuxHost {
@@ -86,5 +121,40 @@ impl HostNetwork for LinuxHost {
 
     fn flush_dns_cache(&self) -> std::io::Result<()> {
         self.dns.flush()
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::ipv6_enabled_from;
+
+    /// The ordinary host, and the three ways it stops being one. `all` and
+    /// `default` are checked separately rather than `all` alone because an
+    /// operator can set `default` back to 1 after a write to `all` reset
+    /// it; the device that matters is created later and inherits `default`.
+    #[test]
+    fn ipv6_is_carried_only_where_both_sysctls_allow_a_device_to_take_an_address() {
+        assert!(ipv6_enabled_from(Some("0\n"), Some("0\n")));
+        assert!(
+            !ipv6_enabled_from(Some("1\n"), Some("1\n")),
+            "net.ipv6.conf.all.disable_ipv6 = 1, as a hardening guide sets it"
+        );
+        assert!(
+            !ipv6_enabled_from(Some("0\n"), Some("1\n")),
+            "a device created later inherits default, which refuses the address"
+        );
+        assert!(
+            !ipv6_enabled_from(Some("1\n"), Some("0\n")),
+            "all = 1 is the operator saying no IPv6, whatever default says"
+        );
+    }
+
+    /// A kernel booted with `ipv6.disable=1` has no `/proc/sys/net/ipv6` at
+    /// all; an unreadable file is the same answer.
+    #[test]
+    fn a_kernel_without_ipv6_does_not_carry_it() {
+        assert!(!ipv6_enabled_from(None, None));
+        assert!(!ipv6_enabled_from(Some("0\n"), None));
+        assert!(!ipv6_enabled_from(None, Some("0\n")));
     }
 }

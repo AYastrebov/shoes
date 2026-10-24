@@ -46,9 +46,13 @@ excluded address goes through the pre-tunnel gateway, and IPv6 takes the same
 split (`::/1` and `8000::/1`) via the device, with a ULA
 (`fd00:6b76:6e00::2/64`, `ip address add`) put on the device first so the
 kernel accepts the routes and picks a v6 source for them. `Hello` says
-`ipv6`, and the client proxies v6 in its config. The exclusion stays IPv4:
-the gateway read is the IPv4 table, so a v6 proxy address would be
-blackholed, and `Start.exclude` refuses it with that reason.
+`ipv6`, and the client proxies v6 in its config. Whether the host can take
+that address is read once at startup from
+`/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6`: a host that disables
+IPv6 keeps the reject routes, `Hello` omits `ipv6`, and the startup log says
+`IPv6 rejected (disable_ipv6 is set)`. The exclusion stays IPv4: the gateway
+read is the IPv4 table, so a v6 proxy address would be blackholed, and
+`Start.exclude` refuses it with that reason.
 
 The gateway comes from `ip -j route show default`, parsed as JSON. Two rules
 that are not obvious: an entry with no `gateway` is skipped, because a

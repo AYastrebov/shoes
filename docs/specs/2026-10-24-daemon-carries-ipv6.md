@@ -12,13 +12,22 @@ and its design `docs/superpowers/specs/2026-10-24-desktop-ipv6-design.md`.
 
 ## Problem
 
-A v6-only destination is unreachable through the desktop tunnel, and every
-dual-stack destination costs a Happy Eyeballs fallback. The reject was the
-right v1 answer -- leaking v6 to the physical interface is the one thing a
-VPN must not do -- but it is not the end state, and the engine already
-forwards v6: `stack_common.rs` registers `::1/0` and a v6 default route on
-the smoltcp interface. What stood between v6 and the proxy was the host
-configuration this daemon owns.
+A v6-only destination, or a v6 literal, is unreachable through the desktop
+tunnel. The reject was the right v1 answer -- leaking v6 to the physical
+interface is the one thing a VPN must not do -- but it is not the end state,
+and the engine already forwards v6: `stack_common.rs` registers `::1/0` and
+a v6 default route on the smoltcp interface. What stood between v6 and the
+proxy was the host configuration this daemon owns.
+
+What this does not change: a dual-stack name still connects over v4. The
+tunnel's v6 source is a ULA, and RFC 6724 destination selection (rule 5,
+prefer matching label; the default policy table in glibc's `gai.conf` and
+Apple's resolver) ranks a v4 destination above a v6 one whose only candidate
+source is `fc00::/7`. Before this change that connection failed v6 at once
+on the reject route and fell back; now it is v4 first. A source that looked
+global would flip the preference for every dual-stack destination, at the
+price of squatting on a prefix that is someone's; that trade is recorded in
+`ROADMAP.md` and not taken here.
 
 ## Scope
 
@@ -30,11 +39,20 @@ builds; no change to the `v1` protocol package.
 
 ## What changes
 
-1. **`host::carries_ipv6()`** -- `cfg!(any(linux, macos))` -- is the one
-   answer, read by the supervisor when it builds the `Plan` and by
-   `service::capabilities` when it answers `Hello`. One function, so a
-   session whose `Hello` promised v6 while its routes rejected it cannot
-   exist.
+1. **`host::carries_ipv6()`** is the one answer, read by the supervisor
+   when it builds the `Plan`, by `service::capabilities` when it answers
+   `Hello`, and by the `Start` door when it admits a v6 resolver. One
+   function, so a session whose `Hello` promised v6 while its routes
+   rejected it cannot exist. The build answers it on macOS (true) and
+   Windows (false). On Linux it is probed once per process from
+   `/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6`: a hardened host
+   sets both to 1, and the kernel then refuses an address on a device
+   created later (`EACCES` from `addrconf_add_dev`) while still accepting
+   the reject routes -- so that host started fine before and must go on
+   doing so, with v6 rejected and no capability promised. A kernel with no
+   `/proc/sys/net/ipv6` at all answers the same way. Probed once rather
+   than per call so a client told `ipv6` at `Hello` is not refused it at
+   `Start`.
 2. **A ULA on the device**, `fd00:6b76:6e00::2/64` (`kvn` in hex, so a
    capture names its owner), added by the host arm -- `ip address add … dev`
    on Linux, `ifconfig utunN inet6 … prefixlen 64 alias` on macOS -- after
@@ -60,22 +78,34 @@ builds; no change to the `v1` protocol package.
 A failed address add reverts the exclusions already installed and never
 reaches the tunnel routes (`an_address_failure_undoes_the_exclusion_and_stops`).
 `AlreadyExists` on the address means the device already had it -- not ours,
-not recorded, as for a route. Revert continues past a failed address removal
-and reports it with the rest.
+not recorded, as for a route. On Linux `ip` says "File exists" and the arm
+maps it; on macOS `ifconfig … alias` of an address the utun already has
+exits 0 and says nothing (`SIOCAIFADDR_IN6` updates it in place), so the arm
+reads `ifconfig <utun> inet6` first and answers `AlreadyExists` from the
+listing. Revert continues past a failed address removal and reports it with
+the rest. Revert takes the address off after every route rather than in the
+exact reverse of apply; the record keeps routes and addresses as two lists,
+and nothing depends on the exclusions coming off before the address.
 
 ## Testing
 
 `plan.rs`: the carrying order as a whole sequence; revert removes the address
 last; an address failure undoes the exclusion. `state.rs`: a record with
-addresses round-trips; one without loads. `linux/routes.rs` and
-`macos/mod.rs`: the argv of the address commands and the matchers for "not
-there" and "already there". `service.rs`: the capability matches
-`carries_ipv6()`; `exclude` refused on every arm; `dns` refused only where
-not carried, over the real transport. Live, by KVN on its Linux host:
+addresses round-trips; one without loads. `linux/routes.rs`: the argv of
+the address commands and the matchers for "not there" and "already there".
+`linux/mod.rs`: the sysctl decision, both files and their absence.
+`macos/mod.rs`: the argv, the "not there" matcher, and the listing parse
+that finds an address already on the utun (scoped link-local and all).
+`service.rs`: the capability matches `carries_ipv6()`; `exclude` refused on
+every arm; `dns` refused only where not carried, over the real transport,
+and where carried it fails exactly as the same request with a v4 resolver
+does. Live, by KVN on its Linux host:
 `curl -6` exits through the VPS's v6 address with the tunnel up; both route
 tables byte-identical after stop; `kill -9` leaves no v6 route behind.
 
 ## Out of scope
 
-A v6 proxy address. Windows carrying v6. Changing the v4 address, which
-stays the engine's own `10.0.0.2` through `TunConfig`.
+A v6 proxy address. Windows carrying v6. A global-looking v6 source, which
+would make dual-stack destinations prefer the tunnel's v6. Changing the v4
+address, which stays the engine's own `10.0.0.2` through `TunConfig`. The
+first three are in `ROADMAP.md`, "Recorded debt".

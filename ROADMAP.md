@@ -121,6 +121,29 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   #101, which found dropped bytes), and
   `shadow_tls/shadow_tls_server_handler.rs` (`shadow_tls/tests.rs`, #78; a
   probe-matrix row, #102). The rest of the list is quality-plan PR 4.4.
+- **`shoesd` takes no IPv6 proxy address** (2026-10-24, the daemon carries
+  IPv6). `Start.exclude` refuses v6 on every arm because the exclusion
+  route goes through the default gateway and `default_gateway()` reads only
+  the IPv4 table (`ip -j route show default`, `netstat -rn -f inet`, the
+  IPv4 forwarding table on Windows); a v6 proxy address would be blackholed
+  and the session would come up with a proxy it cannot reach. Lifting it
+  touches the gateway read on all three arms, `exclusion_routes`, the
+  `reapply` comparison and the door in `service.rs`. Cost: a proxy reachable
+  only over v6 cannot be used from the desktop.
+- **Windows rejects IPv6** (same change). wintun's configuration path
+  cannot express an IPv6 address (`src/tun/mod.rs`), and a route via a
+  device with no v6 source is worse than a reject. Fixing it touches the
+  wintun adapter setup and the Windows arm's `add_address`/`delete_address`;
+  `carries_ipv6()` then answers true there and nothing else changes. Cost:
+  v6-only destinations are unreachable from Windows; dual-stack ones fall
+  back to v4 at once.
+- **The tunnel's v6 source is a ULA, so dual-stack names go v4** (same
+  change). RFC 6724 rule 5 ranks a v4 destination above a v6 one whose only
+  source is `fc00::/7`, so only v6-only destinations and literals use the
+  tunnel's v6. Flipping that means a source that looks global, which is a
+  prefix that belongs to someone and a change to `host::TUNNEL_IPV6` alone.
+  Cost: a dual-stack site is reached over v4 through the tunnel, which is
+  what happened before, now without the failed v6 attempt first.
 
 ## Table of Contents
 

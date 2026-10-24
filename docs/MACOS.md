@@ -99,7 +99,8 @@ That daemon is `shoesd` (`src/bin/shoesd/`), built with `--features daemon`
 and shipped as its own release artifact. It is a root launchd job serving gRPC
 over a Unix domain socket, and unlike the extension it configures the host: the
 split default route in both families (a ULA on the utun first, through
-`ifconfig … inet6 … alias`, so the v6 halves have a source), a host route per
+`ifconfig … inet6 … alias` after `ifconfig <utun> inet6` has shown it is not
+already there, so the v6 halves have a source), a host route per
 excluded address, and DNS through `SCDynamicStore` -- all reverted on stop,
 and after a crash from a record it writes before each change. Design and decisions:
 [docs/specs/2026-09-04-macos-privileged-daemon.md](specs/2026-09-04-macos-privileged-daemon.md).

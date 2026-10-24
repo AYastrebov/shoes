@@ -134,7 +134,7 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         // send from, and the host would pick the physical interface's global
         // address -- a packet the server cannot answer.
         if plan.carry_ipv6 {
-            self.add_recorded_address(tunnel_address(&plan.interface), state)?;
+            self.add_recorded(tunnel_address(&plan.interface), state)?;
         }
 
         for route in tunnel_routes(&plan.interface, plan.carry_ipv6) {
@@ -216,7 +216,7 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         Ok(changed)
     }
 
-    /// Record the route, then install it.
+    /// Record the item -- a route or an address -- then apply it.
     ///
     /// That order is the whole point of the record: a crash between the two
     /// leaves a route described but not applied, and reverting it is a no-op.
@@ -224,38 +224,20 @@ impl<'a, N: HostNetwork> Session<'a, N> {
     /// with no network.
     ///
     /// One failure is different: `AlreadyExists` means the host had this exact
-    /// route before the session -- a static route of the user's, say. It is
-    /// not ours, so it comes back out of the record before the error goes up;
-    /// otherwise the revert that follows, or a later recovery, would delete a
-    /// route this daemon never created.
-    fn add_recorded(&self, route: Route, state: &mut AppliedState) -> std::io::Result<()> {
-        state.routes.push(route);
+    /// route before the session -- a static route of the user's, say -- or the
+    /// device already had the address. It is not ours, so it comes back out of
+    /// the record before the error goes up; otherwise the revert that follows,
+    /// or a later recovery, would delete something this daemon never created.
+    ///
+    /// One function for both kinds, so the contract has one copy to keep.
+    fn add_recorded<T: Recorded>(&self, item: T, state: &mut AppliedState) -> std::io::Result<()> {
+        T::list(state).push(item);
         state.save(&self.state_path)?;
-        let route = &state.routes[state.routes.len() - 1];
-        if let Err(e) = self.net.add_route(route) {
+        let items = T::list(state);
+        let item = &items[items.len() - 1];
+        if let Err(e) = item.apply(self.net) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                state.routes.pop();
-                state.save(&self.state_path)?;
-            }
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Record the address, then set it -- the same contract as [`Self::add_recorded`],
-    /// including the `AlreadyExists` rule: an address the device already had is
-    /// not ours to remove.
-    fn add_recorded_address(
-        &self,
-        address: InterfaceAddress,
-        state: &mut AppliedState,
-    ) -> std::io::Result<()> {
-        state.addresses.push(address);
-        state.save(&self.state_path)?;
-        let address = &state.addresses[state.addresses.len() - 1];
-        if let Err(e) = self.net.add_address(address) {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                state.addresses.pop();
+                T::list(state).pop();
                 state.save(&self.state_path)?;
             }
             return Err(e);
@@ -284,7 +266,16 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         self.net.flush_dns_cache()
     }
 
-    /// Put everything in `state` back, in reverse order.
+    /// Put everything in `state` back: DNS, then the routes in reverse, then
+    /// the addresses in reverse.
+    ///
+    /// Not the exact reverse of `apply`, which put the address on between the
+    /// exclusions and the tunnel routes. The record keeps routes and addresses
+    /// as two lists, so that interleaving is not known here, and it does not
+    /// need to be: no route depends on the address being gone, and the
+    /// exclusions outliving the address by a few calls costs nothing. Should
+    /// a step ever depend on the address's position, record the order rather
+    /// than infer it.
     ///
     /// Every step is attempted even after one fails; the failures are reported
     /// together at the end.
@@ -307,9 +298,10 @@ impl<'a, N: HostNetwork> Session<'a, N> {
             }
         }
 
-        // Addresses last, because they went on before the routes that use
-        // them. A device that is already gone took them along; the arm treats
-        // that as success, as it does for a route.
+        // Addresses after every route, because the routes that use them went
+        // on later (see above for why not the exact reverse). A device that is
+        // already gone took them along; the arm treats that as success, as it
+        // does for a route.
         for address in state.addresses.iter().rev() {
             if let Err(e) = self.net.delete_address(address) {
                 failures.push(format!("removing {address:?}: {e}"));
@@ -391,6 +383,34 @@ fn tunnel_address(interface: &str) -> InterfaceAddress {
     }
 }
 
+/// Something the record lists and the host applies: which list of
+/// [`AppliedState`] it lives in, and which [`HostNetwork`] call installs it.
+/// What [`Session::add_recorded`] needs to treat a route and an address alike.
+trait Recorded: Sized {
+    fn list(state: &mut AppliedState) -> &mut Vec<Self>;
+    fn apply<N: HostNetwork>(&self, net: &N) -> std::io::Result<()>;
+}
+
+impl Recorded for Route {
+    fn list(state: &mut AppliedState) -> &mut Vec<Self> {
+        &mut state.routes
+    }
+
+    fn apply<N: HostNetwork>(&self, net: &N) -> std::io::Result<()> {
+        net.add_route(self)
+    }
+}
+
+impl Recorded for InterfaceAddress {
+    fn list(state: &mut AppliedState) -> &mut Vec<Self> {
+        &mut state.addresses
+    }
+
+    fn apply<N: HostNetwork>(&self, net: &N) -> std::io::Result<()> {
+        net.add_address(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +482,10 @@ mod tests {
         );
     }
 
-    /// The address is removed last: it went on before the routes that use it.
+    /// The address is removed after every route: the tunnel routes that use
+    /// it went on later. (The exclusions went on earlier and come off earlier
+    /// too; `revert` says why that is not the exact reverse and why it does
+    /// not matter.)
     #[test]
     fn revert_removes_the_address_after_the_routes() {
         let dir = tempfile::tempdir().unwrap();
@@ -472,14 +495,10 @@ mod tests {
 
         session.revert(&applied).expect("a clean revert");
 
-        let undo: Vec<&Step> = net
-            .steps()
+        let steps = net.steps();
+        let undo: Vec<&Step> = steps
             .iter()
             .filter(|s| matches!(s, Step::DeleteRoute(_) | Step::DeleteAddress(_)))
-            .cloned()
-            .collect::<Vec<_>>()
-            .leak()
-            .iter()
             .collect();
         assert_eq!(
             undo.last(),
@@ -621,17 +640,13 @@ mod tests {
             .apply(&plan())
             .expect_err("a DNS failure must fail the start");
 
-        let deleted: Vec<&Route> = net
-            .steps()
+        let steps = net.steps();
+        let deleted: Vec<&Route> = steps
             .iter()
             .filter_map(|step| match step {
                 Step::DeleteRoute(route) => Some(route),
                 _ => None,
             })
-            .cloned()
-            .collect::<Vec<_>>()
-            .leak()
-            .iter()
             .collect();
         assert_eq!(deleted.len(), 5, "every added route comes back off");
 
