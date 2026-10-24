@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## v0.8.1
+
+The desktop daemon carries IPv6 (#108), the agent guidelines are
+reorganised along `agents.md` (#107), and tokio moves to 1.54.1 for
+RUSTSEC-2026-0386. `shoesd` on Linux and macOS routes the v6 halves via the
+tunnel device behind a ULA and says `ipv6` in `Hello`; on Linux it probes
+`disable_ipv6` first, so a host that turns IPv6 off keeps the rejects and
+starts as before, and Windows keeps them by design. No `v1` protocol change:
+a client that does not read the capability sees the `Start` contract it
+had, and one that does may hand the daemon a v6 resolver where v6 is
+carried.
+
+tokio 1.54.1, for RUSTSEC-2026-0386: `AsyncFd::new` took any `AsRawFd`, a
+bare descriptor nobody owned included, and is deprecated in favour of the
+unsafe `AsyncFd::register`, whose contract is that the descriptor stays open
+and the same for the `AsyncFd`'s life. The TPROXY UDP listener is the one
+caller; it moves an owned `socket2::Socket` in, which already met that
+contract, and now says so in a `SAFETY` comment; `Cargo.toml` asks for
+tokio 1.53.3 at least, where that constructor appears. No behaviour change. The
+scheduled audit went red on this on 2026-10-24, and `cargo audit --deny
+warnings` also runs on every push and pull request.
 
 `shoesd` carries IPv6 on Linux and macOS. The two v6 halves (`::/1`,
 `8000::/1`) are routed via the tunnel device instead of being rejected, the

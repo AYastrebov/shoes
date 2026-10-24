@@ -552,7 +552,16 @@ mod linux {
         let mut listeners = Vec::with_capacity(binds.len());
         for bind in binds {
             let listener = crate::socket_util::new_transparent_udp_listener(bind)
-                .and_then(AsyncFd::new)
+                .and_then(|socket| {
+                    // SAFETY: `register` asks that the descriptor stay open,
+                    // and stay the same one, for the `AsyncFd`'s whole life.
+                    // The socket is moved in here and owned by the `AsyncFd`
+                    // until the demux task drops it; nothing else holds or
+                    // closes it, and a `socket2::Socket` never swaps its
+                    // descriptor. (RUSTSEC-2026-0386 is about `new` accepting
+                    // a bare `RawFd` nobody owns, which this is not.)
+                    unsafe { AsyncFd::register(socket) }.map_err(std::io::Error::from)
+                })
                 .map_err(|e| {
                     std::io::Error::new(e.kind(), format!("tproxy listener at {bind}: {e}"))
                 })?;

@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -194,7 +194,11 @@ shake = "0.1"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "auto-icmp-echo-reply"] }
 socket2 = "0.6"
 subtle = "2"
-tokio = { version = "1", features = [
+# 1.53.3 is where `AsyncFd::register` appears, the constructor
+# src/tproxy/mod.rs uses since RUSTSEC-2026-0386 deprecated `AsyncFd::new`;
+# a lower floor would let a downstream lockfile resolve a tokio this code
+# does not compile against.
+tokio = { version = "1.53.3", features = [
     "fs",
     "io-util",
     "macros",
