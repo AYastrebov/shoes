@@ -39,6 +39,25 @@ impl HostNetwork for WindowsHost {
         routes::delete(route)
     }
 
+    /// Never reached: [`super::carries_ipv6`] is false here, so the plan asks
+    /// for no address. The refusal is for a future arm that forgets to flip
+    /// both together.
+    fn add_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{address:?}: this arm puts no IPv6 address on the wintun adapter and does not \
+                 carry IPv6"
+            ),
+        ))
+    }
+
+    fn delete_address(&self, _address: &super::InterfaceAddress) -> std::io::Result<()> {
+        // Nothing was ever added, so there is nothing to remove -- and a
+        // revert must not fail over it.
+        Ok(())
+    }
+
     /// The tunnel adapter itself, as on Linux: resolvers go on the tunnel's
     /// own interface, which nothing else on the host writes. The NRPT rule
     /// [`dns::write`] adds alongside is what stops the other interfaces from

@@ -461,6 +461,8 @@ impl<N: HostNetwork> Inner<N> {
             interface: interface.clone(),
             exclude: exclude.clone(),
             dns: dns.clone(),
+            // The same answer `Hello` gives, from the same function.
+            carry_ipv6: crate::host::carries_ipv6(),
         };
         let applied = match self.session().apply(&plan) {
             Ok(applied) => applied,
@@ -874,6 +876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("applied.json");
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: Vec::new(),
             dns: Some(DnsBackup {
@@ -989,6 +992,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("applied.json");
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: Vec::new(),
             dns: Some(DnsBackup {
@@ -1045,6 +1049,7 @@ mod tests {
         let (transitions, _) = broadcast::channel(8);
 
         let applied = AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: vec![Route::net(
                 "0.0.0.0".parse().unwrap(),
@@ -1092,6 +1097,7 @@ mod tests {
         let (transitions, _) = broadcast::channel(8);
 
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: Vec::new(),
             dns: None,
@@ -1132,6 +1138,7 @@ mod tests {
         let (transitions, _) = broadcast::channel(8);
 
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: Vec::new(),
             dns: None,
@@ -1171,6 +1178,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("applied.json");
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: vec![Route::net(
                 "0.0.0.0".parse().unwrap(),

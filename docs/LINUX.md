@@ -42,8 +42,17 @@ calling application's problem: KVN runs `pkexec <bundled path>/shoesd install`.
 
 `ip` by absolute path from a fixed candidate list, never `PATH`. The split
 default (`0.0.0.0/1` and `128.0.0.0/1`) pins to the device, one host route per
-excluded address goes through the pre-tunnel gateway, and IPv6 gets native
-`unreachable` routes rather than the loopback-and-flag shape macOS needs.
+excluded address goes through the pre-tunnel gateway, and IPv6 takes the same
+split (`::/1` and `8000::/1`) via the device, with a ULA
+(`fd00:6b76:6e00::2/64`, `ip address add`) put on the device first so the
+kernel accepts the routes and picks a v6 source for them. `Hello` says
+`ipv6`, and the client proxies v6 in its config. Whether the host can take
+that address is read once at startup from
+`/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6`: a host that disables
+IPv6 keeps the reject routes, `Hello` omits `ipv6`, and the startup log says
+`IPv6 rejected (disable_ipv6 is set)`. The exclusion stays IPv4: the gateway
+read is the IPv4 table, so a v6 proxy address would be blackholed, and
+`Start.exclude` refuses it with that reason.
 
 The gateway comes from `ip -j route show default`, parsed as JSON. Two rules
 that are not obvious: an entry with no `gateway` is skipped, because a
@@ -163,7 +172,9 @@ with it, unaided.
 
 What survives, and therefore what `AppliedState` exists for here: the exclusion
 host routes, which hang off the physical interface, and the direct backend's
-`/etc/resolv.conf`.
+`/etc/resolv.conf`. The tunnel's own v6 routes and its ULA go with the device,
+like the v4 ones; the record carries the address anyway, and removing an
+address from a device that is gone is treated as done.
 
 ## Release artifacts
 
@@ -185,4 +196,5 @@ sockets and there is no `SO_MARK` in the tree; the exclusion host route is
 sufficient. No `bind_interface` in the daemon: `SO_BINDTODEVICE` *is* supported
 on Linux and would remove the exclusion route entirely, but it lives in the
 config's outbound section and the daemon's contract is that it rewrites the TUN
-section and nothing else. No IPv6 inside the tunnel.
+section and nothing else. No IPv6 *proxy address*: `exclude` is IPv4-only
+until the gateway read covers the v6 table.

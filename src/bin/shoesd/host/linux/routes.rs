@@ -90,6 +90,63 @@ impl Routes {
     }
 }
 
+impl Routes {
+    /// `ip address add <addr>/<prefix> dev <device>`. "File exists" is reported
+    /// as `AlreadyExists`, so the plan knows the address was not ours.
+    pub fn add_address(&self, address: &crate::host::InterfaceAddress) -> std::io::Result<()> {
+        match run(&self.program, &address_args("add", address)) {
+            Ok(()) => Ok(()),
+            Err(e) if is_existing_address(&e.to_string()) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                e.to_string(),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `ip address del …`. An address that is not there is success -- and only
+    /// that -- for the reason [`Routes::delete`] gives; here the usual way it
+    /// is not there is that the device it was on is gone.
+    pub fn delete_address(&self, address: &crate::host::InterfaceAddress) -> std::io::Result<()> {
+        match run(&self.program, &address_args("del", address)) {
+            Ok(()) => Ok(()),
+            Err(e) if is_absent_address(&e.to_string()) => {
+                log::debug!("{address:?} was already gone");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The argv for `ip address add`/`ip address del`. The family is inferred
+/// from the literal, as it is for routes.
+fn address_args(verb: &str, address: &crate::host::InterfaceAddress) -> Vec<String> {
+    vec![
+        "address".to_string(),
+        verb.to_string(),
+        format!("{}/{}", address.address, address.prefix),
+        "dev".to_string(),
+        address.interface.clone(),
+    ]
+}
+
+/// `EEXIST`, as `ip` reports it under `LC_ALL=C`.
+fn is_existing_address(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("rtnetlink answers: file exists")
+}
+
+/// `EADDRNOTAVAIL` for a deletion: the address is not on the device, or the
+/// device is gone. `ip` says "Cannot find device" for the second; both mean
+/// there is nothing left to remove.
+fn is_absent_address(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rtnetlink answers: cannot assign requested address")
+        || message.contains("cannot find device")
+}
+
 /// The first candidate that exists.
 ///
 /// Separate from [`Routes::locate`] so the ordering is asserted against a
@@ -669,5 +726,47 @@ mod tests {
 
         let missing = dir.path().join("nothing");
         assert!(locate_among(&[missing]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+    use crate::host::InterfaceAddress;
+
+    fn ula() -> InterfaceAddress {
+        InterfaceAddress {
+            interface: "shoesd".into(),
+            address: "fd00:6b76:6e00::2".parse().unwrap(),
+            prefix: 64,
+        }
+    }
+
+    /// The shape of the one address command this daemon runs as root.
+    #[test]
+    fn the_address_goes_on_and_off_the_device_by_name() {
+        assert_eq!(
+            address_args("add", &ula()),
+            ["address", "add", "fd00:6b76:6e00::2/64", "dev", "shoesd"]
+        );
+        assert_eq!(
+            address_args("del", &ula()),
+            ["address", "del", "fd00:6b76:6e00::2/64", "dev", "shoesd"]
+        );
+    }
+
+    #[test]
+    fn only_the_kernels_own_words_count_as_absent_or_existing() {
+        assert!(is_absent_address(
+            "ip failed (exit status: 2): RTNETLINK answers: Cannot assign requested address"
+        ));
+        assert!(is_absent_address("Cannot find device \"shoesd\""));
+        assert!(!is_absent_address(
+            "RTNETLINK answers: Operation not permitted"
+        ));
+        assert!(is_existing_address("RTNETLINK answers: File exists"));
+        assert!(!is_existing_address(
+            "RTNETLINK answers: Operation not permitted"
+        ));
     }
 }

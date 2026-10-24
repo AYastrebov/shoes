@@ -39,9 +39,11 @@ message HelloReply {
   uint32 protocol = 1;
   string daemon_version = 2;
   string engine_version = 3;
-  // What this build can actually do to the host: "routes", "dns". A platform
-  // whose arm is unimplemented omits the capability rather than failing at
-  // Start, so a GUI asks instead of inferring from the operating system.
+  // What this build can actually do to the host: "routes", "dns", and "ipv6"
+  // where IPv6 is routed into the tunnel rather than rejected (a GUI then
+  // generates a config that proxies v6). A platform whose arm is
+  // unimplemented omits the capability rather than failing at Start, so a GUI
+  // asks instead of inferring from the operating system.
   repeated string capabilities = 4;
 }
 
@@ -68,18 +70,22 @@ message StartRequest {
   // pre-tunnel default gateway; without them the proxy's own connection
   // routes into the tunnel it is carrying.
   //
-  // IPv4 only in v1, and an IPv6 address here is INVALID_ARGUMENT rather than
-  // silently ignored: the daemon rejects ::/1 and 8000::/1, so a v6 exclusion
-  // would be unreachable behind a session that otherwise looked healthy.
+  // IPv4 only, whatever the capabilities say, and an IPv6 address here is
+  // INVALID_ARGUMENT rather than silently ignored: the host route goes via
+  // the pre-tunnel default gateway, and gateway discovery reads only the
+  // IPv4 table. A client resolves the proxy to an IPv4 literal; a proxy
+  // reachable over v6 alone is not supported in this protocol version.
   repeated string exclude = 2;
   // Resolvers to advertise to the host. Inside the tunnel by design.
   //
-  // IPv4 only in v1, and an IPv6 address here is INVALID_ARGUMENT. Advertising
-  // an address does not exempt it from routing: the host still sends queries to
-  // it, and the daemon rejects ::/1 and 8000::/1 for the life of the session --
-  // so a v6 resolver means every lookup fails while the session reports
-  // RUNNING, which reads to a user as a broken internet rather than a broken
-  // proxy.
+  // An IPv6 resolver is accepted only when HelloReply.capabilities lists
+  // "ipv6", and is INVALID_ARGUMENT otherwise. Advertising an address does
+  // not exempt it from routing: the host still sends queries to it, and a
+  // daemon without the capability rejects ::/1 and 8000::/1 for the life of
+  // the session -- so a v6 resolver there would mean every lookup fails
+  // while the session reports RUNNING, which reads to a user as a broken
+  // internet rather than a broken proxy. With the capability the two halves
+  // are routed into the tunnel and the resolver is reachable through it.
   repeated string dns = 3;
 }
 

@@ -68,9 +68,27 @@ fn capabilities(extra: Vec<String>) -> Vec<String> {
     } else {
         Vec::new()
     };
+    // From the one function the supervisor also reads, so what the client is
+    // told and what the routes do cannot differ.
+    if crate::host::carries_ipv6() {
+        capabilities.push(CAPABILITY_IPV6.to_string());
+    }
     capabilities.extend(extra);
     capabilities
 }
+
+/// The capability that says IPv6 goes into the tunnel rather than being
+/// rejected; a client generates a config that proxies v6 when it sees it.
+const CAPABILITY_IPV6: &str = "ipv6";
+
+/// Why `exclude` never takes IPv6, carried or not.
+const EXCLUDE_STAYS_IPV4: &str = "the proxy's own address is reached over IPv4: its exclusion route \
+                                  goes through the IPv4 default gateway, which is the one this daemon \
+                                  reads";
+
+/// Why `dns` refuses IPv6 where the routes reject it.
+const DNS_BEHIND_REJECTS: &str = "this daemon rejects IPv6 at the routing table, so a v6 resolver \
+                                  would be unreachable while the session reported RUNNING";
 
 #[tonic::async_trait]
 impl Daemon for DaemonService {
@@ -103,9 +121,14 @@ impl Daemon for DaemonService {
         // A name is refused rather than resolved -- that lookup's answer would
         // decide what bypasses the tunnel.
         let exclude = parse_addresses(&request.exclude, "exclude")?;
-        refuse_ipv6(&exclude, "exclude")?;
+        refuse_ipv6(&exclude, "exclude", EXCLUDE_STAYS_IPV4)?;
         let dns = parse_addresses(&request.dns, "dns")?;
-        refuse_ipv6(&dns, "dns")?;
+        // From the function the plan is built from, not from the capability
+        // list: that list also carries what `main` learned at startup, and a
+        // string in it is a weaker guarantee than the one reading.
+        if !crate::host::carries_ipv6() {
+            refuse_ipv6(&dns, "dns", DNS_BEHIND_REJECTS)?;
+        }
 
         let supervisor = self.supervisor.clone();
         let result =
@@ -358,28 +381,25 @@ fn parse_addresses(values: &[String], field: &str) -> Result<Vec<IpAddr>, Status
 
 /// Refuse an IPv6 address where the daemon cannot carry one.
 ///
-/// v1 has no IPv6 inside the tunnel and installs `::/1` and `8000::/1` as
-/// reject routes, so *every* v6 destination is unreachable for the life of the
-/// session. That applies to both fields this guards, and the second was missed
-/// on the first pass:
+/// Two fields, two reasons, one shape.
 ///
-/// - An excluded v6 address would need a v6 gateway to escape past those
-///   rejects, and the gateway lookup reads `netstat -rn -f inet` -- so it
-///   would be blackholed instead, and the session would come up with a proxy
-///   it cannot reach.
-/// - A v6 *resolver* is worse. Advertising it through `SCDynamicStore` does
-///   not exempt it from routing: the host still has to send queries to that
-///   address, and the reject route answers them. The session reports RUNNING
-///   while every lookup fails, which reads to a user as a broken internet
-///   rather than a broken proxy.
+/// - `exclude` never takes IPv6, carried or not: an excluded address needs a
+///   host route through the pre-tunnel default gateway, and the gateway
+///   lookup reads the IPv4 table (`netstat -rn -f inet`, `ip route show
+///   default`). A v6 address would be blackholed instead, and the session
+///   would come up with a proxy it cannot reach. Clients resolve the proxy
+///   preferring A records for this reason.
+/// - `dns` takes IPv6 only where the arm carries it. Behind reject routes a
+///   v6 resolver is unreachable, and advertising it does not exempt it from
+///   routing: the host still sends queries to that address and the reject
+///   answers them. The session reports RUNNING while every lookup fails,
+///   which reads to a user as a broken internet rather than a broken proxy.
 ///
-/// Refusing at the door is the honest answer until v6 is carried.
-fn refuse_ipv6(addresses: &[IpAddr], field: &str) -> Result<(), Status> {
+/// Refusing at the door, with the reason, is the honest answer in both cases.
+fn refuse_ipv6(addresses: &[IpAddr], field: &str, why: &str) -> Result<(), Status> {
     if let Some(address) = addresses.iter().find(|address| address.is_ipv6()) {
         return Err(Status::invalid_argument(format!(
-            "{field}: {address} is IPv6, which this daemon does not carry in v1 -- \
-             it installs ::/1 and 8000::/1 as reject routes, so an excluded v6 \
-             address would be unreachable rather than bypassed"
+            "{field}: {address} is IPv6, which this field does not take -- {why}"
         )));
     }
     Ok(())
@@ -653,8 +673,12 @@ mod tests {
     /// nothing.
     #[test]
     fn an_ipv6_exclusion_is_refused_rather_than_blackholed() {
-        let status = refuse_ipv6(&["2001:db8::1".parse().unwrap()], "exclude")
-            .expect_err("v6 is not carried in v1");
+        let status = refuse_ipv6(
+            &["2001:db8::1".parse().unwrap()],
+            "exclude",
+            EXCLUDE_STAYS_IPV4,
+        )
+        .expect_err("the proxy stays on IPv4");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
             status.message().contains("2001:db8::1"),
@@ -662,7 +686,26 @@ mod tests {
             status.message()
         );
 
-        refuse_ipv6(&["203.0.113.7".parse().unwrap()], "exclude").expect("v4 is fine");
+        refuse_ipv6(
+            &["203.0.113.7".parse().unwrap()],
+            "exclude",
+            EXCLUDE_STAYS_IPV4,
+        )
+        .expect("v4 is fine");
+    }
+
+    /// What the client branches on. Read from the same function the
+    /// supervisor builds its plan from, so it is true by construction on
+    /// every platform -- and asserted here so a refactor that splits the two
+    /// is caught.
+    #[test]
+    fn the_ipv6_capability_says_exactly_what_the_routes_will_do() {
+        let caps = capabilities(Vec::new());
+        assert_eq!(
+            caps.contains(&CAPABILITY_IPV6.to_string()),
+            crate::host::carries_ipv6(),
+            "{caps:?}"
+        );
     }
 
     /// A v6 resolver is refused for the same reason, which this test used to
@@ -675,7 +718,7 @@ mod tests {
     /// with every lookup failing.
     #[test]
     fn a_v6_resolver_is_refused_too() {
-        let status = refuse_ipv6(&["2001:db8::1".parse().unwrap()], "dns")
+        let status = refuse_ipv6(&["2001:db8::1".parse().unwrap()], "dns", DNS_BEHIND_REJECTS)
             .expect_err("a resolver behind a reject route is unreachable");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
@@ -684,7 +727,8 @@ mod tests {
             status.message()
         );
 
-        refuse_ipv6(&["1.1.1.1".parse().unwrap()], "dns").expect("v4 resolvers are fine");
+        refuse_ipv6(&["1.1.1.1".parse().unwrap()], "dns", DNS_BEHIND_REJECTS)
+            .expect("v4 resolvers are fine");
     }
 
     #[test]
@@ -1044,37 +1088,66 @@ mod tests {
     /// The unit tests above call `refuse_ipv6` directly, which says nothing
     /// about whether `Start` actually calls it -- deleting either call site
     /// left them all green. This drives the request a client would send.
+    ///
+    /// `exclude` is refused on every arm. `dns` is refused only where the arm
+    /// rejects v6 at the routing table; where it carries v6 the request passes
+    /// the door and fails later, on its empty config, with an error that says
+    /// nothing about IPv6 -- which is the assertion on a carrying arm.
     #[tokio::test(flavor = "multi_thread")]
     async fn start_refuses_ipv6_in_either_field() {
         let (mut client, shutdown) = serve_admitting_me().await;
 
-        for (field, request) in [
-            (
-                "exclude",
-                proto::StartRequest {
-                    yaml: "---\n[]\n".into(),
-                    exclude: vec!["2001:db8::1".into()],
-                    dns: vec![],
-                },
-            ),
-            (
-                "dns",
-                proto::StartRequest {
-                    yaml: "---\n[]\n".into(),
-                    exclude: vec![],
-                    dns: vec!["2001:db8::1".into()],
-                },
-            ),
-        ] {
-            let status = client.start(request).await.unwrap_err_or_else_panic(field);
+        let exclude = proto::StartRequest {
+            yaml: "---\n[]\n".into(),
+            exclude: vec!["2001:db8::1".into()],
+            dns: vec![],
+        };
+        let status = client
+            .start(exclude)
+            .await
+            .unwrap_err_or_else_panic("exclude");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "exclude must be refused before anything is applied"
+        );
+        assert!(
+            status.message().contains("exclude"),
+            "exclude: the message names the field, got {}",
+            status.message()
+        );
+
+        let dns = proto::StartRequest {
+            yaml: "---\n[]\n".into(),
+            exclude: vec![],
+            dns: vec!["2001:db8::1".into()],
+        };
+        let status = client.start(dns).await.unwrap_err_or_else_panic("dns");
+        if crate::host::carries_ipv6() {
+            // A carrying arm takes the v6 resolver, so the request fails on
+            // its empty config -- which is also an InvalidArgument. The
+            // control is the same request with a v4 resolver: the two must
+            // fail identically, or the resolver's family changed the outcome.
+            let control = proto::StartRequest {
+                yaml: "---\n[]\n".into(),
+                exclude: vec![],
+                dns: vec!["10.0.0.1".into()],
+            };
+            let expected = client
+                .start(control)
+                .await
+                .unwrap_err_or_else_panic("the v4 control");
+            assert_eq!(status.code(), expected.code());
             assert_eq!(
-                status.code(),
-                tonic::Code::InvalidArgument,
-                "{field} must be refused before anything is applied"
+                status.message(),
+                expected.message(),
+                "a carrying arm must fail a v6 resolver exactly as it fails a v4 one"
             );
+        } else {
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
             assert!(
-                status.message().contains(field),
-                "{field}: the message names the field, got {}",
+                status.message().contains("dns"),
+                "dns: the message names the field, got {}",
                 status.message()
             );
         }

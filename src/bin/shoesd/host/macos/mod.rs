@@ -28,6 +28,7 @@ use super::{Destination, DnsState, HostNetwork, Route, Via};
 /// rule already protects. Naming the paths costs nothing and removes the
 /// question.
 const ROUTE: &str = "/sbin/route";
+const IFCONFIG: &str = "/sbin/ifconfig";
 const NETSTAT: &str = "/usr/sbin/netstat";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
@@ -78,6 +79,45 @@ impl HostNetwork for MacosHost {
             Ok(()) => Ok(()),
             Err(e) if is_absent_route(&e.to_string()) => {
                 log::debug!("{route:?} was already gone");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn add_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        // Looked up before it is added, because `ifconfig … alias` of an
+        // address the interface already has exits 0: `SIOCAIFADDR_IN6` updates
+        // the existing entry in place and prints nothing. Linux's `ip` says
+        // "File exists" and the arm turns that into `AlreadyExists`; here
+        // there is no such text to turn, and without this read an address
+        // someone else put on the utun would be recorded as ours and removed
+        // on revert -- the exact thing `AlreadyExists` exists to prevent.
+        let family = if address.address.is_ipv6() {
+            "inet6"
+        } else {
+            "inet"
+        };
+        let listing = run_capturing(IFCONFIG, &[address.interface.as_str(), family])?;
+        if lists_address(&listing, address.address) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already has {}/{}",
+                    address.interface, address.address, address.prefix
+                ),
+            ));
+        }
+        run(IFCONFIG, &address_args("alias", address))
+    }
+
+    fn delete_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        // Not there is success -- and only that -- as for a route; the usual
+        // way it is not there is that the utun it was on is gone.
+        match run(IFCONFIG, &address_args("-alias", address)) {
+            Ok(()) => Ok(()),
+            Err(e) if is_absent_address(&e.to_string()) => {
+                log::debug!("{address:?} was already gone");
                 Ok(())
             }
             Err(e) => Err(e),
@@ -173,6 +213,53 @@ fn route_args(verb: &str, route: &Route) -> Vec<String> {
     }
 
     args
+}
+
+/// The argv for `ifconfig <utun> inet6 <addr> prefixlen <n> alias|-alias`.
+///
+/// Pure, for the same reason [`route_args`] is: what runs as root is asserted
+/// in a test rather than discovered on a live machine.
+fn address_args(verb: &str, address: &super::InterfaceAddress) -> Vec<String> {
+    vec![
+        address.interface.clone(),
+        if address.address.is_ipv6() {
+            "inet6"
+        } else {
+            "inet"
+        }
+        .to_string(),
+        address.address.to_string(),
+        "prefixlen".to_string(),
+        address.prefix.to_string(),
+        verb.to_string(),
+    ]
+}
+
+/// Whether `ifconfig <interface> <family>` output lists `address`.
+///
+/// An address row is `inet6 <addr>[%scope] prefixlen <n> …`, and the link-local
+/// row carries a `%utunN` scope suffix that the parse has to drop. Everything
+/// else -- the flags line, `nd6 options`, `inet` rows when asked for `inet6` --
+/// fails the parse and is skipped.
+fn lists_address(listing: &str, address: IpAddr) -> bool {
+    listing.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let family = fields.next();
+        let candidate = fields.next();
+        matches!(family, Some("inet" | "inet6"))
+            && candidate
+                .and_then(|c| c.split('%').next())
+                .and_then(|c| c.parse::<IpAddr>().ok())
+                .is_some_and(|c| c == address)
+    })
+}
+
+/// What `ifconfig` says when the address, or the interface, is not there.
+fn is_absent_address(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("can't assign requested address")
+        || message.contains("does not exist")
+        || message.contains("no such interface")
 }
 
 /// The default gateway from `netstat -rn` output.
@@ -451,5 +538,91 @@ Destination        Gateway            Flags               Netif Expire
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    fn ula() -> crate::host::InterfaceAddress {
+        crate::host::InterfaceAddress {
+            interface: "utun4".into(),
+            address: "fd00:6b76:6e00::2".parse().unwrap(),
+            prefix: 64,
+        }
+    }
+
+    #[test]
+    fn the_v6_address_is_an_inet6_alias_on_the_utun() {
+        assert_eq!(
+            address_args("alias", &ula()),
+            [
+                "utun4",
+                "inet6",
+                "fd00:6b76:6e00::2",
+                "prefixlen",
+                "64",
+                "alias"
+            ]
+        );
+        assert_eq!(
+            address_args("-alias", &ula()),
+            [
+                "utun4",
+                "inet6",
+                "fd00:6b76:6e00::2",
+                "prefixlen",
+                "64",
+                "-alias"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_ifconfigs_own_words_count_as_absent() {
+        assert!(is_absent_address(
+            "ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address"
+        ));
+        assert!(is_absent_address(
+            "ifconfig: interface utun4 does not exist"
+        ));
+        assert!(!is_absent_address(
+            "ifconfig: ioctl (SIOCAIFADDR): Operation not permitted"
+        ));
+    }
+
+    /// The shape of `ifconfig utun4 inet6` on a utun that already carries the
+    /// ULA: a flags line, a scoped link-local, the ULA, and the `nd6` line.
+    /// `alias` on this interface would exit 0 and say nothing, so this listing
+    /// is the only way to learn the address was there before the session.
+    const UTUN_WITH_THE_ULA: &str = "\
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+\tinet6 fe80::ce81:b1c:bd2c:69e%utun4 prefixlen 64 scopeid 0x17
+\tinet6 fd00:6b76:6e00::2 prefixlen 64
+\tnd6 options=201<PERFORMNUD,DAD>
+";
+
+    #[test]
+    fn an_address_already_on_the_utun_is_found_in_the_listing() {
+        assert!(lists_address(UTUN_WITH_THE_ULA, ula().address));
+    }
+
+    /// A fresh utun lists only its link-local, whose `%utun4` scope must not
+    /// make the row unparseable -- or every listing would read as "absent"
+    /// and the check would never fire.
+    #[test]
+    fn a_fresh_utun_does_not_list_it() {
+        let fresh = "\
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+\tinet6 fe80::ce81:b1c:bd2c:69e%utun4 prefixlen 64 scopeid 0x17
+\tnd6 options=201<PERFORMNUD,DAD>
+";
+        assert!(!lists_address(fresh, ula().address));
+        assert!(
+            lists_address(fresh, "fe80::ce81:b1c:bd2c:69e".parse().unwrap()),
+            "the scoped link-local row parses, scope dropped"
+        );
+        assert!(!lists_address("", ula().address));
     }
 }
