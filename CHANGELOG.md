@@ -17,7 +17,8 @@ bare descriptor nobody owned included, and is deprecated in favour of the
 unsafe `AsyncFd::register`, whose contract is that the descriptor stays open
 and the same for the `AsyncFd`'s life. The TPROXY UDP listener is the one
 caller; it moves an owned `socket2::Socket` in, which already met that
-contract, and now says so in a `SAFETY` comment. No behaviour change. The
+contract, and now says so in a `SAFETY` comment; `Cargo.toml` asks for
+tokio 1.53.3 at least, where that constructor appears. No behaviour change. The
 scheduled audit went red on this on 2026-10-24, and `cargo audit --deny
 warnings` also runs on every push and pull request.
 
