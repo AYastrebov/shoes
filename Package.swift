@@ -20,8 +20,8 @@ import PackageDescription
 // which builds the zip, computes the checksum, commits this file and only
 // then tags -- so the tag points at a manifest that names its own release.
 // A checksum of all zeros means no release has published this manifest yet.
-let shoesRelease = "v0.8.0"
-let shoesChecksum = "6c386936d9dc4dc324a0ef6893bd89d6153b3c86c6bb3a1bf01f2bc234472e8f"
+let shoesRelease = "v0.8.1"
+let shoesChecksum = "9e27659fc415936c7547581c5c8857e625b75f0591e94f5a02164e5e4923e89c"
 
 let shoesFFI: Target =
     ProcessInfo.processInfo.environment["SHOES_LOCAL_XCFRAMEWORK"] != nil
