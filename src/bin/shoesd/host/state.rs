@@ -18,7 +18,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DnsState, Route};
+use super::{DnsState, InterfaceAddress, Route};
 
 /// What was applied, in the order it was applied.
 ///
@@ -33,6 +33,11 @@ pub struct AppliedState {
     /// Routes, in application order.
     #[serde(default)]
     pub routes: Vec<Route>,
+
+    /// Addresses put on the tunnel device, in application order. Absent from
+    /// records written before the daemon carried IPv6, which load as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<InterfaceAddress>,
 
     /// What DNS looked like before, and where to put it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,7 +67,7 @@ pub struct DnsBackup {
 impl AppliedState {
     /// Whether there is anything to undo.
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty() && self.dns.is_none()
+        self.routes.is_empty() && self.addresses.is_empty() && self.dns.is_none()
     }
 
     /// Write the record, atomically.
@@ -154,6 +159,7 @@ mod tests {
 
     fn populated() -> AppliedState {
         AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".to_string()),
             routes: vec![
                 route_for_test("0.0.0.0", 1, Via::Interface("utun4".into())),

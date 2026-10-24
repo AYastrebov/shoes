@@ -21,7 +21,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use super::state::{AppliedState, DnsBackup};
-use super::{Destination, DnsState, HostNetwork, Route, Via};
+use super::{
+    Destination, DnsState, HostNetwork, InterfaceAddress, Route, TUNNEL_IPV6, TUNNEL_IPV6_PREFIX,
+    Via,
+};
 
 /// What a session wants done to the host.
 #[derive(Debug, Clone)]
@@ -34,6 +37,11 @@ pub struct Plan {
     pub exclude: Vec<IpAddr>,
     /// Resolvers to advertise. Empty leaves the host's DNS alone.
     pub dns: Vec<IpAddr>,
+    /// Whether IPv6 goes into the tunnel -- a ULA on the device and the two
+    /// v6 halves routed via it -- or is rejected at the routing table. The
+    /// supervisor answers it from [`super::carries_ipv6`], the same function
+    /// `Hello` reports from.
+    pub carry_ipv6: bool,
 }
 
 /// Applies a [`Plan`] and can undo it.
@@ -66,8 +74,9 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         }
 
         log::warn!(
-            "a previous session left {} route(s){} applied; undoing them",
+            "a previous session left {} route(s), {} address(es){} applied; undoing them",
             state.routes.len(),
+            state.addresses.len(),
             if state.dns.is_some() {
                 " and a DNS override"
             } else {
@@ -120,7 +129,15 @@ impl<'a, N: HostNetwork> Session<'a, N> {
             self.add_recorded(route, state)?;
         }
 
-        for route in tunnel_routes(&plan.interface) {
+        // The address before the routes that need it: a v6 route via a device
+        // with no v6 address is accepted by the kernel but has no source to
+        // send from, and the host would pick the physical interface's global
+        // address -- a packet the server cannot answer.
+        if plan.carry_ipv6 {
+            self.add_recorded_address(tunnel_address(&plan.interface), state)?;
+        }
+
+        for route in tunnel_routes(&plan.interface, plan.carry_ipv6) {
             self.add_recorded(route, state)?;
         }
 
@@ -225,6 +242,27 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         Ok(())
     }
 
+    /// Record the address, then set it -- the same contract as [`Self::add_recorded`],
+    /// including the `AlreadyExists` rule: an address the device already had is
+    /// not ours to remove.
+    fn add_recorded_address(
+        &self,
+        address: InterfaceAddress,
+        state: &mut AppliedState,
+    ) -> std::io::Result<()> {
+        state.addresses.push(address);
+        state.save(&self.state_path)?;
+        let address = &state.addresses[state.addresses.len() - 1];
+        if let Err(e) = self.net.add_address(address) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                state.addresses.pop();
+                state.save(&self.state_path)?;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn apply_dns(
         &self,
         interface: &str,
@@ -266,6 +304,15 @@ impl<'a, N: HostNetwork> Session<'a, N> {
         for route in state.routes.iter().rev() {
             if let Err(e) = self.net.delete_route(route) {
                 failures.push(format!("removing {route:?}: {e}"));
+            }
+        }
+
+        // Addresses last, because they went on before the routes that use
+        // them. A device that is already gone took them along; the arm treats
+        // that as success, as it does for a route.
+        for address in state.addresses.iter().rev() {
+            if let Err(e) = self.net.delete_address(address) {
+                failures.push(format!("removing {address:?}: {e}"));
             }
         }
 
@@ -314,23 +361,34 @@ fn is_exclusion(route: &Route, exclude: &[IpAddr]) -> bool {
 /// is still in the table for exclusions to point at, and a crash leaves it
 /// exactly as it was.
 ///
-/// The v6 halves are rejects. v1 does not carry IPv6, and the alternatives are
-/// worse: leaving it alone leaks every v6 connection to the physical
-/// interface, and blackholing makes each one wait out a timeout before Happy
-/// Eyeballs falls back to v4. A reject fails immediately, so the fallback is
-/// immediate too.
-fn tunnel_routes(interface: &str) -> Vec<Route> {
+/// The v6 halves take the same shape via the device where the arm carries v6
+/// (`carry_ipv6`), and are rejects where it does not. The alternatives to a
+/// reject are worse: leaving v6 alone leaks every v6 connection to the
+/// physical interface, and blackholing makes each one wait out a timeout
+/// before Happy Eyeballs falls back to v4. A reject fails immediately, so the
+/// fallback is immediate too.
+fn tunnel_routes(interface: &str, carry_ipv6: bool) -> Vec<Route> {
     let via = Via::Interface(interface.to_string());
+    let via6 = if carry_ipv6 { via.clone() } else { Via::Reject };
     vec![
         Route::net(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1, via.clone()),
         Route::net(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, via),
-        Route::net(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, Via::Reject),
+        Route::net(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, via6.clone()),
         Route::net(
             IpAddr::V6(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)),
             1,
-            Via::Reject,
+            via6,
         ),
     ]
+}
+
+/// The device's IPv6 address, where v6 is carried. See [`TUNNEL_IPV6`].
+fn tunnel_address(interface: &str) -> InterfaceAddress {
+    InterfaceAddress {
+        interface: interface.to_string(),
+        address: IpAddr::V6(TUNNEL_IPV6),
+        prefix: TUNNEL_IPV6_PREFIX,
+    }
 }
 
 #[cfg(test)]
@@ -347,7 +405,113 @@ mod tests {
             interface: "utun4".to_string(),
             exclude: vec![ip("203.0.113.7")],
             dns: vec![ip("10.0.0.1")],
+            carry_ipv6: false,
         }
+    }
+
+    fn carrying() -> Plan {
+        Plan {
+            carry_ipv6: true,
+            ..plan()
+        }
+    }
+
+    fn ula() -> InterfaceAddress {
+        tunnel_address("utun4")
+    }
+
+    /// With v6 carried, the device gets its address after the exclusions and
+    /// before any tunnel route, and the v6 halves go via the device instead of
+    /// being rejected. Asserted as a sequence for the same reason the v4 order
+    /// is: a reordering looks harmless and is not -- a v6 route via a device
+    /// with no v6 address sends packets from the physical interface's address.
+    #[test]
+    fn carrying_ipv6_addresses_the_device_before_routing_v6_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+
+        let applied = session.apply(&carrying()).expect("every step succeeds");
+
+        let via = Via::Interface("utun4".into());
+        assert_eq!(
+            net.steps(),
+            vec![
+                Step::Gateway,
+                Step::AddRoute(Route::host(
+                    ip("203.0.113.7"),
+                    Via::Gateway(ip("192.168.1.1"))
+                )),
+                Step::AddAddress(ula()),
+                Step::AddRoute(Route::net(ip("0.0.0.0"), 1, via.clone())),
+                Step::AddRoute(Route::net(ip("128.0.0.0"), 1, via.clone())),
+                Step::AddRoute(Route::net(ip("::"), 1, via.clone())),
+                Step::AddRoute(Route::net(ip("8000::"), 1, via)),
+                Step::PrimaryService("utun4".into()),
+                Step::ReadDns("primary".into()),
+                Step::WriteDns("primary".into(), vec![ip("10.0.0.1")]),
+                Step::FlushDns,
+            ],
+            "got {:#?}",
+            net.steps()
+        );
+        assert_eq!(
+            applied.addresses,
+            vec![ula()],
+            "the address is in the record"
+        );
+    }
+
+    /// The address is removed last: it went on before the routes that use it.
+    #[test]
+    fn revert_removes_the_address_after_the_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new().with_gateway(Some(ip("192.168.1.1")));
+        let session = Session::new(&net, session_path(&dir));
+        let applied = session.apply(&carrying()).unwrap();
+
+        session.revert(&applied).expect("a clean revert");
+
+        let undo: Vec<&Step> = net
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::DeleteRoute(_) | Step::DeleteAddress(_)))
+            .cloned()
+            .collect::<Vec<_>>()
+            .leak()
+            .iter()
+            .collect();
+        assert_eq!(
+            undo.last(),
+            Some(&&Step::DeleteAddress(ula())),
+            "the address comes off after every route: {undo:#?}"
+        );
+        assert_eq!(undo.len(), 6, "five routes and one address");
+    }
+
+    /// The address step sits between the exclusions and the tunnel routes, so
+    /// its failure has to undo the exclusion and must never reach the routes.
+    #[test]
+    fn an_address_failure_undoes_the_exclusion_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Recorder::new()
+            .with_gateway(Some(ip("192.168.1.1")))
+            .failing_add_address();
+        let session = Session::new(&net, session_path(&dir));
+
+        session.apply(&carrying()).expect_err("the address fails");
+
+        assert_eq!(net.count_added(), 1, "only the exclusion went on");
+        assert_eq!(net.count_deleted(), 1, "and it came back off");
+        assert!(
+            net.steps().contains(&Step::DeleteAddress(ula())),
+            "the recorded address is asked off too, as a route would be: {:#?}",
+            net.steps()
+        );
+        assert!(
+            !net.steps().iter().any(|s| matches!(s, Step::WriteDns(..))),
+            "DNS is never reached"
+        );
     }
 
     fn session_path(dir: &tempfile::TempDir) -> PathBuf {
@@ -553,6 +717,7 @@ mod tests {
         let session = Session::new(&net, session_path(&dir));
 
         let state = AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: vec![
                 Route::net(ip("0.0.0.0"), 1, Via::Interface("utun4".into())),
@@ -589,6 +754,7 @@ mod tests {
         let path = session_path(&dir);
 
         let left_behind = AppliedState {
+            addresses: Vec::new(),
             interface: Some("utun4".into()),
             routes: vec![Route::net(ip("0.0.0.0"), 1, Via::Interface("utun4".into()))],
             dns: Some(DnsBackup {

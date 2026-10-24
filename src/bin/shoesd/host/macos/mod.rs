@@ -28,6 +28,7 @@ use super::{Destination, DnsState, HostNetwork, Route, Via};
 /// rule already protects. Naming the paths costs nothing and removes the
 /// question.
 const ROUTE: &str = "/sbin/route";
+const IFCONFIG: &str = "/sbin/ifconfig";
 const NETSTAT: &str = "/usr/sbin/netstat";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
@@ -78,6 +79,30 @@ impl HostNetwork for MacosHost {
             Ok(()) => Ok(()),
             Err(e) if is_absent_route(&e.to_string()) => {
                 log::debug!("{route:?} was already gone");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn add_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        match run(IFCONFIG, &address_args("alias", address)) {
+            Ok(()) => Ok(()),
+            Err(e) if is_existing_address(&e.to_string()) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                e.to_string(),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn delete_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        // Not there is success -- and only that -- as for a route; the usual
+        // way it is not there is that the utun it was on is gone.
+        match run(IFCONFIG, &address_args("-alias", address)) {
+            Ok(()) => Ok(()),
+            Err(e) if is_absent_address(&e.to_string()) => {
+                log::debug!("{address:?} was already gone");
                 Ok(())
             }
             Err(e) => Err(e),
@@ -173,6 +198,39 @@ fn route_args(verb: &str, route: &Route) -> Vec<String> {
     }
 
     args
+}
+
+/// The argv for `ifconfig <utun> inet6 <addr> prefixlen <n> alias|-alias`.
+///
+/// Pure, for the same reason [`route_args`] is: what runs as root is asserted
+/// in a test rather than discovered on a live machine.
+fn address_args(verb: &str, address: &super::InterfaceAddress) -> Vec<String> {
+    vec![
+        address.interface.clone(),
+        if address.address.is_ipv6() {
+            "inet6"
+        } else {
+            "inet"
+        }
+        .to_string(),
+        address.address.to_string(),
+        "prefixlen".to_string(),
+        address.prefix.to_string(),
+        verb.to_string(),
+    ]
+}
+
+/// What `ifconfig` says when the address is already on the interface.
+fn is_existing_address(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("file exists")
+}
+
+/// What `ifconfig` says when the address, or the interface, is not there.
+fn is_absent_address(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("can't assign requested address")
+        || message.contains("does not exist")
+        || message.contains("no such interface")
 }
 
 /// The default gateway from `netstat -rn` output.
@@ -451,5 +509,60 @@ Destination        Gateway            Flags               Netif Expire
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    fn ula() -> crate::host::InterfaceAddress {
+        crate::host::InterfaceAddress {
+            interface: "utun4".into(),
+            address: "fd00:6b76:6e00::2".parse().unwrap(),
+            prefix: 64,
+        }
+    }
+
+    #[test]
+    fn the_v6_address_is_an_inet6_alias_on_the_utun() {
+        assert_eq!(
+            address_args("alias", &ula()),
+            [
+                "utun4",
+                "inet6",
+                "fd00:6b76:6e00::2",
+                "prefixlen",
+                "64",
+                "alias"
+            ]
+        );
+        assert_eq!(
+            address_args("-alias", &ula()),
+            [
+                "utun4",
+                "inet6",
+                "fd00:6b76:6e00::2",
+                "prefixlen",
+                "64",
+                "-alias"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_ifconfigs_own_words_count_as_absent_or_existing() {
+        assert!(is_absent_address(
+            "ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address"
+        ));
+        assert!(is_absent_address(
+            "ifconfig: interface utun4 does not exist"
+        ));
+        assert!(!is_absent_address(
+            "ifconfig: ioctl (SIOCAIFADDR): Operation not permitted"
+        ));
+        assert!(is_existing_address(
+            "ifconfig: ioctl (SIOCAIFADDR): File exists"
+        ));
     }
 }

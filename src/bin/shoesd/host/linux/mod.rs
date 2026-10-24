@@ -61,6 +61,14 @@ impl HostNetwork for LinuxHost {
         self.routes.delete(route)
     }
 
+    fn add_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        self.routes.add_address(address)
+    }
+
+    fn delete_address(&self, address: &super::InterfaceAddress) -> std::io::Result<()> {
+        self.routes.delete_address(address)
+    }
+
     fn primary_dns_service(&self, interface: &str) -> std::io::Result<String> {
         // The tunnel's own link, not the physical one -- which is what the
         // argument exists for. Our resolvers on `eno1` would be clobbered by

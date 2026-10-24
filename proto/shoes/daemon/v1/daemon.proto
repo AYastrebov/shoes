@@ -39,9 +39,11 @@ message HelloReply {
   uint32 protocol = 1;
   string daemon_version = 2;
   string engine_version = 3;
-  // What this build can actually do to the host: "routes", "dns". A platform
-  // whose arm is unimplemented omits the capability rather than failing at
-  // Start, so a GUI asks instead of inferring from the operating system.
+  // What this build can actually do to the host: "routes", "dns", and "ipv6"
+  // where IPv6 is routed into the tunnel rather than rejected (a GUI then
+  // generates a config that proxies v6). A platform whose arm is
+  // unimplemented omits the capability rather than failing at Start, so a GUI
+  // asks instead of inferring from the operating system.
   repeated string capabilities = 4;
 }
 

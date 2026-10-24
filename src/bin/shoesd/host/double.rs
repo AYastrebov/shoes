@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::net::IpAddr;
 
-use super::{DnsState, HostNetwork, Route};
+use super::{DnsState, HostNetwork, InterfaceAddress, Route};
 
 /// One thing the daemon asked the host to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum Step {
     Gateway,
     AddRoute(Route),
     DeleteRoute(Route),
+    AddAddress(InterfaceAddress),
+    DeleteAddress(InterfaceAddress),
     PrimaryService(String),
     ReadDns(String),
     WriteDns(String, Vec<IpAddr>),
@@ -36,6 +38,7 @@ pub struct Recorder {
     /// host had before the session -- someone else's.
     fail_add_kind: std::io::ErrorKind,
     fail_delete: bool,
+    fail_add_address: bool,
     fail_write_dns: bool,
     /// The live version of `fail_write_dns`, shared so a test can flip it
     /// after the recorder has been moved onto the supervisor thread.
@@ -52,6 +55,7 @@ impl Recorder {
             fail_add_after: None,
             fail_add_kind: std::io::ErrorKind::Other,
             fail_delete: false,
+            fail_add_address: false,
             fail_write_dns: false,
             fail_write_dns_now: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -95,6 +99,13 @@ impl Recorder {
     /// which is what a revert must report rather than swallow.
     pub fn failing_delete_route(mut self) -> Self {
         self.fail_delete = true;
+        self
+    }
+
+    /// Fail the tunnel address, which comes after the exclusions and before
+    /// the tunnel routes -- the step whose failure must undo the exclusions.
+    pub fn failing_add_address(mut self) -> Self {
+        self.fail_add_address = true;
         self
     }
 
@@ -172,6 +183,22 @@ impl HostNetwork for Recorder {
         if self.fail_delete {
             return Err(std::io::Error::other("delete_route refused by the test"));
         }
+        Ok(())
+    }
+
+    fn add_address(&self, address: &InterfaceAddress) -> std::io::Result<()> {
+        if self.fail_add_address {
+            // Not recorded: the host does not have it. As with a refused
+            // route, `apply` still asks for it to be removed, and a real host
+            // answers that with "not there" and success.
+            return Err(std::io::Error::other("add_address refused by the test"));
+        }
+        self.record(Step::AddAddress(address.clone()));
+        Ok(())
+    }
+
+    fn delete_address(&self, address: &InterfaceAddress) -> std::io::Result<()> {
+        self.record(Step::DeleteAddress(address.clone()));
         Ok(())
     }
 

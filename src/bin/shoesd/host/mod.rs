@@ -38,10 +38,39 @@ pub use state::AppliedState;
 #[cfg(test)]
 pub use state::DnsBackup;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// The tunnel device's IPv6 address where the daemon carries v6. A ULA --
+/// `fd00:6b76:6e00::` is `kvn` in hex, so a capture names its owner. It exists
+/// so the kernel accepts the v6 routes and picks a v6 source for them; nothing
+/// listens on it. The v4 counterpart is the engine's own `10.0.0.2`, set
+/// through the TUN config; this one is host policy, like the routes, and is
+/// recorded and reverted like them.
+pub const TUNNEL_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6b76, 0x6e00, 0, 0, 0, 0, 2);
+pub const TUNNEL_IPV6_PREFIX: u8 = 64;
+
+/// Whether this build's host arm can give the device an IPv6 address, and so
+/// route v6 into the tunnel rather than reject it.
+///
+/// One function, read by the supervisor (which builds the plan) and by
+/// `Hello` (which tells the client), so the two cannot disagree -- a session
+/// whose `Hello` promised v6 while its routes rejected it would report
+/// RUNNING with every v6 connection failing. Windows stays out until wintun's
+/// configuration path can express an IPv6 address (`src/tun/mod.rs`).
+pub fn carries_ipv6() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// An address the daemon put on the tunnel device and must remove again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceAddress {
+    pub interface: String,
+    pub address: IpAddr,
+    pub prefix: u8,
+}
 
 /// Everything restoring a service's DNS needs, beyond the service's name.
 ///
@@ -114,10 +143,11 @@ pub enum Via {
     Blackhole,
     /// Refused, audibly: the sender gets an unreachable error at once.
     ///
-    /// For IPv6, which v1 does not carry. A blackhole would make every v6
-    /// connection wait out its timeout before Happy Eyeballs fell back to v4;
-    /// a reject makes the fallback immediate. Leaking v6 to the physical
-    /// interface is not an option, so those are the two choices.
+    /// For IPv6 where the arm cannot carry it (see [`carries_ipv6`]). A
+    /// blackhole would make every v6 connection wait out its timeout before
+    /// Happy Eyeballs fell back to v4; a reject makes the fallback immediate.
+    /// Leaking v6 to the physical interface is not an option, so those are
+    /// the two choices.
     Reject,
 }
 
@@ -195,6 +225,15 @@ pub trait HostNetwork {
     /// routes that were never added -- and one that refuses there would abort
     /// the revert partway and leave the rest installed.
     fn delete_route(&self, route: &Route) -> std::io::Result<()>;
+
+    /// Put an address on the tunnel device. `AlreadyExists` for one the device
+    /// already had -- not ours, exactly as a route the host had is not.
+    fn add_address(&self, address: &InterfaceAddress) -> std::io::Result<()>;
+
+    /// Remove it. Must treat an address that is not there as success, for the
+    /// reason [`HostNetwork::delete_route`] gives: revert is asked to remove
+    /// what a crash, or the device going away, already took with it.
+    fn delete_address(&self, address: &InterfaceAddress) -> std::io::Result<()>;
 
     /// The id of the network service DNS should be set on, for a session on
     /// `interface`.

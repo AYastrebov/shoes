@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+`shoesd` carries IPv6 on Linux and macOS. The two v6 halves (`::/1`,
+`8000::/1`) are routed via the tunnel device instead of being rejected, the
+device gets a ULA (`fd00:6b76:6e00::2/64`) from the host arm so the kernel
+accepts the routes and picks a v6 source, and `Hello.capabilities` gains
+`"ipv6"` where that is so -- a client then generates a config that proxies v6.
+`Start.dns` takes a v6 resolver on a carrying arm; `Start.exclude` stays
+IPv4-only on every arm, because the exclusion route goes through the IPv4
+default gateway. The address is recorded in `AppliedState` and reverted
+after the routes; records from older builds load with none. Windows keeps
+the rejects and does not advertise the capability until wintun can take a
+v6 address. Design: `docs/specs/2026-10-24-daemon-carries-ipv6.md`.
+
 Agent guidelines reorganised along `agents.md` and Android's AI-tools
 guides:
 

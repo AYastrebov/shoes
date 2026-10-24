@@ -639,7 +639,7 @@ host has no engine symbol and the extension does. Design:
 on macOS, systemd on Linux -- serving gRPC over a Unix domain socket, with the `.proto` owned here in
 `proto/shoes/daemon/v1/`. It hosts `shoes::control` in-process and configures
 the host around it: the split default route, a host route per excluded address,
-IPv6 rejects, and DNS through `SCDynamicStore` — reverted on stop, and after a
+the same split for IPv6 via the device (rejects only on Windows), and DNS through `SCDynamicStore` — reverted on stop, and after a
 crash from a record written before each change. Authentication is the socket's
 peer credentials; there is no token and no TCP listener. Design and the
 decisions taken:
