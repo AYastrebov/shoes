@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+`shoesd` on macOS restores a service's DNS keys exactly, not as the parsed
+servers (#110). KVN's first live macOS run against 0.8.1 found every session
+leaving the host's DNS changed after a clean stop: the revert record was the
+`ServerAddresses` of `State:`, written back to both keys, which dropped the
+lease's `DomainName` and left `Setup:` -- the user's configuration, which
+overrides DHCP -- pinning the lease's resolvers on the next network the Mac
+joined. The record now carries each key whole (`DnsState::store_keys`, the
+macOS counterpart of Linux's `verbatim`), as the XML property list of its
+dictionary or as absent, and the revert puts back exactly that: absent by
+removing the key, since an empty dictionary is a service that resolves
+nothing. A 0.8.1 record still loads and is restored from its servers. The
+dynamic store is behind a `Store` trait, so the restore runs in tests
+against a store in memory -- the real one refuses writes from anything but
+root, which is why 0.8.1 shipped the one path no test reached. Applying
+still writes a servers-only dictionary, so a lease's search domain is not in
+force while a session is up; recorded in `ROADMAP.md`.
+
 ## v0.8.1
 
 The desktop daemon carries IPv6 (#108), the agent guidelines are

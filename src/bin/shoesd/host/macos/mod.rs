@@ -11,11 +11,13 @@
 //! request. OpenVPN Connect shipped CVE-2026-9560 by doing otherwise, and the
 //! addresses in these arrays arrive over the control socket.
 
-mod dns;
+pub mod dns;
 pub mod monitor;
 
 use std::net::IpAddr;
 use std::process::Command;
+
+use system_configuration::dynamic_store::SCDynamicStore;
 
 use super::{Destination, DnsState, HostNetwork, Route, Via};
 
@@ -34,8 +36,11 @@ const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
 
 /// The real thing.
-pub struct MacosHost {
-    dns: dns::DnsStore,
+///
+/// Generic over the DNS store for one reason: the restore path has to run in
+/// a test, and the system's store refuses writes from anything but root.
+pub struct MacosHost<S: dns::Store = SCDynamicStore> {
+    dns: dns::DnsStore<S>,
 }
 
 impl MacosHost {
@@ -46,7 +51,17 @@ impl MacosHost {
     }
 }
 
-impl HostNetwork for MacosHost {
+#[cfg(test)]
+impl<S: dns::Store> MacosHost<S> {
+    /// Over a store that is not the system's: the DNS tests' way in.
+    fn with_store(store: S) -> Self {
+        Self {
+            dns: dns::DnsStore::with_store(store),
+        }
+    }
+}
+
+impl<S: dns::Store> HostNetwork for MacosHost<S> {
     fn default_gateway(&self) -> std::io::Result<Option<IpAddr>> {
         // `netstat -rn` rather than `route -n get default`, and the difference
         // is not cosmetic. `route get` does a longest-prefix lookup for the
@@ -333,6 +348,11 @@ fn run_capturing(program: &str, args: &[&str]) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::dns::Store;
+    use super::dns::testing::{
+        MapStore, empty_dictionary, lease_dictionary, servers_dictionary, setup_key, state_key,
+        user_dictionary,
+    };
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
@@ -565,6 +585,113 @@ Destination        Gateway            Flags               Netif Expire
             Some(host.dns.snapshot(&service).unwrap()),
             "the backup must carry each key as it is, to restore from"
         );
+    }
+
+    /// A revert puts each key back as it was, not the parsed servers on both.
+    /// 0.8.1 did the latter, and KVN's first live macOS run found every
+    /// session leaving the lease's `DomainName` gone and `Setup:` -- the
+    /// user's configuration, which overrides the lease -- pinning the lease's
+    /// resolvers on the next network. Through `write_dns`, because the choice
+    /// between restoring the keys and writing the servers is made there, and
+    /// against a store in memory, because the real one refuses writes from
+    /// anything but root. With 0.8.1's writer put back, this fails.
+    #[test]
+    fn a_revert_puts_each_key_back_as_it_was() {
+        let service = "2BFF3B4D-TEST";
+        let (state, setup) = (state_key(service), setup_key(service));
+        let map = MapStore::default();
+        map.set(&state, &lease_dictionary());
+        map.set(&setup, &user_dictionary());
+        let host = MacosHost::with_store(map.clone());
+
+        let backup = host.read_dns(service).unwrap();
+        assert_eq!(
+            backup.servers,
+            [ip("172.29.5.17"), ip("172.22.2.17")],
+            "the servers are State:'s, for the log"
+        );
+
+        // Apply, as a session does: the tunnel's resolver, and only that, on
+        // both keys.
+        let tunnel = DnsState::servers(&[ip("10.99.0.1")]);
+        host.write_dns(service, &tunnel).unwrap();
+        for key in [&state, &setup] {
+            assert_eq!(map.get(key), Some(servers_dictionary(&tunnel.servers)));
+        }
+
+        // Revert; then once more, which is `recover()` after a partial one.
+        for _ in 0..2 {
+            host.write_dns(service, &backup).unwrap();
+            assert_eq!(
+                map.get(&state),
+                Some(lease_dictionary()),
+                "State: is the lease again, DomainName included"
+            );
+            assert_eq!(
+                map.get(&setup),
+                Some(user_dictionary()),
+                "Setup: is the user's again, not the lease's resolvers"
+            );
+        }
+    }
+
+    /// Absent and empty are different things, and each comes back as it was:
+    /// an absent key by removing it, not by writing an empty dictionary,
+    /// which is a service configured to resolve nothing; an empty dictionary
+    /// as itself, not by removing the key.
+    #[test]
+    fn a_revert_tells_an_absent_key_from_an_empty_one() {
+        let service = "2BFF3B4D-TEST";
+        let (state, setup) = (state_key(service), setup_key(service));
+        let map = MapStore::default();
+        map.set(&state, &empty_dictionary());
+        // And no `Setup:` at all: a service the user never touched.
+        let host = MacosHost::with_store(map.clone());
+
+        let backup = host.read_dns(service).unwrap();
+        assert!(backup.servers.is_empty());
+        host.write_dns(service, &DnsState::servers(&[ip("10.99.0.1")]))
+            .unwrap();
+        assert!(map.get(&setup).is_some(), "applying writes Setup: too");
+
+        for _ in 0..2 {
+            host.write_dns(service, &backup).unwrap();
+            assert_eq!(
+                map.get(&state),
+                Some(empty_dictionary()),
+                "an empty dictionary is restored as one"
+            );
+            assert_eq!(
+                map.get(&setup),
+                None,
+                "an absent key is restored by removing it"
+            );
+        }
+    }
+
+    /// A record written by 0.8.1 carries no keys, and is restored the only
+    /// way it can be: its servers on both keys, and no key at all where it
+    /// had none -- which hands the question back to DHCP.
+    #[test]
+    fn a_record_without_keys_is_restored_from_its_servers() {
+        let service = "2BFF3B4D-TEST";
+        let (state, setup) = (state_key(service), setup_key(service));
+        let map = MapStore::default();
+        let host = MacosHost::with_store(map.clone());
+        host.write_dns(service, &DnsState::servers(&[ip("10.99.0.1")]))
+            .unwrap();
+
+        let old_record = DnsState::servers(&[ip("192.0.2.53")]);
+        assert_eq!(old_record.store_keys, None);
+        host.write_dns(service, &old_record).unwrap();
+        for key in [&state, &setup] {
+            assert_eq!(map.get(key), Some(servers_dictionary(&old_record.servers)));
+        }
+
+        host.write_dns(service, &DnsState::servers(&[])).unwrap();
+        host.write_dns(service, &DnsState::servers(&[])).unwrap();
+        assert_eq!(map.get(&state), None);
+        assert_eq!(map.get(&setup), None);
     }
 }
 
