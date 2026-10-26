@@ -150,7 +150,7 @@ impl AppliedState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{DnsState, InterfaceAddress, Via, route_for_test};
+    use crate::host::{DnsState, InterfaceAddress, StoreKeys, Via, route_for_test};
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
@@ -175,9 +175,25 @@ mod tests {
             ],
             dns: Some(DnsBackup {
                 service: "ABC-123".to_string(),
-                state: DnsState::servers(&[ip("192.168.1.1")]),
+                state: DnsState {
+                    store_keys: Some(StoreKeys {
+                        state: Some("<plist><dict/></plist>".to_string()),
+                        setup: None,
+                    }),
+                    ..DnsState::servers(&[ip("192.168.1.1")])
+                },
             }),
         }
+    }
+
+    /// A record written by 0.8.1 has no `store_keys`, and a daemon upgraded
+    /// with a session still recorded must load it rather than refuse the
+    /// file -- it is restored from the servers, which is all it has.
+    #[test]
+    fn a_dns_backup_from_0_8_1_still_loads() {
+        let state: DnsState = serde_json::from_str(r#"{"servers":["192.168.1.1"]}"#).unwrap();
+        assert_eq!(state, DnsState::servers(&[ip("192.168.1.1")]));
+        assert_eq!(state.store_keys, None);
     }
 
     #[test]

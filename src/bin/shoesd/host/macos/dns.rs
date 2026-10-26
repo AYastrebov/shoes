@@ -13,18 +13,29 @@
 //! resolver reads now; `Setup:` is what the system re-derives `State:` from
 //! when the network changes underneath. Writing only the first works until the
 //! Wi-Fi flaps.
+//!
+//! And both are put back exactly, each from its own [`StoreKeys`] snapshot,
+//! never from the parsed servers: the two keys hold different things, and a
+//! dictionary holds more than its servers. See [`DnsState::store_keys`].
+//!
+//! [`DnsState::store_keys`]: super::super::DnsState::store_keys
 
 use std::net::IpAddr;
 
 use core_foundation::array::CFArray;
 use core_foundation::base::{TCFType, ToVoid};
+use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
-use core_foundation::propertylist::CFPropertyList;
+use core_foundation::propertylist::{
+    self, CFPropertyList, kCFPropertyListImmutable, kCFPropertyListXMLFormat_v1_0,
+};
 use core_foundation::string::{CFString, CFStringRef};
 use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
 use system_configuration::sys::schema_definitions::{
     kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSServerAddresses,
 };
+
+use super::super::StoreKeys;
 
 /// A handle on the dynamic store.
 pub struct DnsStore {
@@ -144,6 +155,68 @@ impl DnsStore {
         }
         Ok(())
     }
+
+    /// Both keys of a service exactly as they are now -- what a revert puts
+    /// back. A key that is not there is recorded as absent, not as empty.
+    pub fn snapshot(&self, service: &str) -> std::io::Result<StoreKeys> {
+        Ok(StoreKeys {
+            state: self.snapshot_key(&state_key(service))?,
+            setup: self.snapshot_key(&setup_key(service))?,
+        })
+    }
+
+    fn snapshot_key(&self, key: &str) -> std::io::Result<Option<String>> {
+        self.store.get(key).map(|value| to_xml(&value)).transpose()
+    }
+
+    /// Put both keys back exactly as [`DnsStore::snapshot`] found them: the
+    /// saved dictionary where there was one, and no key where there was none.
+    ///
+    /// Idempotent, for the reason [`DnsStore::write`] gives: an absent key
+    /// that is already gone is success.
+    pub fn restore(&self, service: &str, keys: &StoreKeys) -> std::io::Result<()> {
+        for (key, saved) in [
+            (state_key(service), &keys.state),
+            (setup_key(service), &keys.setup),
+        ] {
+            let succeeded = match saved {
+                Some(xml) => self.store.set_raw(key.as_str(), &from_xml(xml)?),
+                None => self.store.get(key.as_str()).is_none() || self.store.remove(key.as_str()),
+            };
+            if !succeeded {
+                return Err(std::io::Error::other(format!(
+                    "the system configuration store refused to restore {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A property list as XML, the form a revert record carries it in: every
+/// type a dictionary can hold survives it, and the record stays readable.
+fn to_xml(value: &CFPropertyList) -> std::io::Result<String> {
+    let data =
+        propertylist::create_data(value.as_concrete_TypeRef(), kCFPropertyListXMLFormat_v1_0)
+            .map_err(|e| std::io::Error::other(format!("could not serialise a DNS key: {e}")))?;
+    String::from_utf8(data.bytes().to_vec())
+        .map_err(|e| std::io::Error::other(format!("a serialised DNS key is not UTF-8: {e}")))
+}
+
+/// The inverse of [`to_xml`].
+fn from_xml(xml: &str) -> std::io::Result<CFPropertyList> {
+    let (value, _format) = propertylist::create_with_data(
+        CFData::from_buffer(xml.as_bytes()),
+        kCFPropertyListImmutable,
+    )
+    .map_err(|e| {
+        std::io::Error::other(format!(
+            "the revert record holds an unreadable DNS key: {e}"
+        ))
+    })?;
+    // SAFETY: `create_with_data` returns a new, non-null property list on
+    // success, owned by the caller: the create rule takes that ownership.
+    Ok(unsafe { CFPropertyList::wrap_under_create_rule(value) })
 }
 
 fn state_key(service: &str) -> String {
@@ -177,6 +250,7 @@ fn dns_dictionary(servers: &[IpAddr]) -> CFDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_foundation::propertylist::CFPropertyListSubClass;
 
     /// Both keys, and the service id in each. `State:` is what the resolver
     /// reads now; `Setup:` is what the system re-derives it from when the
@@ -190,6 +264,61 @@ mod tests {
         assert_eq!(
             setup_key("2BFF3B4D-0D0A"),
             "Setup:/Network/Service/2BFF3B4D-0D0A/DNS"
+        );
+    }
+
+    /// A DHCP service's dictionary, the shape the live run found: servers and
+    /// the lease's domain. Whatever else a key holds must survive the record
+    /// too, so the fixture carries an empty array beside them.
+    fn lease_dictionary() -> CFPropertyList {
+        let servers =
+            CFArray::from_CFTypes(&[CFString::new("172.29.5.17"), CFString::new("172.22.2.17")]);
+        let domain = CFString::new("corp.example");
+        let none: CFArray<CFString> = CFArray::from_CFTypes(&[]);
+        let dictionary = CFDictionary::from_CFType_pairs(&[
+            (CFString::new("ServerAddresses"), servers.as_CFType()),
+            (CFString::new("DomainName"), domain.as_CFType()),
+            (CFString::new("SearchDomains"), none.as_CFType()),
+        ]);
+        dictionary.to_untyped().to_CFPropertyList()
+    }
+
+    /// The whole dictionary goes into the record and comes back out equal --
+    /// not just `ServerAddresses`, which is all 0.8.1 kept.
+    #[test]
+    fn a_dns_key_survives_the_record_whole() {
+        let original = lease_dictionary();
+        let xml = to_xml(&original).unwrap();
+        assert!(xml.contains("<string>corp.example</string>"), "{xml}");
+
+        let back = from_xml(&xml).unwrap();
+        assert_eq!(back, original);
+        assert_eq!(to_xml(&back).unwrap(), xml, "a second trip changes nothing");
+    }
+
+    /// A damaged record is an error the revert reports, not a key silently
+    /// written as nothing.
+    #[test]
+    fn an_unreadable_saved_key_is_an_error() {
+        let error = from_xml("not a property list").unwrap_err();
+        assert!(error.to_string().contains("unreadable DNS key"), "{error}");
+    }
+
+    /// A key that is not there is recorded as absent -- restored by removing
+    /// it -- rather than as an empty dictionary, which would be a service
+    /// configured to resolve nothing.
+    #[test]
+    fn a_service_without_keys_snapshots_as_absent() {
+        let store = DnsStore::open().unwrap();
+        let keys = store
+            .snapshot("00000000-0000-0000-0000-NOT-A-SERVICE")
+            .unwrap();
+        assert_eq!(
+            keys,
+            StoreKeys {
+                state: None,
+                setup: None
+            }
         );
     }
 

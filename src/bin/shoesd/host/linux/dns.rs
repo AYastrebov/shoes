@@ -586,6 +586,7 @@ fn read_file_state(path: &Path) -> std::io::Result<DnsState> {
             .unwrap_or_default(),
         symlink_target,
         verbatim,
+        store_keys: None,
     })
 }
 

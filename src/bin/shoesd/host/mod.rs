@@ -109,9 +109,9 @@ pub struct InterfaceAddress {
 
 /// Everything restoring a service's DNS needs, beyond the service's name.
 ///
-/// A resolver list alone is enough on macOS, and was enough when this trait
-/// had one implementation. The direct `/etc/resolv.conf` backend needs one
-/// thing more: whether the path was a **symlink**, and to what. On a
+/// A resolver list alone is never enough to restore from, on either arm that
+/// has one -- see [`DnsState::verbatim`] and [`DnsState::store_keys`]. The
+/// direct `/etc/resolv.conf` backend needs one thing more besides: whether the path was a **symlink**, and to what. On a
 /// resolved host it points at `stub-resolv.conf`; elsewhere it may point into
 /// `/run`. Restoring a flattened regular file where a symlink was is how this
 /// class of tool breaks a host permanently -- the real manager keeps rewriting
@@ -145,6 +145,32 @@ pub struct DnsState {
     /// restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbatim: Option<String>,
+    /// macOS: the service's two DNS keys exactly as they were.
+    ///
+    /// The counterpart of [`DnsState::verbatim`] for a backend that is a store
+    /// rather than a file, and needed for the same reason. A service's DNS
+    /// dictionary carries more than `ServerAddresses` -- a DHCP lease's
+    /// `DomainName`, a user's `SearchDomains` -- and the `State:` and `Setup:`
+    /// keys hold different things: `State:` is the lease, `Setup:` is the
+    /// user's configuration, which overrides it. Restoring the parsed servers
+    /// to both, which 0.8.1 did, dropped the search domain and left `Setup:`
+    /// pinning the lease's resolvers, so the Mac kept asking them on the next
+    /// network it joined.
+    ///
+    /// `None` for every other backend, in the apply direction, and in a
+    /// record written by 0.8.1 or earlier -- which is restored the old way,
+    /// from `servers`, since that is all it knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_keys: Option<StoreKeys>,
+}
+
+/// A macOS service's `State:` and `Setup:` DNS keys, each as the XML property
+/// list of its whole dictionary, or `None` where the key was absent -- which
+/// is not the same as an empty dictionary, and is restored by removing the key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreKeys {
+    pub state: Option<String>,
+    pub setup: Option<String>,
 }
 
 impl DnsState {
@@ -155,6 +181,7 @@ impl DnsState {
             servers: servers.to_vec(),
             symlink_target: None,
             verbatim: None,
+            store_keys: None,
         }
     }
 }
@@ -287,9 +314,9 @@ pub trait HostNetwork {
     /// Set the resolvers on a service. An empty list restores the default,
     /// which is what reverting to a service that had none means.
     ///
-    /// `state.symlink_target` is meaningful only on a revert, and only for the
-    /// direct file backend; applying passes [`DnsState::servers`], which
-    /// carries none.
+    /// `state.symlink_target`, `state.verbatim` and `state.store_keys` are
+    /// meaningful only on a revert, each for its own backend; applying passes
+    /// [`DnsState::servers`], which carries none of them.
     ///
     /// Must treat a service that is not there as success, for the reason
     /// [`HostNetwork::delete_route`] gives about routes. Revert runs after the

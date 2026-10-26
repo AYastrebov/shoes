@@ -131,14 +131,20 @@ impl HostNetwork for MacosHost {
     }
 
     fn read_dns(&self, service: &str) -> std::io::Result<DnsState> {
-        // No symlink to remember: SCDynamicStore is a store, not a file.
-        self.dns
-            .read(service)
-            .map(|servers| DnsState::servers(&servers))
+        // No symlink to remember: SCDynamicStore is a store, not a file. The
+        // servers are for logs and diagnostics; the keys are what restores.
+        let mut state = DnsState::servers(&self.dns.read(service)?);
+        state.store_keys = Some(self.dns.snapshot(service)?);
+        Ok(state)
     }
 
     fn write_dns(&self, service: &str, state: &DnsState) -> std::io::Result<()> {
-        self.dns.write(service, &state.servers)
+        match &state.store_keys {
+            Some(keys) => self.dns.restore(service, keys),
+            // Applying, or a revert record from 0.8.1, which saved nothing
+            // more than the servers.
+            None => self.dns.write(service, &state.servers),
+        }
     }
 
     fn flush_dns_cache(&self) -> std::io::Result<()> {
@@ -538,6 +544,27 @@ Destination        Gateway            Flags               Netif Expire
                 }
             }
         }
+    }
+
+    /// The backup a session takes is both keys whole, not the parsed servers.
+    /// 0.8.1 kept only the servers and restored them to both keys, which
+    /// dropped the lease's `DomainName` and left `Setup:` pinning the lease's
+    /// resolvers on the next network. A read, so it runs unprivileged against
+    /// this machine's own primary service; skipped where there is none.
+    #[test]
+    fn the_dns_backup_keeps_both_keys_whole() {
+        let host = MacosHost::new().unwrap();
+        let Ok(service) = host.primary_dns_service("utun99") else {
+            return;
+        };
+
+        let backup = host.read_dns(&service).expect("reading the service's DNS");
+
+        assert_eq!(
+            backup.store_keys,
+            Some(host.dns.snapshot(&service).unwrap()),
+            "the backup must carry each key as it is, to restore from"
+        );
     }
 }
 
