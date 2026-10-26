@@ -445,6 +445,21 @@ The previous values are remembered — in the state file, not only in memory —
 and restored on stop. `SCDynamicStore::set` returns `bool` rather than a
 `Result`, so every call is checked.
 
+What is remembered is each key whole, not the servers parsed out of it
+(`DnsState::store_keys`, added in #110 after KVN's first live run on 0.8.1).
+The two keys hold different things — `State:` is the lease, `Setup:` is the
+user's configuration, which overrides it — and a dictionary holds more than
+`ServerAddresses`: the lease's `DomainName`, the user's `SearchDomains`.
+Restoring the parsed servers to both, which 0.8.1 did, dropped the search
+domain and left `Setup:` pinning the lease's resolvers on the next network the
+Mac joined. So the record carries each key as the XML property list of its
+dictionary, or as absent, and the revert puts back exactly that: the saved
+dictionary where there was one, and no key where there was none. Absent and
+empty are different — an empty dictionary is a service configured to resolve
+nothing. A record from 0.8.1 has no keys and is restored from its servers.
+The store is behind a `Store` trait so the restore runs in tests against a
+store in memory; the real one refuses writes from anything but root.
+
 Explicitly **not** `networksetup`, which is what wg-quick uses. Two reasons, and
 the second is the one that decides it. Clash Nyanpasu's DNS has been broken that
 way since macOS 14.3 (libnyanpasu/nyanpasu-service#26), because `networksetup`
@@ -483,8 +498,8 @@ failure mode with the worst blast radius in this design.
 
 Before the first privileged change, the daemon writes a root-owned state file
 (`/var/db/shoesd/applied.json`, mode `0600`) describing everything it is about
-to apply: the routes with their gateways, the DNS service id with the previous
-resolver list, and the interface name. It is written and fsynced *before* the
+to apply: the routes with their gateways, the DNS service id with its two keys
+as they were, and the interface name. It is written and fsynced *before* the
 change, not after, so the window where a change exists and is unrecorded is
 closed rather than merely small.
 
