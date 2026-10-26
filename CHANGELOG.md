@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.8.2
+
+One fix, for the desktop daemon on macOS: a session no longer leaves the
+host's DNS changed after a clean stop (#110). The revert record carries the
+service's `State:` and `Setup:` keys whole and puts back exactly those, so a
+DHCP lease's search domain survives and `Setup:` no longer pins the lease's
+resolvers on the next network. A 0.8.1 record still loads. No protocol, FFI
+or configuration change; the Linux and Windows daemons and the mobile
+libraries are rebuilt unchanged.
 
 `shoesd` on macOS restores a service's DNS keys exactly, not as the parsed
 servers (#110). KVN's first live macOS run against 0.8.1 found every session
