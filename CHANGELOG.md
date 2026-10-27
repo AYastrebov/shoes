@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+VLESS UDP under the Vision flow now reaches sing-box servers. The client
+sent it as the plain UDP command with no flow named; sing-box refuses that
+for a Vision user (`flow mismatch: expected xtls-rprx-vision, but got
+none`), so every UDP packet over a sing-box VLESS Vision server was dropped
+while TCP worked. It now goes as both reference clients send it (Xray's
+VLESS outbound, sing-vmess's `DialEarlyXUDPPacketConn`): the Mux command
+under the Vision flow, inside a Vision stream, with the packets as XUDP
+frames. That is also the only UDP an Xray server takes under the flow, and
+the form shoes' own server already read. The TLS and REALITY Vision
+clients both change; VLESS without Vision still sends the plain UDP
+command.
+
+The new client XUDP stream frames packets byte for byte as sing-box's
+client does (session 0, a New frame and then Keep frames naming the
+target, no global ID), checked against the captured sing-box flight in
+`tests/data/kat/frames-sing`. It closes the session with an End frame on
+shutdown, as Xray's client does, and drops a packet over 8192 - 666 bytes,
+the most an Xray server reads in one frame. UDP/443 is carried, as
+sing-box's client carries it; Xray's client refuses it under plain
+`xtls-rprx-vision` to push QUIC back onto TCP, which is a client policy
+rather than something either server enforces. The whole-frame decode the
+server used is now shared by both directions (`xudp::frame::decode_frame`).
+
 ## v0.8.3
 
 One fix, for the desktop daemon on macOS: `sudo shoesd install` over a

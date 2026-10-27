@@ -260,6 +260,71 @@ impl FrameMetadata {
     }
 }
 
+/// Xray refuses frame metadata longer than this (common/mux/frame.go, Unmarshal).
+pub const MAX_METADATA_LEN: usize = 512;
+
+/// Decode one whole frame off the front of `buf`: its metadata and, under
+/// OptionData, its payload. Nothing is consumed until the whole frame, payload
+/// included, is buffered, so `Ok(None)` leaves a partial frame for the next
+/// read to complete.
+///
+/// Every status may carry OptionData: an End or KeepAlive carries it too, and
+/// Xray reads and discards it (common/mux/server.go, handleStatusKeepAlive and
+/// handleStatusEnd).
+pub fn decode_frame(
+    buf: &mut BytesMut,
+) -> std::io::Result<Option<(FrameMetadata, Option<BytesMut>)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let metadata_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+
+    if metadata_len > MAX_METADATA_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata too long: {metadata_len}"),
+        ));
+    }
+
+    if buf.len() < 2 + metadata_len {
+        return Ok(None);
+    }
+
+    if metadata_len < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata too short: {}", metadata_len),
+        ));
+    }
+
+    // The option byte: past metadata_len(2) + session_id(2) + status(1)
+    let has_data = (buf[2 + 3] & FrameOption::DATA) != 0;
+
+    let data_len_offset = 2 + metadata_len;
+    let data_len = if has_data {
+        if buf.len() < data_len_offset + 2 {
+            return Ok(None);
+        }
+        let data_len =
+            u16::from_be_bytes([buf[data_len_offset], buf[data_len_offset + 1]]) as usize;
+        if buf.len() < data_len_offset + 2 + data_len {
+            return Ok(None);
+        }
+        Some(data_len)
+    } else {
+        None
+    };
+
+    let metadata = FrameMetadata::decode(buf)?
+        .ok_or_else(|| std::io::Error::other("metadata incomplete after the length check"))?;
+    let data = data_len.map(|len| {
+        buf.advance(2);
+        buf.split_to(len)
+    });
+    Ok(Some((metadata, data)))
+}
+
 /// Encode address to buffer (VLESS address format)
 fn encode_address(buf: &mut BytesMut, address: &Address) -> std::io::Result<()> {
     match address {

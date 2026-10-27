@@ -144,14 +144,13 @@ impl TcpClientHandler for TlsClientHandler {
                     .setup_client_udp_bidirectional(Box::new(tls_stream), target)
                     .await
             }
-            TlsInnerClientHandler::VisionVless { uuid, .. } => {
-                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+            TlsInnerClientHandler::VisionVless { uuid, .. } => Ok(
+                crate::vless::vless_client_handler::setup_vision_vless_udp_bidirectional(
                     tls_stream,
                     uuid,
                     target.into_location(),
-                )
-                .await
-            }
+                ),
+            ),
         }
     }
 }
