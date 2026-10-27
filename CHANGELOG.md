@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.8.3
+
+One fix, for the desktop daemon on macOS: `sudo shoesd install` over a
+running daemon no longer fails with `Bootstrap failed: 5: Input/output
+error` (#112). No protocol, FFI or configuration change; the Linux and
+Windows daemons and the mobile libraries are rebuilt unchanged.
+
+`shoesd install` on macOS retries `launchctl bootstrap` while launchd
+answers status 5 (#112). Upgrading 0.8.1 to 0.8.2 in place failed twice
+that way, leaving the new binary installed and no daemon running, and a
+third run succeeded: `install` boots the old job out and bootstraps the new
+plist straight after, and the bootout returns before launchd has finished
+with the old job. Waiting for the job to disappear from `launchctl print`
+would not have been enough, since the second failure came with the service
+already gone; launchd has to be asked again. The bootstrap is retried six
+times with the wait doubling from 250 ms, under eight seconds in all; any
+other status is reported at once. Status 5 is also launchd's answer for a
+plist it will not load, so a genuine refusal now costs those few seconds
+before it is reported, and the final error says what the machine is left
+with and that running the install again usually loads it. The bootstrap
+and the sleep are parameters, so the tests script launchd's answers without
+waiting. Not done: a `launchctl print` after a successful bootstrap, since
+with `RunAtLoad` and `KeepAlive` a loaded job is launchd's to start and
+restart. Not verified live, which needs root over a running daemon.
+
 ## v0.8.2
 
 One fix, for the desktop daemon on macOS: a session no longer leaves the
