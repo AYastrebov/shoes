@@ -206,13 +206,87 @@ pub fn install(socket_path: &Path, state_path: &Path, group: Option<&str>) -> st
     // loaded. A first install has nothing to remove, so the failure is
     // ignored rather than reported.
     let _ = run(LAUNCHCTL, &["bootout".into(), format!("system/{LABEL}")]);
-    run(
-        LAUNCHCTL,
-        &["bootstrap".into(), "system".into(), PLIST_PATH.into()],
-    )?;
+    bootstrap_with_retry(bootstrap_once, std::thread::sleep)?;
 
     log::info!("installed {INSTALLED_BINARY} and bootstrapped {LABEL}");
     Ok(())
+}
+
+/// `launchctl bootstrap`'s exit status for `Input/output error`.
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_EIO: i32 = 5;
+
+/// How many times the bootstrap is tried, and the wait before the first
+/// retry, doubled each time after: 0.25 + 0.5 + 1 + 2 + 4 s, under eight
+/// seconds in all.
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_ATTEMPTS: u32 = 6;
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_FIRST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One `launchctl bootstrap` of the plist, failing with its exit status.
+#[cfg(target_os = "macos")]
+fn bootstrap_once() -> Result<(), (Option<i32>, std::io::Error)> {
+    let args = ["bootstrap", "system", PLIST_PATH];
+    let output = Command::new(LAUNCHCTL).args(args).output().map_err(|e| {
+        let error =
+            std::io::Error::new(e.kind(), format!("could not run {LAUNCHCTL} {args:?}: {e}"));
+        (None, error)
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = std::io::Error::other(format!(
+        "{LAUNCHCTL} {args:?} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ));
+    Err((output.status.code(), error))
+}
+
+/// Bootstrap the job, retrying while launchd answers status 5.
+///
+/// The `bootout` before it returns before launchd has finished with the old
+/// job, and a `bootstrap` in that window fails with `Bootstrap failed: 5:
+/// Input/output error` -- after which the new binary is installed and no
+/// daemon runs at all. Seen upgrading 0.8.1 to 0.8.2: two failures, then a
+/// third run of `shoesd install` succeeded. The second came with `launchctl
+/// print` already reporting no such job, so waiting for the job to vanish
+/// would not have been enough; launchd has to be asked again.
+///
+/// Status 5 is also launchd's answer for a plist it will not load, so a real
+/// refusal costs these few seconds before it is reported, unchanged. Any
+/// other failure is reported at once.
+///
+/// The bootstrap and the sleep are parameters so the tests can script
+/// launchd's answers and not wait.
+#[cfg(target_os = "macos")]
+fn bootstrap_with_retry(
+    mut bootstrap: impl FnMut() -> Result<(), (Option<i32>, std::io::Error)>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    let mut wait = BOOTSTRAP_FIRST_WAIT;
+    let mut attempt = 1;
+    loop {
+        match bootstrap() {
+            Ok(()) => return Ok(()),
+            Err((Some(BOOTSTRAP_EIO), e)) if attempt < BOOTSTRAP_ATTEMPTS => {
+                log::debug!("bootstrap attempt {attempt} of {BOOTSTRAP_ATTEMPTS}: {e}; retrying");
+                sleep(wait);
+                wait *= 2;
+                attempt += 1;
+            }
+            Err((_, e)) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{INSTALLED_BINARY} is installed but {LABEL} is not running: {e}; \
+                         running `shoesd install` again usually loads it"
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Stop the job, remove it, and delete both files.
@@ -2169,6 +2243,63 @@ mod linux_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
+
+    /// launchd's answers, in order, and the waits asked for between them.
+    fn scripted(answers: &[Option<i32>]) -> (std::io::Result<()>, usize, Vec<std::time::Duration>) {
+        let mut answers = answers.iter();
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let result = bootstrap_with_retry(
+            || {
+                calls += 1;
+                match answers
+                    .next()
+                    .expect("bootstrapped more often than scripted")
+                {
+                    None => Ok(()),
+                    Some(code) => {
+                        Err((Some(*code), std::io::Error::other(format!("status {code}"))))
+                    }
+                }
+            },
+            |wait| waits.push(wait),
+        );
+        (result, calls, waits)
+    }
+
+    /// The upgrade that left no daemon running: two status-5 failures right
+    /// after the bootout, then success. Retried, and each wait longer.
+    #[test]
+    fn a_bootstrap_refused_with_status_5_is_retried() {
+        let (result, calls, waits) = scripted(&[Some(BOOTSTRAP_EIO), Some(BOOTSTRAP_EIO), None]);
+        result.expect("the third attempt loads it");
+        assert_eq!(calls, 3);
+        assert_eq!(waits, [BOOTSTRAP_FIRST_WAIT, BOOTSTRAP_FIRST_WAIT * 2]);
+    }
+
+    /// A launchd that never accepts it is reported after the last attempt,
+    /// saying what state the machine is left in.
+    #[test]
+    fn a_bootstrap_that_keeps_failing_says_the_daemon_is_not_running() {
+        let answers = vec![Some(BOOTSTRAP_EIO); BOOTSTRAP_ATTEMPTS as usize];
+        let (result, calls, waits) = scripted(&answers);
+        let error = result.expect_err("it never loaded");
+        assert_eq!(calls, BOOTSTRAP_ATTEMPTS as usize);
+        assert_eq!(waits.len(), BOOTSTRAP_ATTEMPTS as usize - 1);
+        assert!(waits.iter().sum::<std::time::Duration>() < std::time::Duration::from_secs(10));
+        let message = error.to_string();
+        assert!(message.contains("is not running"), "{message}");
+        assert!(message.contains("status 5"), "{message}");
+    }
+
+    /// Anything but status 5 is not the race, and is reported at once.
+    #[test]
+    fn any_other_bootstrap_failure_is_not_retried() {
+        let (result, calls, waits) = scripted(&[Some(37)]);
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert!(waits.is_empty());
+    }
 
     fn rendered() -> String {
         plist(
