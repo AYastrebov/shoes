@@ -25,6 +25,18 @@ sing-box's client carries it; Xray's client refuses it under plain
 rather than something either server enforces. The whole-frame decode the
 server used is now shared by both directions (`xudp::frame::decode_frame`).
 
+Two defects the review of that change found are fixed with it. The XUDP
+metadata decoder read a frame's destination from the whole buffer rather
+than from the bytes the frame declared, so a frame that named a UDP
+destination and then ended (`00 05 00 00 02 00 02`) panicked the task that
+read it, on the server as well as the new client; a destination that runs
+past the declared metadata is now refused as invalid data. And the Vision
+client looked inside each XUDP write for TLS records, so a datagram ending
+in a byte that could begin one (`0x16`) had that byte held back for a
+record that never came, and the datagram waited on the next write; a Vision
+stream that carries XUDP now pads each write whole, as Xray's VisionWriter
+pads each buffer.
+
 ## v0.8.3
 
 One fix, for the desktop daemon on macOS: `sudo shoesd install` over a

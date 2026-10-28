@@ -104,7 +104,10 @@ where
     let (io, connection) = tls_stream.into_inner();
     let mut user_uuid = [0u8; 16];
     user_uuid.copy_from_slice(user_id);
-    let vision_stream = VisionStream::new_client(io, connection, user_uuid, request_header);
+    // Each frame is padded whole, as Xray pads its buffers: there is no TLS
+    // record inside to wait for, and a frame ending in 0x16 must not be held.
+    let vision_stream =
+        VisionStream::new_client(io, connection, user_uuid, request_header).pad_whole_writes();
     Box::new(XudpClientStream::new(vision_stream, target))
 }
 

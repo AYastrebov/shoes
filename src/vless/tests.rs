@@ -305,6 +305,21 @@ fn udp_asks_for_mux_under_the_vision_flow() {
 /// a Vision XUDP session, under its target; the reply comes back through it.
 #[tokio::test]
 async fn udp_rides_the_vision_flow_as_xudp() {
+    udp_round_trip(b"query").await;
+}
+
+/// A datagram ending in a byte that could begin a TLS record is still sent
+/// whole: the client pads each XUDP write as one unit, as Xray's VisionWriter
+/// does, rather than holding the tail back for a record that never comes.
+#[tokio::test]
+async fn a_datagram_ending_in_a_tls_prefix_is_sent_whole() {
+    udp_round_trip(b"query\x16").await;
+    udp_round_trip(b"query\x16\x03\x03").await;
+}
+
+/// One datagram to the server and one back, with nothing else written in
+/// between: the server must see it on its own.
+async fn udp_round_trip(payload: &[u8]) {
     let (server, client) = handlers();
     let (client_end, server_end) = tcp_pair().await;
     let accepted =
@@ -315,7 +330,7 @@ async fn udp_rides_the_vision_flow_as_xudp() {
         .setup_client_udp_bidirectional(Box::new(client_end), dns.clone().into())
         .await
         .unwrap();
-    poll_fn(|cx| Pin::new(&mut *packets).poll_write_message(cx, b"query"))
+    poll_fn(|cx| Pin::new(&mut *packets).poll_write_message(cx, payload))
         .await
         .unwrap();
     poll_fn(|cx| Pin::new(&mut *packets).poll_flush_message(cx))
@@ -344,7 +359,7 @@ async fn udp_rides_the_vision_flow_as_xudp() {
     .expect("the server read the packet")
     .unwrap();
     assert_eq!(source, "192.0.2.53:53".parse().unwrap());
-    assert_eq!(buf.filled(), b"query");
+    assert_eq!(buf.filled(), payload);
 
     poll_fn(|cx| {
         Pin::new(&mut *sessions).poll_write_session_message(cx, session, b"answer", &source)
