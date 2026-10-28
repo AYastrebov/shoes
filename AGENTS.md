@@ -37,8 +37,9 @@ shoes --dry-run examples/<name>.yaml     # parse a config without starting
 ```
 
 The gate, before claiming anything works. CI (`.github/workflows/lint.yml`,
-`test.yml`) runs the same commands, and every configuration is clean and
-stays that way; `--tests` is in on purpose, since it catches what the other
+`test.yml`) runs the same commands, the FFI line on its macOS runner, plus
+the iOS and Android target lints; every configuration is clean and stays
+that way; `--tests` is in on purpose, since it catches what the other
 passes cannot see.
 
 ```bash

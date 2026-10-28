@@ -77,8 +77,15 @@ jobs:
       # Scoped to lib and bins on purpose. --all-targets currently reports
       # around fifteen further lints in test code; widening this needs that
       # cleared first, or it lands red.
+      # The gate AGENTS.md documents, command for command: the default
+      # configuration with its tests, then the desktop control surface. The
+      # host job used to run a bare `cargo clippy`, so a lint in a test or
+      # behind `desktop` was red locally and green here.
       - name: Run clippy
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --lib --bins --tests -- -D warnings
+
+      - name: Run clippy with the desktop control surface enabled
+        run: cargo clippy --locked --features desktop --lib --bins --tests -- -D warnings
 
   # Every platform the daemon builds on, because the `HostNetwork` arms share a
   # trait and a sequencer but no code -- a change that satisfies one compiles
@@ -101,10 +108,16 @@ jobs:
         include:
           - runner: macos-latest
             label: macOS
+            # The FFI and the iOS target lint here, the one runner where
+            # both compile; the Linux host reports the FFI's entry points
+            # as dead code, since nothing on Linux calls them.
+            targets: aarch64-apple-ios
           - runner: ubuntu-latest
             label: Linux
+            targets: ''
           - runner: windows-latest
             label: Windows
+            targets: ''
 
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +127,7 @@ jobs:
         with:
           toolchain: ${{ env.LINT_TOOLCHAIN }}
           components: clippy
+          targets: ${{ matrix.targets }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -160,6 +174,18 @@ jobs:
       # skips them is a lint that never reads the half most likely to rot.
       - name: Run clippy for the daemon
         run: cargo clippy --locked --features daemon --bins --tests -- -D warnings
+
+      # The last line of the documented gate, and one beyond it: the FFI
+      # with its tests on the host, and the FFI for the iOS target, which
+      # the XCFramework build compiles but never lints. A warning that only
+      # appears under the iOS cfg reached a release unseen before this.
+      - name: Run clippy with the FFI surface enabled (macOS)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked --features ffi,control-stats --lib --tests -- -D warnings
+
+      - name: Run clippy for the iOS target (macOS)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked --lib --features ffi,control-stats --target aarch64-apple-ios -- -D warnings
 
   clippy-android:
     name: Clippy (aarch64-linux-android)
