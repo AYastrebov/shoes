@@ -1,0 +1,17 @@
+# Version updates for the actions the workflows pin by commit. Each
+# action is pinned to a SHA with its version in a comment, which is what
+# Dependabot keeps current; without this, a deprecated action (setup-java
+# v4, 2026-10-28) is noticed only when its job starts warning.
+#
+# Actions only. Rust dependencies are updated by hand with `cargo update`
+# and reviewed in their own PRs, and `cargo audit` runs nightly in lint.yml.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: [ "*" ]
