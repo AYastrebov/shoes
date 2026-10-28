@@ -166,9 +166,9 @@ impl<S: Store> DnsStore<S> {
     /// Writing `{ ServerAddresses }` alone, as every release through 0.9.0
     /// did, dropped a lease's `DomainName` and a user's `SearchDomains` for
     /// the life of a session, so a bare hostname that resolved through the
-    /// search list before did not resolve through the tunnel. The re-apply
-    /// after a network change comes through here too, and so merges into
-    /// whatever the new network's lease wrote.
+    /// search list before did not resolve through the tunnel. Re-applying on
+    /// the original service comes through here too, merging any new lease
+    /// written to that service; a change of primary service is not handled.
     ///
     /// An empty list removes the override, which is how a service that had no
     /// explicit resolvers is restored.
