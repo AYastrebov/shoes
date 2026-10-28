@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.9.0
+
+A minor version, for the mobile FFI: Android gains a stopped listener,
+`start` returns a session id on both platforms, and `stop(handle)` acts on
+that session only (#121). A host that passes `stop` what `start` returned,
+as KVN's Android app and the Swift package do, needs no change; a host
+that passed a constant must pass the id now. The C symbol list and callback
+types are unchanged, so the Apple framework is a drop-in; the Kotlin
+bridge keeps its three-argument `start`. Also the Android build tooling
+moves to AGP 9.4.1 and Gradle 9.8.2 (#120), and the tag build no longer
+runs the macOS C-surface check (#119). No configuration change.
 
 Android gets a stopped listener, and both platforms a real session id.
 `ShoesNative.start` takes a fourth argument, a `StoppedListener` or null,
