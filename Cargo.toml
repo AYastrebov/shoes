@@ -130,7 +130,7 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "42a7e9f5d2ae2778f486324321dc6f93f0684f46", default-features = false }
 aws-lc-rs = { version = "1", default-features = false }
 base64 = "0.22"
-blake2 = "0.10"
+blake2 = "0.11"
 blake3 = "1"
 bytes = "1"
 chacha20poly1305 = "0.10"
