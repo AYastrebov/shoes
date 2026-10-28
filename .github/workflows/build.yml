@@ -19,6 +19,13 @@ on:
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        # Set by release-apple.yml: build on this branch and upload the
+        # archives to the draft release of that name. Empty for a plain
+        # dispatch, which builds and uploads nothing.
+        description: 'Draft release to upload the archives to (release-apple.yml sets this)'
+        default: ''
 
 permissions:
   contents: read
@@ -292,11 +299,17 @@ jobs:
   release:
     name: Create Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    # On a tag push, or when release-apple.yml dispatched this run with the
+    # draft's name: the archives go to that release, created here only for
+    # a hand-pushed tag that has none yet.
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
     steps:
       - name: Download all artifacts
@@ -311,11 +324,15 @@ jobs:
           find artifacts -type f -name '*.tar.gz' -exec cp {} release-artifacts/ \;
           ls -la release-artifacts/
 
-      - name: Create Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: release-artifacts/*
-          # Published, not a draft: a tag push should produce a visible release
-          # with the artifacts attached, not one that waits for a manual click.
-          draft: false
-          generate_release_notes: true
+      # gh, not action-gh-release: the release usually exists already as
+      # a draft that release-apple.yml created and will publish, and gh
+      # resolves a draft by its tag name. A tag pushed by hand gets a
+      # published release created here, with generated notes.
+      - name: Upload to the release
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber release-artifacts/*

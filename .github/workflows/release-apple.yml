@@ -4,24 +4,41 @@ name: Release Apple
 # checksum of the zip for the tag it is on, and that zip comes from that
 # tag's build -- so no tag-triggered flow can produce a manifest that names
 # its own release. This one builds first, computes the checksum, commits
-# Package.swift, pushes the branch, stages a DRAFT release carrying the zip,
-# and only then publishes it -- publishing is what creates the tag, at the
-# manifest commit. Nothing irreversible happens before the asset is safely
-# attached, and a failure after the draft exists is recovered by re-running
-# the workflow, which finds the draft and publishes it instead of rebuilding.
+# Package.swift, pushes the branch, uploads the zip to a DRAFT release, and
+# only then publishes it -- publishing is what creates the tag, at the
+# manifest commit. Nothing irreversible happens before every asset is
+# safely attached, and a failure after the draft exists is recovered by
+# re-running the workflow, which finds the draft and finishes it.
 #
-# The tag this creates is made by the API with the workflow's token, and
-# GitHub does not fire on:push workflows for that -- so mobile.yml and
-# build.yml are dispatched here, on the tag ref, to attach the AAR and the
-# desktop binaries. This workflow is the only producer of
-# Shoes.xcframework.zip; mobile.yml's release job attaches the AAR alone and
-# checks the manifest actually names its tag.
+# The AAR and the desktop binaries are built at the same time as the
+# framework, not after it: the draft is created first, and mobile.yml and
+# build.yml are dispatched on the branch with its tag name, so their
+# release jobs upload to the draft while this job builds the framework.
+# Publishing waits for both. They build from the bump commit, one commit
+# before the tag's manifest commit; the trees differ only in
+# Package.swift, which no binary reads. Before 2026-10-28 they were
+# dispatched after the publish, onto the tag, and the release took the sum
+# of the three builds instead of the slowest.
+#
+# This workflow is the only producer of Shoes.xcframework.zip. A tag
+# pushed by hand still runs build.yml and mobile.yml on the tag, and
+# mobile.yml's release job checks the manifest actually names that tag.
+#
+# `dry_run` exercises everything against a draft named v<version>-dryrun
+# -- the fan-out, the framework build, the uploads, the wait -- and
+# deletes the draft at the end instead of publishing, with no commit and
+# no push. Run it from a branch to test a change to this flow.
+
 on:
   workflow_dispatch:
     inputs:
       version:
         description: 'Version to release, without the v (e.g. 0.2.15). Must match Cargo.toml.'
         required: true
+      dry_run:
+        description: 'Build and attach everything to a throwaway draft, then delete it. No commit, no tag.'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -40,6 +57,7 @@ jobs:
       # Through env, never interpolated into scripts: an expression inside
       # run: is expanded before the shell parses, which is an injection.
       VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -54,31 +72,87 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "version '$VERSION' is not MAJOR.MINOR.PATCH"; exit 1; }
 
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "tag v$VERSION already exists -- this version is released"; exit 1
-          fi
-
-          if gh release view "v$VERSION" --json isDraft,assets \
-               --jq '.isDraft and ([.assets[].name] | index("Shoes.xcframework.zip") != null)' \
-               2>/dev/null | grep -q true; then
-            # A previous run built, committed and staged the draft, then
-            # failed at publish. The zip and the committed checksum agree;
-            # rebuilding would break that. Publish what exists.
-            echo "mode=publish" >> "$GITHUB_OUTPUT"
-            echo "recovering: draft v$VERSION already carries the zip"
+          if [ "$DRY_RUN" = "true" ]; then
+            tag="v$VERSION-dryrun"
+            echo "dry run: the draft is $tag, nothing is committed or published"
           else
+            tag="v$VERSION"
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "tag $tag already exists -- this version is released"; exit 1
+            fi
             cargo_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
             [ "$cargo_version" = "$VERSION" ] \
               || { echo "Cargo.toml says $cargo_version, input says $VERSION"; exit 1; }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # A previous run built, committed and uploaded the framework, then
+          # failed later. The zip and the committed checksum agree;
+          # rebuilding would break that. Go straight to the wait and the
+          # publish, re-dispatching only what is missing.
+          if gh release view "$tag" --json isDraft,assets \
+               --jq '.isDraft and ([.assets[].name] | index("Shoes.xcframework.zip") != null)' \
+               2>/dev/null | grep -q true; then
+            echo "mode=finish" >> "$GITHUB_OUTPUT"
+            echo "recovering: draft $tag already carries the framework"
+          else
             echo "mode=full" >> "$GITHUB_OUTPUT"
           fi
+          echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # The draft first, so the fan-out builds have something to upload to
+      # while the framework builds. It carries the tag NAME and no tag yet;
+      # its target moves to the manifest commit before publish.
+      - name: Create the draft
+        if: steps.plan.outputs.mode == 'full'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "draft $TAG exists from an earlier attempt; keeping it"
+          else
+            gh release create "$TAG" --draft --target "$(git rev-parse HEAD)" \
+              --title "$TAG" --generate-notes
+          fi
+
+      # Both at once, on this branch, uploading to the draft by its name.
+      # On a finish-mode re-run only the builds whose assets are missing
+      # are dispatched again.
+      - name: Dispatch the AAR and desktop-binary builds
+        id: dispatch
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | join(" ")')
+          need_binaries=false; need_aar=false
+          for a in shoes-linux-x86_64.tar.gz shoes-linux-x86_64-musl.tar.gz shoes-linux-arm64.tar.gz \
+                   shoes-linux-arm64-musl.tar.gz shoes-macos-arm64.tar.gz shoes-windows-x86_64.tar.gz \
+                   shoes-windows-arm64.tar.gz shoesd-linux-x86_64.tar.gz shoesd-linux-arm64.tar.gz \
+                   shoesd-macos-arm64.tar.gz shoesd-windows-x86_64.tar.gz shoesd-windows-arm64.tar.gz; do
+            case " $assets " in *" $a "*) ;; *) need_binaries=true ;; esac
+          done
+          case " $assets " in *" shoes-release.aar "*) ;; *) need_aar=true ;; esac
+          if [ "$need_binaries" = true ]; then
+            gh workflow run build.yml --ref "$GITHUB_REF_NAME" -f "release_tag=$TAG"
+            echo "dispatched build.yml for $TAG"
+          fi
+          if [ "$need_aar" = true ]; then
+            gh workflow run mobile.yml --ref "$GITHUB_REF_NAME" -f "release_tag=$TAG"
+            echo "dispatched mobile.yml for $TAG"
+          fi
+          echo "binaries=$need_binaries" >> "$GITHUB_OUTPUT"
+          echo "aar=$need_aar" >> "$GITHUB_OUTPUT"
 
       - name: Build the XCFramework
         if: steps.plan.outputs.mode == 'full'
         uses: ./.github/actions/build-apple
 
-      - name: Zip, checksum, commit the manifest, stage the draft
+      - name: Zip, checksum, commit the manifest, upload to the draft
         if: steps.plan.outputs.mode == 'full'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
         run: |
           set -euo pipefail
           (cd output/apple && zip -r -q Shoes.xcframework.zip Shoes.xcframework/)
@@ -86,39 +160,83 @@ jobs:
           checksum=$(swift package compute-checksum output/apple/Shoes.xcframework.zip)
           echo "sha256 $checksum"
 
-          sed -i '' "s/^let shoesRelease = \".*\"\$/let shoesRelease = \"v$VERSION\"/" Package.swift
-          sed -i '' "s/^let shoesChecksum = \".*\"\$/let shoesChecksum = \"$checksum\"/" Package.swift
-          git diff Package.swift
+          if [ "$DRY_RUN" != "true" ]; then
+            sed -i '' "s/^let shoesRelease = \".*\"\$/let shoesRelease = \"$TAG\"/" Package.swift
+            sed -i '' "s/^let shoesChecksum = \".*\"\$/let shoesChecksum = \"$checksum\"/" Package.swift
+            git diff Package.swift
 
-          # Committed as the release author, not as the bot: this is a
-          # change to the tree the tag will point at.
-          git config user.name "Andrey Yastrebov"
-          git config user.email "ayastrebov@gmail.com"
-          git add Package.swift
-          git commit -m "release: $VERSION"
-          git push origin "HEAD:$GITHUB_REF_NAME"
+            # Committed as the release author, not as the bot: this is a
+            # change to the tree the tag will point at.
+            git config user.name "Andrey Yastrebov"
+            git config user.email "ayastrebov@gmail.com"
+            git add Package.swift
+            git commit -m "release: $VERSION"
+            git push origin "HEAD:$GITHUB_REF_NAME"
 
-          # Draft: carries the tag NAME and the asset, creates no tag yet.
-          gh release create "v$VERSION" \
-            --draft \
-            --target "$(git rev-parse HEAD)" \
-            --title "v$VERSION" \
-            --generate-notes \
-            output/apple/Shoes.xcframework.zip
+            # The tag the publish creates points at the manifest commit.
+            gh release edit "$TAG" --target "$(git rev-parse HEAD)"
+          fi
 
-      # Publishing the draft is the one irreversible step: it creates the
-      # tag at the draft's target commit -- the manifest commit.
-      - name: Publish
-        run: gh release edit "v$VERSION" --draft=false
+          gh release upload "$TAG" output/apple/Shoes.xcframework.zip --clobber
 
-      # The tag now exists, made by the API with this workflow's token, which
-      # fires no on:push workflow. Dispatch the two that attach the rest of
-      # the release on the tag ref; their release jobs see refs/tags/v* and
-      # run, and action-gh-release appends to the existing release.
-      - name: Dispatch the AAR and desktop-binary builds onto the tag
+      # The runs this job dispatched: the newest workflow_dispatch run of
+      # each workflow on this branch since the plan step. Watched to
+      # completion; a failed or cancelled one fails the release before the
+      # publish, and a re-run of this workflow dispatches it again.
+      - name: Wait for the AAR and desktop-binary builds
+        env:
+          STARTED: ${{ steps.plan.outputs.started }}
+          NEED_BINARIES: ${{ steps.dispatch.outputs.binaries }}
+          NEED_AAR: ${{ steps.dispatch.outputs.aar }}
         run: |
           set -euo pipefail
-          gh workflow run mobile.yml --ref "v$VERSION"
-          gh workflow run build.yml --ref "v$VERSION"
-          echo "Dispatched mobile.yml and build.yml on v$VERSION; their release"
-          echo "jobs attach the AAR and the desktop binaries."
+          wait_for() {
+            local workflow="$1" id=""
+            for attempt in $(seq 1 30); do
+              id=$(gh run list --workflow "$workflow" --branch "$GITHUB_REF_NAME" \
+                     --event workflow_dispatch --created ">=$STARTED" --limit 1 \
+                     --json databaseId --jq '.[0].databaseId // empty')
+              [ -n "$id" ] && break
+              sleep 10
+            done
+            [ -n "$id" ] || { echo "no $workflow run appeared after $STARTED"; exit 1; }
+            echo "waiting for $workflow run $id"
+            gh run watch "$id" --exit-status --interval 30 >/dev/null
+            echo "$workflow run $id succeeded"
+          }
+          [ "$NEED_BINARIES" = true ] && wait_for build.yml
+          [ "$NEED_AAR" = true ] && wait_for mobile.yml
+          true
+
+      - name: Check every asset is attached
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | join(" ")')
+          missing=""
+          for a in Shoes.xcframework.zip shoes-release.aar \
+                   shoes-linux-x86_64.tar.gz shoes-linux-x86_64-musl.tar.gz shoes-linux-arm64.tar.gz \
+                   shoes-linux-arm64-musl.tar.gz shoes-macos-arm64.tar.gz shoes-windows-x86_64.tar.gz \
+                   shoes-windows-arm64.tar.gz shoesd-linux-x86_64.tar.gz shoesd-linux-arm64.tar.gz \
+                   shoesd-macos-arm64.tar.gz shoesd-windows-x86_64.tar.gz shoesd-windows-arm64.tar.gz; do
+            case " $assets " in *" $a "*) ;; *) missing="$missing $a" ;; esac
+          done
+          [ -z "$missing" ] || { echo "draft $TAG is missing:$missing"; exit 1; }
+          echo "all 14 assets attached to $TAG"
+
+      # Publishing the draft is the one irreversible step: it creates the
+      # tag at the draft's target -- the manifest commit. The tag is made
+      # by the API with this workflow's token, which fires no on:push
+      # workflow, and nothing needs to: every asset is already attached.
+      - name: Publish
+        if: inputs.dry_run != true
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false
+
+      - name: Delete the dry-run draft
+        if: always() && inputs.dry_run == true && steps.plan.outputs.tag != ''
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: gh release delete "$TAG" --yes --cleanup-tag || true

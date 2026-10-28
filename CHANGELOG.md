@@ -31,6 +31,21 @@ configuration or the iOS target at all, so a warning in a test, behind
 job runs the default and desktop lines with their tests; the macOS daemon
 job runs the FFI line with its tests and a clippy for `aarch64-apple-ios`.
 
+A release builds its three artifacts at once. `release-apple.yml` creates
+the draft release first and dispatches the AAR and desktop-binary builds
+on the branch with the draft's name, so they upload while the framework
+builds; the manifest commit, the framework upload and the draft's retarget
+follow as before, and the publish, which creates the tag, waits for both
+builds and checks all 14 assets are attached. The release's wall time is
+the slowest build instead of the sum, and a fan-out build that fails or is
+cancelled fails the release before anything irreversible happens; a re-run
+finds the draft and dispatches only what is missing. The two fan-out
+release jobs upload with `gh` by tag name, which resolves a draft; a tag
+pushed by hand still gets its release from them, with the manifest check
+on that path unchanged. A `dry_run` input exercises the whole flow against
+a throwaway draft and deletes it, with no commit and no tag. Spec:
+`docs/specs/2026-10-28-parallel-release.md`.
+
 ## v0.9.0
 
 A minor version, for the mobile FFI: Android gains a stopped listener,

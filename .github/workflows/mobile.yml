@@ -40,6 +40,12 @@ on:
   schedule:
     - cron: '41 3 * * *'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        # Set by release-apple.yml: build the AAR on this branch and upload
+        # it to the draft release of that name. Empty for a plain dispatch.
+        description: 'Draft release to upload the AAR to (release-apple.yml sets this)'
+        default: ''
 
 permissions:
   contents: read
@@ -407,13 +413,17 @@ jobs:
   release:
     name: Attach to Release
     # android only: apple is skipped on tags (above), and this job attaches
-    # nothing the apple job makes.
+    # nothing the apple job makes. Runs on a tag push, or when
+    # release-apple.yml dispatched this run with the draft's name.
     needs: [ android ]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -421,8 +431,11 @@ jobs:
       # A tag pushed by hand -- git tag && git push, the old habit -- reaches
       # here with a manifest that names no published framework, and every
       # SwiftPM consumer of that tag would fail to resolve. Fail the release
-      # loudly instead of shipping it quietly broken.
+      # loudly instead of shipping it quietly broken. Tag pushes only: on a
+      # dispatch from release-apple.yml the manifest is being written by
+      # that very workflow while this runs.
       - name: Check the manifest names this release
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           release=$(grep -m1 '^let shoesRelease' Package.swift | sed 's/.*"\(.*\)"/\1/')
@@ -441,21 +454,17 @@ jobs:
         with:
           path: artifacts
 
+      # The AAR only, by name. Shoes.xcframework.zip is attached by
+      # release-apple.yml, which computes the checksum Package.swift names
+      # and commits it before the tag exists. Re-attaching a rebuilt zip
+      # here would overwrite that asset with a byte-different one -- zip
+      # timestamps alone -- and break every consumer's checksum. This job
+      # must be unable to touch it, not merely unlikely to: the upload
+      # names one file. The release exists before this runs, as a draft
+      # from release-apple.yml or as the published release build.yml made
+      # for a hand-pushed tag; gh resolves a draft by its tag name.
       - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          # The AAR only. Shoes.xcframework.zip is attached by
-          # release-apple.yml, which computes the checksum Package.swift
-          # names and commits it before the tag exists. Re-attaching a
-          # rebuilt zip here would overwrite that asset with a byte-different
-          # one -- zip timestamps alone -- and break every consumer's
-          # checksum. This job must be unable to touch it, not merely
-          # unlikely to.
-          files: artifacts/shoes-android/shoes-release.aar
-          # Published, not a draft, matching build.yml. This job and build.yml's
-          # release both target the same tag; softprops/action-gh-release is
-          # idempotent per tag, so whichever runs first creates the release and
-          # the other appends its artifacts. Release notes are generated once, by
-          # build.yml, so this leaves generate_release_notes off.
-          draft: false
-          generate_release_notes: false
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            artifacts/shoes-android/shoes-release.aar
