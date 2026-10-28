@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+CI only. Jobs that are not needed no longer run. A pull request or push
+that changes only Markdown, `docs/` or `LICENSE` skips Lint and Test; tags
+still run everything. The Apple XCFramework and the Swift package jobs run
+only when Build Mobile Libraries is started by hand: the framework that
+ships is built by the release workflow, and building it on every pull
+request that touched the packaging cost two macOS jobs of up to an hour
+each. Pull requests run that workflow's macOS C-surface check and Android
+build only when they touch the FFI, the header, `android/`, the Android
+build script or the dependencies, since Lint already compiles the library
+for iOS, macOS and Android on every PR. The two nightlies, the seven
+release builds and the AAR, skip a night when `mobile` has not moved since
+the last one that built, refreshing at least every six days to keep their
+caches inside GitHub's seven-day eviction. A release dispatch of the
+binaries or AAR build now runs in a concurrency group of its own and is
+never cancelled: it shared one with every other run on the branch, which is
+how a re-run of an older release build cancelled the 0.9.0 finish run's
+build, and how the nightly could have cancelled a release in progress. The
+macOS C-surface check no longer runs on a release dispatch, which only
+attaches the AAR; it was that job, waiting for a runner, that turned the
+0.9.0 mobile run red.
+
 CI only. A release re-run no longer waits for a macOS runner it does not
 need. `release-apple.yml` was one `macos-latest` job, so finish mode -- the
 re-run after a failure past the manifest commit, which only re-dispatches

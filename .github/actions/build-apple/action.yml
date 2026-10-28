@@ -1,9 +1,9 @@
 name: Build the Apple XCFramework
 description: >
   Toolchain, caches, cbindgen, and scripts/build-apple.sh. One definition,
-  used by mobile.yml's apple job (the build PRs exercise) and by
+  used by mobile.yml's apple job (a manual pre-release check) and by
   release-apple.yml (the build that ships) -- so the two cannot drift and the
-  released artifact is built exactly as CI tested it.
+  released artifact is built exactly as the check built it.
 runs:
   using: composite
   steps:

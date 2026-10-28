@@ -1,39 +1,50 @@
 name: Build Mobile Libraries
 
-# Tags, pull requests and manual runs, as before -- plus branch pushes that
-# touch the Swift package or what it wraps. The Swift under swift/ is this
-# repository's own code and no other workflow compiles it (test.yml runs on
-# ubuntu), so leaving it to the tag would let a push that breaks the package
-# stay green until someone opened a PR. The Android and release jobs keep
-# the old policy through their `if:` below, so a Swift push buys the Apple
-# jobs and nothing else. Path filters are not evaluated for tag pushes, so
-# a tag still runs everything.
+# Which job runs when:
 #
-# The cost the old policy accepted still stands for Android: its build is
-# not compiled on a branch push, so a break there is caught when a tag is
-# pushed rather than when the code lands. Run this workflow by hand
-# (Actions -> Run workflow) before tagging if a change touched the JNI
-# layer or build-android.sh.
+# - apple + swift (the XCFramework and the Swift package): a manual run
+#   only. release-apple.yml builds the framework that ships.
+# - macos (the C surface): pull requests and branch pushes that touch the
+#   FFI or the header, and manual runs; not on a release.
+# - android (the AAR): pull requests, tags, release dispatches, manual runs
+#   and the nightly when the branch moved; not on a branch push.
+# - release (attach the AAR): tags and release dispatches.
+#
+# The cost that stands: the Swift package is checked only when someone
+# runs this workflow by hand, and the Android build is not compiled on a
+# branch push. Run it (Actions -> Run workflow, no release_tag) before a
+# release if swift/, Package.swift, the JNI layer or a build script
+# changed. Path filters are not evaluated for tag pushes.
 on:
   push:
     tags: [ 'v*' ]
     branches: [ master, mobile ]
+    # What the macOS C-surface job checks; the Apple framework and Swift
+    # jobs no longer run on a push (see the apple job).
     paths:
-      - 'swift/**'
-      - 'Package.swift'
-      - '.swift-format'
       - 'include/**'
       - 'src/ffi/**'
-      - 'scripts/build-apple.sh'
       - '.github/workflows/mobile.yml'
   pull_request:
     branches: [ master, mobile ]
-    # A docs-only PR does not need two macOS runners and an NDK build; Test
-    # and Lint still run on it.
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
+    # Only when what the two PR jobs check changed: the C surface (macOS)
+    # and the AAR (Android). Lint already compiles the library for every
+    # mobile target on every PR -- the FFI configuration on macOS,
+    # `aarch64-apple-ios`, and Android through cargo ndk -- so an ordinary
+    # Rust change is checked there. Dependencies are in the list because a
+    # bump is how a cross build stops linking. The Apple framework and the
+    # Swift package are not built on a PR at all (see the apple job). Before
+    # 2026-10-28 every non-docs PR paid for three macOS jobs here.
+    paths:
+      - 'include/**'
+      - 'src/ffi/**'
+      - 'android/**'
+      - 'scripts/build-android.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.cargo/**'
+      - '.github/workflows/mobile.yml'
   # Nightly, on the default branch: the android job alone (the macOS jobs
   # are guarded below), so the tag build's AAR restores a warm cache
   # instead of compiling three ABIs cold.
@@ -50,28 +61,91 @@ on:
 permissions:
   contents: read
 
+# A release dispatch (release_tag set) is in a group of its own, by run id,
+# and is never cancelled: it was sharing `<workflow>-refs/heads/mobile` with
+# every other run on the branch, so on 2026-10-28 a re-run of an older
+# release build cancelled the 0.9.0 finish run's fresh one, and the 03:xx
+# nightly would have cancelled any release build still going. The event is
+# in the group so the nightly and a branch push do not cancel each other
+# either. Everything else keeps the newest-run-wins rule.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.release_tag && format('release-{0}', github.run_id) || format('{0}-{1}', github.event_name, github.ref) }}
+  cancel-in-progress: ${{ !inputs.release_tag }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The nightly's reason to run is a change since the last one: a nightly
+  # over an unchanged `mobile` rebuilds what the last one built. So a
+  # scheduled run first asks whether HEAD differs from the last successful
+  # scheduled run's commit, and skips when it does not -- unless that run is
+  # six days old, so the caches it keeps warm are touched inside GitHub's
+  # seven-day eviction window. Any other event runs, and so does a nightly
+  # whose question cannot be answered.
+  changed:
+    name: Changed since the last nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: mobile.yml
+        run: |
+          set -uo pipefail
+          if [ "$EVENT" != schedule ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The last successful scheduled run that built something. A night
+          # this job skipped also ends in success, and must not count, or an
+          # unchanged branch would never reach the six-day refresh.
+          last=""
+          runs=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --event schedule \
+                   --status success --limit 20 --json databaseId,headSha,createdAt \
+                   --jq '.[] | "\(.databaseId) \(.headSha) \(.createdAt)"' 2>/dev/null) || runs=""
+          while read -r id run_sha run_created; do
+            [ -n "$id" ] || continue
+            built=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+                      --jq '[.jobs[] | select(.name != "Changed since the last nightly"
+                                              and .conclusion == "success")] | length' \
+                      2>/dev/null) || built=0
+            if [ "${built:-0}" -gt 0 ]; then last="$run_sha $run_created"; break; fi
+          done <<< "$runs"
+          sha=${last%% *}; created=${last#* }
+          if [ -z "$last" ] || [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "running: last successful nightly was at ${sha:-none}, HEAD is $GITHUB_SHA"
+          elif [ $(( $(date +%s) - $(date -d "$created" +%s) )) -gt $(( 6 * 86400 )) ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "running: HEAD unchanged, but the last nightly ($created) is six days old"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skipping: the nightly of $created already built $GITHUB_SHA"
+          fi
+
   # ──────────────────────────────────────────────────────────────────────────
   # Apple — XCFramework (iOS device arm64, iOS simulator arm64, macOS arm64)
   # ──────────────────────────────────────────────────────────────────────────
   apple:
     name: Build Apple XCFramework
     runs-on: macos-latest
-    # Not on a tag: by then this commit was built here as a PR, and the tag
-    # itself was created by release-apple.yml, which built and published the
-    # framework minutes earlier. Rebuilding it on the tag spent twenty macOS
-    # minutes on an artifact nothing may touch -- the release job attaches
-    # the AAR alone, deliberately. Sentry's tag CI makes the same call: the
-    # release pipeline is the sole builder. The swift job follows this gate
-    # through needs:.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
+    # Only on a manual run of this workflow, never on a pull request, a
+    # push, a tag or the nightly. The framework is built for real by
+    # release-apple.yml, the sole builder of what ships; building it here as
+    # well cost two macOS jobs of up to an hour on every PR that touched the
+    # packaging, for an artifact nothing downloads. Run this workflow by
+    # hand (Actions -> Run workflow, no release_tag) before a release when
+    # swift/, Package.swift or the build script changed: the swift job,
+    # which follows this gate through needs:, is the only place the Swift
+    # package is linted, tested, typechecked for iOS and link-checked.
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.release_tag }}
     timeout-minutes: 60
 
     steps:
@@ -196,7 +270,11 @@ jobs:
     # this check as a PR, and the release job attaches nothing this job
     # makes. On the v0.8.4 tag it cost twelve macOS minutes and, when no
     # macOS runner came, turned the tag's run red for no asset's sake.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
+    #
+    # Nor on a release dispatch, for the same reason: it attaches only the
+    # AAR. On 0.9.0 this job got no macOS runner and turned the release's
+    # mobile run red although the AAR had attached.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' && !inputs.release_tag }}
     timeout-minutes: 45
 
     steps:
@@ -282,9 +360,13 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   android:
     name: Build Android AAR
+    needs: changed
     runs-on: ubuntu-latest
-    # Not on a branch push: see the trigger comment at the top.
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
+    # Not on a branch push: see the trigger comment at the top. Nor on a
+    # nightly over an unchanged branch: see `changed`.
+    if: >-
+      (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')) &&
+      needs.changed.outputs.run == 'true'
     timeout-minutes: 60
 
     steps:
