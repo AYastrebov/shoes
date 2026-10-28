@@ -127,7 +127,7 @@ serde_json = { version = "1", optional = true }
 # Optional, for `daemon`: `net` carries the UnixListenerStream the daemon
 # hands to tonic.
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
-awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "42a7e9f5d2ae2778f486324321dc6f93f0684f46", default-features = false }
+awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "738ce7e26b520dd621571e913a53bdc9795fc2f5", default-features = false }
 aws-lc-rs = { version = "1", default-features = false }
 base64 = "0.23"
 blake2 = "0.11"
