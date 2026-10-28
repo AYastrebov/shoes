@@ -133,7 +133,7 @@ base64 = "0.22"
 blake2 = "0.11"
 blake3 = "1"
 bytes = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 chrono = "0.4"
 dashmap = "6"
 # Pinned to the major: shake 0.1 implements digest 0.11's XofReader, and a
