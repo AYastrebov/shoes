@@ -72,6 +72,7 @@ jobs:
         with:
           key: clippy-host
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # Scoped to lib and bins on purpose. --all-targets currently reports
       # around fifteen further lints in test code; widening this needs that
@@ -119,6 +120,7 @@ jobs:
         with:
           key: clippy-daemon-${{ matrix.runner }}
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # prost-build stopped vendoring protoc.
       - name: Install protoc (macOS)
@@ -179,6 +181,7 @@ jobs:
         with:
           key: clippy-android
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2

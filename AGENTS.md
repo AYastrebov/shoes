@@ -129,7 +129,9 @@ default build does not compile them at all (see `src/ffi/AGENTS.md`).
   named (an obfuscation password under four bytes is refused because
   `smPSKMinLen` upstream refuses it).
 - Every option reaches `CONFIG.md`, a config in `examples/` that parses, and,
-  if it needs no certificate, the smoke loop in `.github/workflows/build.yml`.
+  if it needs no certificate, the smoke loops in `.github/workflows/test.yml`
+  (every PR, debug binary) and `.github/workflows/build.yml` (tags and
+  nightly, release binary).
   Procedure: `.agent/skills/adding-a-config-option/`.
 
 ## Commits and pull requests
