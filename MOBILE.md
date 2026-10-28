@@ -197,7 +197,9 @@ artifacts are built with the feature on.
    reading it — prefer leaking it. A handle that is not the running session's
    id — 0, a session already gone, a constant — stops nothing and returns true
    with a warning in the log: nothing of yours is running. Pass what `start`
-   returned, never a constant.
+   returned, never a constant. A stop decided while `start` is still running
+   cannot name that session yet: record it, and carry it out with the id once
+   `start` returns (the Swift wrapper waits for the in-flight start itself).
 5. Forward network changes while the tunnel runs: `networkChanged()` /
    `shoes_network_changed()`. See finding 3.
 
@@ -466,7 +468,9 @@ session id from a process-wide counter that starts at 1, `stop(handle)` acts
 on the session with that id and on no other -- any other value is a no-op
 that reports released, with a warning -- and the stopped callback is handed
 the id with the reason. There is still one tunnel per process; the id is
-identity, not multiplicity.
+identity, not multiplicity. An exit that lands while a stop is waiting on
+that very session is still recorded, so a crash that raced the host's stop
+reaches `getLastError` as before.
 
 Before: `shoes_start` returned the literal `1` and `shoes_stop(_handle)`
 ignored its argument, so the API implied a multi-instance model it did not

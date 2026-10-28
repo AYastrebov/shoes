@@ -125,6 +125,12 @@ in production under KVN's macOS provider:
    return and the slot-taking bridge already keeps one session's death
    from reaching another's handler.
 
+   A consequence hosts must know: a stop issued before `start` has returned
+   cannot name the session that start is making. KVN's Android
+   `ShoesSession` records such a stop and carries it out when the start
+   returns, with the handle it got; the Swift wrapper in this repository
+   waits for the in-flight start itself (change 6). Both headers say so.
+
 4. **An exit names the session it is for.** Today an exit and a start can
    cross: `ExitGuard::drop` (`src/control/mod.rs`) marks the service
    stopped before it calls `on_exit`, and `is_service_running()` reads
@@ -136,11 +142,19 @@ in production under KVN's macOS provider:
    library. The fix: the exit closure handed to `start_and_install`
    captures its own id (`move |reason| fire_stopped(id, reason)`), and
    `fire_stopped` compares it with the slot's. On a match it records and
-   delivers as today. On a mismatch, or an empty slot, it does neither:
-   the session that exited is gone and the one in the slot is someone
-   else's; it logs at warn naming both ids. The test installs session B,
-   fires A's exit, and asserts B's callback is untouched and
-   `get_last_error` unchanged.
+   delivers as today. If the id is the one a stop has taken out of the
+   slot and is waiting on, the exit is the exit guard's losing race -- a
+   real failure that landed as the host reached for the switch, or the
+   stop's own unrequested-end echo -- and is recorded for `get_last_error`
+   without a callback, so the stop's existing echo rule
+   (`written_by_the_stop`, from an earlier fix that kept such a crash
+   visible) still judges it. Otherwise, a mismatch or an empty slot with
+   no stop waiting, it is dropped: the session that exited is gone and the
+   one in the slot is someone else's; it logs at warn naming both ids.
+   Tests: session B installed, A's exit fired, B's callback untouched and
+   `get_last_error` unchanged; a session that fails while its stop waits
+   leaves the failure in `get_last_error` and calls no callback; the echo
+   variant restores the earlier error.
 
 5. **`stop(handle)` acts on that session only.** `stop_service_locked`
    takes the id: if it names the running session, the stop proceeds as
@@ -170,6 +184,13 @@ in production under KVN's macOS provider:
    no handle (never started, or already stopped) passes 0, which the
    library answers with released, so the provider's
    `if engine.isRunning { await engine.stop() }` call sites keep working.
+   A `stop()` that arrives while `start` is still inside the native call
+   waits for that call and then stops the session it made: before this
+   change `shoes_stop(1)` queued behind the start and stopped whatever ran,
+   and a stop that passed 0 instead would have left the engine running
+   after `stopTunnel` returned. The start task records the id itself, so
+   a waiter finds it set. The native start and stop are injectable on a
+   test instance so this sequencing is tested without the library.
    The class comment is corrected. The package's public API (`start`,
    `stop`, `isRunning`) does not change, so a consumer such as KVN's macOS
    provider needs nothing.

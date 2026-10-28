@@ -26,7 +26,12 @@ Also fixed with it, found in the design review: an exit and a start could
 cross, since the exit guard marks a service stopped before it delivers the
 exit, and the old session's exit then overwrote the error the new start
 had cleared and reached the new session's callback. An exit now names its
-session, and one for a session no longer in the slot is dropped.
+session, and one for a session no longer in the slot is dropped -- unless
+a stop is waiting on that session, in which case it is recorded without a
+callback, so a crash that raced the host's stop still reaches
+`getLastError`, as an earlier fix made sure of. The Swift wrapper also
+waits for a start still inside the native call before it stops, so
+disconnecting while still connecting stops the session that start made.
 
 The Android AAR builds with AGP 9.4.1 and Gradle 9.8.2, up from 9.0.1 and
 9.5.0; nothing in the module's build script changes, since it enables no

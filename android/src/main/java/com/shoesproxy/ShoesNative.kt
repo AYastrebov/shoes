@@ -257,7 +257,9 @@ object ShoesNative {
      * nothing and returns true, with a warning in the log: nothing of yours
      * is running. So pass what [start] returned, never a constant; and a
      * late [StoppedListener] handler may call this with its own id without
-     * touching the session that replaced it.
+     * touching the session that replaced it. A stop decided while [start]
+     * is still running cannot name that session yet: record it, and carry
+     * it out with the id once [start] returns.
      *
      * @param handle The session id returned by [start].
      * @return true when the engine confirmed the stop — the descriptor is

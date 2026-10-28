@@ -15,7 +15,7 @@
 - clippy at `-D warnings` in every configuration, including `--target aarch64-apple-ios` and `cargo ndk -t arm64-v8a` (`src/ffi/AGENTS.md`); `unwrap`/`expect` warn outside tests.
 - Ids are `u64`, start at 1, process-wide, strictly increasing; crossed to `jlong` / `c_long` as-is.
 - `stop` on a stale or unknown id, 0 included, is a no-op that returns released (`true` / `1`) and warns in the log; it never writes `LAST_ERROR`.
-- A late exit (slot empty or holding another id) is logged at warn and neither delivered nor recorded.
+- A late exit for a session a stop is waiting on is recorded for `get_last_error` without a callback (the stop's echo rule judges it); any other late exit (slot empty or holding another id) is logged at warn and neither delivered nor recorded.
 - Every exit has a sentence; the Kotlin listener's `reason` is never null. Strings crossing the boundary use `common::c_string_lossy`'s rule (no interior NUL).
 - No Cyrillic anywhere. Commit subjects `area: imperative summary`, bodies say why, `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - The C symbol list of `include/shoes.h` does not change (the macOS surface check counts it).
