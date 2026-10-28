@@ -8,7 +8,8 @@ KDoc'd, and the only Kotlin. The JNI entry points it binds are in
 ## Commands
 
 Needs `ANDROID_NDK_HOME` (or `ANDROID_HOME` with an NDK), `cargo-ndk`,
-Gradle 8.6 or later on the path (CI uses 9.5.0), and Java 17 or later.
+Gradle 9.6 or later on the path (CI uses 9.8.2; AGP 9.4 needs 9.6), and
+Java 17 or later.
 
 ```bash
 bash scripts/build-android.sh            # output/android/shoes-release.aar

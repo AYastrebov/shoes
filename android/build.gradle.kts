@@ -23,10 +23,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    sourceSets {
-        getByName("main") {
-            // JNI .so files built by cargo-ndk / build-android.sh
-            jniLibs.srcDirs("src/main/jniLibs")
-        }
-    }
+    // The JNI libraries cargo-ndk writes to src/main/jniLibs are picked up
+    // from there by default; naming the directory again through srcDirs is
+    // deprecated in AGP 9.4.
 }

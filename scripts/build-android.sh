@@ -7,7 +7,7 @@
 # Requirements:
 #   - Android NDK: set ANDROID_NDK_HOME, or NDK_HOME, or have ANDROID_HOME with NDK installed
 #   - cargo-ndk: installed automatically if missing
-#   - Gradle 8.6+ available as `gradle` in PATH, or ./gradlew in android/
+#   - Gradle 9.6+ (what AGP 9.4 needs) as `gradle` in PATH, or ./gradlew in android/
 #   - Java 17+
 #
 set -euo pipefail
