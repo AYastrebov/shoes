@@ -101,13 +101,16 @@ so the stock x86_64 emulator can load the library at all; without it,
 x86 slice. The Apple framework ships iOS device, iOS simulator and macOS slices, all
 arm64.
 
-CI (`.github/workflows/mobile.yml`) triggers on `v*` tags, on pull requests to
-`master` and `mobile`, manually, and on branch pushes that touch the Swift
-package or the FFI (`swift/**`, `Package.swift`, `include/**`, `src/ffi/**`) —
-those pushes run the Apple jobs and the macOS surface checks, not Android. The
-AAR content check runs when a tag is pushed or when you run the workflow by
-hand; do that before tagging if a change touched the JNI layer or
-`build-android.sh`, since nothing else compiles the Android targets.
+CI (`.github/workflows/mobile.yml`) builds the XCFramework and checks the
+Swift package (format lint, `swift test`, the iOS typecheck, the link check)
+only when the workflow is run by hand; the framework that ships is built by
+`Release Apple`. Pull requests run the macOS C-surface check and the Android
+build when they touch the FFI, the header, `android/`, `build-android.sh` or
+the dependencies (`Cargo.toml`, `Cargo.lock`); branch pushes that touch
+`include/**` or `src/ffi/**` run the C-surface check alone. The AAR content
+check runs on tags and releases. Run the workflow by hand (no `release_tag`)
+before a release if `swift/`, `Package.swift`, the JNI layer or a build script
+changed, since nothing else builds the Swift package or links the AAR.
 
 **Releases are cut by the `Release Apple` workflow, not by `git tag`.** It
 builds the XCFramework, writes its checksum into `Package.swift`, commits,

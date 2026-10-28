@@ -30,19 +30,82 @@ on:
 permissions:
   contents: read
 
+# A release dispatch (release_tag set) is in a group of its own, by run id,
+# and is never cancelled: it was sharing `<workflow>-refs/heads/mobile` with
+# every other run on the branch, so on 2026-10-28 a re-run of an older
+# release build cancelled the 0.9.0 finish run's fresh one, and the 03:xx
+# nightly would have cancelled any release build still going. The event is
+# in the group so the nightly and a branch push do not cancel each other
+# either. Everything else keeps the newest-run-wins rule.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.release_tag && format('release-{0}', github.run_id) || format('{0}-{1}', github.event_name, github.ref) }}
+  cancel-in-progress: ${{ !inputs.release_tag }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The nightly's reason to run is a change since the last one: a nightly
+  # over an unchanged `mobile` rebuilds what the last one built. So a
+  # scheduled run first asks whether HEAD differs from the last successful
+  # scheduled run's commit, and skips when it does not -- unless that run is
+  # six days old, so the caches it keeps warm are touched inside GitHub's
+  # seven-day eviction window. Any other event runs, and so does a nightly
+  # whose question cannot be answered.
+  changed:
+    name: Changed since the last nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: build.yml
+        run: |
+          set -uo pipefail
+          if [ "$EVENT" != schedule ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The last successful scheduled run that built something. A night
+          # this job skipped also ends in success, and must not count, or an
+          # unchanged branch would never reach the six-day refresh.
+          last=""
+          runs=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --event schedule \
+                   --status success --limit 20 --json databaseId,headSha,createdAt \
+                   --jq '.[] | "\(.databaseId) \(.headSha) \(.createdAt)"' 2>/dev/null) || runs=""
+          while read -r id run_sha run_created; do
+            [ -n "$id" ] || continue
+            built=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+                      --jq '[.jobs[] | select(.name != "Changed since the last nightly"
+                                              and .conclusion == "success")] | length' \
+                      2>/dev/null) || built=0
+            if [ "${built:-0}" -gt 0 ]; then last="$run_sha $run_created"; break; fi
+          done <<< "$runs"
+          sha=${last%% *}; created=${last#* }
+          if [ -z "$last" ] || [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "running: last successful nightly was at ${sha:-none}, HEAD is $GITHUB_SHA"
+          elif [ $(( $(date +%s) - $(date -d "$created" +%s) )) -gt $(( 6 * 86400 )) ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "running: HEAD unchanged, but the last nightly ($created) is six days old"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skipping: the nightly of $created already built $GITHUB_SHA"
+          fi
+
   build:
     # Named by the friendly asset name, not the target triple: the triple's
     # "unknown" vendor is rustc's identifier and still what we build, but it
     # has no business in a check list a human scans.
     name: Build ${{ matrix.asset_name }}
+    needs: changed
+    if: needs.changed.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:

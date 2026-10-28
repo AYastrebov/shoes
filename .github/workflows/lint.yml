@@ -4,8 +4,19 @@ on:
   push:
     branches: [ master, mobile ]
     tags: [ 'v*' ]
+    # Documentation changes nothing these jobs check: no code, test or
+    # build reads a Markdown file. Path filters are not evaluated for tag
+    # pushes, so a tag still runs everything.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
     branches: [ master, mobile ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   # For the audit job alone (the other jobs skip scheduled runs): an advisory
   # published against an unchanged lockfile used to go unnoticed until
   # something else landed — the chacha20 yank sat exactly there, failing the

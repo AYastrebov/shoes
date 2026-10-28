@@ -18,9 +18,12 @@ SHOES_LOCAL_XCFRAMEWORK=1 swift test
 swift format lint --strict --recursive swift Package.swift
 ```
 
-CI (`.github/workflows/mobile.yml`) also builds both schemes for
+`.github/workflows/mobile.yml`, run by hand, also builds both schemes for
 `generic/platform=iOS` and runs the link check under `swift/LinkCheck`, which
-proves the app product does not pull the engine's symbols.
+proves the app product does not pull the engine's symbols. No pull request or
+push runs it: the framework is built only for a release, so run the workflow
+(Actions -> Run workflow, no `release_tag`) before a release that changed
+anything here, and say in the PR that you did.
 
 ## Rules
 
