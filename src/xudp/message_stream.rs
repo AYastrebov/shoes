@@ -29,10 +29,7 @@ use crate::async_stream::{
 };
 use crate::resolver::{Resolver, ResolverCache};
 
-use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
-
-/// Xray refuses frame metadata longer than this (common/mux/frame.go, Unmarshal).
-const MAX_METADATA_LEN: usize = 512;
+use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork, decode_frame};
 
 /// The largest response payload sent. Xray reads a frame into one 8192-byte
 /// buffer and its own XUDP writer skips anything over 8192 - 666
@@ -131,66 +128,9 @@ impl XudpMessageStream {
         // and tail-recursion there would exhaust the stack. Each iteration consumes bytes,
         // so the loop always makes progress toward a payload frame or an empty buffer.
         loop {
-            // First, peek at the buffer to determine total frame size WITHOUT consuming anything.
-            // We need to check: metadata_len (2 bytes) + metadata + data_len (2 bytes) + data
-
-            // Need at least 2 bytes for metadata length
-            if self.read_buffer.len() < 2 {
+            let Some((metadata, data)) = decode_frame(&mut self.read_buffer)? else {
                 return Ok(None);
-            }
-
-            let metadata_len =
-                u16::from_be_bytes([self.read_buffer[0], self.read_buffer[1]]) as usize;
-
-            if metadata_len > MAX_METADATA_LEN {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("metadata too long: {metadata_len}"),
-                ));
-            }
-
-            // Check if we have complete metadata
-            if self.read_buffer.len() < 2 + metadata_len {
-                return Ok(None);
-            }
-
-            if metadata_len < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("metadata too short: {}", metadata_len),
-                ));
-            }
-
-            // Peek at the option byte: skip metadata_len(2) + session_id(2) + status(1)
-            let has_data = (self.read_buffer[2 + 3] & 0x01) != 0; // FrameOption::DATA
-
-            // The whole frame, data included, must be buffered before any of it
-            // is consumed. Every status may carry OptionData: an End or KeepAlive
-            // carries it too, and Xray reads and discards it (common/mux/server.go,
-            // handleStatusKeepAlive and handleStatusEnd).
-            let data_len_offset = 2 + metadata_len;
-            let data_len = if has_data {
-                if self.read_buffer.len() < data_len_offset + 2 {
-                    return Ok(None);
-                }
-                let data_len = u16::from_be_bytes([
-                    self.read_buffer[data_len_offset],
-                    self.read_buffer[data_len_offset + 1],
-                ]) as usize;
-                if self.read_buffer.len() < data_len_offset + 2 + data_len {
-                    return Ok(None);
-                }
-                Some(data_len)
-            } else {
-                None
             };
-
-            let metadata = FrameMetadata::decode(&mut self.read_buffer)?
-                .expect("metadata decode should succeed after length check");
-            let data = data_len.map(|len| {
-                self.read_buffer.advance(2);
-                self.read_buffer.split_to(len)
-            });
 
             log::debug!(
                 "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",

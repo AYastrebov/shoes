@@ -13,11 +13,12 @@ use crate::async_stream::AsyncStream;
 use crate::crypto::CryptoTlsStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
+use crate::xudp::XudpClientStream;
 
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_response_stream::VlessResponseStream;
-use super::vless_util::{COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
+use super::vless_util::{COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
 
 pub struct VlessTcpClientHandler {
     user_id: Box<[u8]>,
@@ -82,21 +83,32 @@ impl TcpClientHandler for VlessTcpClientHandler {
     }
 }
 
-/// Helper function for setup_client_udp_bidirectional that can be called from TlsClientHandler
-/// for Vision VLESS or regular VLESS over TLS.
-pub async fn setup_vless_udp_bidirectional<IO>(
-    mut stream: CryptoTlsStream<IO>,
+/// UDP under the Vision flow, sent as Xray and sing-box send it: the Mux
+/// command with the flow named, inside a Vision stream, carrying the packets
+/// as XUDP frames (Xray proxy/vless/outbound, sing-vmess vless
+/// DialEarlyXUDPPacketConn). The plain UDP command without the flow, which
+/// this sent before, is refused by sing-box for a Vision user ("flow
+/// mismatch: expected xtls-rprx-vision, but got none"); with the flow, by
+/// both servers.
+pub fn setup_vision_vless_udp_bidirectional<IO>(
+    tls_stream: CryptoTlsStream<IO>,
     user_id: &[u8],
     target: NetLocation,
-) -> std::io::Result<Box<dyn AsyncMessageStream>>
+) -> Box<dyn AsyncMessageStream>
 where
     IO: crate::async_stream::AsyncStream + 'static,
 {
-    write_vless_udp_header(&mut stream, user_id, &target).await?;
-    stream.flush().await?;
-    let response_stream = Box::new(VlessResponseStream::new(stream));
-    let message_stream = VlessMessageStream::new(response_stream);
-    Ok(Box::new(message_stream))
+    // Sent inside the first padded frame, as for TCP.
+    let request_header = vless_mux_header(user_id, vision_flow_addon_data());
+
+    let (io, connection) = tls_stream.into_inner();
+    let mut user_uuid = [0u8; 16];
+    user_uuid.copy_from_slice(user_id);
+    // Each frame is padded whole, as Xray pads its buffers: there is no TLS
+    // record inside to wait for, and a frame ending in 0x16 must not be held.
+    let vision_stream =
+        VisionStream::new_client(io, connection, user_uuid, request_header).pad_whole_writes();
+    Box::new(XudpClientStream::new(vision_stream, target))
 }
 
 pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
@@ -127,6 +139,18 @@ where
         client_stream: Box::new(vision_stream),
         early_data: None,
     })
+}
+
+/// The VLESS request header for the Mux command: version, user id, addons,
+/// command, and no address, which comes in the XUDP frames instead.
+pub(super) fn vless_mux_header(user_id: &[u8], addon_data: &[u8]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(1 + 16 + 1 + addon_data.len() + 1);
+    header.push(0);
+    header.extend_from_slice(user_id);
+    header.push(addon_data.len() as u8);
+    header.extend_from_slice(addon_data);
+    header.push(COMMAND_MUX);
+    header
 }
 
 /// Write VLESS UDP header for single-target bidirectional UDP (COMMAND_UDP = 2).

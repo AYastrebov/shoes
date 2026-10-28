@@ -212,42 +212,51 @@ impl FrameMetadata {
             ));
         }
 
-        // Track how many metadata bytes we consume
-        let metadata_start = buf.len();
+        // Everything the frame declares is inside these bytes. A destination
+        // that runs past them is refused rather than read out of the next
+        // frame, or off the end of the buffer.
+        let mut meta = buf.split_to(metadata_len);
 
-        let session_id = buf.get_u16();
-        let status = SessionStatus::try_from(buf.get_u8())?;
-        let option = FrameOption::from(buf.get_u8());
+        let session_id = meta.get_u16();
+        let status = SessionStatus::try_from(meta.get_u8())?;
+        let option = FrameOption::from(meta.get_u8());
 
         let mut network = None;
         let mut target = None;
 
-        // Calculate remaining metadata bytes (after session_id, status, option = 4 bytes)
-        let remaining_metadata = metadata_len.saturating_sub(4);
-
-        // Parse destination for New or Keep+UDP
-        // Check remaining_metadata > 0 to know if there's address data
-        if remaining_metadata > 0
+        // A destination follows for New, and for Keep when the byte after the
+        // option says UDP (Xray common/mux/frame.go, FrameMetadata.Unmarshal).
+        if meta.has_remaining()
             && (status == SessionStatus::New
-                || (status == SessionStatus::Keep && buf.remaining() > 0 && buf[0] == 0x02))
+                || (status == SessionStatus::Keep && meta[0] == TargetNetwork::Udp as u8))
         {
-            let net_byte = buf.get_u8();
+            let net_byte = meta.get_u8();
             network = Some(TargetNetwork::try_from(net_byte)?);
 
-            let port = buf.get_u16();
-            let address = decode_address(buf)?;
+            if meta.remaining() < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "destination port runs past the metadata",
+                ));
+            }
+            let port = meta.get_u16();
+            let address = decode_address(&mut meta).map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "destination address runs past the metadata",
+                ),
+                _ => e,
+            })?;
             target = Some(NetLocation::new(address, port));
         }
 
-        // Consume any remaining metadata bytes we didn't parse
-        let consumed = metadata_start - buf.len();
-        let unconsumed = metadata_len.saturating_sub(consumed);
-        if unconsumed > 0 {
+        // Whatever is left is the global ID or padding, which neither side
+        // of this implementation uses.
+        if meta.has_remaining() {
             log::debug!(
                 "[XUDP DECODE] Skipping {} unconsumed metadata bytes (GlobalID or padding)",
-                unconsumed
+                meta.remaining()
             );
-            buf.advance(unconsumed);
         }
 
         Ok(Some(FrameMetadata {
@@ -258,6 +267,71 @@ impl FrameMetadata {
             network,
         }))
     }
+}
+
+/// Xray refuses frame metadata longer than this (common/mux/frame.go, Unmarshal).
+pub const MAX_METADATA_LEN: usize = 512;
+
+/// Decode one whole frame off the front of `buf`: its metadata and, under
+/// OptionData, its payload. Nothing is consumed until the whole frame, payload
+/// included, is buffered, so `Ok(None)` leaves a partial frame for the next
+/// read to complete.
+///
+/// Every status may carry OptionData: an End or KeepAlive carries it too, and
+/// Xray reads and discards it (common/mux/server.go, handleStatusKeepAlive and
+/// handleStatusEnd).
+pub fn decode_frame(
+    buf: &mut BytesMut,
+) -> std::io::Result<Option<(FrameMetadata, Option<BytesMut>)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+
+    let metadata_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+
+    if metadata_len > MAX_METADATA_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata too long: {metadata_len}"),
+        ));
+    }
+
+    if buf.len() < 2 + metadata_len {
+        return Ok(None);
+    }
+
+    if metadata_len < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("metadata too short: {}", metadata_len),
+        ));
+    }
+
+    // The option byte: past metadata_len(2) + session_id(2) + status(1)
+    let has_data = (buf[2 + 3] & FrameOption::DATA) != 0;
+
+    let data_len_offset = 2 + metadata_len;
+    let data_len = if has_data {
+        if buf.len() < data_len_offset + 2 {
+            return Ok(None);
+        }
+        let data_len =
+            u16::from_be_bytes([buf[data_len_offset], buf[data_len_offset + 1]]) as usize;
+        if buf.len() < data_len_offset + 2 + data_len {
+            return Ok(None);
+        }
+        Some(data_len)
+    } else {
+        None
+    };
+
+    let metadata = FrameMetadata::decode(buf)?
+        .ok_or_else(|| std::io::Error::other("metadata incomplete after the length check"))?;
+    let data = data_len.map(|len| {
+        buf.advance(2);
+        buf.split_to(len)
+    });
+    Ok(Some((metadata, data)))
 }
 
 /// Encode address to buffer (VLESS address format)
@@ -842,5 +916,35 @@ mod tests {
         let decoded = FrameMetadata::decode(&mut buf).unwrap().unwrap();
         assert!(decoded.option.has_data());
         assert!(decoded.option.has_error());
+    }
+
+    /// A destination that runs past the declared metadata is an error, not a
+    /// read into whatever follows: the frame `00 05 00 00 02 00 02` claims
+    /// five metadata bytes and a UDP destination, then ends.
+    #[test]
+    fn a_destination_past_the_metadata_is_rejected() {
+        let truncated_keep: &[u8] = &[0x00, 0x05, 0x00, 0x00, 0x02, 0x00, 0x02];
+        let err = decode_frame(&mut BytesMut::from(truncated_keep)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // The same frame with a whole valid frame behind it: still refused,
+        // and the next frame's bytes are not read as the missing port.
+        let mut buf = BytesMut::from(truncated_keep);
+        FrameMetadata {
+            session_id: 0,
+            status: SessionStatus::Keep,
+            option: FrameOption::new(),
+            target: None,
+            network: None,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        let err = decode_frame(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // A New frame whose address is cut off after the port.
+        let truncated_new: &[u8] = &[0x00, 0x07, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x35];
+        let err = decode_frame(&mut BytesMut::from(truncated_new)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

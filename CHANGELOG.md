@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+VLESS UDP under the Vision flow now reaches sing-box servers. The client
+sent it as the plain UDP command with no flow named; sing-box refuses that
+for a Vision user (`flow mismatch: expected xtls-rprx-vision, but got
+none`), so every UDP packet over a sing-box VLESS Vision server was dropped
+while TCP worked. It now goes as both reference clients send it (Xray's
+VLESS outbound, sing-vmess's `DialEarlyXUDPPacketConn`): the Mux command
+under the Vision flow, inside a Vision stream, with the packets as XUDP
+frames. That is also the only UDP an Xray server takes under the flow, and
+the form shoes' own server already read. The TLS and REALITY Vision
+clients both change; VLESS without Vision still sends the plain UDP
+command.
+
+The new client XUDP stream frames packets byte for byte as sing-box's
+client does (session 0, a New frame and then Keep frames naming the
+target, no global ID), checked against the captured sing-box flight in
+`tests/data/kat/frames-sing`. It closes the session with an End frame on
+shutdown, as Xray's client does, and drops a packet over 8192 - 666 bytes,
+the most an Xray server reads in one frame. UDP/443 is carried, as
+sing-box's client carries it; Xray's client refuses it under plain
+`xtls-rprx-vision` to push QUIC back onto TCP, which is a client policy
+rather than something either server enforces. The whole-frame decode the
+server used is now shared by both directions (`xudp::frame::decode_frame`).
+
+Two defects the review of that change found are fixed with it. The XUDP
+metadata decoder read a frame's destination from the whole buffer rather
+than from the bytes the frame declared, so a frame that named a UDP
+destination and then ended (`00 05 00 00 02 00 02`) panicked the task that
+read it, on the server as well as the new client; a destination that runs
+past the declared metadata is now refused as invalid data. And the Vision
+client looked inside each XUDP write for TLS records, so a datagram ending
+in a byte that could begin one (`0x16`) had that byte held back for a
+record that never came, and the datagram waited on the next write; a Vision
+stream that carries XUDP now pads each write whole, as Xray's VisionWriter
+pads each buffer.
+
 ## v0.8.3
 
 One fix, for the desktop daemon on macOS: `sudo shoesd install` over a

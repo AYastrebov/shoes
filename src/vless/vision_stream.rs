@@ -164,6 +164,16 @@ pub struct VisionStream<IO> {
     /// Used in PaddingTls mode - drained immediately before switching modes
     pending_plain_writes: BytesMut,
 
+    /// Pad each write as one unit, without looking inside it for TLS
+    /// records. Set for XUDP, whose frames never start a TLS record at a
+    /// write boundary. Xray's VisionWriter pads whole buffers the same way
+    /// (proxy/proxy.go, VisionWriter.Write). With the inner deframer, a write
+    /// ending in a byte that could begin a TLS record (0x16) has that tail
+    /// held back for the rest of a record that never comes, and the datagram
+    /// it ends waits on the next write.
+    /// Used in PaddingTls mode
+    pad_whole_writes: bool,
+
     /// Caches whether we've hit EOF when reading
     /// Used in PaddingTls and Tls mode
     is_read_eof: bool,
@@ -260,8 +270,16 @@ where
             pending_direct_mode_switch: false,
             pending_tls_mode_switch: false,
             pending_plain_writes: BytesMut::new(),
+            pad_whole_writes: false,
             is_read_eof: false,
         }
+    }
+
+    /// Pad every write as one unit, for a stream that carries XUDP frames
+    /// rather than a TLS session; see the `pad_whole_writes` field.
+    pub fn pad_whole_writes(mut self) -> Self {
+        self.pad_whole_writes = true;
+        self
     }
 
     /// Feed initial read data that was already decrypted by TLS but needs VISION unpadding
@@ -1170,6 +1188,47 @@ where
         }
     }
 
+    /// Pad and queue a chunk the filter will not take for TLS, counting it
+    /// against the filter as Xray's VisionWriter counts a buffer: a Continue
+    /// frame while the filter still runs, otherwise the End frame after which
+    /// the write side moves to Tls mode on the next write. Returns whether the
+    /// filter is still running. A drain that is not done is not an error;
+    /// the next write or flush finishes it.
+    fn write_padded_non_tls(
+        &mut self,
+        cx: &mut Context<'_>,
+        chunk: &[u8],
+    ) -> Poll<io::Result<bool>> {
+        self.filter.decrement_filter_count();
+        let still_filtering = self.filter.is_filtering();
+        let command = if still_filtering {
+            COMMAND_CONTINUE
+        } else {
+            // Sending end command to switch to TLS, there are no more padded packets.
+            self.pending_tls_mode_switch = true;
+            COMMAND_END
+        };
+
+        let padded_packet = if self.write_first_packet {
+            self.write_first_packet = false;
+            super::vision_pad::pad_with_uuid_and_command(
+                chunk,
+                &self.user_uuid,
+                command,
+                self.filter.is_tls(),
+            )
+        } else {
+            super::vision_pad::pad_with_command(chunk, command, self.filter.is_tls())
+        };
+
+        self.write_to_session(&padded_packet)?;
+        match self.drain_all_writes_padding(cx) {
+            Poll::Pending | Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        }
+        Poll::Ready(Ok(still_filtering))
+    }
+
     fn poll_write_padding_tls(
         &mut self,
         cx: &mut Context<'_>,
@@ -1194,6 +1253,13 @@ where
             self.pending_tls_mode_switch = false;
             self.switch_write_to_tls_mode()?;
             return self.poll_write_tls(cx, buf);
+        }
+
+        if self.pad_whole_writes {
+            // Never TLS, so there is no record to find: the whole write is
+            // one padded chunk, like one of Xray's buffers.
+            ready!(self.write_padded_non_tls(cx, buf))?;
+            return Poll::Ready(Ok(buf.len()));
         }
 
         // Feed write buffer to inner deframer and check for ApplicationData
@@ -1326,8 +1392,9 @@ where
                     // complete the "TLS record", but since it's not actually TLS, no more
                     // data will come. This would cause a hang.
                     //
-                    // This is extremely unlikely in practice, so we choose not to handle this edge
-                    // case to keep the code simple.
+                    // This is extremely unlikely for a TCP stream in practice, so we choose not
+                    // to handle this edge case to keep the code simple. A stream that is never
+                    // TLS, such as XUDP, sets `pad_whole_writes` and never reaches this arm.
                     break;
                 }
                 Ok(DeframeResult::UnknownPrefix(prefix)) => {
@@ -1336,74 +1403,18 @@ where
 
                     processed_len += prefix.len();
 
-                    self.filter.decrement_filter_count();
-
-                    if self.filter.is_filtering() {
-                        // We don't assume the deframer won't return any more packets,
-                        // so we continue here, and stop if we're no longer filtering.
-                        let padded_packet = if self.write_first_packet {
-                            self.write_first_packet = false;
-                            super::vision_pad::pad_with_uuid_and_command(
-                                &prefix,
-                                &self.user_uuid,
-                                COMMAND_CONTINUE,
-                                self.filter.is_tls(),
-                            )
-                        } else {
-                            super::vision_pad::pad_with_command(
-                                &prefix,
-                                COMMAND_CONTINUE,
-                                self.filter.is_tls(),
-                            )
-                        };
-
-                        self.write_to_session(&padded_packet)?;
-                        match self.drain_all_writes_padding(cx) {
-                            Poll::Pending => {}
-                            Poll::Ready(Ok(())) => {}
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        }
-
-                        // Continue processing
-                    } else {
-                        // Sending end command to switch to TLS, there are no more padded packets.
-                        self.pending_tls_mode_switch = true;
-
-                        let padded_packet = if self.write_first_packet {
-                            self.write_first_packet = false;
-                            super::vision_pad::pad_with_uuid_and_command(
-                                &prefix,
-                                &self.user_uuid,
-                                COMMAND_END,
-                                self.filter.is_tls(),
-                            )
-                        } else {
-                            super::vision_pad::pad_with_command(
-                                &prefix,
-                                COMMAND_END,
-                                self.filter.is_tls(),
-                            )
-                        };
-
-                        // Clear deframe, not really necessary since deallocate will occur and this
-                        // will never be used again.
-                        self.inner_write_deframer.clear();
-
-                        self.write_to_session(&padded_packet)?;
-                        // Drain and handle result
-                        match self.drain_all_writes_padding(cx) {
-                            Poll::Ready(Ok(())) => {
-                                // Fully drained
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => {
-                                // Still draining
-                            }
-                        }
-
-                        // tell caller to resend the next packets after the mode switch
-                        return Poll::Ready(Ok(processed_len - existing_inner_len));
+                    if ready!(self.write_padded_non_tls(cx, &prefix))? {
+                        // Continue processing: the deframer may return more.
+                        continue;
                     }
+
+                    // The End frame went out; no more padded packets follow.
+                    // Clear the deframer, not really necessary since deallocate
+                    // will occur and this will never be used again.
+                    self.inner_write_deframer.clear();
+
+                    // tell caller to resend the next packets after the mode switch
+                    return Poll::Ready(Ok(processed_len - existing_inner_len));
                 }
                 Err(e) => {
                     // Deframing failed, this error means we've already seen a valid TLS record on

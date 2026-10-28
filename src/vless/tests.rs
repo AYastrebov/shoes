@@ -1,11 +1,13 @@
 //! A VLESS Vision client and server over real TLS, built from config the way
 //! the binary builds them.
 
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use crate::address::NetLocation;
 use crate::config::{ClientProxyConfig, RuleConfig, ServerProxyConfig};
@@ -280,4 +282,102 @@ async fn a_shutdown_delivers_what_was_written_before_it() {
         .unwrap();
     received.extend_from_slice(&rest);
     assert_eq!(received, b"last words");
+}
+
+/// UDP over Vision asks for the Mux command under the Vision flow, with no
+/// address: sing-box refuses a Vision user's request that names no flow, and
+/// both reference servers refuse the plain UDP command under it.
+#[test]
+fn udp_asks_for_mux_under_the_vision_flow() {
+    let user_id = crate::uuid_util::parse_uuid(USER_ID).unwrap();
+    let addon = super::vless_util::vision_flow_addon_data();
+    let header = super::vless_client_handler::vless_mux_header(&user_id, addon);
+
+    let mut expected = vec![0];
+    expected.extend_from_slice(&user_id);
+    expected.push(addon.len() as u8);
+    expected.extend_from_slice(addon);
+    expected.push(super::vless_util::COMMAND_MUX);
+    assert_eq!(header, expected);
+}
+
+/// A packet goes out over the Vision flow as XUDP and the server reads it as
+/// a Vision XUDP session, under its target; the reply comes back through it.
+#[tokio::test]
+async fn udp_rides_the_vision_flow_as_xudp() {
+    udp_round_trip(b"query").await;
+}
+
+/// A datagram ending in a byte that could begin a TLS record is still sent
+/// whole: the client pads each XUDP write as one unit, as Xray's VisionWriter
+/// does, rather than holding the tail back for a record that never comes.
+#[tokio::test]
+async fn a_datagram_ending_in_a_tls_prefix_is_sent_whole() {
+    udp_round_trip(b"query\x16").await;
+    udp_round_trip(b"query\x16\x03\x03").await;
+}
+
+/// One datagram to the server and one back, with nothing else written in
+/// between: the server must see it on its own.
+async fn udp_round_trip(payload: &[u8]) {
+    let (server, client) = handlers();
+    let (client_end, server_end) = tcp_pair().await;
+    let accepted =
+        tokio::spawn(async move { server.setup_server_stream(Box::new(server_end)).await });
+
+    let dns = NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
+    let mut packets = client
+        .setup_client_udp_bidirectional(Box::new(client_end), dns.clone().into())
+        .await
+        .unwrap();
+    poll_fn(|cx| Pin::new(&mut *packets).poll_write_message(cx, payload))
+        .await
+        .unwrap();
+    poll_fn(|cx| Pin::new(&mut *packets).poll_flush_message(cx))
+        .await
+        .unwrap();
+
+    let TcpServerSetupResult::SessionBasedUdp {
+        stream: mut sessions,
+        ..
+    } = tokio::time::timeout(HANG, accepted)
+        .await
+        .expect("the server read the request")
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("not an XUDP session stream");
+    };
+
+    let mut storage = vec![0u8; 65535];
+    let mut buf = ReadBuf::new(&mut storage);
+    let (session, source) = tokio::time::timeout(
+        HANG,
+        poll_fn(|cx| Pin::new(&mut *sessions).poll_read_session_message(cx, &mut buf)),
+    )
+    .await
+    .expect("the server read the packet")
+    .unwrap();
+    assert_eq!(source, "192.0.2.53:53".parse().unwrap());
+    assert_eq!(buf.filled(), payload);
+
+    poll_fn(|cx| {
+        Pin::new(&mut *sessions).poll_write_session_message(cx, session, b"answer", &source)
+    })
+    .await
+    .unwrap();
+    poll_fn(|cx| Pin::new(&mut *sessions).poll_flush_message(cx))
+        .await
+        .unwrap();
+
+    let mut storage = vec![0u8; 65535];
+    let mut buf = ReadBuf::new(&mut storage);
+    tokio::time::timeout(
+        HANG,
+        poll_fn(|cx| Pin::new(&mut *packets).poll_read_message(cx, &mut buf)),
+    )
+    .await
+    .expect("the reply came back")
+    .unwrap();
+    assert_eq!(buf.filled(), b"answer");
 }
