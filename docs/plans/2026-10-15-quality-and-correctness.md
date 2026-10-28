@@ -54,7 +54,9 @@ weeks of it and carry most of the value.
 | 5 | Done | 5.1 #89, 5.2 #91, 5.3 #92 |
 
 Releases: v0.6.0 after Phase 0 (#59), v0.7.0 after Phase 1 and 3.3 part 1
-(#82). Nothing has been released since #82.
+(#82), v0.8.0 after the fix-wave review (#106), v0.8.1 to v0.8.3 for the
+daemon (#109, #111, #113), v0.8.4 after the Vision UDP fix and the
+dependency sweep (#114 to #117).
 
 Reviewed 2026-10-22 (`docs/audits/2026-10-22-fix-wave-review.md`): every
 fix claimed above is present and tested; the gaps found beside them (TUIC

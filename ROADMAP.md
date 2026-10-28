@@ -154,6 +154,17 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   network-change re-apply too (`macos/mod.rs`, `macos/dns.rs::write`). Cost:
   unqualified names fail for the life of a session; fully qualified ones are
   unaffected.
+- **Two process-level tests flake on CI** (2026-10-28, seen on #114 and
+  #115). `tests/transparent.rs`'s redirect test copies the `shoes` binary
+  and spawns it; a sibling test's copy can hold the file open for writing
+  across the spawn's fork, and the exec fails with `Text file busy`
+  (ETXTBSY). `tests/process_contract.rs` waits 15 s for a line on the
+  child's stdout, and a loaded runner (macOS CI; a local run alongside a
+  cross-compile) can miss it. Fixing the first means copying the binary
+  once per test process, or serialising copy and spawn; the second, a
+  longer wait or a readiness signal that does not depend on scheduling.
+  Cost: a red Test job that a rerun turns green, which hides a real
+  failure when one comes.
 
 ## Table of Contents
 
