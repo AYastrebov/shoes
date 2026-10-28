@@ -117,22 +117,27 @@ public final class ShoesEngine: Sendable {
         guard initialized.isSet else { throw ShoesError.notInitialized }
         guard !isRunning else { throw ShoesError.alreadyRunning }
 
-        CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped)
-        // The task records the session itself, so a `stop()` that awaited
-        // it finds the id set before it looks.
+        // The task installs the callbacks and records the session itself,
+        // so a `stop()` that awaited it finds the id set before it looks,
+        // and a start refused below has touched nothing.
         let startNative = self.startNative
         let session = self.session
         let yaml = config.yaml
         // Created and registered under one lock, so a `stop()` that takes
         // the same lock sees the task the moment it can run, never a
-        // native start already under way with nothing registered.
-        let task = inFlight.start {
-            Task.detached(priority: .userInitiated) {
-                let handle = startNative(yaml, deviceFD)
-                if handle > 0 { session.set(handle) }
-                return handle
-            }
-        }
+        // native start already under way with nothing registered; and a
+        // second start while one is registered is refused here, before it
+        // could replace the task a stop must wait for.
+        guard
+            let task = inFlight.start({
+                Task.detached(priority: .userInitiated) {
+                    CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped)
+                    let handle = startNative(yaml, deviceFD)
+                    if handle > 0 { session.set(handle) }
+                    return handle
+                }
+            })
+        else { throw ShoesError.alreadyRunning }
         let handle = await task.value
         inFlight.clear(task)
         guard handle > 0 else {
@@ -161,19 +166,28 @@ public final class ShoesEngine: Sendable {
         if let starting = inFlight.get() {
             _ = await starting.value
         }
-        // Overlapping stops share one native stop: the first takes the id
-        // and runs it, the rest await its answer, so none can report
-        // "released" while the engine still reads the descriptor.
-        let session = self.session
+        // The session id is taken and the stop registered under one lock.
+        // A stop that gets an id runs its own native stop, so a session
+        // started while an earlier stop is returning is never left to that
+        // earlier stop's answer; a stop that gets no id joins the stop in
+        // flight, if any, so it cannot report "released" while the engine
+        // still reads the descriptor.
         let stopNative = self.stopNative
-        let task = stopping.share {
-            Task.detached(priority: .userInitiated) {
-                let handle = session.take()
-                return stopNative(handle) == 1
-            }
-        }
+        guard
+            let task = stopping.share(
+                take: session.take,
+                make: { handle in
+                    Task.detached(priority: .userInitiated) {
+                        stopNative(handle) == 1
+                    }
+                })
+        else { return true }
         let released = await task.value
         stopping.clear(task)
+        // Once more after the engine confirmed: a start that lost the race
+        // to this stop may have installed handlers for the session just
+        // stopped.
+        CallbackBridge.shared.clear()
         return released
     }
 
@@ -226,9 +240,11 @@ private final class LockedTask: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Task<Int, Never>?
     /// Creates the task with `make` and registers it under the lock, so a
-    /// reader never sees a task running unregistered.
-    func start(_ make: () -> Task<Int, Never>) -> Task<Int, Never> {
+    /// reader never sees a task running unregistered. Nil, and nothing
+    /// made, while a start is already registered.
+    func start(_ make: () -> Task<Int, Never>) -> Task<Int, Never>? {
         lock.withLock {
+            if value != nil { return nil }
             let task = make()
             value = task
             return task
@@ -243,16 +259,18 @@ private final class LockedTask: @unchecked Sendable {
     }
 }
 
-/// The stop task in flight, if any: a second stop joins it.
+/// The stop task in flight, if any: a stop with no session of its own joins it.
 private final class LockedStop: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Task<Bool, Never>?
-    /// The stop in flight, or a new one made with `make` and registered,
-    /// under one lock.
-    func share(_ make: () -> Task<Bool, Never>) -> Task<Bool, Never> {
+    /// Under one lock: `take` the session id; with one, make and register a
+    /// stop for it, replacing whatever was registered; without one, the stop
+    /// in flight, or nil when there is none and nothing to stop.
+    func share(take: () -> Int, make: (Int) -> Task<Bool, Never>) -> Task<Bool, Never>? {
         lock.withLock {
-            if let running = value { return running }
-            let task = make()
+            let handle = take()
+            if handle == 0 { return value }
+            let task = make(handle)
             value = task
             return task
         }

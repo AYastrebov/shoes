@@ -142,6 +142,70 @@ import Testing
     #expect(elapsed >= .milliseconds(300))
 }
 
+/// A second start while one is in flight is refused by the wrapper, before
+/// it can replace the registered start a stop must wait for: the first
+/// start's session is what a stop then stops.
+@Test func aSecondStartWhileOneIsInFlightIsRefused() async throws {
+    let starts = Recorded()
+    let stops = Recorded()
+    let engine = ShoesEngine(
+        forTesting: (),
+        start: { _, _ in
+            starts.append(0)
+            if starts.values.count == 1 {
+                Thread.sleep(forTimeInterval: 0.3)
+                return 7
+            }
+            return -1
+        },
+        stop: { handle in
+            stops.append(handle)
+            return 1
+        })
+    try engine.initialize(logLevel: .error)
+    let config = ShoesConfiguration(yaml: "tun:\n  device_fd: 7\n")
+    async let first: Void = engine.start(
+        config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    try await Task.sleep(for: .milliseconds(50))
+    await #expect(throws: ShoesError.alreadyRunning) {
+        try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    }
+    let released = await engine.stop()
+    try await first
+    #expect(released == true)
+    #expect(stops.values == [7])
+}
+
+/// A stop task is not reused once its session is gone: a session started
+/// while the previous stop's native call is returning gets its own stop.
+@Test func aStopAfterANewStartStopsTheNewSession() async throws {
+    let stops = Recorded()
+    let firstStopEntered = Fired()
+    let engine = ShoesEngine(
+        forTesting: (),
+        start: { _, _ in stops.values.isEmpty ? 7 : 8 },
+        stop: { handle in
+            stops.append(handle)
+            if handle == 7 {
+                firstStopEntered.set()
+                // The native stop has done its work; the wrapper's
+                // continuation has not run yet.
+                Thread.sleep(forTimeInterval: 0.3)
+            }
+            return 1
+        })
+    try engine.initialize(logLevel: .error)
+    let config = ShoesConfiguration(yaml: "tun:\n  device_fd: 7\n")
+    try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    async let firstStop = engine.stop()
+    while !firstStopEntered.isSet { try await Task.sleep(for: .milliseconds(10)) }
+    try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    let secondStop = await engine.stop()
+    _ = await firstStop
+    #expect(secondStop == true)
+    #expect(stops.values == [7, 8])
+}
+
 /// Handles passed to a stop, readable from any thread.
 private final class Recorded: @unchecked Sendable {
     private let lock = NSLock()
