@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.8.4
+
+One protocol fix and a dependency sweep. VLESS UDP under the Vision flow
+now reaches sing-box servers, carried as XUDP under the Mux command the
+way Xray and sing-box send it (#114), with two defects its review found
+fixed alongside: a panic in the XUDP metadata decoder on a frame whose
+destination ran past its declared length, and a datagram ending in `0x16`
+held back by the Vision writer. awgtun 0.12.0 corrects the AmneziaWG
+handshake timestamp epoch to the one kernel WireGuard and wireguard-go use
+(#117). Every dependency is on its current major (#115, #116). No FFI or
+configuration change; the mobile libraries and the daemons are rebuilt
+with the new dependencies.
 
 awgtun moves to 0.12.0 (738ce7e). The change that reaches the wire: the
 AmneziaWG handshake timestamp now uses the epoch every reference uses
