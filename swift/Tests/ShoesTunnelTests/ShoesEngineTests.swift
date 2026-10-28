@@ -114,6 +114,34 @@ import Testing
     #expect(stops.values == [7])
 }
 
+/// Two stops that overlap share one native stop: the second waits for the
+/// first and reports its result, rather than taking a 0 handle and
+/// reporting "released" while the engine still reads the descriptor.
+@Test func overlappingStopsShareOneNativeStop() async throws {
+    let stops = Recorded()
+    let engine = ShoesEngine(
+        forTesting: (),
+        start: { _, _ in 7 },
+        stop: { handle in
+            stops.append(handle)
+            Thread.sleep(forTimeInterval: 0.3)
+            return 1
+        })
+    try engine.initialize(logLevel: .error)
+    let config = ShoesConfiguration(yaml: "tun:\n  device_fd: 7\n")
+    try await engine.start(config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    let began = ContinuousClock.now
+    async let first = engine.stop()
+    try await Task.sleep(for: .milliseconds(50))
+    async let second = engine.stop()
+    let (a, b) = await (first, second)
+    let elapsed = ContinuousClock.now - began
+    #expect(a == true)
+    #expect(b == true)
+    #expect(stops.values == [7])
+    #expect(elapsed >= .milliseconds(300))
+}
+
 /// Handles passed to a stop, readable from any thread.
 private final class Recorded: @unchecked Sendable {
     private let lock = NSLock()

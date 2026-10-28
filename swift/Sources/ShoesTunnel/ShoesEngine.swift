@@ -35,6 +35,9 @@ public final class ShoesEngine: Sendable {
     /// The native start in flight, so a `stop()` can wait for it.
     private let inFlight = LockedTask()
 
+    /// The native stop in flight, so overlapping stops share it.
+    private let stopping = LockedStop()
+
     /// The native calls, replaceable for tests of this wrapper's own
     /// choreography; the library's own behaviour is tested in Rust.
     private let startNative: @Sendable (String, Int32) -> Int
@@ -120,12 +123,16 @@ public final class ShoesEngine: Sendable {
         let startNative = self.startNative
         let session = self.session
         let yaml = config.yaml
-        let task = Task.detached(priority: .userInitiated) {
-            let handle = startNative(yaml, deviceFD)
-            if handle > 0 { session.set(handle) }
-            return handle
+        // Created and registered under one lock, so a `stop()` that takes
+        // the same lock sees the task the moment it can run, never a
+        // native start already under way with nothing registered.
+        let task = inFlight.start {
+            Task.detached(priority: .userInitiated) {
+                let handle = startNative(yaml, deviceFD)
+                if handle > 0 { session.set(handle) }
+                return handle
+            }
         }
-        inFlight.set(task)
         let handle = await task.value
         inFlight.clear(task)
         guard handle > 0 else {
@@ -154,11 +161,20 @@ public final class ShoesEngine: Sendable {
         if let starting = inFlight.get() {
             _ = await starting.value
         }
-        let handle = session.take()
+        // Overlapping stops share one native stop: the first takes the id
+        // and runs it, the rest await its answer, so none can report
+        // "released" while the engine still reads the descriptor.
+        let session = self.session
         let stopNative = self.stopNative
-        return await Task.detached(priority: .userInitiated) {
-            stopNative(handle) == 1
-        }.value
+        let task = stopping.share {
+            Task.detached(priority: .userInitiated) {
+                let handle = session.take()
+                return stopNative(handle) == 1
+            }
+        }
+        let released = await task.value
+        stopping.clear(task)
+        return released
     }
 
     /// Tell the engine the network changed. Returns the number of tunnel
@@ -209,10 +225,39 @@ private final class LockedFlag: @unchecked Sendable {
 private final class LockedTask: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Task<Int, Never>?
-    func set(_ task: Task<Int, Never>) { lock.withLock { value = task } }
+    /// Creates the task with `make` and registers it under the lock, so a
+    /// reader never sees a task running unregistered.
+    func start(_ make: () -> Task<Int, Never>) -> Task<Int, Never> {
+        lock.withLock {
+            let task = make()
+            value = task
+            return task
+        }
+    }
     func get() -> Task<Int, Never>? { lock.withLock { value } }
     /// Clears the slot if it still holds `task`; a newer start's task stays.
     func clear(_ task: Task<Int, Never>) {
+        lock.withLock {
+            if value == task { value = nil }
+        }
+    }
+}
+
+/// The stop task in flight, if any: a second stop joins it.
+private final class LockedStop: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Task<Bool, Never>?
+    /// The stop in flight, or a new one made with `make` and registered,
+    /// under one lock.
+    func share(_ make: () -> Task<Bool, Never>) -> Task<Bool, Never> {
+        lock.withLock {
+            if let running = value { return running }
+            let task = make()
+            value = task
+            return task
+        }
+    }
+    func clear(_ task: Task<Bool, Never>) {
         lock.withLock {
             if value == task { value = nil }
         }
