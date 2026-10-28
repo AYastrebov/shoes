@@ -141,16 +141,20 @@ in production under KVN's macOS provider:
    reason -- the misattribution the id is meant to prevent, inside the
    library. The fix: the exit closure handed to `start_and_install`
    captures its own id (`move |reason| fire_stopped(id, reason)`), and
-   `fire_stopped` compares it with the slot's. On a match it records and
-   delivers as today. If the id is the one a stop has taken out of the
-   slot and is waiting on, the exit is the exit guard's losing race -- a
-   real failure that landed as the host reached for the switch, or the
-   stop's own unrequested-end echo -- and is recorded for `get_last_error`
-   without a callback, so the stop's existing echo rule
-   (`written_by_the_stop`, from an earlier fix that kept such a crash
-   visible) still judges it. Otherwise, a mismatch or an empty slot with
-   no stop waiting, it is dropped: the session that exited is gone and the
-   one in the slot is someone else's; it logs at warn naming both ids.
+   `fire_stopped` compares it with the slot's. On a match it records the
+   reason under the slot's lock and delivers as today. If the id is the one
+   the last stop took out of the slot, the exit is the exit guard's losing
+   race, which can land during the stop's wait or after the stop returned
+   (the guard marks the service stopped, which ends the wait, and delivers
+   only after): a real failure is recorded for `get_last_error` without a
+   callback -- a crash that raced the host's hand on the switch, which an
+   earlier fix (6b1baa51) made sure stays visible -- and the stop's own
+   unrequested-end echo is discarded. Otherwise it is dropped: the slot
+   holds a successor or nothing of this session's remains; it logs at warn
+   naming both ids. Installing a session clears the last error and the
+   stopped-id mark under the same lock, so an exit that wrote before the
+   install is cleared by it and one after is dropped: a new session never
+   starts life carrying the old one's failure.
    Tests: session B installed, A's exit fired, B's callback untouched and
    `get_last_error` unchanged; a session that fails while its stop waits
    leaves the failure in `get_last_error` and calls no callback; the echo

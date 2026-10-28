@@ -468,9 +468,10 @@ session id from a process-wide counter that starts at 1, `stop(handle)` acts
 on the session with that id and on no other -- any other value is a no-op
 that reports released, with a warning -- and the stopped callback is handed
 the id with the reason. There is still one tunnel per process; the id is
-identity, not multiplicity. An exit that lands while a stop is waiting on
-that very session is still recorded, so a crash that raced the host's stop
-reaches `getLastError` as before.
+identity, not multiplicity. An exit for the session the last stop ended
+is still recorded if it is a failure, whether it lands during the stop's wait
+or after, so a crash that raced the host's stop reaches `getLastError` as
+before; installing the next session clears it.
 
 Before: `shoes_start` returned the literal `1` and `shoes_stop(_handle)`
 ignored its argument, so the API implied a multi-instance model it did not
