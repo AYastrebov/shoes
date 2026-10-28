@@ -438,9 +438,11 @@ known to work.
 **DNS.** Through `SCDynamicStore` — `system-configuration` 0.8.0, Mullvad's
 crate, whose own `set_dns` example is precisely this operation. The daemon reads
 the `PrimaryService` property (`kSCDynamicStorePropNetPrimaryService`) of
-`State:/Network/Global/IPv4`, then writes a dictionary keyed
-`kSCPropNetDNSServerAddresses` to both
-`State:/Network/Service/<primary>/DNS` and `Setup:/Network/Service/<primary>/DNS`.
+`State:/Network/Global/IPv4`, then sets `kSCPropNetDNSServerAddresses` in the
+dictionary of both `State:/Network/Service/<primary>/DNS` and
+`Setup:/Network/Service/<primary>/DNS`, keeping the rest of each but
+`ServerPort` -- a port that belonged to the replaced resolvers -- or writes a
+dictionary of that one key where there was none.
 The previous values are remembered — in the state file, not only in memory —
 and restored on stop. `SCDynamicStore::set` returns `bool` rather than a
 `Result`, so every call is checked.
@@ -459,6 +461,12 @@ empty are different — an empty dictionary is a service configured to resolve
 nothing. A record from 0.8.1 has no keys and is restored from its servers.
 The store is behind a `Store` trait so the restore runs in tests against a
 store in memory; the real one refuses writes from anything but root.
+
+Applying keeps the rest of each dictionary for the same reason. Until 0.9.0 it
+wrote `{ ServerAddresses }` alone, so while a session was up the lease's
+`DomainName` and the user's `SearchDomains` were gone, and a bare hostname that
+resolved through the search list before did not. The re-apply after a network
+change merges the same way, into whatever the new network's lease wrote.
 
 Explicitly **not** `networksetup`, which is what wg-quick uses. Two reasons, and
 the second is the one that decides it. Clash Nyanpasu's DNS has been broken that

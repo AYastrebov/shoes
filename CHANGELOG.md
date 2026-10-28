@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+`shoesd` on macOS keeps a network's search domains while a session is up.
+Applying DNS wrote a dictionary holding only the tunnel's resolvers to the
+service's `State:` and `Setup:` keys, so the lease's `DomainName` and the
+user's `SearchDomains` went away until the revert put them back, and a bare
+hostname that resolved through the search list did not. It now sets
+`ServerAddresses` in each key's existing dictionary and keeps the rest,
+including on the re-apply after a network change, except a `ServerPort`,
+which belonged to the resolvers being replaced; the revert is unchanged.
+Closes the recorded-debt entry from #110.
+
 Tests only. `h2mux`'s activity-tracker test no longer fails when the runner
 oversleeps. It slept 50 ms and then asserted the tracker was not idle against
 a 100 ms threshold, which a loaded macOS runner exceeded on `mobile` after

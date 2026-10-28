@@ -18,6 +18,10 @@
 //! never from the parsed servers: the two keys hold different things, and a
 //! dictionary holds more than its servers. See [`DnsState::store_keys`].
 //!
+//! For the same reason applying changes only `ServerAddresses` in each key
+//! and keeps the rest of its dictionary: a lease's `DomainName` and a user's
+//! `SearchDomains` stay in force while the tunnel's resolvers answer.
+//!
 //! [`DnsState::store_keys`]: super::super::DnsState::store_keys
 
 use std::net::IpAddr;
@@ -25,7 +29,7 @@ use std::net::IpAddr;
 use core_foundation::array::CFArray;
 use core_foundation::base::{TCFType, ToVoid};
 use core_foundation::data::CFData;
-use core_foundation::dictionary::CFDictionary;
+use core_foundation::dictionary::{CFDictionary, CFMutableDictionary};
 use core_foundation::propertylist::{
     self, CFPropertyList, CFPropertyListSubClass, kCFPropertyListImmutable,
     kCFPropertyListXMLFormat_v1_0,
@@ -33,7 +37,7 @@ use core_foundation::propertylist::{
 use core_foundation::string::{CFString, CFStringRef};
 use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
 use system_configuration::sys::schema_definitions::{
-    kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSServerAddresses,
+    kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSServerAddresses, kSCPropNetDNSServerPort,
 };
 
 use super::super::StoreKeys;
@@ -158,6 +162,14 @@ impl<S: Store> DnsStore<S> {
 
     /// Set the resolvers on a service, on both keys.
     ///
+    /// Only the resolvers: each key keeps the rest of its dictionary.
+    /// Writing `{ ServerAddresses }` alone, as every release through 0.9.0
+    /// did, dropped a lease's `DomainName` and a user's `SearchDomains` for
+    /// the life of a session, so a bare hostname that resolved through the
+    /// search list before did not resolve through the tunnel. Re-applying on
+    /// the original service comes through here too, merging any new lease
+    /// written to that service; a change of primary service is not handled.
+    ///
     /// An empty list removes the override, which is how a service that had no
     /// explicit resolvers is restored.
     pub fn write(&self, service: &str, servers: &[IpAddr]) -> std::io::Result<()> {
@@ -177,7 +189,8 @@ impl<S: Store> DnsStore<S> {
                 // same absent key.
                 self.store.get(key.as_str()).is_none() || self.store.remove(key.as_str())
             } else {
-                self.store.set(key.as_str(), &dns_dictionary(servers))
+                let merged = dns_dictionary(self.store.get(key.as_str()), servers);
+                self.store.set(key.as_str(), &merged)
             };
 
             // Both APIs answer with a bool rather than a Result, so an
@@ -264,22 +277,39 @@ fn setup_key(service: &str) -> String {
     format!("Setup:/Network/Service/{service}/DNS")
 }
 
-/// `{ ServerAddresses: [...] }`.
-fn dns_dictionary(servers: &[IpAddr]) -> CFPropertyList {
+/// `existing` with its `ServerAddresses` set to `servers`, its `ServerPort`
+/// removed, and everything else in it kept; `{ ServerAddresses: [...] }`
+/// where there is no dictionary to keep.
+fn dns_dictionary(existing: Option<CFPropertyList>, servers: &[IpAddr]) -> CFPropertyList {
     let addresses: Vec<CFString> = servers
         .iter()
         .map(|address| CFString::new(&address.to_string()))
         .collect();
+    let addresses = CFArray::from_CFTypes(&addresses);
 
     // SAFETY: a static constant from SystemConfiguration, borrowed for the
     // lifetime of the dictionary built from it.
     let key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
-    let typed = CFDictionary::from_CFType_pairs(&[(key, CFArray::from_CFTypes(&addresses))]);
 
-    // The typed dictionary is laundered into an untyped one on the way to a
-    // property list, which is what the store takes. This is what the crate's
-    // own `set_dns` example does.
-    typed.to_untyped().into_CFPropertyList()
+    // A copy, never the store's own dictionary: the store hands out an
+    // immutable one. Untyped, because the values are of every type a
+    // property list holds.
+    let mut merged: CFMutableDictionary =
+        match existing.and_then(CFPropertyList::downcast_into::<CFDictionary>) {
+            Some(dictionary) => CFMutableDictionary::from(&dictionary),
+            None => CFMutableDictionary::new(),
+        };
+    // The dictionary retains both, so they may drop after this.
+    merged.set(key.as_CFTypeRef(), addresses.as_CFTypeRef());
+
+    // The port belongs to the resolvers being replaced: kept, it would send
+    // the tunnel's resolvers queries on a port they do not listen on, where
+    // the tunnel's DNS answers on 53. The revert's snapshot still has it.
+    // SAFETY: as for `key`.
+    let port = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerPort) };
+    merged.remove(port.as_CFTypeRef());
+
+    merged.to_immutable().into_CFPropertyList()
 }
 
 /// The doubles the host's tests share with this module's.
@@ -326,26 +356,13 @@ pub mod testing {
     /// the lease's domain. Whatever else a key holds must survive the record
     /// too, so the fixture carries an empty array beside them.
     pub fn lease_dictionary() -> CFPropertyList {
-        let servers =
-            CFArray::from_CFTypes(&[CFString::new("172.29.5.17"), CFString::new("172.22.2.17")]);
-        let domain = CFString::new("corp.example");
-        let none: CFArray<CFString> = CFArray::from_CFTypes(&[]);
-        dictionary(&[
-            ("ServerAddresses", servers.as_CFType()),
-            ("DomainName", domain.as_CFType()),
-            ("SearchDomains", none.as_CFType()),
-        ])
+        lease_dictionary_with(&["172.29.5.17", "172.22.2.17"].map(|a| a.parse().unwrap()))
     }
 
     /// What a user types into Network Settings: their own resolver and a
     /// search domain, in `Setup:`, which overrides the lease.
     pub fn user_dictionary() -> CFPropertyList {
-        let servers = CFArray::from_CFTypes(&[CFString::new("192.0.2.53")]);
-        let search = CFArray::from_CFTypes(&[CFString::new("home.example")]);
-        dictionary(&[
-            ("ServerAddresses", servers.as_CFType()),
-            ("SearchDomains", search.as_CFType()),
-        ])
+        user_dictionary_with(&["192.0.2.53".parse().unwrap()])
     }
 
     /// `{}`: a service configured to resolve nothing, which is not the same
@@ -354,12 +371,44 @@ pub mod testing {
         dictionary(&[])
     }
 
-    /// What applying writes: the servers, and nothing else.
+    /// What applying writes where a key had nothing: the servers alone.
     pub fn servers_dictionary(servers: &[IpAddr]) -> CFPropertyList {
-        dns_dictionary(servers)
+        dns_dictionary(None, servers)
     }
 
-    fn dictionary(pairs: &[(&str, CFType)]) -> CFPropertyList {
+    /// [`lease_dictionary`] with the tunnel's resolvers: what applying
+    /// writes over a lease, its `DomainName` kept.
+    pub fn lease_dictionary_with(servers: &[IpAddr]) -> CFPropertyList {
+        let domain = CFString::new("corp.example");
+        let none: CFArray<CFString> = CFArray::from_CFTypes(&[]);
+        dictionary(&[
+            ("ServerAddresses", addresses(servers).as_CFType()),
+            ("DomainName", domain.as_CFType()),
+            ("SearchDomains", none.as_CFType()),
+        ])
+    }
+
+    /// [`user_dictionary`] with the tunnel's resolvers, its `SearchDomains`
+    /// kept.
+    pub fn user_dictionary_with(servers: &[IpAddr]) -> CFPropertyList {
+        let search = CFArray::from_CFTypes(&[CFString::new("home.example")]);
+        dictionary(&[
+            ("ServerAddresses", addresses(servers).as_CFType()),
+            ("SearchDomains", search.as_CFType()),
+        ])
+    }
+
+    fn addresses(servers: &[IpAddr]) -> CFArray<CFString> {
+        let servers: Vec<CFString> = servers
+            .iter()
+            .map(|address| CFString::new(&address.to_string()))
+            .collect();
+        CFArray::from_CFTypes(&servers)
+    }
+
+    /// A dictionary of the given entries, for a fixture the ones above do
+    /// not cover.
+    pub fn dictionary(pairs: &[(&str, CFType)]) -> CFPropertyList {
         let pairs: Vec<(CFString, CFType)> = pairs
             .iter()
             .map(|(key, value)| (CFString::new(key), value.clone()))
@@ -442,6 +491,64 @@ mod tests {
         assert_eq!(
             servers,
             ["172.29.5.17", "172.22.2.17"].map(|s| s.parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// A network change is macOS putting the new lease back in `State:`,
+    /// and the re-apply that follows writes the tunnel's resolvers over it.
+    /// The lease's domain is the new network's, and it is kept: replacing
+    /// the dictionary, as every release through 0.9.0 did, dropped it for as
+    /// long as the session lasted.
+    #[test]
+    fn a_reapply_over_a_new_lease_keeps_its_domain() {
+        let map = MapStore::default();
+        let store = DnsStore::with_store(map.clone());
+        let tunnel: [IpAddr; 1] = ["10.99.0.1".parse().unwrap()];
+
+        store.write("S", &tunnel).unwrap();
+        assert_eq!(
+            map.get(&state_key("S")),
+            Some(testing::servers_dictionary(&tunnel)),
+            "no key before: the servers alone"
+        );
+
+        map.set(&state_key("S"), &lease_dictionary());
+        store.write("S", &tunnel).unwrap();
+        assert_eq!(
+            map.get(&state_key("S")),
+            Some(testing::lease_dictionary_with(&tunnel))
+        );
+    }
+
+    /// A resolver on a port of its own: the tunnel's resolvers replace it
+    /// on 53, so its `ServerPort` goes with its addresses, and the domain
+    /// beside them stays.
+    #[test]
+    fn applying_drops_the_old_resolvers_port() {
+        use core_foundation::number::CFNumber;
+        let old = CFArray::from_CFTypes(&[CFString::new("192.0.2.53")]);
+        let domain = CFString::new("corp.example");
+        let map = MapStore::default();
+        map.set(
+            &state_key("S"),
+            &testing::dictionary(&[
+                ("ServerAddresses", old.as_CFType()),
+                ("ServerPort", CFNumber::from(5353).as_CFType()),
+                ("DomainName", domain.as_CFType()),
+            ]),
+        );
+        let store = DnsStore::with_store(map.clone());
+        let tunnel: [IpAddr; 1] = ["10.99.0.1".parse().unwrap()];
+
+        store.write("S", &tunnel).unwrap();
+
+        let tunnel_addresses = CFArray::from_CFTypes(&[CFString::new("10.99.0.1")]);
+        assert_eq!(
+            map.get(&state_key("S")),
+            Some(testing::dictionary(&[
+                ("ServerAddresses", tunnel_addresses.as_CFType()),
+                ("DomainName", domain.as_CFType()),
+            ]))
         );
     }
 
