@@ -169,7 +169,7 @@ impl DirectionCipher {
         let ciphertext = self
             .aead
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: plaintext,
                     aad: b"",
@@ -210,7 +210,7 @@ impl DirectionCipher {
 
         self.aead
             .decrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: ciphertext,
                     aad: b"",

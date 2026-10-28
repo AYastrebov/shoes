@@ -129,11 +129,11 @@ serde_json = { version = "1", optional = true }
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
 awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "42a7e9f5d2ae2778f486324321dc6f93f0684f46", default-features = false }
 aws-lc-rs = { version = "1", default-features = false }
-base64 = "0.22"
-blake2 = "0.10"
+base64 = "0.23"
+blake2 = "0.11"
 blake3 = "1"
 bytes = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 chrono = "0.4"
 dashmap = "6"
 # Pinned to the major: shake 0.1 implements digest 0.11's XofReader, and a
@@ -157,12 +157,12 @@ hyper-util = { version = "0.1", features = ["tokio", "server"] }
 indexmap = "2"
 libc = "0.2"
 log = { version = "0.4", features = ["std", "release_max_level_info"] }
-lru = "0.18"
+lru = "0.19"
 md-5 = "0.11"
 memchr = "2"
 mime_guess = "2"
 notify = "8"
-parking_lot = "0.12"
+parking_lot = "0.13"
 percent-encoding = "2"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 # Not used directly; this is a floor under quinn's own dependency. Through
