@@ -8,7 +8,8 @@ service's `State:` and `Setup:` keys, so the lease's `DomainName` and the
 user's `SearchDomains` went away until the revert put them back, and a bare
 hostname that resolved through the search list did not. It now sets
 `ServerAddresses` in each key's existing dictionary and keeps the rest,
-including on the re-apply after a network change; the revert is unchanged.
+including on the re-apply after a network change, except a `ServerPort`,
+which belonged to the resolvers being replaced; the revert is unchanged.
 Closes the recorded-debt entry from #110.
 
 Tests only. `h2mux`'s activity-tracker test no longer fails when the runner

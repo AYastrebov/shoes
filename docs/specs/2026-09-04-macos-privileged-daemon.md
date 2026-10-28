@@ -440,7 +440,8 @@ crate, whose own `set_dns` example is precisely this operation. The daemon reads
 the `PrimaryService` property (`kSCDynamicStorePropNetPrimaryService`) of
 `State:/Network/Global/IPv4`, then sets `kSCPropNetDNSServerAddresses` in the
 dictionary of both `State:/Network/Service/<primary>/DNS` and
-`Setup:/Network/Service/<primary>/DNS`, keeping the rest of each, or writes a
+`Setup:/Network/Service/<primary>/DNS`, keeping the rest of each but
+`ServerPort` -- a port that belonged to the replaced resolvers -- or writes a
 dictionary of that one key where there was none.
 The previous values are remembered — in the state file, not only in memory —
 and restored on stop. `SCDynamicStore::set` returns `bool` rather than a

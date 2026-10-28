@@ -37,7 +37,7 @@ use core_foundation::propertylist::{
 use core_foundation::string::{CFString, CFStringRef};
 use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
 use system_configuration::sys::schema_definitions::{
-    kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSServerAddresses,
+    kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSServerAddresses, kSCPropNetDNSServerPort,
 };
 
 use super::super::StoreKeys;
@@ -277,9 +277,9 @@ fn setup_key(service: &str) -> String {
     format!("Setup:/Network/Service/{service}/DNS")
 }
 
-/// `existing` with its `ServerAddresses` set to `servers` and everything
-/// else in it kept; `{ ServerAddresses: [...] }` where there is no
-/// dictionary to keep.
+/// `existing` with its `ServerAddresses` set to `servers`, its `ServerPort`
+/// removed, and everything else in it kept; `{ ServerAddresses: [...] }`
+/// where there is no dictionary to keep.
 fn dns_dictionary(existing: Option<CFPropertyList>, servers: &[IpAddr]) -> CFPropertyList {
     let addresses: Vec<CFString> = servers
         .iter()
@@ -301,6 +301,13 @@ fn dns_dictionary(existing: Option<CFPropertyList>, servers: &[IpAddr]) -> CFPro
         };
     // The dictionary retains both, so they may drop after this.
     merged.set(key.as_CFTypeRef(), addresses.as_CFTypeRef());
+
+    // The port belongs to the resolvers being replaced: kept, it would send
+    // the tunnel's resolvers queries on a port they do not listen on, where
+    // the tunnel's DNS answers on 53. The revert's snapshot still has it.
+    // SAFETY: as for `key`.
+    let port = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerPort) };
+    merged.remove(port.as_CFTypeRef());
 
     merged.to_immutable().into_CFPropertyList()
 }
@@ -399,7 +406,9 @@ pub mod testing {
         CFArray::from_CFTypes(&servers)
     }
 
-    fn dictionary(pairs: &[(&str, CFType)]) -> CFPropertyList {
+    /// A dictionary of the given entries, for a fixture the ones above do
+    /// not cover.
+    pub fn dictionary(pairs: &[(&str, CFType)]) -> CFPropertyList {
         let pairs: Vec<(CFString, CFType)> = pairs
             .iter()
             .map(|(key, value)| (CFString::new(key), value.clone()))
@@ -508,6 +517,38 @@ mod tests {
         assert_eq!(
             map.get(&state_key("S")),
             Some(testing::lease_dictionary_with(&tunnel))
+        );
+    }
+
+    /// A resolver on a port of its own: the tunnel's resolvers replace it
+    /// on 53, so its `ServerPort` goes with its addresses, and the domain
+    /// beside them stays.
+    #[test]
+    fn applying_drops_the_old_resolvers_port() {
+        use core_foundation::number::CFNumber;
+        let old = CFArray::from_CFTypes(&[CFString::new("192.0.2.53")]);
+        let domain = CFString::new("corp.example");
+        let map = MapStore::default();
+        map.set(
+            &state_key("S"),
+            &testing::dictionary(&[
+                ("ServerAddresses", old.as_CFType()),
+                ("ServerPort", CFNumber::from(5353).as_CFType()),
+                ("DomainName", domain.as_CFType()),
+            ]),
+        );
+        let store = DnsStore::with_store(map.clone());
+        let tunnel: [IpAddr; 1] = ["10.99.0.1".parse().unwrap()];
+
+        store.write("S", &tunnel).unwrap();
+
+        let tunnel_addresses = CFArray::from_CFTypes(&[CFString::new("10.99.0.1")]);
+        assert_eq!(
+            map.get(&state_key("S")),
+            Some(testing::dictionary(&[
+                ("ServerAddresses", tunnel_addresses.as_CFType()),
+                ("DomainName", domain.as_CFType()),
+            ]))
         );
     }
 
