@@ -8,8 +8,12 @@ import ShoesFFI
 /// The shoes engine, as a Swift host sees it.
 ///
 /// One per process, because the library is: `shoes_is_running` is a
-/// process-wide fact and `shoes_stop` ignores the handle it is given. The
-/// two rules the C surface states in prose are properties here:
+/// process-wide fact and there is one session at a time. `shoes_stop` acts
+/// on the session whose id it is given and on no other, so this wrapper
+/// keeps the id `shoes_start_with_fd` returned and passes it back; after a
+/// stop, or before any start, it passes 0, which the library answers with
+/// "released" since nothing of ours is running. The two rules the C surface
+/// states in prose are properties here:
 ///
 /// - `stop()` is `async` and returns only when the engine has released the
 ///   descriptor. There is no synchronous stop; a host that wants
@@ -22,6 +26,9 @@ public final class ShoesEngine: Sendable {
     /// `shoes_init` is idempotent, but `start` before it would fail inside
     /// the FFI with a less useful error than `.notInitialized`.
     private let initialized = LockedFlag()
+
+    /// The id of the running session, 0 when there is none.
+    private let session = LockedHandle()
 
     private init() {}
 
@@ -81,6 +88,7 @@ public final class ShoesEngine: Sendable {
             CallbackBridge.shared.clear()
             throw ShoesError.startFailed(lastError() ?? "shoes_start_with_fd returned \(handle)")
         }
+        session.set(handle)
     }
 
     /// Signal shutdown and wait until the engine has released the
@@ -98,8 +106,9 @@ public final class ShoesEngine: Sendable {
         // a requested stop is not an event, and a traffic tick during it is
         // not worth delivering.
         CallbackBridge.shared.clear()
+        let handle = session.take()
         return await Task.detached(priority: .userInitiated) {
-            shoes_stop(1) == 1
+            shoes_stop(handle) == 1
         }.value
     }
 
@@ -145,4 +154,20 @@ private final class LockedFlag: @unchecked Sendable {
     private var value = false
     var isSet: Bool { lock.withLock { value } }
     func set() { lock.withLock { value = true } }
+}
+
+/// A session id readable and clearable from any thread; 0 is "none".
+private final class LockedHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func set(_ handle: Int) { lock.withLock { value = handle } }
+    /// The id, and 0 from now on: a stop takes it, so a second stop
+    /// passes nothing to stop.
+    func take() -> Int {
+        lock.withLock {
+            let handle = value
+            value = 0
+            return handle
+        }
+    }
 }

@@ -57,9 +57,12 @@ import Testing
         #expect(engine.networkChanged() == 0)
     }
 
+    /// With no session there is no id to pass; the wrapper passes 0 and
+    /// the library reports released, since nothing of ours is running.
     @Test func stopIsSafeWhenNothingRuns() async throws {
         try engine.initialize(logLevel: .error)
-        await engine.stop()
+        let released = await engine.stop()
+        #expect(released == true)
         #expect(engine.isRunning == false)
     }
 
