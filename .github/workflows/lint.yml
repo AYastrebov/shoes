@@ -88,6 +88,10 @@ jobs:
   # arm, and its first run found a dead test helper nothing else had.
   clippy-daemon:
     name: Clippy (${{ matrix.label }} daemon)
+    # The schedule exists for the advisory check; the lint jobs are
+    # guarded like fmt and the host clippy. This one was not, and ran a
+    # macOS, a Windows and a Linux clippy every night with nothing changed.
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.runner }}
 
     strategy:

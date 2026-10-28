@@ -1,0 +1,42 @@
+name: PR closed
+
+# Merging or closing a pull request does not cancel the workflow runs its
+# last push started: they keep their place in the runner queue and finish
+# for a branch nobody will look at again. On 2026-10-28 four such runs
+# for an already-merged bump PR sat ahead of the release's build while
+# macOS runners were scarce. This cancels them the moment the PR closes.
+#
+# Only runs for the PR's own head branch, started by a pull_request
+# event: never a run on the base branch, and never the push run the merge
+# itself started.
+
+on:
+  pull_request:
+    types: [ closed ]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    name: Cancel the closed PR's runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Through env, never interpolated into the script: a branch name is
+      # attacker-chosen text on a fork PR.
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: Cancel queued and in-progress runs for the head branch
+        run: |
+          set -euo pipefail
+          for status in queued in_progress; do
+            gh run list --repo "$GITHUB_REPOSITORY" --branch "$HEAD_REF" \
+              --event pull_request --status "$status" --limit 50 \
+              --json databaseId --jq '.[].databaseId' \
+            | while read -r id; do
+                echo "cancelling run $id ($status)"
+                gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
+              done
+          done

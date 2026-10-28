@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+CI only. A closed or merged pull request now cancels the queued and running
+workflow runs its last push started, so they no longer hold runners for a
+branch nobody will look at again; on the day of the 0.9.0 release four such
+runs sat ahead of the release build while macOS runners were scarce. The
+nightly schedule, which exists for the advisory check, no longer runs the
+three-platform daemon clippy, the one lint job that lacked the schedule
+guard.
+
 ## v0.9.0
 
 A minor version, for the mobile FFI: Android gains a stopped listener,
