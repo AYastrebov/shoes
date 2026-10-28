@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+awgtun moves to 0.12.0 (738ce7e). The change that reaches the wire: the
+AmneziaWG handshake timestamp now uses the epoch every reference uses
+(+10, as kernel WireGuard and wireguard-go), so moving a peer identity
+between shoes and a kernel or Go client no longer stalls its next
+handshake for 27 seconds. A server that has already accepted a timestamp
+from an older build may make that window expire once on upgrade. The
+rest is housekeeping shoes inherits: awgtun is on the digest 0.11 and
+rand_core 0.10 RustCrypto generation this crate already uses, with
+`x25519-dalek` 3 and `curve25519-dalek` 5, so the old `blake2`,
+`chacha20poly1305`, `digest` 0.10 and `rand_core` 0.6 lines leave the
+graph along with their eleven supporting crates. No shoes code changes:
+the x25519 types it uses are the same.
+
 The five direct dependencies the lockfile update left on an old major
 move up, one commit each: `blake2` 0.11 and `chacha20poly1305` 0.11 join
 the digest 0.11 and rand_core 0.10 lines the rest of the crate uses;
