@@ -17,7 +17,7 @@ runs:
       with:
         # shared-key, not key: the automatic key embeds the job name, and
         # this action runs as mobile.yml's `apple` job and as
-        # release-apple.yml's `release` job, which never matched each other.
+        # release-apple.yml's `framework` job, which never matched each other.
         shared-key: apple
         cache-on-failure: true
         save-if: ${{ github.event_name != 'pull_request' }}

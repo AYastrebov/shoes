@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+CI only. A release re-run no longer waits for a macOS runner it does not
+need. `release-apple.yml` was one `macos-latest` job, so finish mode -- the
+re-run after a failure past the manifest commit, which only re-dispatches
+the missing builds, waits and publishes -- queued for a Mac all the same,
+and the 0.9.0 recovery run was cancelled for want of one while GitHub's
+macOS arm64 runners were short. The workflow is now three jobs: planning,
+the draft and the dispatch on Ubuntu; the framework build, the manifest
+commit and the zip upload on macOS, skipped in finish mode; and the wait,
+the asset check and the publish on Ubuntu, which runs only after the
+framework job succeeded or was skipped. The dry-run cleanup is its own job,
+so a dry run deletes its draft whichever job it failed in.
+
 Documentation only. The `docs/superpowers/` tree is gone. It was the
 August location for design documents and implementation plans, before
 `docs/specs/` and `docs/plans/` existed, and `AGENTS.md` has pointed at
