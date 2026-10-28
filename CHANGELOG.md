@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+The Android AAR builds with AGP 9.4.1 and Gradle 9.8.2, up from 9.0.1 and
+9.5.0; nothing in the module's build script changes, since it enables no
+minification and ships no keep rules, which is where the 9.1 to 9.4
+behaviour changes live. CI's Gradle setup action moves to its current
+release and publishes a Build Scan of every AAR build to the public
+scans.gradle.com, linked from the job log, so a slow or oddly cached build
+can be read from its task timeline rather than guessed at.
+
 ## v0.8.4
 
 One protocol fix and a dependency sweep. VLESS UDP under the Vision flow
