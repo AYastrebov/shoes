@@ -46,6 +46,13 @@ on that path unchanged. A `dry_run` input exercises the whole flow against
 a throwaway draft and deletes it, with no commit and no tag. Spec:
 `docs/specs/2026-10-28-parallel-release.md`.
 
+Workflow hygiene: the GitHub-owned actions (checkout, upload-artifact,
+download-artifact) are pinned by commit like every third-party action,
+and Dependabot keeps the action pins current weekly, grouped in one PR;
+the protoc install that lint, test and build each carried a copy of is one
+composite action; and the Test workflow no longer runs the FFI feature set
+on Windows, where nothing ships it.
+
 ## v0.9.0
 
 A minor version, for the mobile FFI: Android gains a stopped listener,
