@@ -23,6 +23,14 @@ build shares one cache key between the pull-request job and the release
 job, which never matched before, and the Android AAR build gets a nightly
 so a tag's AAR no longer compiles three ABIs cold.
 
+The Lint workflow now runs the gate AGENTS.md documents, command for
+command. The host clippy job ran a bare `cargo clippy`, without `--tests`
+and without the `desktop` configuration, and nothing linted the FFI
+configuration or the iOS target at all, so a warning in a test, behind
+`desktop`, or under the iOS cfg was red locally and green in CI. The host
+job runs the default and desktop lines with their tests; the macOS daemon
+job runs the FFI line with its tests and a clippy for `aarch64-apple-ios`.
+
 ## v0.9.0
 
 A minor version, for the mobile FFI: Android gains a stopped listener,
