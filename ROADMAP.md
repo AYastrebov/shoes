@@ -165,6 +165,27 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   longer wait or a readiness signal that does not depend on scheduling.
   Cost: a red Test job that a rerun turns green, which hides a real
   failure when one comes.
+- **The probe matrix's SOCKS wrong-password cell flakes on Windows**
+  (2026-10-26, seen on #110). `src/probe_tests.rs` expects `Data` for
+  `("socks", WrongKey)` and sometimes gets `ClosedAtOnce` on
+  `windows-latest`. The probe pipelines greeting, auth and `CONNECT` in one
+  write; on a wrong password the server writes its two-byte failure and
+  drops the socket with `CONNECT` unread, which sends RST, and Windows
+  discards received data still queued when an RST arrives (Linux does not).
+  Fixing it means draining or half-closing before the drop in the SOCKS
+  server's auth-failure path, or a probe that waits for the reply before
+  sending `CONNECT`. Cost: the same as the entry above.
+- **A release's publish step follows only the newest dispatched build**
+  (2026-10-28, the 0.9.0 release). `release-apple.yml`'s `publish` job
+  finds the newest `workflow_dispatch` run of `build.yml` and `mobile.yml`
+  since the plan started and fails the release if that run is not green.
+  A macOS job cancelled for want of a runner, which GitHub's arm64
+  capacity made common that day, fails the release even when a re-run of
+  the same build later attaches everything; 0.9.0 was published by hand
+  after one did. Fixing it means waiting on the assets rather than on one
+  run: poll the draft for the 14 names until a deadline, and fail only
+  then. Cost: a re-dispatch of the release workflow, or a manual publish,
+  each time a fan-out job is cancelled.
 
 ## Table of Contents
 

@@ -87,11 +87,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_activity_tracker_becomes_idle() {
+        let started = Instant::now();
         let tracker = ActivityTracker::new();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(tracker.is_idle(Duration::from_millis(40)));
-        assert!(!tracker.is_idle(Duration::from_millis(100)));
+        // The ceiling is the sleep as measured by a clock of the test's own,
+        // not a constant: a loaded CI runner overslept a 50 ms sleep past the
+        // 100 ms bound this used to assert, and the tracker was right to call
+        // that idle.
+        assert!(!tracker.is_idle(started.elapsed() + Duration::from_secs(1)));
     }
 
     #[tokio::test]
