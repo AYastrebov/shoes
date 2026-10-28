@@ -117,26 +117,27 @@ public final class ShoesEngine: Sendable {
         guard initialized.isSet else { throw ShoesError.notInitialized }
         guard !isRunning else { throw ShoesError.alreadyRunning }
 
-        // The task installs the callbacks and records the session itself,
-        // so a `stop()` that awaited it finds the id set before it looks,
-        // and a start refused below has touched nothing.
+        // The task records the session itself, so a `stop()` that awaited
+        // it finds the id set before it looks.
         let startNative = self.startNative
         let session = self.session
         let yaml = config.yaml
-        // Created and registered under one lock, so a `stop()` that takes
-        // the same lock sees the task the moment it can run, never a
-        // native start already under way with nothing registered; and a
-        // second start while one is registered is refused here, before it
-        // could replace the task a stop must wait for.
+        // Handlers installed, task created and task registered under one
+        // lock, the lock a `stop()` clears the handlers and reads the task
+        // through: either the stop finds this start and its handlers and
+        // clears them, or it finds nothing and this start installs after
+        // it, as a start after a stop should. A second start while one is
+        // registered is refused here, before it has touched anything.
         guard
-            let task = inFlight.start({
-                Task.detached(priority: .userInitiated) {
-                    CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped)
-                    let handle = startNative(yaml, deviceFD)
-                    if handle > 0 { session.set(handle) }
-                    return handle
-                }
-            })
+            let task = inFlight.start(
+                install: { CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped) },
+                make: {
+                    Task.detached(priority: .userInitiated) {
+                        let handle = startNative(yaml, deviceFD)
+                        if handle > 0 { session.set(handle) }
+                        return handle
+                    }
+                })
         else { throw ShoesError.alreadyRunning }
         let handle = await task.value
         inFlight.clear(task)
@@ -157,13 +158,16 @@ public final class ShoesEngine: Sendable {
     /// discard. Discarding it still reproduces the old behavior.
     @discardableResult
     public func stop() async -> Bool {
-        // Cleared first, as the library clears its own slot before it stops:
-        // a requested stop is not an event, and a traffic tick during it is
-        // not worth delivering.
-        CallbackBridge.shared.clear()
-        // A start still inside the native call owns the session this stop
-        // is for; its id exists only once that call returns.
-        if let starting = inFlight.get() {
+        // The handlers are cleared under the registration lock, as the
+        // library clears its own slot before it stops: a requested stop is
+        // not an event, and a traffic tick during it is not worth
+        // delivering. Under that lock, so a start in flight has either
+        // installed its handlers already (cleared here, and the engine it
+        // makes dies to nobody) or installs them after (a start after a
+        // stop, whose handlers are its own to keep). A start still inside
+        // the native call owns the session this stop is for; its id exists
+        // only once that call returns.
+        if let starting = inFlight.takeForStop(clearing: { CallbackBridge.shared.clear() }) {
             _ = await starting.value
         }
         // The session id is taken and the stop registered under one lock.
@@ -184,10 +188,6 @@ public final class ShoesEngine: Sendable {
         else { return true }
         let released = await task.value
         stopping.clear(task)
-        // Once more after the engine confirmed: a start that lost the race
-        // to this stop may have installed handlers for the session just
-        // stopped.
-        CallbackBridge.shared.clear()
         return released
     }
 
@@ -239,18 +239,27 @@ private final class LockedFlag: @unchecked Sendable {
 private final class LockedTask: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Task<Int, Never>?
-    /// Creates the task with `make` and registers it under the lock, so a
-    /// reader never sees a task running unregistered. Nil, and nothing
-    /// made, while a start is already registered.
-    func start(_ make: () -> Task<Int, Never>) -> Task<Int, Never>? {
+    /// Runs `install`, then creates the task with `make` and registers it,
+    /// all under the lock, so a reader never sees a task running
+    /// unregistered or without its handlers. Nil, and nothing done, while
+    /// a start is already registered.
+    func start(install: () -> Void, make: () -> Task<Int, Never>) -> Task<Int, Never>? {
         lock.withLock {
             if value != nil { return nil }
+            install()
             let task = make()
             value = task
             return task
         }
     }
-    func get() -> Task<Int, Never>? { lock.withLock { value } }
+    /// The registered task, if any, after running `clearing` under the
+    /// same lock `start` installs under.
+    func takeForStop(clearing: () -> Void) -> Task<Int, Never>? {
+        lock.withLock {
+            clearing()
+            return value
+        }
+    }
     /// Clears the slot if it still holds `task`; a newer start's task stays.
     func clear(_ task: Task<Int, Never>) {
         lock.withLock {
