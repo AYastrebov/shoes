@@ -20,6 +20,15 @@ name: Release Apple
 # dispatched after the publish, onto the tag, and the release took the sum
 # of the three builds instead of the slowest.
 #
+# Three jobs, so only the framework build waits for a macOS runner. `plan`
+# (Ubuntu) validates, creates the draft and dispatches the fan-out;
+# `framework` (macOS) builds, commits the manifest and uploads the zip, and
+# runs only when the draft does not carry the zip yet; `publish` (Ubuntu)
+# waits for the fan-out, checks the assets and publishes. A re-run after a
+# failure past the manifest commit -- finish mode -- therefore needs no
+# macOS runner of its own. Until 2026-10-28 it was one macOS job, and the
+# 0.9.0 recovery run was cancelled for want of a runner it did not need.
+#
 # This workflow is the only producer of Shoes.xcframework.zip. A tag
 # pushed by hand still runs build.yml and mobile.yml on the tag, and
 # mobile.yml's release job checks the manifest actually names that tag.
@@ -49,16 +58,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build, checksum, tag, publish
-    runs-on: macos-latest
-    timeout-minutes: 90
+  plan:
+    name: Plan, draft, dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       # Through env, never interpolated into scripts: an expression inside
       # run: is expanded before the shell parses, which is an injection.
       VERSION: ${{ inputs.version }}
       DRY_RUN: ${{ inputs.dry_run }}
       GH_TOKEN: ${{ github.token }}
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      mode: ${{ steps.plan.outputs.mode }}
+      started: ${{ steps.plan.outputs.started }}
+      binaries: ${{ steps.dispatch.outputs.binaries }}
+      aar: ${{ steps.dispatch.outputs.aar }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -88,8 +103,9 @@ jobs:
 
           # A previous run built, committed and uploaded the framework, then
           # failed later. The zip and the committed checksum agree;
-          # rebuilding would break that. Go straight to the wait and the
-          # publish, re-dispatching only what is missing.
+          # rebuilding would break that. Skip the framework job and go
+          # straight to the wait and the publish, re-dispatching only what is
+          # missing.
           if gh release view "$tag" --json isDraft,assets \
                --jq '.isDraft and ([.assets[].name] | index("Shoes.xcframework.zip") != null)' \
                2>/dev/null | grep -q true; then
@@ -145,14 +161,27 @@ jobs:
           echo "binaries=$need_binaries" >> "$GITHUB_OUTPUT"
           echo "aar=$need_aar" >> "$GITHUB_OUTPUT"
 
+  # The one job that needs macOS, and it runs only when the draft does not
+  # carry the framework yet.
+  framework:
+    name: Build, checksum, commit the manifest
+    needs: plan
+    if: needs.plan.outputs.mode == 'full'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: Build the XCFramework
-        if: steps.plan.outputs.mode == 'full'
         uses: ./.github/actions/build-apple
 
       - name: Zip, checksum, commit the manifest, upload to the draft
-        if: steps.plan.outputs.mode == 'full'
-        env:
-          TAG: ${{ steps.plan.outputs.tag }}
         run: |
           set -euo pipefail
           (cd output/apple && zip -r -q Shoes.xcframework.zip Shoes.xcframework/)
@@ -179,21 +208,39 @@ jobs:
 
           gh release upload "$TAG" output/apple/Shoes.xcframework.zip --clobber
 
-      # The runs this job dispatched: the newest workflow_dispatch run of
-      # each workflow on this branch since the plan step. Watched to
+  publish:
+    name: Wait, check, publish
+    needs: [plan, framework]
+    # After the framework job, or without it in finish mode. `always()` is
+    # what lets a skipped `framework` through; the result checks keep a
+    # failed or cancelled one from publishing.
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      (needs.framework.result == 'success' || needs.framework.result == 'skipped')
+    runs-on: ubuntu-latest
+    # The wait is for the slowest fan-out build, a macOS one that may queue.
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+
+    steps:
+      # The runs the plan job dispatched: the newest workflow_dispatch run
+      # of each workflow on this branch since the plan step. Watched to
       # completion; a failed or cancelled one fails the release before the
       # publish, and a re-run of this workflow dispatches it again.
       - name: Wait for the AAR and desktop-binary builds
         env:
-          STARTED: ${{ steps.plan.outputs.started }}
-          NEED_BINARIES: ${{ steps.dispatch.outputs.binaries }}
-          NEED_AAR: ${{ steps.dispatch.outputs.aar }}
+          STARTED: ${{ needs.plan.outputs.started }}
+          NEED_BINARIES: ${{ needs.plan.outputs.binaries }}
+          NEED_AAR: ${{ needs.plan.outputs.aar }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           wait_for() {
             local workflow="$1" id=""
             for attempt in $(seq 1 30); do
-              id=$(gh run list --workflow "$workflow" --branch "$GITHUB_REF_NAME" \
+              id=$(gh run list --repo "$REPO" --workflow "$workflow" --branch "$GITHUB_REF_NAME" \
                      --event workflow_dispatch --created ">=$STARTED" --limit 1 \
                      --json databaseId --jq '.[0].databaseId // empty')
               [ -n "$id" ] && break
@@ -201,7 +248,7 @@ jobs:
             done
             [ -n "$id" ] || { echo "no $workflow run appeared after $STARTED"; exit 1; }
             echo "waiting for $workflow run $id"
-            gh run watch "$id" --exit-status --interval 30 >/dev/null
+            gh run watch "$id" --repo "$REPO" --exit-status --interval 30 >/dev/null
             echo "$workflow run $id succeeded"
           }
           [ "$NEED_BINARIES" = true ] && wait_for build.yml
@@ -210,10 +257,10 @@ jobs:
 
       - name: Check every asset is attached
         env:
-          TAG: ${{ steps.plan.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | join(" ")')
+          assets=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '[.assets[].name] | join(" ")')
           missing=""
           for a in Shoes.xcframework.zip shoes-release.aar \
                    shoes-linux-x86_64.tar.gz shoes-linux-x86_64-musl.tar.gz shoes-linux-arm64.tar.gz \
@@ -232,11 +279,19 @@ jobs:
       - name: Publish
         if: inputs.dry_run != true
         env:
-          TAG: ${{ steps.plan.outputs.tag }}
-        run: gh release edit "$TAG" --draft=false
+          REPO: ${{ github.repository }}
+        run: gh release edit "$TAG" --repo "$REPO" --draft=false
 
-      - name: Delete the dry-run draft
-        if: always() && inputs.dry_run == true && steps.plan.outputs.tag != ''
-        env:
-          TAG: ${{ steps.plan.outputs.tag }}
-        run: gh release delete "$TAG" --yes --cleanup-tag || true
+  # Its own job so a dry run cleans up whichever job it failed in.
+  dry-run-cleanup:
+    name: Delete the dry-run draft
+    needs: [plan, framework, publish]
+    if: always() && inputs.dry_run == true && needs.plan.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      REPO: ${{ github.repository }}
+    steps:
+      - run: gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true

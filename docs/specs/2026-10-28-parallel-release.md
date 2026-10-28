@@ -132,8 +132,17 @@ started.
 - The manifest commit push rejected (someone pushed to `mobile` during the
   release): the job fails before publish, no tag, the draft deleted by the
   operator or left for the re-run, which rebuilds on the new head.
-- `dry_run` leaves nothing behind: the draft is deleted in a step that
-  runs `if: always()` once the dry run began.
+- `dry_run` leaves nothing behind: the draft is deleted in a job that
+  runs `if: always()` once the plan job named the draft.
+- A recovery run must not need a macOS runner it has no use for. As first
+  merged, the workflow was one `macos-latest` job, so the 0.9.0 finish-mode
+  re-run, which only had to re-dispatch `build.yml`, wait and publish, was
+  cancelled after 15 minutes without a runner. The workflow is now three
+  jobs: `plan` (Ubuntu) validates, creates the draft and dispatches the
+  fan-out; `framework` (macOS) builds, commits the manifest and uploads the
+  zip, and is skipped in finish mode; `publish` (Ubuntu) waits, checks the
+  14 assets and publishes, running after `framework` succeeds or is
+  skipped and never after it fails or is cancelled.
 
 ## Testing
 
