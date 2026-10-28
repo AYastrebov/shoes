@@ -384,7 +384,7 @@ fn is_default_heartbeat(value: &u64) -> bool {
 /// mieru client outbound, over mieru's TCP transport.
 ///
 /// The wire format is verified against enfein/mieru; see
-/// docs/superpowers/specs/2026-08-20-mieru-client-outbound-design.md.
+/// docs/specs/2026-08-20-mieru-client-outbound.md.
 /// deny_unknown_fields is what makes mieru's own options - multiplexing,
 /// low entropy, port ranges, the 0-RTT handshake mode - a named error rather
 /// than a setting that is silently ignored.

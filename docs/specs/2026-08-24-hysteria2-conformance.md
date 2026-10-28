@@ -156,8 +156,7 @@ congestion control.
 
 ## Phase 2 — robustness — done
 
-Landed 2026-08-25 on `feature/hysteria2-conformance-phase-2`. Plan:
-[docs/superpowers/plans/2026-08-25-hysteria2-conformance-phase-2.md](../plans/2026-08-25-hysteria2-conformance-phase-2.md).
+Landed 2026-08-25 on `feature/hysteria2-conformance-phase-2`.
 
 One deviation from what is written below. 2.1 is stated against the server's own
 table, but the shared `FragmentTable` that the *client* uses has the identical

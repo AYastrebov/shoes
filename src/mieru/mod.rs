@@ -1,7 +1,7 @@
 //! The mieru proxy protocol, client side.
 //!
 //! Wire format verified against enfein/mieru at b9bbc41; see
-//! docs/superpowers/specs/2026-08-20-mieru-client-outbound-design.md for the
+//! docs/specs/2026-08-20-mieru-client-outbound.md for the
 //! citation table.
 
 pub mod client;
