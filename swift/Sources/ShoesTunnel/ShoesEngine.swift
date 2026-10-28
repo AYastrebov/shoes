@@ -12,8 +12,10 @@ import ShoesFFI
 /// on the session whose id it is given and on no other, so this wrapper
 /// keeps the id `shoes_start_with_fd` returned and passes it back; after a
 /// stop, or before any start, it passes 0, which the library answers with
-/// "released" since nothing of ours is running. The two rules the C surface
-/// states in prose are properties here:
+/// "released" since nothing of ours is running. A `stop()` that arrives
+/// while `start` is still inside the native call waits for that call to
+/// return, so it stops the session the start made rather than nothing. The
+/// two rules the C surface states in prose are properties here:
 ///
 /// - `stop()` is `async` and returns only when the engine has released the
 ///   descriptor. There is no synchronous stop; a host that wants
@@ -30,11 +32,44 @@ public final class ShoesEngine: Sendable {
     /// The id of the running session, 0 when there is none.
     private let session = LockedHandle()
 
-    private init() {}
+    /// The native start in flight, so a `stop()` can wait for it.
+    private let inFlight = LockedTask()
+
+    /// The native calls, replaceable for tests of this wrapper's own
+    /// choreography; the library's own behaviour is tested in Rust.
+    private let startNative: @Sendable (String, Int32) -> Int
+    private let stopNative: @Sendable (Int) -> Int32
+
+    private init() {
+        startNative = { yaml, fd in
+            shoes_start_with_fd(
+                yaml, fd, shoesProtectCallback, shoesTrafficCallback, shoesStoppedCallback)
+        }
+        stopNative = { handle in shoes_stop(handle) }
+    }
 
     /// A second instance for tests of the pre-initialization path. The FFI
     /// state behind it is still process-global.
-    init(forTesting: Void) {}
+    convenience init(forTesting: Void) {
+        self.init(
+            forTesting: (),
+            start: { yaml, fd in
+                shoes_start_with_fd(
+                    yaml, fd, shoesProtectCallback, shoesTrafficCallback, shoesStoppedCallback)
+            },
+            stop: { handle in shoes_stop(handle) })
+    }
+
+    /// An instance whose native start and stop are the closures given, for
+    /// tests of how this wrapper sequences them.
+    init(
+        forTesting: Void,
+        start: @escaping @Sendable (String, Int32) -> Int,
+        stop: @escaping @Sendable (Int) -> Int32
+    ) {
+        startNative = start
+        stopNative = stop
+    }
 
     public var version: String {
         String(cString: shoes_get_version())
@@ -80,15 +115,23 @@ public final class ShoesEngine: Sendable {
         guard !isRunning else { throw ShoesError.alreadyRunning }
 
         CallbackBridge.shared.install(traffic: onTraffic, stopped: onStopped)
-        let handle = await Task.detached(priority: .userInitiated) {
-            shoes_start_with_fd(
-                config.yaml, deviceFD, shoesProtectCallback, shoesTrafficCallback, shoesStoppedCallback)
-        }.value
+        // The task records the session itself, so a `stop()` that awaited
+        // it finds the id set before it looks.
+        let startNative = self.startNative
+        let session = self.session
+        let yaml = config.yaml
+        let task = Task.detached(priority: .userInitiated) {
+            let handle = startNative(yaml, deviceFD)
+            if handle > 0 { session.set(handle) }
+            return handle
+        }
+        inFlight.set(task)
+        let handle = await task.value
+        inFlight.clear(task)
         guard handle > 0 else {
             CallbackBridge.shared.clear()
             throw ShoesError.startFailed(lastError() ?? "shoes_start_with_fd returned \(handle)")
         }
-        session.set(handle)
     }
 
     /// Signal shutdown and wait until the engine has released the
@@ -106,9 +149,15 @@ public final class ShoesEngine: Sendable {
         // a requested stop is not an event, and a traffic tick during it is
         // not worth delivering.
         CallbackBridge.shared.clear()
+        // A start still inside the native call owns the session this stop
+        // is for; its id exists only once that call returns.
+        if let starting = inFlight.get() {
+            _ = await starting.value
+        }
         let handle = session.take()
+        let stopNative = self.stopNative
         return await Task.detached(priority: .userInitiated) {
-            shoes_stop(handle) == 1
+            stopNative(handle) == 1
         }.value
     }
 
@@ -154,6 +203,20 @@ private final class LockedFlag: @unchecked Sendable {
     private var value = false
     var isSet: Bool { lock.withLock { value } }
     func set() { lock.withLock { value = true } }
+}
+
+/// The start task in flight, if any, readable from any thread.
+private final class LockedTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Task<Int, Never>?
+    func set(_ task: Task<Int, Never>) { lock.withLock { value = task } }
+    func get() -> Task<Int, Never>? { lock.withLock { value } }
+    /// Clears the slot if it still holds `task`; a newer start's task stays.
+    func clear(_ task: Task<Int, Never>) {
+        lock.withLock {
+            if value == task { value = nil }
+        }
+    }
 }
 
 /// A session id readable and clearable from any thread; 0 is "none".

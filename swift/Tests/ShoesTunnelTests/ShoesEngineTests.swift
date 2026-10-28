@@ -88,6 +88,40 @@ import Testing
     }
 }
 
+/// A stop that lands while the native start is still running waits for it
+/// and then stops the session that start made, rather than passing 0 and
+/// stopping nothing: the user disconnecting while still connecting.
+@Test func aStopDuringAStartWaitsForItAndStopsThatSession() async throws {
+    let stops = Recorded()
+    let engine = ShoesEngine(
+        forTesting: (),
+        start: { _, _ in
+            Thread.sleep(forTimeInterval: 0.3)
+            return 7
+        },
+        stop: { handle in
+            stops.append(handle)
+            return 1
+        })
+    try engine.initialize(logLevel: .error)
+    let config = ShoesConfiguration(yaml: "tun:\n  device_fd: 7\n")
+    async let started: Void = engine.start(
+        config, deviceFD: 7, onTraffic: { _, _ in }, onStopped: { _ in })
+    try await Task.sleep(for: .milliseconds(50))
+    let released = await engine.stop()
+    try await started
+    #expect(released == true)
+    #expect(stops.values == [7])
+}
+
+/// Handles passed to a stop, readable from any thread.
+private final class Recorded: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handles: [Int] = []
+    var values: [Int] { lock.withLock { handles } }
+    func append(_ handle: Int) { lock.withLock { handles.append(handle) } }
+}
+
 /// A set-once flag readable from any thread, for the test above.
 private final class Fired: @unchecked Sendable {
     private let lock = NSLock()
