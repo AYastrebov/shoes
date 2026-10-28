@@ -45,9 +45,10 @@ description: Checklist for adding, renaming, bounding or removing a YAML configu
 
   An example that references a PEM file the repository does not carry can
   be dry-run with a throwaway certificate outside the tree.
-- `.github/workflows/build.yml`, the `Smoke test binary` loop: add the
-  example if it needs no certificate, so a release binary parses it end to
-  end every build.
+- `.github/workflows/test.yml`, the `Smoke test the examples` loop, and
+  `.github/workflows/build.yml`, the `Smoke test binary` loop: add the
+  example to both if it needs no certificate, so every PR's debug binary
+  and every release binary parse it end to end.
 - `CHANGELOG.md` under `## Unreleased`: the option, its default, and the
   reference it follows.
 

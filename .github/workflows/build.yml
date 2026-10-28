@@ -10,18 +10,14 @@ name: Build Binaries
 on:
   push:
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ master, mobile ]
-    # A docs-only PR does not need seven release builds; Test and Lint still
-    # run on it and are the checks with jurisdiction over prose.
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      # Swift-only changes are mobile.yml's business.
-      - 'swift/**'
-      - 'Package.swift'
-      - '.swift-format'
+  # Nightly, on the default branch: the seven release builds, so the
+  # caches a tag build restores exist and are warm, and so a toolchain or
+  # dependency drift shows up on a quiet morning rather than at release.
+  # Not on pull requests any more: that was the whole release matrix, about
+  # ninety CI minutes and twelve macOS minutes per push, for a smoke loop
+  # that test.yml now runs on the debug binary it already builds.
+  schedule:
+    - cron: '23 3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -118,6 +114,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # The musl env vars point cargo's linker and cc-rs (aws-lc-sys,
       # jemalloc, blake3 all compile C) at musl-gcc for the musl targets;

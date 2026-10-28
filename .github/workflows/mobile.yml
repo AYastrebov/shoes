@@ -34,6 +34,11 @@ on:
       - '**.md'
       - 'docs/**'
       - 'LICENSE'
+  # Nightly, on the default branch: the android job alone (the macOS jobs
+  # are guarded below), so the tag build's AAR restores a warm cache
+  # instead of compiling three ABIs cold.
+  schedule:
+    - cron: '41 3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -60,7 +65,7 @@ jobs:
     # the AAR alone, deliberately. Sentry's tag CI makes the same call: the
     # release pipeline is the sole builder. The swift job follows this gate
     # through needs:.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
     timeout-minutes: 60
 
     steps:
@@ -185,7 +190,7 @@ jobs:
     # this check as a PR, and the release job attaches nothing this job
     # makes. On the v0.8.4 tag it cost twelve macOS minutes and, when no
     # macOS runner came, turned the tag's run red for no asset's sake.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
     timeout-minutes: 45
 
     steps:
@@ -201,6 +206,7 @@ jobs:
         with:
           key: macos-ffi
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # The desktop client's privileged host on macOS is a Network Extension
       # provider, which is Swift and so consumes the same C API as iOS -- the
@@ -288,6 +294,7 @@ jobs:
         with:
           key: android
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-ndk
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2

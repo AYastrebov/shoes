@@ -15,8 +15,12 @@ runs:
     - name: Cache Rust build
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
-        key: apple
+        # shared-key, not key: the automatic key embeds the job name, and
+        # this action runs as mobile.yml's `apple` job and as
+        # release-apple.yml's `release` job, which never matched each other.
+        shared-key: apple
         cache-on-failure: true
+        save-if: ${{ github.event_name != 'pull_request' }}
 
     # cbindgen has no taiki-e/install-action manifest, so it is cached as a
     # binary the same way cargo-ndk is elsewhere. Building it from source on

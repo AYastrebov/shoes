@@ -10,6 +10,19 @@ nightly schedule, which exists for the advisory check, no longer runs the
 three-platform daemon clippy, the one lint job that lacked the schedule
 guard.
 
+The release-binary matrix no longer runs on every pull request. It was
+seven release builds, about ninety CI minutes and twelve macOS minutes per
+push, for the example smoke loop; that loop now runs in the Test workflow
+on the debug binary it already builds, on all five runners, and the
+release matrix runs on tags, on manual dispatch and nightly. Caches change
+policy with it: a pull request restores the base branch's caches and saves
+none, since its saves were visible only to itself and, at the repository's
+10 GB cap, evicted every cache a tag or release build could have used;
+pushes to `mobile` and the nightly runs are what save. The Apple framework
+build shares one cache key between the pull-request job and the release
+job, which never matched before, and the Android AAR build gets a nightly
+so a tag's AAR no longer compiles three ABIs cold.
+
 ## v0.9.0
 
 A minor version, for the mobile FFI: Android gains a stopped listener,
