@@ -350,8 +350,8 @@ fn run_capturing(program: &str, args: &[&str]) -> std::io::Result<String> {
 mod tests {
     use super::dns::Store;
     use super::dns::testing::{
-        MapStore, empty_dictionary, lease_dictionary, servers_dictionary, setup_key, state_key,
-        user_dictionary,
+        MapStore, empty_dictionary, lease_dictionary, lease_dictionary_with, servers_dictionary,
+        setup_key, state_key, user_dictionary, user_dictionary_with,
     };
     use super::*;
 
@@ -611,12 +611,22 @@ Destination        Gateway            Flags               Netif Expire
             "the servers are State:'s, for the log"
         );
 
-        // Apply, as a session does: the tunnel's resolver, and only that, on
-        // both keys.
+        // Apply, as a session does: the tunnel's resolver on both keys, and
+        // the rest of each key as it was. Twice, because the re-apply after
+        // a network change writes again over what the first one left.
         let tunnel = DnsState::servers(&[ip("10.99.0.1")]);
-        host.write_dns(service, &tunnel).unwrap();
-        for key in [&state, &setup] {
-            assert_eq!(map.get(key), Some(servers_dictionary(&tunnel.servers)));
+        for _ in 0..2 {
+            host.write_dns(service, &tunnel).unwrap();
+            assert_eq!(
+                map.get(&state),
+                Some(lease_dictionary_with(&tunnel.servers)),
+                "State: keeps the lease's DomainName"
+            );
+            assert_eq!(
+                map.get(&setup),
+                Some(user_dictionary_with(&tunnel.servers)),
+                "Setup: keeps the user's SearchDomains"
+            );
         }
 
         // Revert; then once more, which is `recover()` after a partial one.

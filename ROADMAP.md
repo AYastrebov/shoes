@@ -144,16 +144,6 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   prefix that belongs to someone and a change to `host::TUNNEL_IPV6` alone.
   Cost: a dual-stack site is reached over v4 through the tunnel, which is
   what happened before, now without the failed v6 attempt first.
-- **`shoesd` on macOS applies DNS as a servers-only dictionary** (2026-10-26,
-  #110). The revert now puts both keys back whole, but applying still writes
-  `{ ServerAddresses }` to `State:` and `Setup:`, so a lease's `DomainName`
-  and a user's `SearchDomains` are not in force while a session is up: a
-  bare hostname that resolved through the search list before does not
-  resolve through the tunnel. Fixing it means merging the tunnel's servers
-  into each key's existing dictionary rather than replacing it, in the
-  network-change re-apply too (`macos/mod.rs`, `macos/dns.rs::write`). Cost:
-  unqualified names fail for the life of a session; fully qualified ones are
-  unaffected.
 - **Two process-level tests flake on CI** (2026-10-28, seen on #114 and
   #115). `tests/transparent.rs`'s redirect test copies the `shoes` binary
   and spawns it; a sibling test's copy can hold the file open for writing
@@ -847,12 +837,12 @@ inside a packet tunnel provider talks to the app that owns it.
   happens, it rides the stop callback's channel as a general event callback
   rather than a third function pointer.
 
-### Not asked for, and worth deciding
+### Not asked for, and since done
 
-The same callback does not exist on Android: the JNI `start` still gets its
-failures through `getLastError()` and a poll of `isRunning()`. The Rust side
-is shared, so the Kotlin half is a `StopListener` interface and a global
-reference; the question is whether anyone is asking.
+Android has the same callback since v0.9.0: `ShoesNative.start` takes a
+`StoppedListener`, called with the session id and the reason for an end the
+host did not ask for, in place of `getLastError()` and a poll of
+`isRunning()`.
 
 ## awg-manager engine: postponed
 
