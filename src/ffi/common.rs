@@ -14,7 +14,7 @@
 )]
 
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use log::info;
 
@@ -57,7 +57,9 @@ pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// What a host hands shoes to be told a session ended without being asked.
 /// Called at most once, with the reason; never for a stop the host requested.
-pub type StoppedCallback = Box<dyn FnOnce(&ExitReason) + Send>;
+/// The host's one-shot callback for an end it did not ask for: the id of
+/// the session that ended, and why.
+pub type StoppedCallback = Box<dyn FnOnce(u64, &ExitReason) + Send>;
 
 /// The running session: its handle, and the one-shot callback for its end.
 ///
@@ -74,11 +76,49 @@ pub type StoppedCallback = Box<dyn FnOnce(&ExitReason) + Send>;
 /// [`install_callbacks`] and cleared by the stop, both here, so neither
 /// platform can forget one.
 struct Session {
+    /// Process-wide, from [`next_session_id`]: what `start` returns, what
+    /// `stop` must be given, and what an exit names.
+    id: u64,
     handle: TunServiceHandle,
     on_stop: Option<StoppedCallback>,
 }
 
 static SESSION: parking_lot::Mutex<Option<Session>> = parking_lot::Mutex::new(None);
+
+/// Session ids start at 1, so the first session of a process is handed the
+/// value every session was handed before ids existed, and 0 never names
+/// one. A `u64` will not wrap in the life of a process.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// The id of the session the last stop took out of the slot, 0 once a new
+/// session is installed. An exit for that id is the exit guard's losing
+/// race -- it marks the service stopped, which ends the stop's wait, and
+/// delivers the exit only after, so the delivery can land during the wait
+/// or after the stop has returned. A real failure delivered that way is a
+/// crash that raced the host's hand on the switch and is recorded for
+/// `get_last_error`; the stop's own unrequested-end echo is discarded;
+/// neither reaches a callback the stop has already taken. The mark is
+/// dropped only when the next session installs, under the slot's lock, so
+/// a late exit can never write into a successor's session.
+static STOPPING: AtomicU64 = AtomicU64::new(0);
+
+/// Put `session` in the slot. Under the slot's lock, the last error is
+/// cleared and the stopping mark dropped as well: an exit for the previous
+/// session that wrote its reason before this is cleared by it, and one that
+/// arrives after is dropped by the id check in [`fire_stopped`], so a new
+/// session cannot start life carrying the old one's failure. Returns the
+/// session the slot held, for the caller to release outside the lock.
+fn install_session(session: Session) -> Option<Session> {
+    let mut slot = SESSION.lock();
+    let previous = slot.replace(session);
+    STOPPING.store(0, Ordering::SeqCst);
+    store_last_error(None);
+    previous
+}
 
 /// Last error message from the service. Set when `start_from_config` fails
 /// or the service stops with an error. Read via `shoes_get_last_error()`.
@@ -153,7 +193,8 @@ pub fn clear_callbacks(_transition: &Transition) {
 }
 
 /// Start the prepared service as the session, with `on_stop` for an end the
-/// host did not ask for.
+/// host did not ask for. Returns the session's id: what the host passes
+/// back to stop it, and what its exit is delivered under.
 ///
 /// The session is in its slot before the task is spawned, so an exit in the
 /// first instant finds its callback, and a callback that calls stop finds the
@@ -166,26 +207,75 @@ pub fn start_session(
     runtime: tokio::runtime::Runtime,
     prepared: crate::control::PreparedService,
     on_stop: Option<StoppedCallback>,
-) {
+) -> u64 {
+    let id = next_session_id();
     let mut previous = None;
-    crate::control::start_and_install(runtime, prepared, fire_stopped, |handle| {
-        previous = SESSION.lock().replace(Session { handle, on_stop });
-    });
+    crate::control::start_and_install(
+        runtime,
+        prepared,
+        move |reason| fire_stopped(id, reason),
+        |handle| {
+            previous = install_session(Session {
+                id,
+                handle,
+                on_stop,
+            });
+        },
+    );
     if let Some(previous) = previous {
         previous.handle.discard();
     }
+    id
 }
 
-/// Deliver an exit: the reason is stored for `get_last_error` first, then the
-/// session's callback, if it still has one, is taken and called with the
-/// slot's lock released -- a callback that calls stop must not deadlock on
-/// it. Taken, not read, so it fires at most once; a stop takes the whole
-/// session out first, so a requested stop never reaches it.
-fn fire_stopped(reason: ExitReason) {
-    set_last_exit(&reason);
-    let on_stop = SESSION.lock().as_mut().and_then(|s| s.on_stop.take());
+/// Deliver an exit for session `id`. If that session is the one in the
+/// slot, the reason is stored for `get_last_error` under the slot's lock
+/// -- so an install, which clears the last error under the same lock,
+/// orders strictly before or after it and a successor never starts with
+/// this session's failure -- and the session's callback, if it still has
+/// one, is taken and called with the lock released: a callback that calls
+/// stop must not deadlock on it. Taken, not read, so it fires at most
+/// once; a stop takes the whole session out first, so a requested stop
+/// never reaches it.
+///
+/// If the id is the one the last stop took out (see [`STOPPING`]), a
+/// failure is recorded and nothing is called -- the stop took the callback
+/// with the session -- and an unrequested-end report is discarded as the
+/// stop's own echo, whether it lands during the stop's wait or after the
+/// stop returned.
+///
+/// Otherwise the exit is dropped: the slot holds a successor, or nothing
+/// of this session's remains. The exit guard marks a service stopped
+/// before it delivers its exit, so a start on another thread can pass the
+/// running guard and replace the slot in that window; recording this exit
+/// then would overwrite the error the new start just cleared, and taking
+/// the slot's callback would hand the successor a death that is not its own.
+fn fire_stopped(id: u64, reason: ExitReason) {
+    let on_stop = {
+        let mut slot = SESSION.lock();
+        match slot.as_mut() {
+            Some(session) if session.id == id => {
+                set_last_exit(&reason);
+                session.on_stop.take()
+            }
+            other => {
+                if STOPPING.load(Ordering::SeqCst) == id {
+                    if reason != ExitReason::EndedUnrequested {
+                        set_last_exit(&reason);
+                    }
+                    return;
+                }
+                let running = other.as_ref().map(|s| s.id);
+                log::warn!(
+                    "an exit for session {id} arrived after it was replaced \
+                     (running: {running:?}); dropped: {reason}"
+                );
+                return;
+            }
+        }
+    };
     if let Some(on_stop) = on_stop {
-        on_stop(&reason);
+        on_stop(id, &reason);
     }
 }
 
@@ -225,21 +315,47 @@ pub fn max_log_level_name() -> &'static std::ffi::CStr {
     }
 }
 
-/// End the session and wait for shutdown, then remove its callbacks -- all
-/// inside the caller's transition lock. Clearing them after the lock was
-/// released once wiped the callbacks a queued start had just installed,
-/// leaving its fresh engine with no socket protector.
+/// End the session `handle` names and wait for shutdown, then remove its
+/// callbacks -- all inside the caller's transition lock. Clearing them after
+/// the lock was released once wiped the callbacks a queued start had just
+/// installed, leaving its fresh engine with no socket protector.
+///
+/// A `handle` that is not the running session's id -- 0, a session already
+/// gone, a value `start` never returned -- stops nothing and reports
+/// released: nothing of the caller's is running, and the descriptor of the
+/// session it named, if there ever was one, was let go when that session
+/// ended. This is what lets a host release a session by identity, so a
+/// late death handler cannot stop the session that replaced its own.
 ///
 /// Returns `true` if the service confirmed it stopped, `false` if the wait
 /// timed out. See [`crate::control::stop_handle`] for what that distinction
 /// costs the caller.
-pub fn stop_service_locked(transition: &Transition) -> bool {
+pub fn stop_service_locked(transition: &Transition, handle: u64) -> bool {
     info!("Stopping TUN service");
 
     // The whole session at once, its stopped callback with it: the service
     // task exits during the wait below, and that exit is one the host asked
     // for, so it must find nothing to call.
-    let Some(Session { handle, .. }) = SESSION.lock().take() else {
+    let taken = {
+        let mut slot = SESSION.lock();
+        match slot.as_ref() {
+            Some(session) if session.id == handle => {
+                // Under the slot's lock, so an exit for this id finds
+                // either the session or the stopping mark, never neither.
+                STOPPING.store(handle, Ordering::SeqCst);
+                slot.take()
+            }
+            Some(session) => {
+                log::warn!(
+                    "stop({handle}): the running session is {}; nothing stopped",
+                    session.id
+                );
+                return true;
+            }
+            None => None,
+        }
+    };
+    let Some(Session { handle, .. }) = taken else {
         info!("TUN service was not running");
         clear_callbacks(transition);
         return true;
@@ -259,6 +375,10 @@ pub fn stop_service_locked(transition: &Transition) -> bool {
     // The C and JNI surfaces answer with an int, so the obligation the type
     // carries is flattened here rather than at the call sites.
     let stopped = crate::control::stop_handle(handle).device_released();
+
+    // The stopping mark stays until the next install: the exit guard can
+    // deliver this session's exit after the wait has ended, and that
+    // delivery is judged by the mark, not by this stop's timing.
 
     // One snapshot, compared and matched: two separate reads could see
     // two different values if a late writer lands between them.
@@ -462,32 +582,44 @@ mod tests {
     }
 
     /// A session whose service runs until it is told to stop, installed the
-    /// way `start_session` installs one, with `fire_stopped` as its exit.
-    fn install_test_session(_transition: &Transition, on_stop: Option<StoppedCallback>) {
+    /// way `start_session` installs one: an id from the shared counter, and
+    /// `fire_stopped` for that id as its exit. Returns the id.
+    fn install_test_session(_transition: &Transition, on_stop: Option<StoppedCallback>) -> u64 {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
+        let id = next_session_id();
         let handle = crate::control::start_with(
             runtime,
             |shutdown| async move {
                 let _ = shutdown.await;
                 Ok(())
             },
-            fire_stopped,
+            move |reason| fire_stopped(id, reason),
         );
-        *SESSION.lock() = Some(Session { handle, on_stop });
+        if let Some(previous) = install_session(Session {
+            id,
+            handle,
+            on_stop,
+        }) {
+            previous.handle.discard();
+        }
+        id
     }
 
-    fn counting() -> (
-        StoppedCallback,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>;
+
+    /// A callback that records every (id, reason) it is handed.
+    fn counting() -> (StoppedCallback, Calls) {
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let counted = calls.clone();
-        let callback: StoppedCallback = Box::new(move |_reason| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let callback: StoppedCallback = Box::new(move |id, reason| {
+            counted
+                .lock()
+                .unwrap()
+                .push((id, reason.message().to_string()));
         });
         (callback, calls)
     }
@@ -502,32 +634,223 @@ mod tests {
         let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
         let transition = transition_guard();
         let (callback, calls) = counting();
-        install_test_session(&transition, Some(callback));
+        let id = install_test_session(&transition, Some(callback));
         assert!(is_service_running());
 
-        assert!(stop_service_locked(&transition));
+        assert!(stop_service_locked(&transition, id));
         assert!(!is_service_running());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     /// An end the host did not ask for records its reason for
     /// `get_last_error` and reaches the callback -- once, however many times
-    /// it is delivered.
+    /// it is delivered -- with the id the session was started with.
     #[test]
     fn an_unrequested_end_records_then_calls_once() {
         let _names = crate::tun::device_name_test_lock();
         let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
         let transition = transition_guard();
         let (callback, calls) = counting();
-        install_test_session(&transition, Some(callback));
+        let id = install_test_session(&transition, Some(callback));
 
         for _ in 0..2 {
-            fire_stopped(ExitReason::Failed("engine fell over".to_string()));
+            fire_stopped(id, ExitReason::Failed("engine fell over".to_string()));
         }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(id, "engine fell over".to_string())]
+        );
         assert_eq!(get_last_error().as_deref(), Some("engine fell over"));
 
-        assert!(stop_service_locked(&transition));
+        assert!(stop_service_locked(&transition, id));
+    }
+
+    /// Each session of a process gets a larger id than the one before it.
+    #[test]
+    fn session_ids_increase() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let first = install_test_session(&transition, None);
+        assert!(stop_service_locked(&transition, first));
+        let second = install_test_session(&transition, None);
+        assert!(second > first);
+        assert!(stop_service_locked(&transition, second));
+    }
+
+    /// A stop names the session it is for. Any other value -- 0, a
+    /// neighbour, a session long gone -- stops nothing, reports released
+    /// (nothing of the caller's is running), and touches neither the
+    /// callback nor the last error.
+    #[test]
+    fn a_stop_with_a_stale_id_leaves_the_session_running() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        clear_last_error();
+        let (callback, calls) = counting();
+        let id = install_test_session(&transition, Some(callback));
+
+        for stale in [0, id + 1, id.wrapping_sub(1)] {
+            assert!(stop_service_locked(&transition, stale), "stale {stale}");
+            assert!(is_service_running(), "stale {stale} stopped the session");
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(get_last_error().is_none());
+
+        assert!(stop_service_locked(&transition, id));
+        assert!(!is_service_running());
+    }
+
+    /// An exit and a start can cross: the exit guard marks the service
+    /// stopped before the exit is delivered, so a start on another thread
+    /// can replace the slot in between. The old session's exit must then
+    /// reach neither the successor's callback nor the last error the
+    /// successor's start just cleared.
+    #[test]
+    fn an_exit_for_a_replaced_session_is_dropped() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let (old_callback, old_calls) = counting();
+        let old = install_test_session(&transition, Some(old_callback));
+        let (new_callback, new_calls) = counting();
+        // Replaces the slot as start_session does: the old handle is
+        // discarded, its runtime shut down in the background.
+        let new = install_test_session(&transition, Some(new_callback));
+
+        fire_stopped(old, ExitReason::Failed("late".to_string()));
+        assert!(old_calls.lock().unwrap().is_empty());
+        assert!(new_calls.lock().unwrap().is_empty());
+        assert!(get_last_error().is_none());
+
+        assert!(stop_service_locked(&transition, new));
+    }
+
+    /// A session that, told to stop, reports a failure before it returns:
+    /// the exit guard's losing race, where a real crash lands during the
+    /// stop's wait. Installed the way `install_test_session` installs one.
+    fn install_test_session_that_fails_on_stop(
+        _transition: &Transition,
+        on_stop: Option<StoppedCallback>,
+        failure: ExitReason,
+    ) -> u64 {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let id = next_session_id();
+        let handle = crate::control::start_with(
+            runtime,
+            move |shutdown| async move {
+                let _ = shutdown.await;
+                fire_stopped(id, failure);
+                Ok(())
+            },
+            move |reason| fire_stopped(id, reason),
+        );
+        if let Some(previous) = install_session(Session {
+            id,
+            handle,
+            on_stop,
+        }) {
+            previous.handle.discard();
+        }
+        id
+    }
+
+    /// A failure that lands while the stop waits is a real crash that raced
+    /// the host's hand on the switch: it must survive into `get_last_error`,
+    /// and it must not reach the callback the stop already took.
+    #[test]
+    fn a_failure_racing_a_stop_is_recorded_but_not_delivered() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        clear_last_error();
+        let (callback, calls) = counting();
+        let id = install_test_session_that_fails_on_stop(
+            &transition,
+            Some(callback),
+            ExitReason::Failed("raced".to_string()),
+        );
+
+        assert!(stop_service_locked(&transition, id));
+        assert_eq!(get_last_error().as_deref(), Some("raced"));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// The stop's own echo -- an unrequested-end report for the exit the
+    /// stop caused, delivered by the exit guard's losing race -- is
+    /// discarded, so a requested stop leaves no error behind it.
+    #[test]
+    fn the_stops_own_echo_is_still_discarded() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let id = install_test_session_that_fails_on_stop(
+            &transition,
+            None,
+            ExitReason::EndedUnrequested,
+        );
+
+        assert!(stop_service_locked(&transition, id));
+        assert!(get_last_error().is_none());
+    }
+
+    /// Installing a session is where the last error is cleared and the
+    /// stopping mark dropped, under the slot's lock: an exit for the old
+    /// session that wrote its reason before this install is cleared by it,
+    /// and one that arrives after is dropped by the id check, so the new
+    /// session cannot start life carrying the old one's failure.
+    #[test]
+    fn installing_a_session_clears_the_last_error() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        set_last_error("the old session's failure".to_string());
+        let id = install_test_session(&transition, None);
+        assert!(get_last_error().is_none());
+        assert!(stop_service_locked(&transition, id));
+    }
+
+    /// A failure for the session a stop just ended can land after the stop
+    /// returned: the exit guard marks the service stopped, the stop's wait
+    /// ends on that, and only then is the exit delivered. It is a real
+    /// crash that raced the switch and is still recorded; the stop's own
+    /// unrequested-end echo landing late is still discarded.
+    #[test]
+    fn an_exit_landing_after_the_stop_returned_is_still_judged() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        clear_last_error();
+        let id = install_test_session(&transition, None);
+        assert!(stop_service_locked(&transition, id));
+
+        fire_stopped(id, ExitReason::EndedUnrequested);
+        assert!(get_last_error().is_none(), "the echo is the stop's own");
+
+        fire_stopped(id, ExitReason::Failed("late crash".to_string()));
+        assert_eq!(get_last_error().as_deref(), Some("late crash"));
+    }
+
+    /// Once a new session is installed, a late exit for the one stopped
+    /// before it is nobody's: it must not write over the new session's
+    /// clean slate.
+    #[test]
+    fn a_late_exit_for_the_previous_session_is_dropped_after_a_new_install() {
+        let _names = crate::tun::device_name_test_lock();
+        let _errors = LAST_ERROR_TEST_LOCK.lock().unwrap();
+        let transition = transition_guard();
+        let old = install_test_session(&transition, None);
+        assert!(stop_service_locked(&transition, old));
+        let new = install_test_session(&transition, None);
+
+        fire_stopped(old, ExitReason::Failed("late crash".to_string()));
+        assert!(get_last_error().is_none());
+        assert!(stop_service_locked(&transition, new));
     }
 
     /// The property the transition lock buys: a stop queues behind a
@@ -540,7 +863,7 @@ mod tests {
 
         let stopper = std::thread::spawn(|| {
             let transition = transition_guard();
-            stop_service_locked(&transition)
+            stop_service_locked(&transition, 0)
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(

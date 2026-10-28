@@ -87,10 +87,12 @@ pub type ShoesStoppedCallback = Option<extern "C" fn(reason: *const c_char)>;
 /// contract reserves for "no reason".
 fn on_stop(callback: ShoesStoppedCallback) -> Option<common::StoppedCallback> {
     let callback = callback?;
-    Some(Box::new(move |reason: &crate::control::ExitReason| {
-        let reason = common::c_string_lossy(reason.message());
-        callback(reason.as_ptr());
-    }))
+    Some(Box::new(
+        move |_id: u64, reason: &crate::control::ExitReason| {
+            let reason = common::c_string_lossy(reason.message());
+            callback(reason.as_ptr());
+        },
+    ))
 }
 
 /// Socket protector for iOS: the host's callback, held by the protector
@@ -176,7 +178,8 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
 /// descriptor, the tunnel outlives the stop.
 ///
 /// # Returns
-/// * Handle (> 0) on success
+/// * The session id (> 0) on success: pass it to `shoes_stop`. The first
+///   session of a process is 1; each later one is larger.
 /// * -1 on error
 ///
 /// Installs no stopped callback; use `shoes_start_with_fd` for one.
@@ -224,7 +227,8 @@ pub unsafe extern "C" fn shoes_start(
 /// * `stopped_callback` - see `ShoesStoppedCallback`; may be NULL
 ///
 /// # Returns
-/// * Handle (> 0) on success
+/// * The session id (> 0) on success: pass it to `shoes_stop`. The first
+///   session of a process is 1; each later one is larger.
 /// * -1 on error; `shoes_get_last_error` says why
 ///
 /// # Safety
@@ -357,9 +361,7 @@ unsafe fn start_service(
     // The runtime is built here, with two worker threads, rather than inside
     // control::start: a Network Extension's memory limit is what sets that
     // number, and Android wants all the cores instead.
-    common::start_session(&transition, runtime, prepared, on_stop(stopped_callback));
-
-    1
+    common::start_session(&transition, runtime, prepared, on_stop(stopped_callback)) as c_long
 }
 
 /// Stop the shoes VPN service.
@@ -400,9 +402,13 @@ unsafe fn start_service(
 /// Ignoring the result reproduces exactly that behavior.
 ///
 /// # Arguments
-/// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
+/// * `handle` - The value `shoes_start` or `shoes_start_with_fd` returned:
+///   the id of the session to stop. Any other value -- 0, the id of a
+///   session already gone, a constant -- stops nothing and returns 1, with
+///   a warning in the log: nothing of the caller's is running. Pass what
+///   `start` returned, not a constant.
 #[unsafe(no_mangle)]
-pub extern "C" fn shoes_stop(_handle: c_long) -> c_int {
+pub extern "C" fn shoes_stop(handle: c_long) -> c_int {
     // The whole teardown under one transition guard: a start queued
     // behind it installs its own callbacks the moment the lock frees, so
     // a clear outside the lock wiped the slots that start had just
@@ -410,7 +416,8 @@ pub extern "C" fn shoes_stop(_handle: c_long) -> c_int {
     // callback goes with the session, before the wait: the exit during the
     // stop is one the host asked for, and a stop event for it would be a lie.
     let transition = common::transition_guard();
-    if common::stop_service_locked(&transition) {
+    // A negative value is no session's id; as u64 it matches nothing.
+    if common::stop_service_locked(&transition, handle as u64) {
         1
     } else {
         0

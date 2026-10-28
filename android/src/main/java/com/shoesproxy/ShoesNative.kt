@@ -103,6 +103,37 @@ object ShoesNative {
     }
 
     /**
+     * Functional interface for learning that the engine stopped on its own.
+     *
+     * Called once per session, from a shoes worker thread, when the engine
+     * stops without [stop] having been called for it: a failure, or a task
+     * that ended by itself. Never for a stop this process requested, and
+     * never for a [start] that returned -1. [isRunning] is already false
+     * when it runs and [getLastError] returns the same [reason] afterwards,
+     * so a host that passes no listener can still poll.
+     *
+     * Do not block in it, and marshal to the main thread yourself. Calling
+     * [stop] from inside it is allowed. Calling [start] from inside it is
+     * refused with -1 and a reason: it runs on a worker of the dying
+     * session's runtime, so dispatch a reconnect elsewhere.
+     *
+     * A session that was replaced before its death was delivered never
+     * reaches this: the library drops an exit whose [sessionId] is not the
+     * running session's. Compare [sessionId] with what [start] returned all
+     * the same, if your own event delivery can lag behind a reconnect.
+     */
+    fun interface StoppedListener {
+        /**
+         * Called once when the session ended on its own.
+         *
+         * @param sessionId The value [start] returned for the session that ended.
+         * @param reason    Why it ended: a failure's message, or
+         *                  "service ended without being asked" for a clean end.
+         */
+        fun onStopped(sessionId: Long, reason: String)
+    }
+
+    /**
      * Initialize the shoes library.
      *
      * Must be called once before [start]. Safe to call from any thread.
@@ -190,13 +221,28 @@ object ShoesNative {
      *                        from VPN routing (pass `this::protect` from your VpnService).
      * @param trafficCallback Called with cumulative traffic byte counts about once a
      *                        second, and not at all while the counts are unchanged.
-     * @return A positive handle on success, -1 on error.
+     * @param stoppedListener Called once if the engine stops without [stop];
+     *                        see [StoppedListener]. May be null, in which case
+     *                        an unrequested end is only visible through
+     *                        [isRunning] and [getLastError].
+     * @return The session id, positive, on success; -1 on error. Keep it:
+     *   [stop] acts on the session with that id and on no other, and
+     *   [StoppedListener.onStopped] names it. The first session of a process
+     *   is 1 and each later one is larger.
      */
     external fun start(
         configYaml: String,
         protectCallback: SocketProtector,
         trafficCallback: TrafficListener,
+        stoppedListener: StoppedListener?,
     ): Long
+
+    /** [start] with no [StoppedListener]. */
+    fun start(
+        configYaml: String,
+        protectCallback: SocketProtector,
+        trafficCallback: TrafficListener,
+    ): Long = start(configYaml, protectCallback, trafficCallback, null)
 
     /**
      * Stop the VPN service.
@@ -206,11 +252,21 @@ object ShoesNative {
      * task will not wind down. **Do not call this on the main thread**: the
      * system's ANR budget is about the same 5 seconds.
      *
-     * @param handle The handle returned by [start].
+     * Acts on the session whose id is [handle] and on no other. Any other
+     * value — 0, the id of a session already gone, a constant — stops
+     * nothing and returns true, with a warning in the log: nothing of yours
+     * is running. So pass what [start] returned, never a constant; and a
+     * late [StoppedListener] handler may call this with its own id without
+     * touching the session that replaced it. A stop decided while [start]
+     * is still running cannot name that session yet: record it, and carry
+     * it out with the id once [start] returns.
+     *
+     * @param handle The session id returned by [start].
      * @return true when the engine confirmed the stop — the descriptor is
-     *   released and closing your `ParcelFileDescriptor` is safe. false when
-     *   the wait timed out and the engine may still be reading it: prefer
-     *   leaking the descriptor to closing a number the kernel will reuse.
+     *   released and closing your `ParcelFileDescriptor` is safe — or when
+     *   no session with that id was running. false when the wait timed out
+     *   and the engine may still be reading it: prefer leaking the
+     *   descriptor to closing a number the kernel will reuse.
      */
     external fun stop(handle: Long): Boolean
 
@@ -227,7 +283,9 @@ object ShoesNative {
      * Returns the error string if the service stopped without being asked
      * — a failure's message, or "service ended without being asked" for an
      * unrequested but clean end — and null while the service is running
-     * normally or after a stop this process requested.
+     * normally or after a stop this process requested. A [StoppedListener]
+     * is told the same text as it happens; this is the fallback for a host
+     * that passed none, or wants the reason again later.
      */
     external fun getLastError(): String?
 

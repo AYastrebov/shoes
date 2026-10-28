@@ -101,7 +101,8 @@ int shoes_init(const char *log_level);
  * descriptor, the tunnel outlives the stop.
  *
  * # Returns
- * * Handle (> 0) on success
+ * * The session id (> 0) on success: pass it to `shoes_stop`. The first
+ *   session of a process is 1; each later one is larger.
  * * -1 on error
  *
  * Installs no stopped callback; use `shoes_start_with_fd` for one.
@@ -136,7 +137,8 @@ long shoes_start(const char *config_yaml,
  * * `stopped_callback` - see `ShoesStoppedCallback`; may be NULL
  *
  * # Returns
- * * Handle (> 0) on success
+ * * The session id (> 0) on success: pass it to `shoes_stop`. The first
+ *   session of a process is 1; each later one is larger.
  * * -1 on error; `shoes_get_last_error` says why
  *
  * # Safety
@@ -187,9 +189,13 @@ long shoes_start_with_fd(const char *config_yaml,
  * Ignoring the result reproduces exactly that behavior.
  *
  * # Arguments
- * * `handle` - Handle returned by shoes_start (currently unused, we use global state)
+ * * `handle` - The value `shoes_start` or `shoes_start_with_fd` returned:
+ *   the id of the session to stop. Any other value -- 0, the id of a
+ *   session already gone, a constant -- stops nothing and returns 1, with
+ *   a warning in the log: nothing of the caller's is running. Pass what
+ *   `start` returned, not a constant.
  */
-int shoes_stop(long _handle);
+int shoes_stop(long handle);
 
 /**
  * Check if the shoes service is running.

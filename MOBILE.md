@@ -20,7 +20,7 @@ open and are ordered at the end. Line references were last checked against
 | Entry points | 11 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 13 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
 | Traffic stats | `TrafficListener.onTrafficUpdate`, `getStats()` | `ShoesTrafficCallback`, `shoes_get_stats()` |
-| Error reporting | `getLastError()`, and `start` returns -1 on a bad config | same, via `shoes_get_last_error()` |
+| Error reporting | `getLastError()`, and `start` returns -1 on a bad config; an end the host did not ask for reaches `StoppedListener.onStopped(sessionId, reason)` | same, via `shoes_get_last_error()`; the stopped callback of `shoes_start_with_fd` |
 | Network change | `networkChanged()` | `shoes_network_changed()` |
 | Live log level | `setLogLevel()`, ceiling from `maxLogLevel()` | `shoes_set_log_level()`, ceiling from `shoes_max_log_level()` |
 | Log file | `setLogFile()`, rotates at 4 MiB to `.1` | `shoes_set_log_file()`, the same |
@@ -130,8 +130,8 @@ Android — 11 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `setLogLevel(logLevel: String)` | `android.rs` | 0 ok, -1 unrecognised |
 | `maxLogLevel()` | `android.rs` | the build's ceiling, e.g. `"info"` |
 | `networkChanged()` | `android.rs` | tunnels notified |
-| `start(configYaml, protectCallback, trafficCallback)` | `android.rs:177` | `1` on success, -1 on error |
-| `stop(handle: Long)` | `android.rs:317` | — |
+| `start(configYaml, protectCallback, trafficCallback, stoppedListener?)` | `android.rs` | the session id (> 0) on success, -1 on error; a three-argument overload passes no listener |
+| `stop(handle: Long)` | `android.rs` | true: released, or no session with that id was running; false: timed out |
 | `isRunning()` | `android.rs:332` | boolean |
 | `getLastError()` | `android.rs:348` | string or null |
 | `getStats()` | `android.rs` | JSON string, or null (see below) |
@@ -140,9 +140,9 @@ iOS and macOS — 13 symbols, declared in `include/shoes.h`:
 
 ```c
 int   shoes_init(const char *log_level);
-long  shoes_start(const char *config_yaml, /* protect cb */, /* traffic cb */);
+long  shoes_start(const char *config_yaml, /* protect cb */, /* traffic cb */);           /* the session id, > 0 */
 long  shoes_start_with_fd(const char *config_yaml, int device_fd, /* protect cb */, /* traffic cb */, /* stopped cb */);
-int   shoes_stop(long _handle); /* 1: descriptor released; 0: timed out */
+int   shoes_stop(long handle); /* 1: released, or no session with that id; 0: timed out */
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);
 const char *shoes_max_log_level(void);  // static; do not free
@@ -190,10 +190,16 @@ artifacts are built with the feature on.
    `getLastError()` says why — parsing, validation and resolver construction all
    happen before `start` returns, so it is a real verdict rather than a deferred
    failure.
-4. `stop(...)`. Signals shutdown, then blocks until the engine has released the
-   TUN descriptor — milliseconds in practice, bounded at 5 s. Not from the main
-   thread. Close your descriptor after it returns **true**; on false the wait
-   timed out and the engine may still be reading it — prefer leaking it.
+4. `stop(handle)`, with the id `start` returned. Signals shutdown, then blocks
+   until the engine has released the TUN descriptor — milliseconds in practice,
+   bounded at 5 s. Not from the main thread. Close your descriptor after it
+   returns **true**; on false the wait timed out and the engine may still be
+   reading it — prefer leaking it. A handle that is not the running session's
+   id — 0, a session already gone, a constant — stops nothing and returns true
+   with a warning in the log: nothing of yours is running. Pass what `start`
+   returned, never a constant. A stop decided while `start` is still running
+   cannot name that session yet: record it, and carry it out with the id once
+   `start` returns (the Swift wrapper waits for the in-flight start itself).
 5. Forward network changes while the tunnel runs: `networkChanged()` /
    `shoes_network_changed()`. See finding 3.
 
@@ -207,10 +213,14 @@ Close it yourself after `stop` returns true; a false return means the engine
 may still hold it, and leaking one descriptor beats racing a reader.
 
 There is one tunnel per process. Its state is one `Session` value in the
-`SESSION` global in `common.rs` -- the service handle and, on iOS, the stopped
+`SESSION` global in `common.rs` -- its id, the service handle and the stopped
 callback -- installed whole by `start` and taken whole by `stop`, so no part of
 a session can be cleared while the rest of it stays. Starting over a running
-service is refused rather than permitted.
+service is refused rather than permitted. The id is what `start` returns, what
+`stop` must be given, and what an exit is delivered under: an exit whose id is
+not the running session's is dropped, since the exit guard marks a service
+stopped before it delivers its exit and a start on another thread can replace
+the slot in that window.
 
 ## Threading contract
 
@@ -238,9 +248,15 @@ service is refused rather than permitted.
   service and its `Context` alive. On iOS the protector holds the host's
   callback itself; there is no second slot for it. Do not retain objects across
   a stop/start cycle and assume they are still wired.
-- The iOS stopped callback is part of the session and leaves with it at the
-  start of `stop`, so the exit a requested stop causes is never reported to the
-  host as one it did not ask for. It fires at most once per session.
+- The stopped callback -- `ShoesStoppedCallback` on iOS,
+  `StoppedListener.onStopped(sessionId, reason)` on Android -- is part of the
+  session and leaves with it at the start of `stop`, so the exit a requested
+  stop causes is never reported to the host as one it did not ask for. It
+  fires at most once per session, on a worker of the dying session's runtime:
+  do not block in it, `stop` from inside it is allowed, `start` from inside it
+  is refused with a reason. On Android it attaches that thread to the JVM as
+  the traffic callback does, and an exception the listener throws is cleared
+  there, since no Java frame is above it to take it.
 
 ## Example configs
 
@@ -444,17 +460,25 @@ must still be called off the main thread,
 and the KDoc sample now does that, closes the descriptor afterwards, and checks
 `start`'s return value.
 
-## 5. The handle returned by `start` is not a handle
+## 5. ~~The handle returned by `start` is not a handle~~ — fixed
 
-`shoes_start` returns the literal `1` (`src/ffi/ios.rs:224`,
-`src/ffi/android.rs:307`), and `shoes_stop(_handle)` ignores its argument
-entirely — all state lives in the `SESSION` global. That is fine as long as
-there is exactly one tunnel, which the code enforces ("Multiple TUN configs
-found - only one is allowed for mobile", `common.rs:181`).
+Fixed 2026-10-28, with the Android stopped listener
+(`docs/specs/2026-10-28-android-stopped-listener.md`). `start` returns a
+session id from a process-wide counter that starts at 1, `stop(handle)` acts
+on the session with that id and on no other -- any other value is a no-op
+that reports released, with a warning -- and the stopped callback is handed
+the id with the reason. There is still one tunnel per process; the id is
+identity, not multiplicity. An exit for the session the last stop ended
+is still recorded if it is a failure, whether it lands during the stop's wait
+or after, so a crash that raced the host's stop reaches `getLastError` as
+before; installing the next session clears it.
 
-It is worth either making the handle real or dropping it from the signature.
-As it stands the API implies a multi-instance model it does not have, and a
-caller that stores two handles will silently operate on one tunnel.
+Before: `shoes_start` returned the literal `1` and `shoes_stop(_handle)`
+ignored its argument, so the API implied a multi-instance model it did not
+have, and a host consuming engine events asynchronously could apply one
+session's death to the session that replaced it. The one caller that had
+passed a constant was this repository's own Swift wrapper, fixed in the same
+change.
 
 The double-start hazard this created is now fixed — both platforms refuse to
 start over a running service rather than dropping a live Runtime on the caller's
@@ -528,6 +552,12 @@ once the thread is attached.
   `info`, which in a release build — where `info` is the maximum level — meant a
   page load's worth of source and destination addresses in logcat and in the log
   file the user hands to support. It is `debug` now.
+- **The C stopped callback carries no session id.** `ShoesStoppedCallback`
+  is `(const char *reason)`; the Android listener gets the id alongside. A
+  Swift host that needs it has it from `shoes_start_with_fd`'s return, and
+  `CallbackBridge` takes its slot per session, which is what keeps one
+  session's death from reaching another's handler. A new typedef and a new
+  start variant would carry it; not done until a host needs it.
 - **No `android:extractNativeLibs` guidance.** For a 9.4 MB `libshoes.so`,
   leaving it uncompressed in the APK (`useLegacyPackaging = false`, the default
   on AGP 9) is right, but it doubles the on-disk footprint. Worth measuring.
