@@ -64,6 +64,11 @@ jobs:
         with:
           key: test-${{ matrix.runner }}
           cache-on-failure: true
+          # Pull requests restore the base branch's cache and save nothing:
+          # a PR's saves are visible only to that PR, and at the repository's
+          # 10 GB cap they evicted the caches every tag and release build
+          # needs. Pushes to mobile and the nightly are what save.
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install aws-lc build tools
         if: runner.os == 'Windows'
@@ -74,6 +79,32 @@ jobs:
       # the failure that mattered under everything that did not.
       - name: Run tests
         run: cargo test --locked
+
+      # The example configs, parsed end to end by the binary the tests just
+      # built. This loop lived in build.yml, which ran the whole release
+      # matrix on every pull request to get it; here it costs nothing extra.
+      # build.yml keeps its copy for the release binary, on tags and nightly.
+      - name: Smoke test the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./target/debug/shoes"
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          "$bin" --version
+          configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client reality_client socks_through_wss_vmess"
+          case "$RUNNER_OS" in
+            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client transparent_proxy" ;;
+            Windows) configs="$configs tun_windows" ;;
+            macOS) configs="$configs amneziawg_client tun_macos" ;;
+          esac
+          for cfg in $configs; do
+            echo "==> dry run: examples/$cfg.yaml"
+            "$bin" --dry-run "examples/$cfg.yaml"
+          done
+          cp tests/data/rule_sets/geosite-google.srs tests/data/rule_sets/geoip-ru.srs examples/
+          echo "==> dry run: examples/rule_set.yaml"
+          "$bin" --dry-run examples/rule_set.yaml
+          rm -f examples/geosite-google.srs examples/geoip-ru.srs
 
       # The `ffi` feature gates src/tun/platform.rs and the protect_socket call
       # in src/amneziawg/tunnel.rs:79. Without this the socket-protection code
