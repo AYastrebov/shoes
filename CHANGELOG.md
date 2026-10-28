@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Tests only. `h2mux`'s activity-tracker test no longer fails when the runner
+oversleeps. It slept 50 ms and then asserted the tracker was not idle against
+a 100 ms threshold, which a loaded macOS runner exceeded on `mobile` after
+#131; the ceiling is now the sleep as measured by the test's own clock. The
+two CI flakes still open, the probe matrix's SOCKS wrong-password cell on
+Windows and the release's publish step following a single fan-out run, are
+recorded in `ROADMAP.md`.
+
 CI only. Jobs that are not needed no longer run. A pull request or push
 that changes only Markdown, `docs/` or `LICENSE` skips Lint and Test; tags
 still run everything. The Apple XCFramework and the Swift package jobs run
