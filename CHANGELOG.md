@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+The lockfile moves to the newest versions Cargo.toml already allows:
+89 crates, no code change. Of note on the paths this binary runs,
+`aws-lc-sys` 0.46 (the crypto backend's native build), `hickory` 0.26.3,
+`quinn` 0.11.12, `tokio-rustls` 0.26.6, `hyper` 1.12, `tonic` 0.14.8 and
+`rustls-platform-verifier-android` 0.2. `pem` 4 and `miniz_oxide` 0.9
+move behind `rcgen` and `flate2`, and `pem` 4 brings a second `base64`
+(0.23) into the graph beside the 0.22 this crate uses. The `windows-*`
+0.53 crates and `fsevent-sys` leave the graph. Five direct dependencies
+have a newer major release that this does not take (`parking_lot` 0.13,
+`base64` 0.23, `lru` 0.19, `chacha20poly1305` 0.11, `blake2` 0.11); each
+needs code changes and gets its own change.
+
 VLESS UDP under the Vision flow now reaches sing-box servers. The client
 sent it as the plain UDP command with no flow named; sing-box refuses that
 for a Vision user (`flow mismatch: expected xtls-rprx-vision, but got
