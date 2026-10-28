@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+The five direct dependencies the lockfile update left on an old major
+move up, one commit each: `blake2` 0.11 and `chacha20poly1305` 0.11 join
+the digest 0.11 and rand_core 0.10 lines the rest of the crate uses;
+`lru` 0.19, `base64` 0.23 and `parking_lot` 0.13 compile unchanged. The
+one code change is in the mieru cipher, where the nonce is built with
+`From` rather than the `from_slice` that 0.11 deprecates. The old lines
+of all five stay in the graph behind `awgtun`'s pin, and `parking_lot`
+0.12 also behind `hickory-resolver`; they leave when those move.
+
 The lockfile moves to the newest versions Cargo.toml already allows:
 89 crates, no code change. Of note on the paths this binary runs,
 `aws-lc-sys` 0.46 (the crypto backend's native build), `hickory` 0.26.3,
