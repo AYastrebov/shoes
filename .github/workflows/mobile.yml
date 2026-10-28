@@ -180,6 +180,12 @@ jobs:
     # and the FFI tests -- the checks those paths exist to trigger. The
     # apple job regenerates the header rather than verifying it, so without
     # this a push could drift the surface and stay green until a PR.
+    #
+    # Not on a tag, for the apple job's reason: the tagged commit passed
+    # this check as a PR, and the release job attaches nothing this job
+    # makes. On the v0.8.4 tag it cost twelve macOS minutes and, when no
+    # macOS runner came, turned the tag's run red for no asset's sake.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     timeout-minutes: 45
 
     steps:
