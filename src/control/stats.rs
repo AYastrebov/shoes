@@ -10,7 +10,7 @@
 //! difference is explainable, not zero.
 //!
 //! Outbound naming is specified in
-//! `docs/superpowers/specs/2026-08-26-named-outbounds-design.md`.
+//! `docs/specs/2026-08-26-named-outbounds.md`.
 
 #![allow(
     clippy::unwrap_used,

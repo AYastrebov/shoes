@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Documentation only. The `docs/superpowers/` tree is gone. It was the
+August location for design documents and implementation plans, before
+`docs/specs/` and `docs/plans/` existed, and `AGENTS.md` has pointed at
+those two since the October reorganisation. The eleven designs for shipped
+work (Hysteria2 port hopping and conformance, HTTPUpgrade, mieru, named
+outbounds, the stats FFI, the stopped callback, the macOS extension and
+its package split, AmneziaWG receive resilience, TUN DNS) move to
+`docs/specs/` under their date and name, and the citations in `ROADMAP.md`
+and in four source files follow them. The thirteen August plans and the
+control-API web panel design are deleted: the plans were executed and
+never kept in step with what landed, which `docs/plans/` promises, and the
+web panel was dropped when the focus narrowed in October.
+
 CI only. A closed or merged pull request now cancels the queued and running
 workflow runs its last push started, so they no longer hold runners for a
 branch nobody will look at again; on the day of the 0.9.0 release four such

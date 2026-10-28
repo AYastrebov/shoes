@@ -393,7 +393,7 @@ fn no_datagram_support(session_id: u32) -> std::io::Error {
          advertise max_datagram_frame_size, and quinn will not send datagrams to a \
          peer that omitted it. An official Hysteria2 client does this only with \
          Chrome parroting disabled. See \
-         docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md"
+         docs/specs/2026-08-24-hysteria2-conformance.md"
     ))
 }
 
