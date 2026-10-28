@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+Android gets a stopped listener, and both platforms a real session id.
+`ShoesNative.start` takes a fourth argument, a `StoppedListener` or null,
+behind a three-argument overload that keeps every existing caller as it
+was; the listener is called once, from a shoes worker thread, if the
+engine stops without `stop` having been called for it, with the session id
+and the reason, never for a requested stop and never for a failed start.
+That is the callback iOS has had since `shoes_start_with_fd`, delivered by
+the same code; Android's start simply installed nothing in it, and KVN had
+to poll `isRunning()` every two seconds to notice a dead engine.
+
+`start` now returns a session id, from a counter that starts at 1, instead
+of the literal 1, and `stop(handle)` acts on the session with that id and
+on no other: any other value stops nothing and reports released, with a
+warning in the log, so a late death handler can release its own session
+without touching the one that replaced it. The one thing this stops
+tolerating is a host passing a constant instead of what `start` returned;
+the only such caller was this repository's Swift wrapper, which called
+`shoes_stop(1)` and now passes the id it was given. The C symbol list and
+the C callback types are unchanged.
+
+Also fixed with it, found in the design review: an exit and a start could
+cross, since the exit guard marks a service stopped before it delivers the
+exit, and the old session's exit then overwrote the error the new start
+had cleared and reached the new session's callback. An exit now names its
+session, and one for a session no longer in the slot is dropped.
+
 The Android AAR builds with AGP 9.4.1 and Gradle 9.8.2, up from 9.0.1 and
 9.5.0; nothing in the module's build script changes, since it enables no
 minification and ships no keep rules, which is where the 9.1 to 9.4
