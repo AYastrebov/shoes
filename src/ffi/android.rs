@@ -29,9 +29,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use jni::objects::{Global, JClass, JObject, JString, JValue};
+use jni::refs::Reference;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{EnvUnowned, Outcome};
-use log::{Record, error, info};
+use log::{Record, error, info, warn};
 use tokio::runtime::Runtime;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
@@ -204,9 +205,14 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile<'local>(
 /// * `_class` - Java class (unused)
 /// * `config_yaml` - YAML configuration string (includes TUN config with device_fd and optional Server configs like mixed)
 /// * `protect_callback` - Java object with protect(int fd) method
+/// * `traffic_callback` - Java object with onTrafficUpdate(long, long)
+/// * `stopped_listener` - Java object with onStopped(long, String), or null:
+///   the session's one-shot callback for an end the host did not ask for,
+///   with the contract `ShoesStoppedCallback` states for iOS
 ///
 /// # Returns
-/// * Handle (> 0) on success
+/// * The session id (> 0) on success: what `stop` must be given and what
+///   the listener is handed
 /// * -1 on error
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
@@ -215,6 +221,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     config_yaml: JString<'local>,
     protect_callback: JObject<'local>,
     traffic_callback: JObject<'local>,
+    stopped_listener: JObject<'local>,
 ) -> jlong {
     // block_on below panics on a thread that already has a tokio
     // runtime context (the traffic callback's worker being the way in
@@ -240,27 +247,48 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
         return -1;
     }
 
+    /// What `start` takes out of the JVM before it lets go of the env:
+    /// the config, global references to the host's objects, and the VM
+    /// the callbacks attach to later.
+    struct StartArgs {
+        config: String,
+        protect: Global<JObject<'static>>,
+        traffic: Global<JObject<'static>>,
+        stopped: Option<Global<JObject<'static>>>,
+        jvm: jni::JavaVM,
+    }
+
     let result = unowned
-        .with_env(
-            |env| -> jni::errors::Result<(
-                String,
-                Global<JObject<'static>>,
-                Global<JObject<'static>>,
-                jni::JavaVM,
-            )> {
-                let config_str: String = config_yaml.try_to_string(env)?;
-                let protect_ref = env.new_global_ref(protect_callback)?;
-                let traffic_ref = env.new_global_ref(traffic_callback)?;
-                let jvm = env.get_java_vm()?;
-                Ok((config_str, protect_ref, traffic_ref, jvm))
-            },
-        )
+        .with_env(|env| -> jni::errors::Result<StartArgs> {
+            let config: String = config_yaml.try_to_string(env)?;
+            let protect = env.new_global_ref(protect_callback)?;
+            let traffic = env.new_global_ref(traffic_callback)?;
+            let stopped = if stopped_listener.is_null() {
+                None
+            } else {
+                Some(env.new_global_ref(stopped_listener)?)
+            };
+            let jvm = env.get_java_vm()?;
+            Ok(StartArgs {
+                config,
+                protect,
+                traffic,
+                stopped,
+                jvm,
+            })
+        })
         .into_outcome();
 
-    // Every -1 below leaves a reason in getLastError: the host's only
-    // failure channel is polling it, and a start that fails without
+    // Every -1 below leaves a reason in getLastError: a start that fails
+    // never reaches the stopped listener, and a start that fails without
     // writing it hands the host the previous session's message instead.
-    let (config_str, protect_ref, traffic_ref, jvm) = match result {
+    let StartArgs {
+        config: config_str,
+        protect: protect_ref,
+        traffic: traffic_ref,
+        stopped: stopped_ref,
+        jvm,
+    } = match result {
         Outcome::Ok(v) => v,
         Outcome::Err(e) => {
             error!("Failed to extract JNI values for start: {}", e);
@@ -316,6 +344,39 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     };
     common::install_callbacks(&transition, Arc::new(protector), Arc::new(traffic));
 
+    // The stopped listener calls StoppedListener.onStopped(long, String)
+    // once, from a worker of the dying session's runtime, the way the
+    // traffic callback reaches the JVM. The global reference lives in the
+    // closure and is released when the closure is dropped: after the call,
+    // or with the session when a stop takes it, or with a failed start
+    // below, which never installs it. A listener that throws has its
+    // exception cleared on this thread: there is no Java frame above it
+    // to receive one, and the session it is about has already ended.
+    let jvm_stopped = jvm.clone();
+    let on_stop: Option<common::StoppedCallback> = stopped_ref.map(|listener| {
+        Box::new(move |id: u64, reason: &crate::control::ExitReason| {
+            let message = reason.message().replace('\0', "\u{fffd}");
+            let delivered = jvm_stopped.attach_current_thread(
+                |env: &mut jni::Env| -> jni::errors::Result<()> {
+                    let reason = env.new_string(&message)?;
+                    let call = env.call_method(
+                        &*listener,
+                        jni::jni_str!("onStopped"),
+                        jni::jni_sig!("(JLjava/lang/String;)V"),
+                        &[JValue::Long(id as i64), JValue::Object(&reason)],
+                    );
+                    if env.exception_check() {
+                        env.exception_clear();
+                    }
+                    call.map(|_| ())
+                },
+            );
+            if let Err(e) = delivered {
+                warn!("stopped listener for session {id}: {e}");
+            }
+        }) as common::StoppedCallback
+    });
+
     // Everything installed above -- the protector and the traffic
     // callback, both holding JNI global refs to the host's objects -- is
     // undone by this on any failure below, mirroring ios.rs's fail
@@ -361,12 +422,10 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     // Runtime::new() above, not a pinned worker count: Android has no Network
     // Extension memory limit to stay under, so it takes the cores it can get.
     // That is why control::start receives a runtime rather than building one.
-    // No stopped callback: the host polls getLastError, which the session's
-    // exit fills either way.
-    common::start_session(&transition, runtime, prepared, None);
+    let id = common::start_session(&transition, runtime, prepared, on_stop);
 
-    info!("TUN service started successfully");
-    1
+    info!("TUN service started successfully as session {id}");
+    id as jlong
 }
 
 /// Stop the TUN service.
@@ -374,18 +433,21 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 /// # Arguments
 /// * `_env` - JNI environment (unused)
 /// * `_class` - Java class (unused)
-/// * `handle` - Handle returned by startTun (currently unused, we use global state)
+/// * `handle` - The session id `start` returned. Any other value -- 0, a
+///   session already gone, a constant -- stops nothing and reports
+///   released, with a warning in the log; see `ShoesNative.stop`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     _env: EnvUnowned,
     _class: JClass,
-    _handle: jlong,
+    handle: jlong,
 ) -> jboolean {
     // One transition guard over the stop and the callback clear, so a
     // start queued behind the lock cannot have its just-installed
     // traffic callback wiped by this stop's tail.
     let transition = common::transition_guard();
-    let released = common::stop_service_locked(&transition);
+    // A negative value is no session's id; as u64 it matches nothing.
+    let released = common::stop_service_locked(&transition, handle as u64);
 
     // JNI_TRUE: the engine confirmed the stop and the TUN descriptor is
     // released -- closing the ParcelFileDescriptor is safe. JNI_FALSE:
