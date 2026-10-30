@@ -33,6 +33,12 @@ site at the server's MRU of 1350, so `mtu` now defaults to 1280, IPv6's
 minimum: shoes' userspace TCP does no path MTU discovery to find a smaller
 path out.
 
+`camouflage_secret` speaks to a Keenetic router with its SSTP server's
+camouflage mode on, which answers the SSTP request only when its URI
+carries the secret as the query string and is a plain web server to
+anything else. Nothing documents the mechanism; it was found by probing
+such a router, and the spec records the probe.
+
 A network change now reaches a registry of listeners, `src/network_change.rs`,
 instead of AmneziaWG's endpoint sockets alone. An SSTP session ends at once
 on one: its TCP connection cannot outlive the interface.

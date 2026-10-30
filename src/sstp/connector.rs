@@ -116,6 +116,7 @@ impl SstpConnector {
                 password: config.password,
                 methods,
                 mtu: config.mtu,
+                camouflage_secret: config.camouflage_secret,
             },
             state: Mutex::new(ConnectorState::default()),
         })
@@ -325,6 +326,7 @@ mod tests {
             auth: vec![SstpAuthMethod::Mschapv2],
             mtu: 1280,
             tls: crate::config::SstpTlsConfig::default(),
+            camouflage_secret: None,
         }
     }
 

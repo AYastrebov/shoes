@@ -57,6 +57,9 @@ pub enum ServerAuth {
 
 #[derive(Clone)]
 pub struct Options {
+    /// Keenetic's camouflage: answer the SSTP request only when its URI
+    /// carries this as the query string, and be a web server otherwise.
+    pub camouflage_secret: Option<&'static str>,
     pub auth: ServerAuth,
     pub hash_bitmask: u8,
     pub username: &'static str,
@@ -67,6 +70,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
+            camouflage_secret: None,
             auth: ServerAuth::MsChapV2,
             hash_bitmask: 0x03,
             username: "alice",
@@ -175,13 +179,23 @@ async fn serve(
         }
         buf.extend_from_slice(&chunk[..n]);
     };
-    assert!(
-        buf.starts_with(
-            b"SSTP_DUPLEX_POST /sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/ HTTP/1.1\r\n"
-        ),
-        "{}",
-        String::from_utf8_lossy(&buf)
-    );
+    let expected_target = match options.camouflage_secret {
+        Some(secret) => format!("/sra_{{BA195980-CD49-458b-9E23-C84EE0ADCD75}}/?{secret}"),
+        None => "/sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/".to_string(),
+    };
+    let request_line =
+        String::from_utf8_lossy(buf.split(|&b| b == b'\r').next().unwrap_or_default()).to_string();
+    let mut words = request_line.split(' ');
+    let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    assert_eq!(method, "SSTP_DUPLEX_POST", "{request_line}");
+    if target != expected_target {
+        // What a Keenetic with camouflage on says to a request without its
+        // secret: a web server's 404, and nothing that names SSTP.
+        assert!(options.camouflage_secret.is_some(), "{request_line}");
+        tls.write_all(b"HTTP/1.1 404 Not Found\r\nServer: Web server\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
     let header = String::from_utf8_lossy(&buf[..end]).to_string();
     assert!(
         header.contains("Content-Length: 18446744073709551615\r\n"),

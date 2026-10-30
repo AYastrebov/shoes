@@ -43,6 +43,8 @@ pub struct Settings {
     pub password: crate::config::Redacted<String>,
     pub methods: Vec<ppp::AuthMethod>,
     pub mtu: u16,
+    /// Keenetic's camouflage: the query string the SSTP URI must carry.
+    pub camouflage_secret: Option<crate::config::Redacted<String>>,
 }
 
 pub struct Established {
@@ -98,7 +100,16 @@ async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established>
     let mut stream = CryptoTlsStream::new(io, connection);
 
     let mut reader = PacketReader::default();
-    http_request(&mut stream, &mut reader, &settings.host).await?;
+    http_request(
+        &mut stream,
+        &mut reader,
+        &settings.host,
+        settings
+            .camouflage_secret
+            .as_ref()
+            .map(|s| s.expose().as_str()),
+    )
+    .await?;
 
     stream.write_all(&packet::call_connect_request()).await?;
     stream.flush().await?;
@@ -207,10 +218,18 @@ fn refused(control: &packet::Control<'_>, what: &str) -> io::Error {
 }
 
 /// The request of [MS-SSTP] §3.2.4.1 and §4.1, and the server's `200`.
+///
+/// With Keenetic's camouflage on, the server answers only when the URI
+/// carries the secret as its bare query string (`/sra_{...}/?<secret>`)
+/// and is a web server to every other request: 404 to the standard URI,
+/// 200 to `GET /`. Found by probing a KeeneticOS 4.3 router, since nothing
+/// documents it; `secret=<secret>`, a cookie and the secret as a path all
+/// got the 404. [MS-SSTP] §3.2.4.1 allows a query variable on the URI.
 async fn http_request(
     stream: &mut TlsStream,
     reader: &mut PacketReader,
     host: &str,
+    camouflage_secret: Option<&str>,
 ) -> io::Result<()> {
     let correlation: [u8; 16] = rand::random();
     let h = |range: std::ops::Range<usize>| {
@@ -219,8 +238,11 @@ async fn http_request(
             .map(|b| format!("{b:02X}"))
             .collect::<String>()
     };
+    let query = camouflage_secret
+        .map(|s| format!("?{s}"))
+        .unwrap_or_default();
     let request = format!(
-        "SSTP_DUPLEX_POST /sra_{{BA195980-CD49-458b-9E23-C84EE0ADCD75}}/ HTTP/1.1\r\n\
+        "SSTP_DUPLEX_POST /sra_{{BA195980-CD49-458b-9E23-C84EE0ADCD75}}/{query} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Content-Length: 18446744073709551615\r\n\
          SSTPCORRELATIONID: {{{}-{}-{}-{}-{}}}\r\n\r\n",
@@ -244,9 +266,18 @@ async fn http_request(
             .filter(|c| !c.is_control())
             .take(120)
             .collect();
+        // A 404 is what a camouflaged server says to a request without its
+        // secret, or with the wrong one; the secret itself stays out of it.
+        let hint = match (code, camouflage_secret) {
+            (b"404", None) => {
+                " (a server with camouflage on answers this way: set camouflage_secret)"
+            }
+            (b"404", Some(_)) => " (the camouflage secret may be wrong)",
+            _ => "",
+        };
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("SSTP: the server answered the SSTP request with {printable:?}"),
+            format!("SSTP: the server answered the SSTP request with {printable:?}{hint}"),
         ));
     }
     Ok(())

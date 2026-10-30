@@ -1628,6 +1628,22 @@ fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<(
             sstp.mtu
         )));
     }
+    // It goes on the request line as the query string, so it is limited to
+    // RFC 3986's unreserved characters; Keenetic generates hexadecimal.
+    if let Some(secret) = &sstp.camouflage_secret {
+        let secret = secret.expose();
+        if secret.is_empty()
+            || !secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+        {
+            return Err(invalid(
+                "SSTP camouflage_secret must be the part after '?' in the address the server \
+                 shows: letters, digits, '-', '.', '_' or '~', and not empty."
+                    .into(),
+            ));
+        }
+    }
     validate_server_fingerprints(&mut sstp.tls.server_fingerprints)?;
     let sni_hostname = match &sstp.tls.sni_hostname {
         crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
@@ -2809,6 +2825,7 @@ mod tests {
                 auth: vec![SstpAuthMethod::Mschapv2],
                 mtu: 1280,
                 tls: SstpTlsConfig::default(),
+                camouflage_secret: None,
             }
         }
 
@@ -2849,6 +2866,24 @@ mod tests {
             let mut config = sstp();
             config.tls.verify = false;
             config.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// The secret rides the request line, so it is limited to what a
+        /// query string carries unescaped.
+        #[test]
+        fn a_camouflage_secret_is_a_bare_query_string() {
+            for bad in ["", "a b", "a?b", "a/b", "a#b", "сек"] {
+                let mut config = sstp();
+                config.camouflage_secret = Some(bad.to_string().into());
+                let err = super::super::validate_sstp(&mut config).unwrap_err();
+                assert!(
+                    err.to_string().contains("camouflage_secret"),
+                    "{bad:?}: {err}"
+                );
+            }
+            let mut config = sstp();
+            config.camouflage_secret = Some("0123abcd".to_string().into());
             super::super::validate_sstp(&mut config).unwrap();
         }
 

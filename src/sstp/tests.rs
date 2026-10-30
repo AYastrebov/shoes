@@ -25,7 +25,17 @@ use crate::tcp::terminal_connector::TerminalConnector;
 /// The server's certificate is self-signed and pinned, the way a user with
 /// an RRAS box and no public CA would configure it.
 fn connector(server: &TestServer, auth: Vec<SstpAuthMethod>, password: &str) -> SstpConnector {
-    let config = SstpClientConfig {
+    SstpConnector::new(
+        NetLocation::from(server.address),
+        config_for(server, auth, password),
+        None,
+        true,
+    )
+    .unwrap()
+}
+
+fn config_for(server: &TestServer, auth: Vec<SstpAuthMethod>, password: &str) -> SstpClientConfig {
+    SstpClientConfig {
         username: "alice".into(),
         password: password.to_string().into(),
         auth,
@@ -35,8 +45,8 @@ fn connector(server: &TestServer, auth: Vec<SstpAuthMethod>, password: &str) -> 
             server_fingerprints: NoneOrSome::One(server.fingerprint.clone()),
             sni_hostname: NoneOrOne::Unspecified,
         },
-    };
-    SstpConnector::new(NetLocation::from(server.address), config, None, true).unwrap()
+        camouflage_secret: None,
+    }
 }
 
 fn resolver() -> Arc<dyn Resolver> {
@@ -457,5 +467,40 @@ async fn the_configured_chain_reaches_the_tunnel_through_the_selector() {
         .await
         .unwrap();
     assert_eq!(reply, b"udp via the selector");
+    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 1);
+}
+
+/// Keenetic's camouflage mode: the request must carry the secret as the
+/// URI's query string. Without it, or with the wrong one, the server is a
+/// web server answering 404, and the error says what that means without
+/// repeating the secret.
+#[tokio::test]
+async fn a_camouflaged_server_needs_its_secret_on_the_request() {
+    const SECRET: &str = "0123abcd";
+    let server = testing::start(Options {
+        camouflage_secret: Some(SECRET),
+        ..Options::default()
+    })
+    .await;
+
+    let plain = connector(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let err = tcp_echo(&plain, b"x").await.unwrap_err();
+    assert!(
+        err.to_string().contains("404") && err.to_string().contains("set camouflage_secret"),
+        "{err}"
+    );
+
+    let mut wrong = config_for(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    wrong.camouflage_secret = Some("not-it".to_string().into());
+    let wrong = SstpConnector::new(NetLocation::from(server.address), wrong, None, true).unwrap();
+    let err = tcp_echo(&wrong, b"x").await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("secret may be wrong"), "{text}");
+    assert!(!text.contains("not-it"), "{text}");
+
+    let mut right = config_for(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    right.camouflage_secret = Some(SECRET.to_string().into());
+    let right = SstpConnector::new(NetLocation::from(server.address), right, None, true).unwrap();
+    tcp_echo(&right, b"camouflaged").await.unwrap();
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 1);
 }

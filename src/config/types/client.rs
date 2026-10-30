@@ -420,6 +420,12 @@ pub struct SstpClientConfig {
     pub mtu: u16,
     #[serde(default, skip_serializing_if = "SstpTlsConfig::is_default")]
     pub tls: SstpTlsConfig,
+    /// Keenetic's camouflage mode: the server answers the SSTP request only
+    /// when its URI carries this secret as the query string, and looks like
+    /// a plain web server to anything else. It is the part after `?` in the
+    /// address the router shows, or `show sstp-server` in its CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camouflage_secret: Option<Redacted<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -1283,7 +1289,7 @@ password: secret
         let yaml = r#"
 type: sstp
 username: alice
-password: secret
+password: hunter2
 "#;
         let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
         match config {
@@ -1305,7 +1311,7 @@ password: secret
             !written.contains("auth") && !written.contains("mtu"),
             "{written}"
         );
-        assert!(!format!("{config:?}").contains("secret"));
+        assert!(!format!("{config:?}").contains("hunter2"));
 
         let yaml = r#"
 type: sstp

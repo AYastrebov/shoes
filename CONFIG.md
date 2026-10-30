@@ -1071,6 +1071,7 @@ protocol:
     verify: true               # Default: true
     sni_hostname: string?      # Default: the host in `address`; "" sends none
     server_fingerprints: [string]?  # SHA-256 of the server certificate
+  camouflage_secret: string?   # Keenetic's camouflage mode: the part after '?'
 ```
 
 A client for Microsoft's Secure Socket Tunneling Protocol: PPP over HTTPS,
@@ -1100,6 +1101,14 @@ its far side carries, and shoes' userspace TCP does no path MTU discovery to
 find out, so oversized packets vanish and connections stall mid-handshake.
 Raise it only for a server known to carry more.
 
+`camouflage_secret` is for a Keenetic router with its SSTP server's
+"Camouflage mode" on (KeeneticOS 4.2 and later). Such a server answers the
+SSTP request only when it carries the secret, and is a plain web server to
+anything else, so a scanner cannot tell SSTP is there. The router shows the
+address as `https://<host>/?<secret>`; put the host in `address` and the
+part after `?` here. Without it, or with the wrong one, the connection fails
+with a 404 and the error says so. Only Keenetic is known to do this.
+
 `tcp_settings.no_delay` (default on) and `bind_interface` apply to the TCP
 connection; `transport` is refused.
 
@@ -1114,8 +1123,9 @@ Things to know before relying on it:
   stalls everything inside it, and SSTP is slower there than AmneziaWG or
   Hysteria2 to the same place. It is chosen for reach: HTTPS on 443 crosses
   networks that block WireGuard's UDP.
-- **It is not camouflage.** Anyone who probes the server, or terminates the
-  TLS, can tell it is SSTP, and shoes' TLS handshake is not Windows'. Do not
+- **It is not camouflage on the wire.** Whoever terminates the TLS can tell
+  it is SSTP, and shoes' TLS handshake is not Windows'. A Keenetic with
+  `camouflage_secret` hides the server from probes, nothing more. Do not
   choose it for censorship resistance.
 - **IPv4 only.** The server's IPv6 negotiation is refused, and IPv6
   destinations are unreachable through it.
