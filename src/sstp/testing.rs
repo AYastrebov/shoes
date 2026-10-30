@@ -85,6 +85,9 @@ pub struct Stats {
     pub client_records: AtomicUsize,
     /// IP packets the client sent.
     pub client_packets: AtomicUsize,
+    /// Call Disconnect Acks the client sent: its answer to this server's
+    /// Call Disconnect, which must get out before the session ends.
+    pub disconnect_acks: AtomicUsize,
     /// IP packets that arrived before Call Connected, which the spec has a
     /// client never send.
     pub early_packets: AtomicUsize,
@@ -316,7 +319,11 @@ impl Session {
                     self.send_control(packet::bare_control(message::CALL_DISCONNECT_ACK));
                     return Ok(false);
                 }
-                message::CALL_DISCONNECT_ACK | message::CALL_ABORT => return Ok(false),
+                message::CALL_DISCONNECT_ACK => {
+                    self.stats.disconnect_acks.fetch_add(1, Ordering::SeqCst);
+                    return Ok(false);
+                }
+                message::CALL_ABORT => return Ok(false),
                 _ => {}
             },
             Packet::Data(frame) => {

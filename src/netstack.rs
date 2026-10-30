@@ -835,6 +835,33 @@ pub struct VirtualTcpStream {
 
 /// See `TcpControl::dropped`: without this, a stream dropped without
 /// shutdown pinned its socket, buffers, and cap slot forever.
+impl Drop for VirtualNetStack {
+    /// The loop is gone, whether its tunnel ended under it or its task was
+    /// aborted by a rebuild. Every stream still open on it shares a control
+    /// with it and nothing else, so without this a read parked on one would
+    /// wait forever and a write would fill its ring and then park too. The
+    /// pending connects' reply senders go with the map, which answers their
+    /// callers with an error.
+    fn drop(&mut self) {
+        let controls = self
+            .active_tcp
+            .values()
+            .map(|active| &active.control)
+            .chain(self.pending_tcp.values().map(|pending| &pending.control));
+        for control in controls {
+            let mut ctrl = control.lock();
+            ctrl.recv_closed = true;
+            ctrl.send_closed = true;
+            if let Some(w) = ctrl.recv_waker.take() {
+                w.wake();
+            }
+            if let Some(w) = ctrl.send_waker.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
 impl Drop for VirtualTcpStream {
     fn drop(&mut self) {
         self.control.lock().dropped = true;

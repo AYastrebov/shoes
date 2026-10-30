@@ -221,6 +221,16 @@ async fn a_server_disconnect_is_followed_by_a_new_session() {
     tcp_echo(&connector, b"first").await.unwrap();
     server.stats.disconnect.notify_waiters();
     wait_until_dead(&connector).await;
+    // The Ack is queued by the reader as it ends; the writer flushes it
+    // before the connection closes ([MS-SSTP] §3.1.2.2).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.stats.disconnect_acks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never got its Disconnect Ack"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tcp_echo(&connector, b"second").await.unwrap();
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
 }
@@ -234,6 +244,38 @@ async fn a_network_change_ends_the_session() {
     wait_until_dead(&connector).await;
     tcp_echo(&connector, b"second").await.unwrap();
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
+}
+
+/// A stream open when its session dies ends, rather than waiting on a
+/// netstack that is gone: the netstack closes every control it drops.
+#[tokio::test]
+async fn a_stream_open_across_the_sessions_death_ends() {
+    let server = testing::start(Options::default()).await;
+    let connector = connector(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let mut stream = connector
+        .connect_tcp(&resolver(), echo())
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"alive").await.unwrap();
+    let mut back = [0u8; 5];
+    stream.read_exact(&mut back).await.unwrap();
+
+    connector.network_changed().await;
+    wait_until_dead(&connector).await;
+
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("the read parked on a dead session");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let write = tokio::time::timeout(Duration::from_secs(5), async {
+        stream.write_all(&[0u8; 65536]).await?;
+        stream.flush().await
+    })
+    .await
+    .expect("the write parked on a dead session");
+    assert!(write.is_err(), "a write on a dead session fails");
 }
 
 async fn wait_until_dead(connector: &SstpConnector) {
@@ -334,4 +376,86 @@ async fn a_name_is_reached_at_its_ipv4_address() {
         .err()
         .expect("an IPv6-only name cannot be reached");
     assert!(err.to_string().contains("IPv4 only"), "{err}");
+}
+
+/// The production path, end to end: the config text through the loader
+/// (validation, the single-hop rule for a transport owner), the selector
+/// `create_tcp_client_proxy_selector` builds (the chain builder's terminal
+/// arm), the chain's dial, the tunnel. The tests above construct the
+/// connector directly to reach its internals; this one proves the wiring.
+#[tokio::test]
+async fn the_configured_chain_reaches_the_tunnel_through_the_selector() {
+    use crate::client_proxy_selector::ConnectDecision;
+    use crate::config::{Config, ConfigSelection};
+    use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+
+    let server = testing::start(Options::default()).await;
+    let yaml = format!(
+        r#"
+- address: "127.0.0.1:0"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "{}"
+          protocol:
+            type: sstp
+            username: alice
+            password: "{PASSWORD}"
+            tls:
+              verify: false
+              server_fingerprints: ["{}"]
+"#,
+        server.address, server.fingerprint
+    );
+    let configs = crate::config::load_config_str(&yaml).unwrap();
+    let validated = crate::config::create_server_configs(configs).unwrap();
+    let rules: Vec<_> = validated
+        .configs
+        .into_iter()
+        .filter_map(|config| match config {
+            Config::Server(server) => Some(server.rules),
+            _ => None,
+        })
+        .flat_map(|rules| rules.into_vec())
+        .filter_map(|rule| match rule {
+            ConfigSelection::Config(rule) => Some(rule),
+            ConfigSelection::GroupName(_) => None,
+        })
+        .collect();
+    assert_eq!(rules.len(), 1);
+    let resolver = resolver();
+    let selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
+
+    let ConnectDecision::Allow {
+        chain_group,
+        remote_location,
+    } = selector.judge(echo(), &resolver).await.unwrap()
+    else {
+        panic!("the rule allows everything");
+    };
+    let mut stream = chain_group
+        .connect_tcp(remote_location.clone(), &resolver)
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"via the selector").await.unwrap();
+    let mut back = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back, b"via the selector");
+
+    let mut udp = chain_group
+        .connect_udp_bidirectional(&resolver, remote_location)
+        .await
+        .unwrap();
+    let reply = crate::quic_outbound::testing::udp_echo_exchange(&mut udp, b"udp via the selector")
+        .await
+        .unwrap();
+    assert_eq!(reply, b"udp via the selector");
+    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 1);
 }

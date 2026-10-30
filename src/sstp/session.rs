@@ -201,11 +201,8 @@ async fn writer(
     let largest = 8 + usize::from(mtu);
     let mut batch = Vec::with_capacity(BATCH + largest);
     loop {
-        if state.is_dead() {
-            return Ok(());
-        }
-        if state.stopping() {
-            return goodbye(&mut write, state).await;
+        if state.is_dead() || state.stopping() {
+            return finish(&mut write, &mut control, state).await;
         }
         batch.clear();
         tokio::select! {
@@ -236,9 +233,13 @@ async fn writer(
             // this task, its TLS state and the batch until the kernel gave
             // up on the connection, minutes later on a phone; the session
             // is dead by then and has a successor.
+            //
+            // A stop lands here too. The frame may be partly on the wire,
+            // so nothing can follow it cleanly, not a goodbye either: the
+            // connection just closes, and the server times the call out.
             tokio::select! {
                 biased;
-                _ = state.dead() => return Ok(()),
+                _ = state.changed() => return Ok(()),
                 written = async {
                     write.write_all(&batch).await?;
                     write.flush().await
@@ -262,26 +263,46 @@ fn push_ip(batch: &mut Vec<u8>, ip: &[u8], mtu: u16) {
     encode_ip(batch, ip);
 }
 
-/// LCP Terminate-Request and Call Disconnect in one write, then close once
-/// the reader has seen the Ack, or after [`STOP_WAIT`].
-async fn goodbye(write: &mut WriteHalf<TlsStream>, state: &SessionState) -> io::Result<()> {
+/// The writer's last act, under one deadline of [`STOP_WAIT`] per step:
+/// whatever the reader queued last (a Disconnect Ack to a server that is
+/// leaving, which must reach it), then, if this side is the one leaving,
+/// LCP Terminate-Request and Call Disconnect, the wait for the server's
+/// Ack, and the TLS close.
+async fn finish(
+    write: &mut WriteHalf<TlsStream>,
+    control: &mut mpsc::Receiver<Vec<u8>>,
+    state: &SessionState,
+) -> io::Result<()> {
     let mut out = Vec::new();
-    let terminate = ppp::frame(
-        ppp::protocol::LCP,
-        &ppp::control(ppp::code::TERMINATE_REQUEST, 0xfe, &[]),
-    );
-    out.extend_from_slice(&packet::data_header(terminate.len()));
-    out.extend_from_slice(&terminate);
-    out.extend_from_slice(&packet::bare_control(message::CALL_DISCONNECT));
-    // Bounded like the wait: a goodbye to a server that is gone must not
-    // outlive the stop.
+    while let Ok(packet) = control.try_recv() {
+        out.extend_from_slice(&packet);
+    }
+    let leaving = !state.is_dead();
+    if leaving {
+        let terminate = ppp::frame(
+            ppp::protocol::LCP,
+            &ppp::control(ppp::code::TERMINATE_REQUEST, 0xfe, &[]),
+        );
+        out.extend_from_slice(&packet::data_header(terminate.len()));
+        out.extend_from_slice(&terminate);
+        out.extend_from_slice(&packet::bare_control(message::CALL_DISCONNECT));
+    }
     let _ = tokio::time::timeout(STOP_WAIT, async {
-        write.write_all(&out).await?;
-        write.flush().await
+        if !out.is_empty() {
+            write.write_all(&out).await?;
+            write.flush().await?;
+        }
+        if leaving {
+            // The reader ends the session on the server's Disconnect Ack.
+            state.dead().await;
+        }
+        Ok::<(), io::Error>(())
     })
     .await;
-    let _ = tokio::time::timeout(STOP_WAIT, state.dead()).await;
-    write.shutdown().await
+    // The close flushes rustls's pending ciphertext into the same socket,
+    // which is what may have stalled above.
+    let _ = tokio::time::timeout(STOP_WAIT, write.shutdown()).await;
+    Ok(())
 }
 
 struct Reader {
@@ -316,8 +337,9 @@ impl Reader {
 
             let idle_until = tokio::time::Instant::from_std(last_received + HELLO);
             let read = tokio::select! {
-                // A stop keeps reading: the Disconnect Ack ends it.
-                _ = state.changed(), if !state.stopping() => continue,
+                // A stop keeps reading, for the Disconnect Ack that ends
+                // it; a death ends it at once.
+                _ = state.dead() => return Ok(()),
                 read = tokio::time::timeout_at(idle_until, self.read.read(&mut self.buf[self.end..])) => read,
             };
             match read {

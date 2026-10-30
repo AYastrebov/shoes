@@ -784,6 +784,9 @@ impl Ppp {
         *sent_count += 1;
         let user = self.credentials.username.as_bytes();
         let password = self.credentials.password.expose().as_bytes();
+        // Validation refuses longer ones when PAP is enabled; a length that
+        // wrapped would send a frame the server reads as something else.
+        debug_assert!(user.len() <= 255 && password.len() <= 255);
         let mut data = zeroize::Zeroizing::new(Vec::with_capacity(2 + user.len() + password.len()));
         data.push(user.len() as u8);
         data.extend_from_slice(user);

@@ -1599,6 +1599,17 @@ fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<(
     if password.is_empty() || password.encode_utf16().count() > 256 {
         return Err(invalid("SSTP password must be 1 to 256 characters.".into()));
     }
+    // PAP carries each credential behind a one-octet length (RFC 1334
+    // §2.1.1), as bytes: 256 of them would go out as length zero.
+    if sstp.auth.contains(&super::types::SstpAuthMethod::Pap)
+        && (sstp.username.len() > 255 || password.len() > 255)
+    {
+        return Err(invalid(
+            "SSTP with pap in auth needs a username and password of at most 255 bytes each: \
+             PAP sends each behind a one-byte length."
+                .into(),
+        ));
+    }
     if sstp.auth.is_empty() {
         return Err(invalid(
             "SSTP auth must list at least one method: mschapv2, pap.".into(),
@@ -1623,7 +1634,10 @@ fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<(
         _ => None,
     };
     validate_tls_server_name("SSTP", sni_hostname)?;
-    if !sstp.tls.verify && sstp.tls.server_fingerprints.is_unspecified() {
+    // `is_empty`, not `is_unspecified`: `server_fingerprints: []` or `null`
+    // is a pin set that pins nothing, and selects the verifier that checks
+    // nothing just the same.
+    if !sstp.tls.verify && sstp.tls.server_fingerprints.is_empty() {
         return Err(invalid(
             "SSTP would send your credentials to any server that answers; pin its \
              certificate with tls.server_fingerprints or leave tls.verify on."
@@ -2813,6 +2827,47 @@ mod tests {
             super::super::validate_sstp(&mut config).unwrap();
             config.tls.sni_hostname = NoneOrOne::One(String::new());
             super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// With verification off, only a pin stands between the credentials
+        /// and whoever answers; a pin set that is empty rather than absent
+        /// pins nothing and must be refused the same way.
+        #[test]
+        fn verification_off_needs_a_pin_that_pins_something() {
+            use crate::option_util::NoneOrSome;
+            for empty in [
+                NoneOrSome::Unspecified,
+                NoneOrSome::None,
+                NoneOrSome::Some(vec![]),
+            ] {
+                let mut config = sstp();
+                config.tls.verify = false;
+                config.tls.server_fingerprints = empty;
+                let err = super::super::validate_sstp(&mut config).unwrap_err();
+                assert!(err.to_string().contains("pin its certificate"), "{err}");
+            }
+            let mut config = sstp();
+            config.tls.verify = false;
+            config.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// PAP's lengths are one octet of bytes; MS-CHAPv2's are not.
+        #[test]
+        fn pap_bounds_the_credentials_at_255_bytes() {
+            let mut config = sstp();
+            config.username = "u".repeat(256);
+            super::super::validate_sstp(&mut config).unwrap();
+            config.auth.push(SstpAuthMethod::Pap);
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(err.to_string().contains("255 bytes"), "{err}");
+
+            let mut config = sstp();
+            config.auth = vec![SstpAuthMethod::Pap];
+            // 128 characters, within MS-CHAPv2's 256 UTF-16 units, 256 bytes.
+            config.password = "é".repeat(128).into();
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(err.to_string().contains("255 bytes"), "{err}");
         }
 
         /// Under a wrapping layer the chain builder would hand a transport
