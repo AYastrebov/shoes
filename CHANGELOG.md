@@ -6,7 +6,12 @@ An SSTP client outbound (`type: sstp`): Microsoft's PPP over HTTPS, as
 Windows RRAS, MikroTik, SoftEther, accel-ppp and some routers serve it.
 Like WireGuard it is a layer-3 tunnel and the only hop in its chain. One
 session per hop carries every TCP and UDP connection through the smoltcp
-stack AmneziaWG uses, now shared as `src/netstack.rs`. What it does:
+stack AmneziaWG uses, now shared as `src/netstack.rs`. It is built to
+`docs/specs/2026-10-30-sstp-client-outbound.md`, written from [MS-SSTP]
+and read against Open-SSTP-Client, sstp-client, SoftEther and accel-ppp;
+where they disagree (the CMK length's byte order, the domain in the
+MS-CHAPv2 challenge hash, whether crypto binding is checked at all) the
+spec records which was followed and why. What it does:
 - MS-CHAPv2, with the server's proof checked in constant time, or PAP
   when listed;
 - crypto binding with SHA-256 or SHA-1;
@@ -31,20 +36,6 @@ path out.
 A network change now reaches a registry of listeners, `src/network_change.rs`,
 instead of AmneziaWG's endpoint sockets alone. An SSTP session ends at once
 on one: its TCP connection cannot outlive the interface.
-
-Documentation only. A specification for an SSTP client outbound,
-`docs/specs/2026-10-30-sstp-client-outbound.md`. It is written from
-[MS-SSTP] and read against four implementations: Open-SSTP-Client,
-sstp-client, SoftEther and accel-ppp. Among the points it settles:
-- the CMK length is little-endian;
-- RFC 2759 strips the domain from the MS-CHAPv2 challenge hash, which
-  accel-ppp does not;
-- SoftEther does not check crypto binding, so accel-ppp is the live peer
-  that proves it.
-
-Its performance section batches packets into TLS records, never drops a
-packet between the inner TCP and the socket, and puts
-`TCP_NOTSENT_LOWAT` to a measured A/B. Nothing is implemented yet.
 
 Documentation only. `MOBILE.md` now says what makes the stopped callback
 fire: the AmneziaWG liveness watchdog, the AmneziaWG receive-error streak,

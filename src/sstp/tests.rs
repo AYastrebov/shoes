@@ -307,6 +307,25 @@ async fn a_name_is_reached_at_its_ipv4_address() {
     stream.read_exact(&mut back).await.unwrap();
     assert_eq!(&back, b"v4");
 
+    // The rule engine resolves a name to match it against an IP mask and
+    // keeps the first address: an IPv6 one here, as on a dual-stack host.
+    // The name still has an IPv4 address, and that is the one to use.
+    let mut pre_resolved =
+        ResolvedLocation::new(NetLocation::from_str("dual.test", Some(ECHO_PORT)).unwrap());
+    pre_resolved.set_resolved(SocketAddr::from((
+        [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1],
+        ECHO_PORT,
+    )));
+    let mut stream = connector
+        .connect_tcp(&resolver, pre_resolved)
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"pre").await.unwrap();
+    let mut back = [0u8; 3];
+    stream.read_exact(&mut back).await.unwrap();
+    assert_eq!(&back, b"pre");
+
     let six_only =
         ResolvedLocation::new(NetLocation::from_str("six.test", Some(ECHO_PORT)).unwrap());
     let err = connector

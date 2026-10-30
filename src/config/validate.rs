@@ -1261,10 +1261,34 @@ fn validate_client_vision_protocol(
     }
 }
 
+/// A protocol that owns its transport cannot sit under a wrapping layer:
+/// the chain builder would hand it to the per-stream handler factory, which
+/// has no handler for it. The type system does not say so, so this does.
+fn refuse_wrapped_transport_owner(layer: &str, inner: &ClientProxyConfig) -> std::io::Result<()> {
+    if !inner.owns_transport() {
+        return Ok(());
+    }
+    let hint = match (inner, layer) {
+        (ClientProxyConfig::Sstp(_), "TLS") => {
+            " SSTP does its own TLS; put the settings under the sstp protocol's tls block."
+        }
+        _ => "",
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} owns its transport and cannot be wrapped in a {layer} layer; it must be \
+             the only hop in its chain.{hint}",
+            inner.protocol_name()
+        ),
+    ))
+}
+
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     match config {
         ClientProxyConfig::Tls(tls_config) => {
+            refuse_wrapped_transport_owner("TLS", &tls_config.protocol)?;
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
             let sni_hostname = match &tls_config.sni_hostname {
                 crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
@@ -1276,6 +1300,7 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         ClientProxyConfig::Reality {
             vision, protocol, ..
         } => {
+            refuse_wrapped_transport_owner("Reality", protocol)?;
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
             validate_client_proxy_structure(protocol)?;
         }
@@ -1284,13 +1309,16 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
             sni_hostname,
             ..
         } => {
+            refuse_wrapped_transport_owner("ShadowTLS", protocol)?;
             validate_tls_server_name("ShadowTLS", sni_hostname.as_deref())?;
             validate_client_proxy_structure(protocol)?;
         }
         ClientProxyConfig::Websocket(ws_config) => {
+            refuse_wrapped_transport_owner("WebSocket", &ws_config.protocol)?;
             validate_client_proxy_structure(&ws_config.protocol)?;
         }
         ClientProxyConfig::HttpUpgrade(config) => {
+            refuse_wrapped_transport_owner("HTTPUpgrade", &config.protocol)?;
             validate_client_proxy_structure(&config.protocol)?;
         }
         _ => {}
@@ -1506,13 +1534,6 @@ fn validate_client_config(
                 ));
             }
         }
-        ClientProxyConfig::Tls(tls) if matches!(*tls.protocol, ClientProxyConfig::Sstp(_)) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SSTP does its own TLS; put the settings under the sstp protocol's tls block \
-                 instead of wrapping it in a tls layer.",
-            ));
-        }
         ClientProxyConfig::Tuic(tuic) => {
             if tuic.heartbeat_ms == 0 {
                 return Err(std::io::Error::new(
@@ -1597,6 +1618,11 @@ fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<(
         )));
     }
     validate_server_fingerprints(&mut sstp.tls.server_fingerprints)?;
+    let sni_hostname = match &sstp.tls.sni_hostname {
+        crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
+        _ => None,
+    };
+    validate_tls_server_name("SSTP", sni_hostname)?;
     if !sstp.tls.verify && sstp.tls.server_fingerprints.is_unspecified() {
         return Err(invalid(
             "SSTP would send your credentials to any server that answers; pin its \
@@ -2755,6 +2781,72 @@ mod tests {
         fn a_descriptor_makes_the_name_irrelevant_rather_than_wrong() {
             validate_macos_tun_device(Some(7), Some("tun0"), None, None, None)
                 .expect("a name the platform ignores must not fail the config");
+        }
+    }
+
+    mod sstp {
+        use crate::config::{ClientProxyConfig, SstpAuthMethod, SstpClientConfig, SstpTlsConfig};
+        use crate::option_util::NoneOrOne;
+
+        fn sstp() -> SstpClientConfig {
+            SstpClientConfig {
+                username: "alice".into(),
+                password: "pw".to_string().into(),
+                auth: vec![SstpAuthMethod::Mschapv2],
+                mtu: 1280,
+                tls: SstpTlsConfig::default(),
+            }
+        }
+
+        /// The connector unwraps the TLS settings as validated, so a name
+        /// rustls refuses must be refused here rather than at startup.
+        #[test]
+        fn an_sni_hostname_that_is_not_a_server_name_is_refused() {
+            let mut config = sstp();
+            config.tls.sni_hostname = NoneOrOne::One("vpn example.com".into());
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP client sni_hostname"),
+                "{err}"
+            );
+            config.tls.sni_hostname = NoneOrOne::One("vpn.example.com".into());
+            super::super::validate_sstp(&mut config).unwrap();
+            config.tls.sni_hostname = NoneOrOne::One(String::new());
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// Under a wrapping layer the chain builder would hand a transport
+        /// owner to the per-stream handler factory, which panics on it.
+        #[test]
+        fn a_transport_owner_under_any_layer_is_refused() {
+            let inner = Box::new(ClientProxyConfig::Sstp(Box::new(sstp())));
+            let websocket: ClientProxyConfig =
+                serde_yaml::from_str("type: websocket\nprotocol: {type: direct}").unwrap();
+            let ClientProxyConfig::Websocket(mut ws) = websocket else {
+                panic!("websocket");
+            };
+            ws.protocol = inner.clone();
+            let err =
+                super::super::validate_client_proxy_structure(&ClientProxyConfig::Websocket(ws))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP owns its transport")
+                    && err.to_string().contains("WebSocket"),
+                "{err}"
+            );
+
+            let tls: ClientProxyConfig =
+                serde_yaml::from_str("type: tls\nprotocol: {type: direct}").unwrap();
+            let ClientProxyConfig::Tls(mut tls) = tls else {
+                panic!("tls");
+            };
+            tls.protocol = inner;
+            let err = super::super::validate_client_proxy_structure(&ClientProxyConfig::Tls(tls))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("sstp protocol's tls block"),
+                "{err}"
+            );
         }
     }
 

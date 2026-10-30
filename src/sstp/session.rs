@@ -232,8 +232,18 @@ async fn writer(
             }
         }
         if !batch.is_empty() {
-            write.write_all(&batch).await?;
-            write.flush().await?;
+            // A write parked on a socket whose interface is gone would hold
+            // this task, its TLS state and the batch until the kernel gave
+            // up on the connection, minutes later on a phone; the session
+            // is dead by then and has a successor.
+            tokio::select! {
+                biased;
+                _ = state.dead() => return Ok(()),
+                written = async {
+                    write.write_all(&batch).await?;
+                    write.flush().await
+                } => written?,
+            }
         }
     }
 }
@@ -263,8 +273,13 @@ async fn goodbye(write: &mut WriteHalf<TlsStream>, state: &SessionState) -> io::
     out.extend_from_slice(&packet::data_header(terminate.len()));
     out.extend_from_slice(&terminate);
     out.extend_from_slice(&packet::bare_control(message::CALL_DISCONNECT));
-    write.write_all(&out).await?;
-    write.flush().await?;
+    // Bounded like the wait: a goodbye to a server that is gone must not
+    // outlive the stop.
+    let _ = tokio::time::timeout(STOP_WAIT, async {
+        write.write_all(&out).await?;
+        write.flush().await
+    })
+    .await;
     let _ = tokio::time::timeout(STOP_WAIT, state.dead()).await;
     write.shutdown().await
 }

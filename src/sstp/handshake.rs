@@ -29,10 +29,11 @@ const MAX_HTTP_HEADER: usize = 8192;
 
 pub type TlsStream = CryptoTlsStream<Box<dyn AsyncStream>>;
 
-/// Everything the handshake needs, built once per connector.
+/// Everything the handshake needs, built once per connector; the server's
+/// address is resolved per build and passed beside it.
 pub struct Settings {
-    pub server: SocketAddr,
-    /// The `Host` header: the configured hostname, or the address.
+    pub address: crate::address::NetLocation,
+    /// The `Host` header: the configured hostname, or the literal.
     pub host: String,
     pub tls: Arc<rustls::ClientConfig>,
     pub server_name: rustls::pki_types::ServerName<'static>,
@@ -52,33 +53,27 @@ pub struct Established {
     pub link: Link,
 }
 
-pub async fn establish(settings: &Settings) -> io::Result<Established> {
-    match tokio::time::timeout(NEGOTIATION_TIMEOUT, run(settings)).await {
+pub async fn establish(settings: &Settings, server: SocketAddr) -> io::Result<Established> {
+    match tokio::time::timeout(NEGOTIATION_TIMEOUT, run(settings, server)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "SSTP: no link to {} within {} s",
-                settings.server,
+                server,
                 NEGOTIATION_TIMEOUT.as_secs()
             ),
         )),
     }
 }
 
-async fn run(settings: &Settings) -> io::Result<Established> {
-    let context = |e: io::Error| {
-        io::Error::new(
-            e.kind(),
-            format!("SSTP: connecting to {}: {e}", settings.server),
-        )
-    };
-    let socket = crate::socket_util::new_tcp_socket(
-        settings.bind_interface.as_deref(),
-        settings.server.is_ipv6(),
-    )
-    .map_err(context)?;
-    let tcp = socket.connect(settings.server).await.map_err(context)?;
+async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established> {
+    let context =
+        |e: io::Error| io::Error::new(e.kind(), format!("SSTP: connecting to {}: {e}", server));
+    let socket =
+        crate::socket_util::new_tcp_socket(settings.bind_interface.as_deref(), server.is_ipv6())
+            .map_err(context)?;
+    let tcp = socket.connect(server).await.map_err(context)?;
     if settings.no_delay {
         tcp.set_nodelay(true).map_err(context)?;
     }
@@ -131,7 +126,7 @@ async fn run(settings: &Settings) -> io::Result<Established> {
         if let Some(link) = ppp.link() {
             info!(
                 "SSTP: connected to {}: address {}, MTU {}, DNS {:?}",
-                settings.server,
+                server,
                 link.address,
                 link.peer_mru.min(settings.mtu),
                 link.dns

@@ -605,8 +605,13 @@ impl Ppp {
         let mut method = None;
         for (kind, value) in &options {
             match *kind {
+                // Above MAX_MRU the peer may send what an SSTP packet cannot
+                // hold anyway; this side never sends more than that, and a
+                // Protocol-Reject sized by it must fit a packet.
                 lcp_option::MRU => match <[u8; 2]>::try_from(value.as_slice()) {
-                    Ok(v) if u16::from_be_bytes(v) >= MIN_MRU => mru = u16::from_be_bytes(v),
+                    Ok(v) if u16::from_be_bytes(v) >= MIN_MRU => {
+                        mru = u16::from_be_bytes(v).min(MAX_MRU)
+                    }
                     _ => nak.push((*kind, MIN_MRU.to_be_bytes().to_vec())),
                 },
                 lcp_option::AUTH_PROTOCOL => {
@@ -1319,6 +1324,40 @@ mod tests {
             );
             assert_eq!(&packet.data[..2], rejected.to_be_bytes());
         }
+    }
+
+    /// A server naming an MRU past what an SSTP packet holds gets it bounded,
+    /// so a Protocol-Reject echoing the largest frame still fits a packet:
+    /// `data_header` wraps a longer one into a length the peer misreads.
+    #[test]
+    fn a_huge_peer_mru_is_bounded_so_a_reject_fits_a_packet() {
+        let mut ppp = Ppp::new(credentials(), vec![AuthMethod::MsChapV2], 1500);
+        let now = Instant::now();
+        let request = ppp.start(now);
+        let (_, _, id, _) = reply(&request, 0);
+        ppp.input(
+            &lcp(
+                code::CONFIGURE_REQUEST,
+                1,
+                &vec![
+                    (lcp_option::MRU, 65535u16.to_be_bytes().to_vec()),
+                    (lcp_option::AUTH_PROTOCOL, vec![0xc2, 0x23, 0x81]),
+                ],
+            ),
+            now,
+        )
+        .unwrap();
+        ppp.input(&lcp(code::CONFIGURE_ACK, id, &Options::new()), now)
+            .unwrap();
+        assert_eq!(ppp.peer_mru, MAX_MRU);
+
+        let biggest = frame(0x8057, &vec![0xab; usize::from(MAX_MRU)]);
+        let out = ppp.input(&biggest, now).unwrap();
+        assert!(
+            out[0].len() <= crate::sstp::packet::MAX_PACKET_LEN - crate::sstp::packet::HEADER_LEN,
+            "{} bytes of reply cannot be framed",
+            out[0].len()
+        );
     }
 
     #[test]

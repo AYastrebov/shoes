@@ -31,21 +31,6 @@ use crate::tcp::terminal_connector::TerminalConnector;
 /// is down or refusing the credentials, short enough to notice it is back.
 const REBUILD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Everything needed to dial, fixed when the outbound is built; the server's
-/// address is resolved on each build.
-struct Template {
-    address: NetLocation,
-    host: String,
-    tls: Arc<rustls::ClientConfig>,
-    server_name: rustls::pki_types::ServerName<'static>,
-    bind_interface: Option<String>,
-    no_delay: bool,
-    username: String,
-    password: crate::config::Redacted<String>,
-    methods: Vec<AuthMethod>,
-    mtu: u16,
-}
-
 struct Live {
     state: Arc<SessionState>,
     request_tx: mpsc::Sender<NetStackRequest>,
@@ -75,7 +60,7 @@ struct ConnectorState {
 }
 
 pub struct SstpConnector {
-    template: Template,
+    template: Settings,
     state: Mutex<ConnectorState>,
 }
 
@@ -94,11 +79,23 @@ impl SstpConnector {
         bind_interface: Option<String>,
         no_delay: bool,
     ) -> std::io::Result<Self> {
-        let hostname = address.address().hostname().map(str::to_string);
-        let host = hostname
-            .clone()
-            .unwrap_or_else(|| address.address().to_string());
-        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&host))?;
+        // The `Host` header: the name, or the literal, which for IPv6 needs
+        // its brackets (RFC 7230 §5.4).
+        let host = match address.address().hostname() {
+            Some(name) => name.to_string(),
+            None => {
+                let literal = address.address().to_string();
+                if literal.contains(':') {
+                    format!("[{literal}]")
+                } else {
+                    literal
+                }
+            }
+        };
+        // The name the certificate is checked against is the bare hostname
+        // or literal: rustls takes an IPv6 literal without brackets.
+        let bare = address.address().to_string();
+        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&bare))?;
         let methods = config
             .auth
             .iter()
@@ -108,7 +105,7 @@ impl SstpConnector {
             })
             .collect();
         Ok(SstpConnector {
-            template: Template {
+            template: Settings {
                 address,
                 host,
                 tls,
@@ -198,19 +195,7 @@ impl SstpConnector {
     async fn build(&self, resolver: &Arc<dyn Resolver>) -> std::io::Result<Live> {
         let t = &self.template;
         let server = resolver::resolve_single_address(resolver, &t.address).await?;
-        let settings = Settings {
-            server,
-            host: t.host.clone(),
-            tls: t.tls.clone(),
-            server_name: t.server_name.clone(),
-            bind_interface: t.bind_interface.clone(),
-            no_delay: t.no_delay,
-            username: t.username.clone(),
-            password: t.password.clone(),
-            methods: t.methods.clone(),
-            mtu: t.mtu,
-        };
-        let established = handshake::establish(&settings).await?;
+        let established = handshake::establish(t, server).await?;
         let mtu = established.link.peer_mru.min(t.mtu);
 
         let (ip_to_tunnel_tx, ip_to_tunnel_rx) =
@@ -261,8 +246,14 @@ async fn resolve_target(
     target: &ResolvedLocation,
 ) -> std::io::Result<SocketAddr> {
     let addresses = match target.resolved_addr() {
-        Some(addr) => vec![addr],
-        None => resolver::resolve_addresses(resolver, target.location()).await?,
+        // The rule engine resolves a name to match it against an IP mask and
+        // keeps the first address, which on a dual-stack host is an IPv6
+        // one; the name may have IPv4 addresses too. A literal has only
+        // itself.
+        Some(addr) if addr.is_ipv4() || target.location().address().hostname().is_none() => {
+            vec![addr]
+        }
+        _ => resolver::resolve_addresses(resolver, target.location()).await?,
     };
     addresses
         .iter()
@@ -320,5 +311,44 @@ impl TerminalConnector for SstpConnector {
             .map_err(|_| stopped())?;
         let stream = reply_rx.await.map_err(|_| stopped())??;
         Ok(Box::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SstpClientConfig {
+        SstpClientConfig {
+            username: "alice".into(),
+            password: "pw".to_string().into(),
+            auth: vec![SstpAuthMethod::Mschapv2],
+            mtu: 1280,
+            tls: crate::config::SstpTlsConfig::default(),
+        }
+    }
+
+    /// RFC 7230 §5.4: an IPv6 literal in `Host` keeps its brackets. A
+    /// hostname and an IPv4 literal are themselves.
+    #[test]
+    fn the_host_header_brackets_an_ipv6_literal() {
+        for (address, host) in [
+            ("vpn.example.com:443", "vpn.example.com"),
+            ("192.0.2.1:443", "192.0.2.1"),
+            ("[2001:db8::1]:443", "[2001:db8::1]"),
+        ] {
+            let location = NetLocation::from_str(address, None).unwrap();
+            let connector = SstpConnector::new(location, config(), None, true).unwrap();
+            assert_eq!(connector.template.host, host, "{address}");
+            let literal = !host.starts_with('v');
+            assert_eq!(
+                matches!(
+                    connector.template.server_name,
+                    rustls::pki_types::ServerName::IpAddress(_)
+                ),
+                literal,
+                "{address}: a literal is verified as an IP address, a name as a DNS name"
+            );
+        }
     }
 }
