@@ -252,14 +252,31 @@ impl SstpConnector {
     }
 }
 
+/// The destination's IPv4 address. The session negotiated IPv4 only, so a
+/// name is answered with its first IPv4 address, not its first address: a
+/// live run's first request resolved to an IPv6 address the tunnel could
+/// not carry, though the name had IPv4 ones too.
 async fn resolve_target(
     resolver: &Arc<dyn Resolver>,
     target: &ResolvedLocation,
 ) -> std::io::Result<SocketAddr> {
-    if let Some(addr) = target.resolved_addr() {
-        return Ok(addr);
-    }
-    resolver::resolve_single_address(resolver, target.location()).await
+    let addresses = match target.resolved_addr() {
+        Some(addr) => vec![addr],
+        None => resolver::resolve_addresses(resolver, target.location()).await?,
+    };
+    addresses
+        .iter()
+        .copied()
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "SSTP carries IPv4 only, and {} has no IPv4 address",
+                    target.location()
+                ),
+            )
+        })
 }
 
 fn stopped() -> std::io::Error {

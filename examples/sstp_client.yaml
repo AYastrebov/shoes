@@ -20,6 +20,9 @@
             # The default. Add 'pap' only if the server offers nothing else:
             # it sends the password in the clear inside TLS.
             auth: [mschapv2]
+            # The default, IPv6's minimum. Raise it only for a server known
+            # to carry more: shoes cannot discover a smaller path MTU.
+            mtu: 1280
             tls:
               # A server with a self-signed certificate is reached by pinning
               # its SHA-256 fingerprint instead of verifying a chain.

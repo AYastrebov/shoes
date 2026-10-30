@@ -413,7 +413,7 @@ client_chain:
       password: "a strong password"
       # Optional, shown with their defaults:
       auth: [mschapv2]             # also: pap. Listed in order of preference
-      mtu: 1500
+      mtu: 1280
       tls:
         verify: true
         sni_hostname: "vpn.example.com"   # default: the host in `address`
@@ -425,7 +425,7 @@ client_chain:
 | `username` | required | 1 to 256 ASCII characters, no NUL (RFC 2759 §4: "0 to (theoretically) 256 case-sensitive ASCII characters"; empty is refused because no server accepts it) |
 | `password` | required | `Redacted<String>`. At most 256 UTF-16 code units (RFC 2759 §4) |
 | `auth` | `[mschapv2]` | Non-empty, no duplicates, from `mschapv2` and `pap`. PAP is never used unless listed |
-| `mtu` | 1500 | 576 to 1500. See Performance for why not more, and for the floor |
+| `mtu` | 1280 | 576 to 1500. See Performance for the default, for why not more, and for the floor |
 | `tls.verify` | `true` | `false` without `server_fingerprints` is refused: "SSTP would send your credentials to any server that answers; pin its certificate with server_fingerprints or leave verify on" |
 | `tls.sni_hostname` | the host in `address` | Same handling as the `tls` client's field |
 | `tls.server_fingerprints` | none | Same format and parser as the `tls` client's (`process_fingerprints`, `src/rustls_config_util.rs:317`) |
@@ -576,7 +576,16 @@ The netstack's socket buffers are AmneziaWG's, sized per platform by
 inner connection's receive window and send window against a server on the
 internet.
 
-**The MTU is 1500 by default, and larger is not offered.**
+**The MTU is 1280 by default, and above 1500 is not offered.**
+- 1280 rather than 1500, changed after the first live run. That server
+  offered an MRU of 1350, and every packet toward one large site over about
+  1280 bytes vanished with no ICMP: its uplink was presumably a tunnel.
+  TLS handshakes stalled; 1280 worked and 1300 did not. An OS TCP stack
+  would discover the path MTU; smoltcp does none, so the client must not
+  rely on one. 1280 is the MTU every IPv6 path must carry. Clearing Don't
+  Fragment on what the client sends was tried and did not help, which
+  places the loss on packets toward the client, sized by the MSS it
+  advertises.
 - The device MTU is the smaller of the configured `mtu` and the server's
   MRU, so the client never sends a frame the server would refuse.
 - An inner MTU above 1500 would cut per-packet costs only if segments grew
@@ -749,6 +758,37 @@ the repository.
 | SoftEther in a container | Handshake, both auth methods, `HUB\user`, MRU Nak to 1500, its echo cadence, data |
 | accel-ppp with `/dev/ppp`, in a privileged container, hash SHA-1 and SHA-256 configured, certificate hash checking on | Crypto binding, both hashes. A `DOMAIN\user` name, to settle the disagreement recorded above |
 | Windows Server RRAS, by hand when one is available | The implementation the protocol is defined by. Not a merge gate, because CI cannot run it. The gap is recorded in ROADMAP if it is not run |
+
+**Verified against a real server (2026-10-30).** A production SSTP server
+the user supplied, with a Let's Encrypt certificate (so `verify` on, no
+pin), MS-CHAPv2, and a Call Connect Ack offering SHA-256; behind a
+round-robin name, two server addresses served the run. No details of it
+enter the repository. What worked:
+- the whole handshake, every time: TLS, the HTTP request, call setup, LCP,
+  MS-CHAPv2 with the server's proof checked, Call Connected with the
+  SHA-256 binding (accepted), IPCP with an address and one DNS server;
+- HTTPS to a spread of sites, several connections at once over one
+  session, a DNS query over UDP through SOCKS5;
+- 100 MB downloads at 3.0 to 5.0 MB/s on the release build, with shoes at
+  7% of a core; the path from the test machine to that server, not shoes,
+  is the ceiling, though no second SSTP client was run to prove it.
+
+What it found, both fixed before the PR:
+- **Names resolved to IPv6 first.** The connector took the resolver's first
+  address, an IPv6 one, which an IPv4-only session cannot carry. It now
+  takes the first IPv4 address and says so when a name has none
+  (`a_name_is_reached_at_its_ipv4_address`).
+- **A path-MTU black hole.** The server offered an MRU of 1350; packets
+  toward one large site over about 1280 bytes vanished with no ICMP, so
+  every TLS handshake to it stalled. 1280 worked, 1300 did not. Clearing
+  Don't Fragment on what the client sends was tried and did not help, so
+  the loss is on packets toward the client, sized by the MSS it advertises.
+  The default `mtu` is now 1280 (see Performance).
+
+Not settled by it: some HTTPS destinations failed at every MTU while plain
+HTTP to the same host worked. Size is ruled out; filtering on the server's
+side of the world would fit, and a second SSTP client against the same
+server is what would tell.
 
 **Performance.** `scripts/bench/tunnels.py` gains an SSTP arm against the
 accel-ppp container on loopback, with `NETEM` for delay and loss. The

@@ -208,7 +208,7 @@ protocol gap has widened along an axis that did not exist a year ago — classic
 enterprise VPN — rather than along the one this list measures. The first
 request on that axis came on 2026-10-30, for SSTP: the client is in, built
 to [docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md);
-its live runs against real servers are still to come. OpenVPN and OpenConnect remain unasked for.
+it has been run against a production server, and its runs against SoftEther and accel-ppp are still to come. OpenVPN and OpenConnect remain unasked for.
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,

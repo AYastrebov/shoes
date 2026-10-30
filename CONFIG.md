@@ -1066,7 +1066,7 @@ protocol:
   username: string             # DOMAIN\user for a Windows domain account
   password: string
   auth: [mschapv2]             # Default: [mschapv2]. Also 'pap'; in order of preference
-  mtu: 1500                    # Default: 1500. Between 576 and 1500
+  mtu: 1280                    # Default: 1280. Between 576 and 1500
   tls:                         # Optional
     verify: true               # Default: true
     sni_hostname: string?      # Default: the host in `address`; "" sends none
@@ -1092,6 +1092,13 @@ whoever terminates it, and is used only when listed. EAP, MS-CHAPv1 and
 CHAP-MD5 are not implemented; a server that insists on one fails with its
 name. SoftEther proposes EAP first and moves to MS-CHAPv2 when refused, and
 it reads a `HUB\user` username as the virtual hub to log into.
+
+`mtu` is the largest IP packet either side sends; the server can lower it
+further. The default is 1280, IPv6's minimum, rather than the 1500 most
+servers offer: a server whose uplink is itself a tunnel can offer more than
+its far side carries, and shoes' userspace TCP does no path MTU discovery to
+find out, so oversized packets vanish and connections stall mid-handshake.
+Raise it only for a server known to carry more.
 
 `tcp_settings.no_delay` (default on) and `bind_interface` apply to the TCP
 connection; `transport` is refused.

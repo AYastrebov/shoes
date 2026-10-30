@@ -264,3 +264,55 @@ async fn a_burst_of_packets_shares_tls_records() {
         "{packets} packets took {records} records"
     );
 }
+
+/// Answers every name with an IPv6 address first, as a dual-stack host's
+/// resolver often does.
+#[derive(Debug)]
+struct SixFirst;
+
+impl Resolver for SixFirst {
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+    {
+        let port = location.port();
+        let v4 = location.address().hostname() == Some("dual.test");
+        Box::pin(async move {
+            let mut out = vec![SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], port))];
+            if v4 {
+                out.push(SocketAddr::new(IpAddr::V4(SERVER_IP), port));
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// The tunnel is IPv4 only, so a name is reached at its IPv4 address even
+/// when the resolver lists an IPv6 one first, and a name with none is
+/// refused by saying so. The first live run failed on exactly the first.
+#[tokio::test]
+async fn a_name_is_reached_at_its_ipv4_address() {
+    let server = testing::start(Options::default()).await;
+    let connector = connector(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let resolver: Arc<dyn Resolver> = Arc::new(SixFirst);
+    let dual = ResolvedLocation::new(NetLocation::from_str("dual.test", Some(ECHO_PORT)).unwrap());
+    let mut stream = connector
+        .connect_tcp(&resolver, dual)
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"v4").await.unwrap();
+    let mut back = [0u8; 2];
+    stream.read_exact(&mut back).await.unwrap();
+    assert_eq!(&back, b"v4");
+
+    let six_only =
+        ResolvedLocation::new(NetLocation::from_str("six.test", Some(ECHO_PORT)).unwrap());
+    let err = connector
+        .connect_tcp(&resolver, six_only)
+        .await
+        .err()
+        .expect("an IPv6-only name cannot be reached");
+    assert!(err.to_string().contains("IPv4 only"), "{err}");
+}

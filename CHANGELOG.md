@@ -20,6 +20,14 @@ RFC 3079 print and against sstp-client's test data, one case of which is a
 capture from Windows itself. End-to-end tests run against an in-process
 server that checks the binding the way accel-ppp does.
 
+A first run against a production SSTP server worked end to end and found two
+defects, both fixed. Names resolved to an IPv6 address first, which the
+IPv4-only tunnel cannot carry, so the first IPv4 address is now used. A
+path-MTU black hole behind the server stalled TLS handshakes to one large
+site at the server's MRU of 1350, so `mtu` now defaults to 1280, IPv6's
+minimum: shoes' userspace TCP does no path MTU discovery to find a smaller
+path out.
+
 A network change now reaches a registry of listeners, `src/network_change.rs`,
 instead of AmneziaWG's endpoint sockets alone. An SSTP session ends at once
 on one: its TCP connection cannot outlive the interface.

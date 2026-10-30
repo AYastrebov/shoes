@@ -438,7 +438,13 @@ fn is_default_sstp_auth(auth: &[SstpAuthMethod]) -> bool {
     auth == [SstpAuthMethod::Mschapv2]
 }
 
-pub const DEFAULT_SSTP_MTU: u16 = 1500;
+/// IPv6's minimum MTU, which every path must carry. A server whose own
+/// uplink is a tunnel offers an MRU its far side cannot carry: the first
+/// live run's server offered 1350, and every packet over about 1280 toward
+/// one large site vanished without an ICMP, so its TLS handshakes stalled.
+/// smoltcp does no path MTU discovery to find that out. 1280 against 1350
+/// is about 5% more packets; the alternative is dead connections.
+pub const DEFAULT_SSTP_MTU: u16 = 1280;
 
 fn default_sstp_mtu() -> u16 {
     DEFAULT_SSTP_MTU
