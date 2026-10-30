@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Documentation only. `MOBILE.md` now says what makes the stopped callback
+fire: the AmneziaWG liveness watchdog, the AmneziaWG receive-error streak,
+or the service task failing or ending on its own, and that a stream
+outbound never triggers it, since a server outage only fails connections.
+The first consumer of the 0.9.0 listener had to guess that a VLESS outage
+leaving the engine running was expected; it is.
+
 `shoesd` on macOS keeps a network's search domains while a session is up.
 Applying DNS wrote a dictionary holding only the tunnel's resolvers to the
 service's `State:` and `Setup:` keys, so the lease's `DomainName` and the

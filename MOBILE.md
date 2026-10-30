@@ -260,6 +260,21 @@ the slot in that window.
   is refused with a reason. On Android it attaches that thread to the JVM as
   the traffic callback does, and an exception the listener throws is cleared
   there, since no Java frame is above it to take it.
+- What makes the stopped callback fire. The engine stops on its own in
+  three cases only: the AmneziaWG liveness watchdog gives up (traffic kept
+  going out, nothing came back, a rebind during the silence succeeded, and
+  the silence then lasted 90 seconds; `src/amneziawg/tunnel.rs`,
+  `SILENCE_FATAL_TICKS`), the AmneziaWG receive path produces 100 errors in
+  a row (`RECV_ERROR_FATAL_STREAK`, about five seconds with the backoff), or
+  the service task itself fails or returns without being asked
+  (`src/control/mod.rs`, `ExitReason`). AmneziaWG is the only outbound that
+  reports a fatal condition, because a tunnel that cannot hear its peer is a
+  VPN that is down while looking up. A stream outbound -- VLESS, Trojan,
+  Shadowsocks and the rest, over TCP or QUIC -- has no session-level
+  liveness: a server outage fails each connection as it is made and the
+  engine keeps running, so the next connection succeeds once the server is
+  back. A host that wants a "degraded" state for those builds it from the
+  stats document, not from this callback, which will not come.
 
 ## Example configs
 
