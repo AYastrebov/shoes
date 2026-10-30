@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Documentation only. A specification for an SSTP client outbound,
+`docs/specs/2026-10-30-sstp-client-outbound.md`. It is written from
+[MS-SSTP] and read against four implementations: Open-SSTP-Client,
+sstp-client, SoftEther and accel-ppp. Among the points it settles:
+- the CMK length is little-endian;
+- RFC 2759 strips the domain from the MS-CHAPv2 challenge hash, which
+  accel-ppp does not;
+- SoftEther does not check crypto binding, so accel-ppp is the live peer
+  that proves it.
+
+Its performance section batches packets into TLS records, never drops a
+packet between the inner TCP and the socket, and puts
+`TCP_NOTSENT_LOWAT` to a measured A/B. Nothing is implemented yet.
+
 Documentation only. `MOBILE.md` now says what makes the stopped callback
 fire: the AmneziaWG liveness watchdog, the AmneziaWG receive-error streak,
 or the service task failing or ending on its own, and that a stream

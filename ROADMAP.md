@@ -205,9 +205,10 @@ That framing needs one update, though. sing-box 1.14 stopped being only a
 circumvention proxy: it added an **OpenVPN client *and server*, an OpenConnect
 client**, Snell, and a `bridge` outbound doing layer-3 forwarding. So the
 protocol gap has widened along an axis that did not exist a year ago — classic
-enterprise VPN — rather than along the one this list measures. Whether that
-axis matters to us is a product question nobody has asked yet; it is worth
-asking before it answers itself.
+enterprise VPN — rather than along the one this list measures. The first
+request on that axis came on 2026-10-30, for SSTP: a client is specified in
+[docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md)
+and not yet started. OpenVPN and OpenConnect remain unasked for.
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
