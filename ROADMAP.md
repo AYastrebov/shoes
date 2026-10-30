@@ -206,16 +206,16 @@ circumvention proxy: it added an **OpenVPN client *and server*, an OpenConnect
 client**, Snell, and a `bridge` outbound doing layer-3 forwarding. So the
 protocol gap has widened along an axis that did not exist a year ago — classic
 enterprise VPN — rather than along the one this list measures. The first
-request on that axis came on 2026-10-30, for SSTP: a client is specified in
-[docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md)
-and not yet started. OpenVPN and OpenConnect remain unasked for.
+request on that axis came on 2026-10-30, for SSTP: the client is in, built
+to [docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md);
+its live runs against real servers are still to come. OpenVPN and OpenConnect remain unasked for.
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
 TLS, WebSocket, HTTPUpgrade.
 
 Client: Direct, HTTP, SOCKS5, Shadowsocks, Snell, VMess, VLESS, Trojan, AnyTLS,
-NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1,
+NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1, SSTP,
 port-forward, plus TLS, Reality, ShadowTLS, WebSocket and HTTPUpgrade as
 wrapping layers.
 

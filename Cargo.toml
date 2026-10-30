@@ -139,6 +139,7 @@ dashmap = "6"
 # Pinned to the major: shake 0.1 implements digest 0.11's XofReader, and a
 # wildcard let a re-resolution flip this to 0.10, where the trait does not
 # match and vmess_stream stops compiling. Found during the 0.2.10 release.
+des = "0.9"
 digest = "0.11"
 etherparse = "0.21"
 # rust_backend rather than the default: the C zlib would add a C toolchain
@@ -159,6 +160,9 @@ libc = "0.2"
 log = { version = "0.4", features = ["std", "release_max_level_info"] }
 lru = "0.19"
 md-5 = "0.11"
+# MS-CHAPv2 (RFC 2759) for SSTP: MD4 for the NT password hash, single DES
+# for the challenge response. Both are what the protocol is, not a choice.
+md4 = "0.11"
 memchr = "2"
 mime_guess = "2"
 notify = "8"
@@ -212,6 +216,8 @@ tokio-util = { version = "0.7", features = ["rt", "time"] }
 url = "2"
 webpki-roots = { version = "1" }
 x509-parser = { version = "0.18", default-features = false, features = ["verify-aws"] }
+# Clears the MS-CHAPv2 and SSTP key material on drop.
+zeroize = "1"
 
 # Optional so that only a `--features daemon` build compiles it: a build
 # dependency costs build time on every target otherwise, including the mobile

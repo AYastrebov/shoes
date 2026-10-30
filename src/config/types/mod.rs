@@ -33,9 +33,9 @@ pub mod wg;
 // Re-export all public types for convenience
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
-    HttpUpgradeClientConfig, Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig,
-    TuicClientConfig, TuicCongestionControl, TuicUdpRelayMode, WebsocketClientConfig,
-    WireGuardClientConfig,
+    HttpUpgradeClientConfig, Hysteria2ClientConfig, MieruClientConfig, SstpAuthMethod,
+    SstpClientConfig, SstpTlsConfig, TlsClientConfig, TuicClientConfig, TuicCongestionControl,
+    TuicUdpRelayMode, WebsocketClientConfig, WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{

@@ -189,6 +189,15 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
             )
             .expect("the uuid was validated during config load"),
         ),
+        ClientProxyConfig::Sstp(sstp) => Arc::new(
+            crate::sstp::SstpConnector::new(
+                config.address,
+                *sstp,
+                config.bind_interface.into_option(),
+                config.tcp_settings.unwrap_or_default().no_delay,
+            )
+            .expect("the TLS settings were validated during config load"),
+        ),
         protocol => {
             let connector =
                 crate::amneziawg::AmneziaWgConnector::from_client_config(protocol, config.address)

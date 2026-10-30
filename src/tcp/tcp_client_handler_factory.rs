@@ -475,7 +475,8 @@ pub fn create_tcp_client_handler(
         other @ (ClientProxyConfig::Wireguard(..)
         | ClientProxyConfig::AmneziaWg(..)
         | ClientProxyConfig::Hysteria2(..)
-        | ClientProxyConfig::Tuic(..)) => {
+        | ClientProxyConfig::Tuic(..)
+        | ClientProxyConfig::Sstp(..)) => {
             panic!(
                 "{} owns its transport and should not use TcpClientHandler. \
                     It must be handled as a TerminalConnector in the chain builder.",

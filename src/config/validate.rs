@@ -1424,7 +1424,10 @@ fn validate_client_config(
                 format!("{proto} uses its own transport. Do not set 'transport'."),
             ));
         }
-        if client_config.tcp_settings.is_some() {
+        // SSTP's transport is TCP, so its socket settings apply to it.
+        if client_config.tcp_settings.is_some()
+            && !matches!(client_config.protocol, ClientProxyConfig::Sstp(_))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("tcp_settings is not valid for {proto} protocol."),
@@ -1432,6 +1435,10 @@ fn validate_client_config(
         }
         // quic_settings needs no check here: a tunnel protocol never selects
         // 'transport: quic', so the QUIC block above has already rejected it.
+    }
+
+    if let ClientProxyConfig::Sstp(sstp) = &mut client_config.protocol {
+        validate_sstp(sstp)?;
     }
 
     match &client_config.protocol {
@@ -1499,6 +1506,13 @@ fn validate_client_config(
                 ));
             }
         }
+        ClientProxyConfig::Tls(tls) if matches!(*tls.protocol, ClientProxyConfig::Sstp(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSTP does its own TLS; put the settings under the sstp protocol's tls block \
+                 instead of wrapping it in a tls layer.",
+            ));
+        }
         ClientProxyConfig::Tuic(tuic) => {
             if tuic.heartbeat_ms == 0 {
                 return Err(std::io::Error::new(
@@ -1539,6 +1553,55 @@ fn validate_obfs_config(obfs: Option<&ObfsConfig>) -> std::io::Result<()> {
                 "Obfuscation password must be at least {MIN_OBFS_PASSWORD_LEN} bytes; \
                  the reference implementation rejects anything shorter."
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// The SSTP outbound's fields, against the limits the spec's Configuration
+/// table names (docs/specs/2026-10-30-sstp-client-outbound.md).
+fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<()> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    // RFC 2759 §4: "0 to (theoretically) 256 case-sensitive ASCII
+    // characters"; empty is refused because no server accepts it.
+    if sstp.username.is_empty() || sstp.username.len() > 256 {
+        return Err(invalid("SSTP username must be 1 to 256 characters.".into()));
+    }
+    if !sstp.username.is_ascii() || sstp.username.contains('\0') {
+        return Err(invalid(
+            "SSTP username must be ASCII (RFC 2759 §4), without NUL.".into(),
+        ));
+    }
+    // RFC 2759 §4: up to 256 Unicode characters, counted as UTF-16 units
+    // because that is what MS-CHAPv2 hashes.
+    let password = sstp.password.expose();
+    if password.is_empty() || password.encode_utf16().count() > 256 {
+        return Err(invalid("SSTP password must be 1 to 256 characters.".into()));
+    }
+    if sstp.auth.is_empty() {
+        return Err(invalid(
+            "SSTP auth must list at least one method: mschapv2, pap.".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !sstp.auth.iter().all(|method| seen.insert(*method)) {
+        return Err(invalid("SSTP auth lists a method twice.".into()));
+    }
+    // Above 1500 buys TCP nothing (the far host's MSS bounds segments) and
+    // SoftEther caps the MRU at 1500; below 576 is under IPv4's minimum
+    // reassembly size.
+    if !(576..=1500).contains(&sstp.mtu) {
+        return Err(invalid(format!(
+            "SSTP mtu must be between 576 and 1500, not {}.",
+            sstp.mtu
+        )));
+    }
+    validate_server_fingerprints(&mut sstp.tls.server_fingerprints)?;
+    if !sstp.tls.verify && sstp.tls.server_fingerprints.is_unspecified() {
+        return Err(invalid(
+            "SSTP would send your credentials to any server that answers; pin its \
+             certificate with tls.server_fingerprints or leave tls.verify on."
+                .into(),
         ));
     }
     Ok(())
@@ -2408,8 +2471,8 @@ fn validate_amneziawg_chain_position(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Chain {}: WireGuard/AmneziaWG must be the only hop in a chain. \
-                 Multi-hop chains are not supported.",
+                "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
+                 Hysteria2, TUIC, SSTP) must be the only hop in a chain.",
                 chain_index
             ),
         ));
@@ -2425,7 +2488,8 @@ fn validate_amneziawg_chain_position(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Chain {}: WireGuard/AmneziaWG cannot be mixed with other protocols in a pool.",
+                    "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
+                     Hysteria2, TUIC, SSTP) cannot be mixed with other protocols in a pool.",
                     chain_index
                 ),
             ));

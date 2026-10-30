@@ -709,11 +709,12 @@ the way `src/quic_outbound/testing.rs` serves Hysteria2 and TUIC.
   MS-CHAPv2 and PAP, and IPCP assigning `10.99.0.2`.
 - **It checks crypto binding as accel-ppp does.** It recomputes the
   Compound MAC from the server HLAK `MasterReceiveKey | MasterSendKey`.
-- **IP termination.** Packets it decapsulates go into shoes' own TUN stack
-  through a channel-backed `StackDevice` (`src/tun/stack_common.rs:566`,
-  shaped like the `ScriptedDevice` test double at `:1842`). That stack
-  dials the loopback echo servers, which makes the double a real VPN
-  server in miniature.
+- **IP termination.** Packets it decapsulates go into a small smoltcp
+  interface at the server's address that echoes TCP and UDP, which makes the
+  double a VPN server in miniature. (This was to have been shoes' own TUN
+  stack through a channel-backed `StackDevice`; `src/tun/` compiles only for
+  the mobile targets and `--features ffi`, so the default test build could
+  not run it.)
 - **Construction.** The selector is built with
   `create_tcp_client_proxy_selector`, as production builds it.
 

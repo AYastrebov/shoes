@@ -52,6 +52,19 @@ pub fn notify() -> usize {
     count
 }
 
+/// Whether `listener` is in the registry. A test's way to check that a
+/// tunnel registered itself without calling [`notify`], which would reach
+/// every other test's tunnels too: tests run as threads of one process.
+#[cfg(test)]
+pub fn is_registered(listener: &std::sync::Arc<dyn NetworkChangeListener>) -> bool {
+    let target = std::sync::Arc::downgrade(listener);
+    LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|weak| weak.ptr_eq(&target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

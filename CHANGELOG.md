@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+An SSTP client outbound (`type: sstp`): Microsoft's PPP over HTTPS, as
+Windows RRAS, MikroTik, SoftEther, accel-ppp and some routers serve it.
+Like WireGuard it is a layer-3 tunnel and the only hop in its chain. One
+session per hop carries every TCP and UDP connection through the smoltcp
+stack AmneziaWG uses, now shared as `src/netstack.rs`. What it does:
+- MS-CHAPv2, with the server's proof checked in constant time, or PAP
+  when listed;
+- crypto binding with SHA-256 or SHA-1;
+- IPv4 through IPCP;
+- certificate pinning through `tls.server_fingerprints`.
+
+The writer drains every queued packet into one TLS write, so a burst shares
+a record; the reader never drops a packet, so the outer TCP's flow control
+does the pacing. The crypto is checked against the vectors RFC 2759 and
+RFC 3079 print and against sstp-client's test data, one case of which is a
+capture from Windows itself. End-to-end tests run against an in-process
+server that checks the binding the way accel-ppp does.
+
+A network change now reaches a registry of listeners, `src/network_change.rs`,
+instead of AmneziaWG's endpoint sockets alone. An SSTP session ends at once
+on one: its TCP connection cannot outlive the interface.
+
 Documentation only. A specification for an SSTP client outbound,
 `docs/specs/2026-10-30-sstp-client-outbound.md`. It is written from
 [MS-SSTP] and read against four implementations: Open-SSTP-Client,

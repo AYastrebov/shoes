@@ -443,25 +443,26 @@ mod tests {
         }
     }
 
+    /// The endpoint registers itself, and the listener rebinds it. Rung
+    /// directly rather than through `network_change::notify`, which would
+    /// reach every other test's tunnels too.
     #[tokio::test]
-    async fn a_network_change_reaches_a_live_endpoint_and_not_a_dropped_one() {
+    async fn a_network_change_rebinds_a_registered_endpoint() {
+        use crate::network_change::{NetworkChangeListener, is_registered};
         let (_peer_socket, peer_addr) = peer().await;
-        let dropped = EndpointSocket::connect(peer_addr).await.unwrap();
-        drop(dropped);
-
         let live = EndpointSocket::connect(peer_addr).await.unwrap();
+        let listener: Arc<dyn NetworkChangeListener> = live.clone();
+        assert!(is_registered(&listener));
         tokio::spawn(live.clone().run_rebind_task(|| {}));
         let before = live.local_addr().unwrap();
 
-        // Other tests in this binary may have live endpoints of their own, so
-        // assert on the effect rather than on the count.
-        crate::network_change::notify();
+        live.network_changed();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while live.local_addr().unwrap() == before {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the notification did not reach the live endpoint"
+                "the notification did not rebind the endpoint"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

@@ -285,6 +285,9 @@ pub struct TunnelRuntime {
     /// property under backpressure: a jammed channel keeps the netstack
     /// retrying, so demand keeps advancing even though no packet moves.
     pub outbound_offered: Arc<AtomicUsize>,
+    /// The endpoint socket, for a test that rings its listener directly.
+    #[cfg(test)]
+    endpoint: Arc<EndpointSocket>,
     /// Set when the receive path is gone -- the receive loop terminated
     /// on an error streak, or the liveness watchdog gave up on a socket
     /// that stayed silent under traffic. The engine hears about either
@@ -386,6 +389,8 @@ impl TunnelRuntime {
         // is bound to stops existing every time the device changes network.
         // See src/amneziawg/endpoint.rs.
         let udp_socket = EndpointSocket::connect(endpoint_addr).await?;
+        #[cfg(test)]
+        let test_endpoint = udp_socket.clone();
 
         info!("AmneziaWG tunnel started, endpoint={}", endpoint_addr);
 
@@ -548,6 +553,8 @@ impl TunnelRuntime {
             ip_to_tunnel_tx,
             ip_from_tunnel_rx: ParkingMutex::new(Some(ip_from_tunnel_rx)),
             outbound_offered,
+            #[cfg(test)]
+            endpoint: test_endpoint,
             dead,
             abort_handles,
         }))
@@ -1233,7 +1240,10 @@ mod tests {
 
         // Idle until the rebind: nothing has asked the tunnel to send, so
         // anything the peer receives after this is the announcement.
-        crate::network_change::notify();
+        {
+            use crate::network_change::NetworkChangeListener;
+            runtime.endpoint.network_changed();
+        }
 
         let mut buf = [0u8; 65536];
         let n = tokio::time::timeout(
