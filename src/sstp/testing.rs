@@ -97,6 +97,10 @@ pub struct Stats {
     pub early_packets: AtomicUsize,
     /// Rung to make every live session send Call Disconnect.
     pub disconnect: Notify,
+    /// Rung to make every live session send three malformed PPP frames: an
+    /// empty one, one of `FF 03` alone, and an LCP packet whose Length
+    /// field runs past it. RFC 1661 §5 has the client discard them.
+    pub garbage: Notify,
 }
 
 pub struct TestServer {
@@ -255,6 +259,13 @@ async fn serve(
             }
             _ = stats.disconnect.notified() => {
                 server.send_control(packet::bare_control(message::CALL_DISCONNECT));
+            }
+            _ = stats.garbage.notified() => {
+                for frame in [vec![], vec![0xff, 0x03], ppp::frame(protocol::LCP, &[9, 1, 0xff, 0xff])] {
+                    let mut bytes = packet::data_header(frame.len()).to_vec();
+                    bytes.extend_from_slice(&frame);
+                    server.send_control(bytes);
+                }
             }
         }
     }

@@ -381,7 +381,15 @@ impl Reader {
             self.start += len;
             match packet::parse(&self.buf[range])? {
                 Packet::Data(frame) => {
-                    let (protocol, info) = ppp::split_frame(frame)?;
+                    // RFC 1661 §5: a packet that does not parse is silently
+                    // discarded. One bad frame from the server must not end
+                    // every connection through the session; the SSTP
+                    // framing above is what keeps the stream in sync, and a
+                    // fault there still does.
+                    let Ok((protocol, info)) = ppp::split_frame(frame) else {
+                        debug!("SSTP: discarding a PPP frame with no protocol field");
+                        continue;
+                    };
                     if protocol == ppp::protocol::IPV4 {
                         // The one allocation per inbound packet: the
                         // netstack channel carries owned packets.
@@ -391,8 +399,15 @@ impl Reader {
                         }
                         continue;
                     }
-                    let frame = frame.to_vec();
-                    for reply in self.ppp.input(&frame, Instant::now())? {
+                    let replies = match self.ppp.input_parts(protocol, info, Instant::now()) {
+                        Ok(replies) => replies,
+                        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                            debug!("SSTP: discarding a PPP packet: {e}");
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    for reply in replies {
                         let mut out = Vec::with_capacity(4 + reply.len());
                         out.extend_from_slice(&packet::data_header(reply.len()));
                         out.extend_from_slice(&reply);

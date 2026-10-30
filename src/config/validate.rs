@@ -1467,6 +1467,12 @@ fn validate_client_config(
 
     if let ClientProxyConfig::Sstp(sstp) = &mut client_config.protocol {
         validate_sstp(sstp)?;
+        // With sni_hostname unset, the address's hostname is the name the
+        // certificate is checked against, and the connector unwraps it as
+        // validated: a name rustls refuses must be refused here.
+        if sstp.tls.sni_hostname.is_unspecified() {
+            validate_tls_server_name("SSTP", client_config.address.address().hostname())?;
+        }
     }
 
     match &client_config.protocol {
@@ -2867,6 +2873,41 @@ mod tests {
             config.tls.verify = false;
             config.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
             super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// With no sni_hostname, the address's hostname is what the
+        /// certificate is checked against, and the connector unwraps it as
+        /// validated; a label of 64 characters is a name rustls refuses.
+        #[test]
+        fn an_address_hostname_rustls_refuses_is_refused_at_load() {
+            use crate::address::NetLocation;
+            use crate::config::ClientConfig;
+            let mut config = ClientConfig {
+                address: NetLocation::from_str(
+                    &format!("{}.example.com:443", "a".repeat(64)),
+                    None,
+                )
+                .unwrap(),
+                protocol: ClientProxyConfig::Sstp(Box::new(sstp())),
+                ..Default::default()
+            };
+            let err = super::super::validate_client_config(
+                &mut config,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP client sni_hostname"),
+                "{err}"
+            );
+
+            // An explicit, valid sni_hostname makes the address's name moot.
+            let ClientProxyConfig::Sstp(sstp) = &mut config.protocol else {
+                panic!("sstp");
+            };
+            sstp.tls.sni_hostname = NoneOrOne::One("vpn.example.com".into());
+            super::super::validate_client_config(&mut config, &std::collections::HashMap::new())
+                .unwrap();
         }
 
         /// The secret rides the request line, so it is limited to what a

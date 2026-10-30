@@ -256,6 +256,35 @@ async fn a_network_change_ends_the_session() {
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
 }
 
+/// Three malformed PPP frames from the server are discarded, as RFC 1661
+/// §5 says, and the session and the connection through it carry on.
+#[tokio::test]
+async fn malformed_ppp_frames_are_discarded_not_fatal() {
+    let server = testing::start(Options::default()).await;
+    let connector = connector(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let mut stream = connector
+        .connect_tcp(&resolver(), echo())
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"before").await.unwrap();
+    let mut back = [0u8; 6];
+    stream.read_exact(&mut back).await.unwrap();
+
+    server.stats.garbage.notify_waiters();
+    // The frames go out ahead of the next echo on the same connection.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stream.write_all(b"after").await.unwrap();
+    let mut back = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+        .await
+        .expect("the session died on garbage")
+        .unwrap();
+    assert_eq!(&back, b"after");
+    assert!(connector.session_alive().await);
+    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 1);
+}
+
 /// A stream open when its session dies ends, rather than waiting on a
 /// netstack that is gone: the netstack closes every control it drops.
 #[tokio::test]

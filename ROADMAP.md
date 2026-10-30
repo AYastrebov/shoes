@@ -177,6 +177,18 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   then. Cost: a re-dispatch of the release workflow, or a manual publish,
   each time a fan-out job is cancelled.
 
+- **A name resolves to one address, with no say in its family** (2026-10-31,
+  the SSTP review). The rule engine resolves a name to match it against an
+  IP mask and keeps the first address in `ResolvedLocation`; nothing lets
+  a transport say which family it carries. The SSTP connector, IPv4 only,
+  resolves again when handed an IPv6 address (`src/sstp/connector.rs`,
+  `resolve_target`); AmneziaWG hands whatever it gets to a tunnel that may
+  have no address of that family. Fixing it means keeping every address in
+  `ResolvedLocation`, or a family hint on `Resolver`, and then both tunnel
+  connectors. Cost: one more resolver round trip, cached, per SSTP
+  connection to a dual-stack name, and an IPv6 destination failing inside
+  an IPv4-only AmneziaWG tunnel.
+
 ## Table of Contents
 
 - [Quality and correctness plan](#quality-and-correctness-plan)

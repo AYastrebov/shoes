@@ -169,7 +169,16 @@ async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established>
 
         match packet::parse(&raw)? {
             Packet::Data(frame) => {
-                let frames = ppp.input(frame, now)?;
+                // RFC 1661 §5: a malformed packet is discarded, not fatal;
+                // a server's retransmission follows.
+                let frames = match ppp.input(frame, now) {
+                    Ok(frames) => frames,
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                        debug!("SSTP: discarding a PPP packet during setup: {e}");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 // Authentication done: Call Connected and IPCP's first
                 // request share one write (the spec's "Performance").
                 let control = match ppp.take_authenticated() {

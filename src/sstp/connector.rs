@@ -92,6 +92,13 @@ impl SstpConnector {
                 }
             }
         };
+        // RFC 7230 §5.4: the port too, unless it is the scheme's default. A
+        // server that routes on Host would 404 without it, and a 404 here
+        // reads as camouflage.
+        let host = match address.port() {
+            443 => host,
+            port => format!("{host}:{port}"),
+        };
         // The name the certificate is checked against is the bare hostname
         // or literal: rustls takes an IPv6 literal without brackets.
         let bare = address.address().to_string();
@@ -338,6 +345,8 @@ mod tests {
             ("vpn.example.com:443", "vpn.example.com"),
             ("192.0.2.1:443", "192.0.2.1"),
             ("[2001:db8::1]:443", "[2001:db8::1]"),
+            ("vpn.example.com:8443", "vpn.example.com:8443"),
+            ("[2001:db8::1]:8443", "[2001:db8::1]:8443"),
         ] {
             let location = NetLocation::from_str(address, None).unwrap();
             let connector = SstpConnector::new(location, config(), None, true).unwrap();

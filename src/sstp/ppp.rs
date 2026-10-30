@@ -446,6 +446,18 @@ impl Ppp {
     /// packets are the session's, not this machine's.
     pub fn input(&mut self, frame: &[u8], now: Instant) -> io::Result<Vec<Vec<u8>>> {
         let (protocol, info) = split_frame(frame)?;
+        self.input_parts(protocol, info, now)
+    }
+
+    /// [`Ppp::input`] for a frame the caller has already split. An error of
+    /// kind `InvalidData` is a malformed packet, which RFC 1661 §5 has a
+    /// peer silently discard; every other kind ends the link.
+    pub fn input_parts(
+        &mut self,
+        protocol: u16,
+        info: &[u8],
+        now: Instant,
+    ) -> io::Result<Vec<Vec<u8>>> {
         match protocol {
             protocol::LCP => self.lcp_input(info, now),
             protocol::CHAP if self.phase == Phase::Authenticate => self.chap_input(info),

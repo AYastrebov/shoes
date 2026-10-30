@@ -833,8 +833,6 @@ pub struct VirtualTcpStream {
     notify: Arc<Notify>,
 }
 
-/// See `TcpControl::dropped`: without this, a stream dropped without
-/// shutdown pinned its socket, buffers, and cap slot forever.
 impl Drop for VirtualNetStack {
     /// The loop is gone, whether its tunnel ended under it or its task was
     /// aborted by a rebuild. Every stream still open on it shares a control
@@ -862,6 +860,8 @@ impl Drop for VirtualNetStack {
     }
 }
 
+/// See `TcpControl::dropped`: without this, a stream dropped without
+/// shutdown pinned its socket, buffers, and cap slot forever.
 impl Drop for VirtualTcpStream {
     fn drop(&mut self) {
         self.control.lock().dropped = true;

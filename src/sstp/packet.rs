@@ -83,7 +83,9 @@ impl<'a> Control<'a> {
     /// attribute overrunning the message, or fewer attributes than the count
     /// says, is malformed.
     pub fn attributes(&self) -> std::io::Result<Vec<(u8, &'a [u8])>> {
-        let mut out = Vec::with_capacity(usize::from(self.count));
+        // The count is the wire's; an attribute is at least 4 bytes, so the
+        // message bounds what it can be before anything is reserved.
+        let mut out = Vec::with_capacity(usize::from(self.count).min(self.attributes.len() / 4));
         let mut rest = self.attributes;
         for _ in 0..self.count {
             if rest.len() < 4 {
@@ -359,6 +361,18 @@ mod tests {
         assert!(packet_len(&[0x10, 0x00, 0x00, 0x03]).is_err());
         assert!(packet_len(&[0x20, 0x00, 0x00, 0x08]).is_err());
         assert_eq!(data_header(4091), [0x10, 0x00, 0x0f, 0xff]);
+    }
+
+    /// A count the message cannot hold reserves nothing for it.
+    #[test]
+    fn an_attribute_count_past_the_message_reserves_nothing_for_it() {
+        let packet = [
+            0x10, 0x01, 0x00, 0x0c, 0x00, 0x05, 0xff, 0xff, 0x00, 0x02, 0x00, 0x08,
+        ];
+        let Packet::Control(control) = parse(&packet).unwrap() else {
+            panic!("control");
+        };
+        assert!(control.attributes().is_err());
     }
 
     #[test]
