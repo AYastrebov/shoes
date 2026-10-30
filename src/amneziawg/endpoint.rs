@@ -12,7 +12,7 @@
 //!
 //! A rebind is triggered two ways:
 //!
-//! * the app tells us, through [`notify_network_change`] — the FFI call an
+//! * the app tells us, through [`crate::network_change::notify`] — the FFI call an
 //!   Android `ConnectivityManager.NetworkCallback` or an iOS `NWPathMonitor`
 //!   should make; and
 //! * we notice, when a send fails with an error that means the route is gone.
@@ -25,39 +25,11 @@
 //! new handshake.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
-
-/// Live endpoint sockets, so a network change can reach all of them.
-///
-/// Weak, because the registry must not be what keeps a tunnel alive; dead
-/// entries are swept on the next notification.
-static ENDPOINTS: Mutex<Vec<Weak<EndpointSocket>>> = Mutex::new(Vec::new());
-
-/// Tell every live tunnel that the network moved.
-///
-/// Safe to call from any thread, including a platform callback thread — it
-/// takes an uncontended lock and wakes a task per tunnel, doing no I/O itself.
-/// Returns the number of tunnels notified.
-// Called from the mobile FFI, which the desktop binary does not compile.
-#[allow(dead_code)]
-pub fn notify_network_change() -> usize {
-    let mut endpoints = ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner());
-    endpoints.retain(|weak| weak.strong_count() > 0);
-
-    for endpoint in endpoints.iter() {
-        if let Some(endpoint) = endpoint.upgrade() {
-            endpoint.request_rebind();
-        }
-    }
-
-    let count = endpoints.len();
-    info!("network change: notified {} tunnel endpoint(s)", count);
-    count
-}
 
 /// A UDP socket to the tunnel's peer that can be replaced underneath its users.
 pub struct EndpointSocket {
@@ -67,6 +39,14 @@ pub struct EndpointSocket {
     /// a swap that lands in between is still seen by the next `changed()`.
     socket: watch::Sender<Arc<UdpSocket>>,
     rebind_requested: Notify,
+}
+
+impl crate::network_change::NetworkChangeListener for EndpointSocket {
+    /// A UDP tunnel survives a network change by rebinding under its peer,
+    /// which roams to the new address on the next authenticated packet.
+    fn network_changed(&self) {
+        self.request_rebind();
+    }
 }
 
 impl EndpointSocket {
@@ -81,14 +61,9 @@ impl EndpointSocket {
             rebind_requested: Notify::new(),
         });
 
-        {
-            // Swept here as well as on notification, so a process that starts
-            // many tunnels and never changes network does not accumulate dead
-            // entries.
-            let mut endpoints = ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner());
-            endpoints.retain(|weak| weak.strong_count() > 0);
-            endpoints.push(Arc::downgrade(&endpoint_socket));
-        }
+        let listener: Arc<dyn crate::network_change::NetworkChangeListener> =
+            endpoint_socket.clone();
+        crate::network_change::register(Arc::downgrade(&listener));
 
         Ok(endpoint_socket)
     }
@@ -480,7 +455,7 @@ mod tests {
 
         // Other tests in this binary may have live endpoints of their own, so
         // assert on the effect rather than on the count.
-        notify_network_change();
+        crate::network_change::notify();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while live.local_addr().unwrap() == before {

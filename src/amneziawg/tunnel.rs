@@ -1233,7 +1233,7 @@ mod tests {
 
         // Idle until the rebind: nothing has asked the tunnel to send, so
         // anything the peer receives after this is the announcement.
-        super::super::endpoint::notify_network_change();
+        crate::network_change::notify();
 
         let mut buf = [0u8; 65536];
         let n = tokio::time::timeout(

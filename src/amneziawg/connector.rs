@@ -15,8 +15,8 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
 
 use super::config::AwgRuntimeConfig;
-use super::netstack::{NetStackRequest, VirtualNetStack};
 use super::tunnel::TunnelRuntime;
+use crate::netstack::{NetStackRequest, VirtualNetStack};
 
 struct TunnelState {
     runtime: Arc<TunnelRuntime>,

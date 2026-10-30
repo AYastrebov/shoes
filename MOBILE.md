@@ -297,7 +297,7 @@ or about 35 connections inside an iOS extension's ~50 MB jetsam limit. A single
 page load in Safari opens more than that.
 
 It was also only half the bill. The AmneziaWG virtual stack
-(`src/amneziawg/netstack.rs`) allocates its own four buffers per connection, at
+(`src/netstack.rs`, shared with SSTP) allocates its own four buffers per connection, at
 256 KiB each, and on a mobile VPN the two stacks are in series: a browser
 connection is accepted by the TUN stack and initiated through the netstack, so
 it paid 1.31 MB *plus* 1 MiB. Its UDP sockets took another 128 KiB of payload

@@ -535,7 +535,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_networkChanged(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    crate::amneziawg::notify_network_change() as jint
+    crate::network_change::notify() as jint
 }
 
 /// Get the last error message from the shoes service.
