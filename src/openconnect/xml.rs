@@ -449,10 +449,12 @@ mod tests {
     /// than any real one is left as written.
     #[test]
     fn a_run_of_ampersands_is_linear() {
-        let run = "&".repeat(200_000) + ";";
+        // Two million: the scan that looked for the `;` from every `&`
+        // took a minute here, this takes milliseconds.
+        let run = "&".repeat(2_000_000) + ";";
         let started = std::time::Instant::now();
         assert_eq!(unescape(&run), run);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(unescape("&notanentityatall;"), "&notanentityatall;");
         assert_eq!(unescape("&amp;&lt;&#x10FFFF;x"), "&<\u{10FFFF}x");
     }
