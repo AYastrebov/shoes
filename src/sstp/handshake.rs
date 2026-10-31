@@ -22,6 +22,11 @@ use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake}
 
 /// [MS-SSTP] §3.2.2.1: 60 seconds.
 pub const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one address may take to accept the TCP connection before the
+/// next is tried, as `SocketConnectorImpl::connect` bounds its attempts: a
+/// first address that drops SYNs must not use the whole negotiation
+/// deadline on the addresses after it.
+pub const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The HTTP response's header block is refused past this: a server that
 /// talks this much before `\r\n\r\n` is not an SSTP server.
@@ -45,6 +50,8 @@ pub struct Settings {
     pub mtu: u16,
     /// Keenetic's camouflage: the query string the SSTP URI must carry.
     pub camouflage_secret: Option<crate::config::Redacted<String>>,
+    /// [`CONNECT_ATTEMPT_TIMEOUT`], shortened by a test that stalls one.
+    pub connect_attempt_timeout: Duration,
 }
 
 pub struct Established {
@@ -89,6 +96,18 @@ async fn connect_any(
                 server.is_ipv6(),
             )?;
             socket.connect(server).await
+        };
+        let attempt = async {
+            match tokio::time::timeout(settings.connect_attempt_timeout, attempt).await {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "no answer within {} s",
+                        settings.connect_attempt_timeout.as_secs_f32()
+                    ),
+                )),
+            }
         };
         match attempt.await {
             Ok(tcp) => return Ok((tcp, server)),

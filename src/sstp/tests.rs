@@ -603,3 +603,65 @@ async fn a_terminate_request_is_acked_before_the_session_ends() {
     tcp_echo(&connector, b"second").await.unwrap();
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
 }
+
+/// A first address that drops SYNs, rather than refusing: the attempt is
+/// bounded, so the next address is tried with most of the negotiation
+/// deadline left. The stall is a listener whose backlog is full, after
+/// which the kernel drops further SYNs instead of answering them.
+#[tokio::test]
+async fn a_stalled_first_address_is_abandoned_for_the_next() {
+    let server = testing::start(Options::default()).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let blackhole = socket.listen(1).unwrap();
+    let stalled = blackhole.local_addr().unwrap();
+    // Fill the backlog and never accept; these stay open for the test.
+    let mut fillers = Vec::new();
+    for _ in 0..8 {
+        if let Ok(Ok(c)) = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(stalled),
+        )
+        .await
+        {
+            fillers.push(c);
+        }
+    }
+    let resolver: Arc<dyn Resolver> = Arc::new(DeadThenLive {
+        dead: stalled,
+        live: server.address,
+    });
+    let config = config_for(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let mut connector = SstpConnector::new(
+        NetLocation::from_str("sstp.test:443", None).unwrap(),
+        config,
+        None,
+        true,
+    )
+    .unwrap();
+    connector.connect_attempt_timeout(Duration::from_millis(500));
+
+    let started = tokio::time::Instant::now();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(20),
+        connector.connect_tcp(&resolver, echo()),
+    )
+    .await
+    .expect("the stalled address held the whole connect")
+    .unwrap()
+    .client_stream;
+    stream.write_all(b"past the stall").await.unwrap();
+    let mut back = [0u8; 14];
+    tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back, b"past the stall");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the fallback took {:?}",
+        started.elapsed()
+    );
+    drop(fillers);
+    drop(blackhole);
+}

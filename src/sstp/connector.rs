@@ -124,6 +124,7 @@ impl SstpConnector {
                 methods,
                 mtu: config.mtu,
                 camouflage_secret: config.camouflage_secret,
+                connect_attempt_timeout: handshake::CONNECT_ATTEMPT_TIMEOUT,
             },
             state: Mutex::new(ConnectorState::default()),
         })
@@ -154,6 +155,13 @@ impl SstpConnector {
             );
             live.state.network_changed();
         }
+    }
+
+    /// Shorten the per-address connect attempt, for the test that stalls
+    /// one; the default is ten seconds.
+    #[cfg(test)]
+    pub fn connect_attempt_timeout(&mut self, timeout: std::time::Duration) {
+        self.template.connect_attempt_timeout = timeout;
     }
 
     /// Dial a different server with the same settings, for the test that
