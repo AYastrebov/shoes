@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.9.2
+
+A patch for the SSTP client: the request's `Host` header follows
+`tls.sni_hostname`, so a client that dials the literal and names the server
+in the SNI, as KVN does, reaches a server that routes on `Host` (#137).
+No other change since 0.9.1; the FFI, the Apple framework and the AAR are
+drop-ins.
 
 The SSTP request's `Host` header now names the server the certificate is
 checked against, `tls.sni_hostname` when it is set, instead of always the
