@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Documentation only. A design for reaching a WDTT server, WireGuard carried
+through VK's call TURN relays in RTP-looking packets, as a sidecar crate
+outside shoes: `docs/specs/2026-10-31-wdtt-sidecar.md` records the wire
+format as read from the qWDTT client and server, the credential-provider
+split that keeps VK's call-join and captcha in the apps, and why the
+protocol stays out of `src/`. `ROADMAP.md` gains the section that points
+at it. Nothing is scheduled and no code exists.
+
 ## v0.9.2
 
 A patch for the SSTP client: the request's `Host` header follows

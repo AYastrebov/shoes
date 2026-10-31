@@ -204,6 +204,7 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
 - [mieru: what is left](#mieru-what-is-left)
 - [Lessons from steer](#lessons-from-steer)
 - [Classic VPN clients: OpenConnect](#classic-vpn-clients-openconnect)
+- [WDTT: a sidecar, designed and not built](#wdtt-a-sidecar-designed-and-not-built)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 - [Resolved: AmneziaWG upload was capped by the send window, and the drop was the outbound channel](#resolved-amneziawg-upload-was-capped-by-the-send-window-and-the-drop-was-the-outbound-channel)
@@ -1215,6 +1216,28 @@ and against ocserv in a container, recorded in words.
   offers it, Keenetic's included, requires IPsec transport mode negotiated
   with IKEv1, a separate and deprecated protocol from IKEv2. More work
   than IKEv2 for a protocol every OS speaks natively.
+
+## WDTT: a sidecar, designed and not built
+
+Written 2026-10-31. WDTT, continued as qWDTT
+([SpaceNeuroX/proxy-turn-vk-android](https://github.com/SpaceNeuroX/proxy-turn-vk-android),
+GPL-3.0, Go), carries WireGuard datagrams through VK's video-call TURN
+relays, each wrapped to look like an RTP packet of a call, for carriers
+that pass VK's call media and block everything else. It was asked about,
+read, and rated 3 of 5 (about 3,500 lines) for the data path with the
+TURN credentials supplied from outside, and 5 of 5 and the wrong place
+for VK's anonymous call-join and captcha inside a library.
+
+The decision is that it does not belong in `src/`: no specification
+exists, the wire format has moved twice this year, and the relay and its
+quota are VK's to close. The design is instead a separate Rust crate, a
+sidecar that owns the VK side and exposes a loopback UDP port, which the
+existing `wireguard` outbound sends to with no change to shoes; the apps
+obtain the TURN credentials, since only they can show VK's captcha. The
+design, with the wire format read from the reference and file-level
+citations, is
+[docs/specs/2026-10-31-wdtt-sidecar.md](./docs/specs/2026-10-31-wdtt-sidecar.md).
+Nothing is scheduled and no code exists.
 
 ## Explicitly not planned
 
