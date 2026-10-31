@@ -1261,10 +1261,34 @@ fn validate_client_vision_protocol(
     }
 }
 
+/// A protocol that owns its transport cannot sit under a wrapping layer:
+/// the chain builder would hand it to the per-stream handler factory, which
+/// has no handler for it. The type system does not say so, so this does.
+fn refuse_wrapped_transport_owner(layer: &str, inner: &ClientProxyConfig) -> std::io::Result<()> {
+    if !inner.owns_transport() {
+        return Ok(());
+    }
+    let hint = match (inner, layer) {
+        (ClientProxyConfig::Sstp(_), "TLS") => {
+            " SSTP does its own TLS; put the settings under the sstp protocol's tls block."
+        }
+        _ => "",
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} owns its transport and cannot be wrapped in a {layer} layer; it must be \
+             the only hop in its chain.{hint}",
+            inner.protocol_name()
+        ),
+    ))
+}
+
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     match config {
         ClientProxyConfig::Tls(tls_config) => {
+            refuse_wrapped_transport_owner("TLS", &tls_config.protocol)?;
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
             let sni_hostname = match &tls_config.sni_hostname {
                 crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
@@ -1276,6 +1300,7 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         ClientProxyConfig::Reality {
             vision, protocol, ..
         } => {
+            refuse_wrapped_transport_owner("Reality", protocol)?;
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
             validate_client_proxy_structure(protocol)?;
         }
@@ -1284,13 +1309,16 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
             sni_hostname,
             ..
         } => {
+            refuse_wrapped_transport_owner("ShadowTLS", protocol)?;
             validate_tls_server_name("ShadowTLS", sni_hostname.as_deref())?;
             validate_client_proxy_structure(protocol)?;
         }
         ClientProxyConfig::Websocket(ws_config) => {
+            refuse_wrapped_transport_owner("WebSocket", &ws_config.protocol)?;
             validate_client_proxy_structure(&ws_config.protocol)?;
         }
         ClientProxyConfig::HttpUpgrade(config) => {
+            refuse_wrapped_transport_owner("HTTPUpgrade", &config.protocol)?;
             validate_client_proxy_structure(&config.protocol)?;
         }
         _ => {}
@@ -1424,7 +1452,10 @@ fn validate_client_config(
                 format!("{proto} uses its own transport. Do not set 'transport'."),
             ));
         }
-        if client_config.tcp_settings.is_some() {
+        // SSTP's transport is TCP, so its socket settings apply to it.
+        if client_config.tcp_settings.is_some()
+            && !matches!(client_config.protocol, ClientProxyConfig::Sstp(_))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("tcp_settings is not valid for {proto} protocol."),
@@ -1432,6 +1463,29 @@ fn validate_client_config(
         }
         // quic_settings needs no check here: a tunnel protocol never selects
         // 'transport: quic', so the QUIC block above has already rejected it.
+    }
+
+    if let ClientProxyConfig::Sstp(sstp) = &mut client_config.protocol {
+        validate_sstp(sstp)?;
+        // Unless sni_hostname names something, the address's hostname is
+        // the name the certificate is checked against (`""` and `null` send
+        // no SNI but still verify against it), and the connector unwraps
+        // that name as validated: one rustls refuses must be refused here.
+        // `:443` parses to a hostname of "", which no header, name check or
+        // resolver can use; the connector would panic on it.
+        if client_config.address.address().hostname() == Some("") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSTP address needs a host: a hostname or an IP address before the port.",
+            ));
+        }
+        let names_something = matches!(
+            &sstp.tls.sni_hostname,
+            crate::option_util::NoneOrOne::One(name) if !name.is_empty()
+        );
+        if !names_something {
+            validate_tls_server_name("SSTP", client_config.address.address().hostname())?;
+        }
     }
 
     match &client_config.protocol {
@@ -1539,6 +1593,90 @@ fn validate_obfs_config(obfs: Option<&ObfsConfig>) -> std::io::Result<()> {
                 "Obfuscation password must be at least {MIN_OBFS_PASSWORD_LEN} bytes; \
                  the reference implementation rejects anything shorter."
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// The SSTP outbound's fields, against the limits the spec's Configuration
+/// table names (docs/specs/2026-10-30-sstp-client-outbound.md).
+fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<()> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    // RFC 2759 §4: "0 to (theoretically) 256 case-sensitive ASCII
+    // characters"; empty is refused because no server accepts it.
+    if sstp.username.is_empty() || sstp.username.len() > 256 {
+        return Err(invalid("SSTP username must be 1 to 256 characters.".into()));
+    }
+    if !sstp.username.is_ascii() || sstp.username.contains('\0') {
+        return Err(invalid(
+            "SSTP username must be ASCII (RFC 2759 §4), without NUL.".into(),
+        ));
+    }
+    // RFC 2759 §4: up to 256 Unicode characters, counted as UTF-16 units
+    // because that is what MS-CHAPv2 hashes.
+    let password = sstp.password.expose();
+    if password.is_empty() || password.encode_utf16().count() > 256 {
+        return Err(invalid("SSTP password must be 1 to 256 characters.".into()));
+    }
+    // PAP carries each credential behind a one-octet length (RFC 1334
+    // §2.1.1), as bytes: 256 of them would go out as length zero.
+    if sstp.auth.contains(&super::types::SstpAuthMethod::Pap)
+        && (sstp.username.len() > 255 || password.len() > 255)
+    {
+        return Err(invalid(
+            "SSTP with pap in auth needs a username and password of at most 255 bytes each: \
+             PAP sends each behind a one-byte length."
+                .into(),
+        ));
+    }
+    if sstp.auth.is_empty() {
+        return Err(invalid(
+            "SSTP auth must list at least one method: mschapv2, pap.".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !sstp.auth.iter().all(|method| seen.insert(*method)) {
+        return Err(invalid("SSTP auth lists a method twice.".into()));
+    }
+    // Above 1500 buys TCP nothing (the far host's MSS bounds segments) and
+    // SoftEther caps the MRU at 1500; below 576 is under IPv4's minimum
+    // reassembly size.
+    if !(576..=1500).contains(&sstp.mtu) {
+        return Err(invalid(format!(
+            "SSTP mtu must be between 576 and 1500, not {}.",
+            sstp.mtu
+        )));
+    }
+    // It goes on the request line as the query string, so it is limited to
+    // RFC 3986's unreserved characters; Keenetic generates hexadecimal.
+    if let Some(secret) = &sstp.camouflage_secret {
+        let secret = secret.expose();
+        if secret.is_empty()
+            || !secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+        {
+            return Err(invalid(
+                "SSTP camouflage_secret must be the part after '?' in the address the server \
+                 shows: letters, digits, '-', '.', '_' or '~', and not empty."
+                    .into(),
+            ));
+        }
+    }
+    validate_server_fingerprints(&mut sstp.tls.server_fingerprints)?;
+    let sni_hostname = match &sstp.tls.sni_hostname {
+        crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
+        _ => None,
+    };
+    validate_tls_server_name("SSTP", sni_hostname)?;
+    // `is_empty`, not `is_unspecified`: `server_fingerprints: []` or `null`
+    // is a pin set that pins nothing, and selects the verifier that checks
+    // nothing just the same.
+    if !sstp.tls.verify && sstp.tls.server_fingerprints.is_empty() {
+        return Err(invalid(
+            "SSTP would send your credentials to any server that answers; pin its \
+             certificate with tls.server_fingerprints or leave tls.verify on."
+                .into(),
         ));
     }
     Ok(())
@@ -2408,8 +2546,8 @@ fn validate_amneziawg_chain_position(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Chain {}: WireGuard/AmneziaWG must be the only hop in a chain. \
-                 Multi-hop chains are not supported.",
+                "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
+                 Hysteria2, TUIC, SSTP) must be the only hop in a chain.",
                 chain_index
             ),
         ));
@@ -2425,7 +2563,8 @@ fn validate_amneziawg_chain_position(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Chain {}: WireGuard/AmneziaWG cannot be mixed with other protocols in a pool.",
+                    "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
+                     Hysteria2, TUIC, SSTP) cannot be mixed with other protocols in a pool.",
                     chain_index
                 ),
             ));
@@ -2691,6 +2830,207 @@ mod tests {
         fn a_descriptor_makes_the_name_irrelevant_rather_than_wrong() {
             validate_macos_tun_device(Some(7), Some("tun0"), None, None, None)
                 .expect("a name the platform ignores must not fail the config");
+        }
+    }
+
+    mod sstp {
+        use crate::config::{ClientProxyConfig, SstpAuthMethod, SstpClientConfig, SstpTlsConfig};
+        use crate::option_util::NoneOrOne;
+
+        fn sstp() -> SstpClientConfig {
+            SstpClientConfig {
+                username: "alice".into(),
+                password: "pw".to_string().into(),
+                auth: vec![SstpAuthMethod::Mschapv2],
+                mtu: 1280,
+                tls: SstpTlsConfig::default(),
+                camouflage_secret: None,
+            }
+        }
+
+        /// The connector unwraps the TLS settings as validated, so a name
+        /// rustls refuses must be refused here rather than at startup.
+        #[test]
+        fn an_sni_hostname_that_is_not_a_server_name_is_refused() {
+            let mut config = sstp();
+            config.tls.sni_hostname = NoneOrOne::One("vpn example.com".into());
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP client sni_hostname"),
+                "{err}"
+            );
+            config.tls.sni_hostname = NoneOrOne::One("vpn.example.com".into());
+            super::super::validate_sstp(&mut config).unwrap();
+            config.tls.sni_hostname = NoneOrOne::One(String::new());
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// With verification off, only a pin stands between the credentials
+        /// and whoever answers; a pin set that is empty rather than absent
+        /// pins nothing and must be refused the same way.
+        #[test]
+        fn verification_off_needs_a_pin_that_pins_something() {
+            use crate::option_util::NoneOrSome;
+            for empty in [
+                NoneOrSome::Unspecified,
+                NoneOrSome::None,
+                NoneOrSome::Some(vec![]),
+            ] {
+                let mut config = sstp();
+                config.tls.verify = false;
+                config.tls.server_fingerprints = empty;
+                let err = super::super::validate_sstp(&mut config).unwrap_err();
+                assert!(err.to_string().contains("pin its certificate"), "{err}");
+            }
+            let mut config = sstp();
+            config.tls.verify = false;
+            config.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// With no sni_hostname, the address's hostname is what the
+        /// certificate is checked against, and the connector unwraps it as
+        /// validated; a label of 64 characters is a name rustls refuses.
+        #[test]
+        fn an_address_hostname_rustls_refuses_is_refused_at_load() {
+            use crate::address::NetLocation;
+            use crate::config::ClientConfig;
+            let mut config = ClientConfig {
+                address: NetLocation::from_str(
+                    &format!("{}.example.com:443", "a".repeat(64)),
+                    None,
+                )
+                .unwrap(),
+                protocol: ClientProxyConfig::Sstp(Box::new(sstp())),
+                ..Default::default()
+            };
+            let err = super::super::validate_client_config(
+                &mut config,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP client sni_hostname"),
+                "{err}"
+            );
+
+            // `""` and `null` send no SNI but still verify against the
+            // address's name, so they do not excuse it either.
+            for no_sni in [NoneOrOne::One(String::new()), NoneOrOne::None] {
+                let ClientProxyConfig::Sstp(sstp) = &mut config.protocol else {
+                    panic!("sstp");
+                };
+                sstp.tls.sni_hostname = no_sni;
+                let err = super::super::validate_client_config(
+                    &mut config,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("SSTP client sni_hostname"),
+                    "{err}"
+                );
+            }
+
+            // An explicit, valid sni_hostname makes the address's name moot.
+            let ClientProxyConfig::Sstp(sstp) = &mut config.protocol else {
+                panic!("sstp");
+            };
+            sstp.tls.sni_hostname = NoneOrOne::One("vpn.example.com".into());
+            super::super::validate_client_config(&mut config, &std::collections::HashMap::new())
+                .unwrap();
+        }
+
+        /// `:443` parses to an empty hostname, which the connector cannot
+        /// turn into a name to verify or a Host header.
+        #[test]
+        fn an_empty_address_hostname_is_refused_at_load() {
+            use crate::address::NetLocation;
+            use crate::config::ClientConfig;
+            let mut config = ClientConfig {
+                address: NetLocation::from_str(":443", None).unwrap(),
+                protocol: ClientProxyConfig::Sstp(Box::new(sstp())),
+                ..Default::default()
+            };
+            let err = super::super::validate_client_config(
+                &mut config,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP address needs a host"),
+                "{err}"
+            );
+        }
+
+        /// The secret rides the request line, so it is limited to what a
+        /// query string carries unescaped.
+        #[test]
+        fn a_camouflage_secret_is_a_bare_query_string() {
+            for bad in ["", "a b", "a?b", "a/b", "a#b", "сек"] {
+                let mut config = sstp();
+                config.camouflage_secret = Some(bad.to_string().into());
+                let err = super::super::validate_sstp(&mut config).unwrap_err();
+                assert!(
+                    err.to_string().contains("camouflage_secret"),
+                    "{bad:?}: {err}"
+                );
+            }
+            let mut config = sstp();
+            config.camouflage_secret = Some("0123abcd".to_string().into());
+            super::super::validate_sstp(&mut config).unwrap();
+        }
+
+        /// PAP's lengths are one octet of bytes; MS-CHAPv2's are not.
+        #[test]
+        fn pap_bounds_the_credentials_at_255_bytes() {
+            let mut config = sstp();
+            config.username = "u".repeat(256);
+            super::super::validate_sstp(&mut config).unwrap();
+            config.auth.push(SstpAuthMethod::Pap);
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(err.to_string().contains("255 bytes"), "{err}");
+
+            let mut config = sstp();
+            config.auth = vec![SstpAuthMethod::Pap];
+            // 128 characters, within MS-CHAPv2's 256 UTF-16 units, 256 bytes.
+            config.password = "é".repeat(128).into();
+            let err = super::super::validate_sstp(&mut config).unwrap_err();
+            assert!(err.to_string().contains("255 bytes"), "{err}");
+        }
+
+        /// Under a wrapping layer the chain builder would hand a transport
+        /// owner to the per-stream handler factory, which panics on it.
+        #[test]
+        fn a_transport_owner_under_any_layer_is_refused() {
+            let inner = Box::new(ClientProxyConfig::Sstp(Box::new(sstp())));
+            let websocket: ClientProxyConfig =
+                serde_yaml::from_str("type: websocket\nprotocol: {type: direct}").unwrap();
+            let ClientProxyConfig::Websocket(mut ws) = websocket else {
+                panic!("websocket");
+            };
+            ws.protocol = inner.clone();
+            let err =
+                super::super::validate_client_proxy_structure(&ClientProxyConfig::Websocket(ws))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP owns its transport")
+                    && err.to_string().contains("WebSocket"),
+                "{err}"
+            );
+
+            let tls: ClientProxyConfig =
+                serde_yaml::from_str("type: tls\nprotocol: {type: direct}").unwrap();
+            let ClientProxyConfig::Tls(mut tls) = tls else {
+                panic!("tls");
+            };
+            tls.protocol = inner;
+            let err = super::super::validate_client_proxy_structure(&ClientProxyConfig::Tls(tls))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("sstp protocol's tls block"),
+                "{err}"
+            );
         }
     }
 

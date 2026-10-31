@@ -649,6 +649,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
+name = "des"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "916a94e407b54f9034d71dd748234cd1e516ced6284009906ae246f177eafe5a"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,6 +1655,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "md4"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2604,6 +2622,7 @@ dependencies = [
  "chrono",
  "core-foundation",
  "dashmap",
+ "des",
  "digest",
  "etherparse",
  "flate2",
@@ -2622,6 +2641,7 @@ dependencies = [
  "log",
  "lru",
  "md-5",
+ "md4",
  "memchr",
  "mime_guess",
  "ndk-sys",
@@ -2667,6 +2687,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "wintun-bindings",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

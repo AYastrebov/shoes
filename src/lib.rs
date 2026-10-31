@@ -66,6 +66,8 @@ mod memory;
 pub mod mieru;
 mod mixed_handler;
 mod naiveproxy;
+mod netstack;
+mod network_change;
 mod option_util;
 #[cfg(feature = "control-stats")]
 mod outbound_counting_stream;
@@ -95,6 +97,7 @@ mod socks5_udp_relay;
 mod socks_handler;
 #[cfg(target_os = "linux")]
 mod splice;
+mod sstp;
 mod stream_reader;
 mod sync_adapter;
 mod tcp;

@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+An SSTP client outbound (`type: sstp`): Microsoft's PPP over HTTPS, as
+Windows RRAS, MikroTik, SoftEther, accel-ppp and some routers serve it.
+Like WireGuard it is a layer-3 tunnel and the only hop in its chain. One
+session per hop carries every TCP and UDP connection through the smoltcp
+stack AmneziaWG uses, now shared as `src/netstack.rs`. It is built to
+`docs/specs/2026-10-30-sstp-client-outbound.md`, written from [MS-SSTP]
+and read against Open-SSTP-Client, sstp-client, SoftEther and accel-ppp;
+where they disagree (the CMK length's byte order, the domain in the
+MS-CHAPv2 challenge hash, whether crypto binding is checked at all) the
+spec records which was followed and why. What it does:
+- MS-CHAPv2, with the server's proof checked in constant time, or PAP
+  when listed;
+- crypto binding with SHA-256 or SHA-1;
+- IPv4 through IPCP;
+- certificate pinning through `tls.server_fingerprints`.
+
+The writer drains every queued packet into one TLS write, so a burst shares
+a record; the reader never drops a packet, so the outer TCP's flow control
+does the pacing. The crypto is checked against the vectors RFC 2759 and
+RFC 3079 print and against sstp-client's test data, one case of which is a
+capture from Windows itself. End-to-end tests run against an in-process
+server that checks the binding the way accel-ppp does.
+
+A first run against a production SSTP server worked end to end and found two
+defects, both fixed. Names resolved to an IPv6 address first, which the
+IPv4-only tunnel cannot carry, so the first IPv4 address is now used. A
+path-MTU black hole behind the server stalled TLS handshakes to one large
+site at the server's MRU of 1350, so `mtu` now defaults to 1280, IPv6's
+minimum: shoes' userspace TCP does no path MTU discovery to find a smaller
+path out.
+
+`camouflage_secret` speaks to a Keenetic router with its SSTP server's
+camouflage mode on, which answers the SSTP request only when its URI
+carries the secret as the query string and is a plain web server to
+anything else. Nothing documents the mechanism; it was found by probing
+such a router, and the spec records the probe.
+
+A network change now reaches a registry of listeners, `src/network_change.rs`,
+instead of AmneziaWG's endpoint sockets alone. An SSTP session ends at once
+on one: its TCP connection cannot outlive the interface.
+
 Documentation only. `MOBILE.md` now says what makes the stopped callback
 fire: the AmneziaWG liveness watchdog, the AmneziaWG receive-error streak,
 or the service task failing or ending on its own, and that a stream

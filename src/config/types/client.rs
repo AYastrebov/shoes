@@ -396,6 +396,105 @@ pub struct MieruClientConfig {
     pub password: Redacted<String>,
 }
 
+/// SSTP client outbound: PPP over HTTPS, an L3 tunnel that owns its
+/// transport. Design: docs/specs/2026-10-30-sstp-client-outbound.md.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SstpClientConfig {
+    /// Sent as configured; a `DOMAIN\user` name keeps its domain on the
+    /// wire and leaves it out of the MS-CHAPv2 hash, as RFC 2759 says.
+    pub username: String,
+    pub password: Redacted<String>,
+    /// The methods the client accepts, in order of preference. PAP is used
+    /// only when listed: it sends the password in the clear inside TLS.
+    #[serde(
+        default = "default_sstp_auth",
+        skip_serializing_if = "is_default_sstp_auth"
+    )]
+    pub auth: Vec<SstpAuthMethod>,
+    /// The MRU proposed to the server, and the cap on what this side sends.
+    #[serde(
+        default = "default_sstp_mtu",
+        skip_serializing_if = "is_default_sstp_mtu"
+    )]
+    pub mtu: u16,
+    #[serde(default, skip_serializing_if = "SstpTlsConfig::is_default")]
+    pub tls: SstpTlsConfig,
+    /// Keenetic's camouflage mode: the server answers the SSTP request only
+    /// when its URI carries this secret as the query string, and looks like
+    /// a plain web server to anything else. It is the part after `?` in the
+    /// address the router shows, or `show sstp-server` in its CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camouflage_secret: Option<Redacted<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SstpAuthMethod {
+    #[serde(alias = "ms-chap-v2", alias = "ms_chap_v2", alias = "ms-chapv2")]
+    Mschapv2,
+    Pap,
+}
+
+fn default_sstp_auth() -> Vec<SstpAuthMethod> {
+    vec![SstpAuthMethod::Mschapv2]
+}
+
+fn is_default_sstp_auth(auth: &[SstpAuthMethod]) -> bool {
+    auth == [SstpAuthMethod::Mschapv2]
+}
+
+/// IPv6's minimum MTU, which every path must carry. A server whose own
+/// uplink is a tunnel offers an MRU its far side cannot carry: the first
+/// live run's server offered 1350, and every packet over about 1280 toward
+/// one large site vanished without an ICMP, so its TLS handshakes stalled.
+/// smoltcp does no path MTU discovery to find that out. 1280 against 1350
+/// is about 5% more packets; the alternative is dead connections.
+pub const DEFAULT_SSTP_MTU: u16 = 1280;
+
+fn default_sstp_mtu() -> u16 {
+    DEFAULT_SSTP_MTU
+}
+
+fn is_default_sstp_mtu(mtu: &u16) -> bool {
+    *mtu == DEFAULT_SSTP_MTU
+}
+
+/// SSTP's own TLS session. The field names and meanings are the `tls`
+/// client's.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SstpTlsConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub verify: bool,
+    #[serde(
+        alias = "server_fingerprint",
+        default,
+        skip_serializing_if = "NoneOrSome::is_unspecified"
+    )]
+    pub server_fingerprints: NoneOrSome<String>,
+    #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
+    pub sni_hostname: NoneOrOne<String>,
+}
+
+impl Default for SstpTlsConfig {
+    fn default() -> Self {
+        SstpTlsConfig {
+            verify: true,
+            server_fingerprints: NoneOrSome::Unspecified,
+            sni_hostname: NoneOrOne::Unspecified,
+        }
+    }
+}
+
+impl SstpTlsConfig {
+    fn is_default(&self) -> bool {
+        self.verify
+            && self.server_fingerprints.is_unspecified()
+            && self.sni_hostname.is_unspecified()
+    }
+}
+
 /// TUIC v5 client outbound.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -864,6 +963,9 @@ pub enum ClientProxyConfig {
     /// TUIC v5 client outbound (QUIC-native, owns its transport).
     #[serde(alias = "tuic_v5", alias = "tuicv5")]
     Tuic(Box<TuicClientConfig>),
+    /// SSTP client outbound (PPP over HTTPS, an L3 tunnel that owns its
+    /// transport).
+    Sstp(Box<SstpClientConfig>),
 }
 
 impl ClientProxyConfig {
@@ -881,6 +983,7 @@ impl ClientProxyConfig {
                 | ClientProxyConfig::AmneziaWg(_)
                 | ClientProxyConfig::Hysteria2(_)
                 | ClientProxyConfig::Tuic(_)
+                | ClientProxyConfig::Sstp(_)
         )
     }
 
@@ -908,6 +1011,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::AmneziaWg(..) => "AmneziaWG",
             ClientProxyConfig::Hysteria2(..) => "Hysteria2",
             ClientProxyConfig::Tuic(..) => "TUIC",
+            ClientProxyConfig::Sstp(..) => "SSTP",
         }
     }
 }
@@ -1178,6 +1282,50 @@ password: secret
         }
         assert!(config.owns_transport());
         assert_eq!(config.protocol_name(), "TUIC");
+    }
+
+    #[test]
+    fn test_client_proxy_config_sstp_defaults_and_round_trip() {
+        let yaml = r#"
+type: sstp
+username: alice
+password: hunter2
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ClientProxyConfig::Sstp(ref s) => {
+                assert_eq!(s.auth, [SstpAuthMethod::Mschapv2]);
+                assert_eq!(s.mtu, DEFAULT_SSTP_MTU);
+                assert!(s.tls.verify);
+                assert!(s.tls.server_fingerprints.is_unspecified());
+                assert!(s.tls.sni_hostname.is_unspecified());
+            }
+            ref other => panic!("expected Sstp, got {other:?}"),
+        }
+        assert!(config.owns_transport());
+        assert_eq!(config.protocol_name(), "SSTP");
+        // Defaults are left out when written back, and the password stays
+        // a secret on the way out of Debug.
+        let written = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !written.contains("auth") && !written.contains("mtu"),
+            "{written}"
+        );
+        assert!(!format!("{config:?}").contains("hunter2"));
+
+        let yaml = r#"
+type: sstp
+username: alice
+password: secret
+auth: [pap, ms-chap-v2]
+tls:
+  server_fingerprint: "ab:cd"
+"#;
+        let ClientProxyConfig::Sstp(s) = serde_yaml::from_str(yaml).unwrap() else {
+            panic!("expected Sstp");
+        };
+        assert_eq!(s.auth, [SstpAuthMethod::Pap, SstpAuthMethod::Mschapv2]);
+        assert!(!s.tls.server_fingerprints.is_unspecified());
     }
 
     /// The names are the TUIC reference's and sing-box's, including the

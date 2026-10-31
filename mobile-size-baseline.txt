@@ -7,9 +7,10 @@
 # measures 9812264 without it.
 #
 # CI fails if the built library exceeds this by more than 2%. A band rather
-# than an exact ceiling because this number is recorded from a developer's
-# build while CI compiles with an unpinned stable rustc and its own NDK, and a
-# compiler bump moves the size by kilobytes without anyone touching the code.
+# than an exact ceiling because CI compiles with an unpinned stable rustc and
+# its own NDK, and a compiler bump moves the size by kilobytes without anyone
+# touching the code. Since 2026-10-31 the number is what CI's Android job
+# reported, so that drift no longer eats the band from the start.
 # Raise it deliberately, in a commit that says what bought the bytes. MOBILE.md explains why this budget is
 # defended and, just as importantly, what it is not: download size and RSS are
 # separate budgets, and this is the download one. Code costs bytes here and
@@ -47,6 +48,18 @@
 #                     harnesses the plain tokio::spawn calls had before.
 #                     Measured on the same toolchain as the two numbers it
 #                     is compared with.
+#   9722088 +173704  no code change: CI's unpinned stable rustc and NDK
+#                     30.0 against the developer build that recorded the
+#                     line above, measured on mobile by the Android job
+#                     itself. It had quietly used 1.8% of the 2% band, so
+#                     the next real cost tripped it. From here the number
+#                     is CI's, not a developer build's.
+#   9849696 +127608  the SSTP client: md4 and des for MS-CHAPv2, the PPP
+#                     automaton, the handshake, the session's reader and
+#                     writer, the connector. 1.3% of the library for a
+#                     protocol that reaches servers WireGuard's UDP cannot.
+#                     Measured on the same runner toolchain as the line
+#                     above.
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -59,4 +72,4 @@
 # Judged worth paying: the net 4376 bytes is 0.03% of the library, against a
 # MOBILE.md precedent that declined a 1.0 MiB saving because the build
 # complexity cost more than the megabyte was worth.
-9548384
+9849696

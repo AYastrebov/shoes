@@ -20,6 +20,7 @@ not.
 | `frames-sing-tls` | sing-anytls `CreateProxy`; sing-box's WebSocket client with early data carrying VLESS; VLESS Vision over Go `crypto/tls` (the plaintext the server read) | `src/reference_frames.rs` |
 | `frames-mieru` | mieru v3.38.2 `apis/client`: the first flight to a listener that answers nothing | `src/mieru/client.rs` (shoes has no mieru server; decoded with its segment decoder) |
 | `user-id` | gofrs/uuid v5.5.1 `NewV5(Nil, name)`, which sing-vmess's VLESS and VMess clients call for an id that is not a UUID (Xray `common/uuid` computes the same for 1 to 30 bytes) | `src/uuid_util.rs` |
+| `sstp` | sstp-client 1.0.20 `dd24312`: its CMAC unit test (SHA-1, SHA-256, and a Windows 8.1 to Windows Server 2019 EAP-TLS capture) and its MPPE unit test, by `sstp/extract.py`; the RFC 2759 §9.2 and RFC 3079 §3.5.3 vectors are in the test itself | `src/sstp/crypto.rs`, `src/sstp/packet.rs` |
 
 Where a reference keeps its derived key private (Snell, salamander, mieru),
 the vector holds bytes the reference put on the wire with that key. Shoes
@@ -60,6 +61,15 @@ the RFC text instead:
 ```sh
 curl -sfo /tmp/rfc8448.txt https://www.rfc-editor.org/rfc/rfc8448.txt
 cd tests/data/kat/rfc8448 && python3 -I extract.py /tmp/rfc8448.txt
+```
+
+The SSTP vectors come from sstp-client's own unit-test data, read as numbers
+(the code is GPL; only the published values are copied):
+
+```sh
+git clone https://gitlab.com/sstp-project/sstp-client /tmp/sstp-client
+git -C /tmp/sstp-client checkout dd24312
+cd tests/data/kat/sstp && python3 -I extract.py /tmp/sstp-client/src
 ```
 
 (`docker run` takes the same arguments.) To move a reference to a newer

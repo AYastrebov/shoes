@@ -1,8 +1,10 @@
-//! Virtual network stack for AmneziaWG outbound connections.
+//! Virtual network stack for the layer-3 tunnel outbounds.
 //!
 //! Uses smoltcp to provide a virtual TCP/IP stack that emits IP packets
-//! for the AmneziaWG tunnel to encapsulate, and accepts decapsulated
-//! IP packets from the tunnel.
+//! for a tunnel to carry -- AmneziaWG encapsulates them, SSTP frames them as
+//! PPP -- and accepts the IP packets the tunnel delivers. Nothing in it knows
+//! which tunnel it serves: two bounded channels of IP packets are the whole
+//! interface.
 //!
 //! TCP connections use the TcpConnectionControl ring-buffer+waker pattern
 //! (from tun/tcp_conn.rs) for bridging smoltcp's synchronous sockets to
@@ -420,7 +422,7 @@ impl VirtualNetStack {
                             self.initiate_udp(target, reply);
                         }
                         None => {
-                            debug!("AmneziaWG netstack: request channel closed");
+                            debug!("netstack: request channel closed");
                             break;
                         }
                     }
@@ -442,7 +444,7 @@ impl VirtualNetStack {
                         // sender the connector holds, which is what its
                         // `is_closed()` check rebuilds on.
                         None => {
-                            info!("AmneziaWG netstack: tunnel receive path gone, stopping");
+                            info!("netstack: tunnel receive path gone, stopping");
                             return;
                         }
                     }
@@ -794,7 +796,7 @@ impl VirtualNetStack {
                     break;
                 };
                 if let Err(e) = socket.send_slice(&data, active.target) {
-                    debug!("AmneziaWG UDP send error: {}", e);
+                    debug!("netstack: UDP send error: {}", e);
                 }
             }
 
@@ -829,6 +831,33 @@ pub struct VirtualTcpStream {
     control: Arc<Mutex<TcpControl>>,
     /// The stack's wake handle; see `VirtualNetStack::wake`.
     notify: Arc<Notify>,
+}
+
+impl Drop for VirtualNetStack {
+    /// The loop is gone, whether its tunnel ended under it or its task was
+    /// aborted by a rebuild. Every stream still open on it shares a control
+    /// with it and nothing else, so without this a read parked on one would
+    /// wait forever and a write would fill its ring and then park too. The
+    /// pending connects' reply senders go with the map, which answers their
+    /// callers with an error.
+    fn drop(&mut self) {
+        let controls = self
+            .active_tcp
+            .values()
+            .map(|active| &active.control)
+            .chain(self.pending_tcp.values().map(|pending| &pending.control));
+        for control in controls {
+            let mut ctrl = control.lock();
+            ctrl.recv_closed = true;
+            ctrl.send_closed = true;
+            if let Some(w) = ctrl.recv_waker.take() {
+                w.wake();
+            }
+            if let Some(w) = ctrl.send_waker.take() {
+                w.wake();
+            }
+        }
+    }
 }
 
 /// See `TcpControl::dropped`: without this, a stream dropped without
@@ -966,7 +995,7 @@ impl AsyncWriteMessage for VirtualUdpStream {
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // Drop the packet — UDP is lossy
-                warn!("AmneziaWG: UDP send buffer full, dropping packet");
+                warn!("netstack: UDP send buffer full, dropping packet");
                 Poll::Ready(Ok(()))
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {

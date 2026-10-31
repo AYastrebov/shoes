@@ -1059,6 +1059,83 @@ whichever mode the association's first packet used.
 `zero_rtt_handshake` is a server-side option only. The client rejects it rather
 than accepting it and performing an ordinary handshake.
 
+### SSTP Client
+```yaml
+protocol:
+  type: sstp
+  username: string             # DOMAIN\user for a Windows domain account
+  password: string
+  auth: [mschapv2]             # Default: [mschapv2]. Also 'pap'; in order of preference
+  mtu: 1280                    # Default: 1280. Between 576 and 1500
+  tls:                         # Optional
+    verify: true               # Default: true
+    sni_hostname: string?      # Default: the host in `address`; "" sends none
+    server_fingerprints: [string]?  # SHA-256 of the server certificate
+  camouflage_secret: string?   # Keenetic's camouflage mode: the part after '?'
+```
+
+A client for Microsoft's Secure Socket Tunneling Protocol: PPP over HTTPS,
+as Windows RRAS, MikroTik, SoftEther, accel-ppp and some home routers serve
+it. Like WireGuard it is a layer-3 tunnel, so it must be the only hop in its
+chain; TCP and UDP to any destination go through it. One session, opened on
+the first connection, carries every connection through the hop. Design:
+`docs/specs/2026-10-30-sstp-client-outbound.md`.
+
+The server's certificate is checked as for the `tls` client, and its hash is
+what crypto binding sends. With `verify` on, a pin in `server_fingerprints`
+is checked on top of the chain, so an SSTP server with a self-signed
+certificate (a Windows RRAS box, a router without a public name) is reached
+with `verify: false` and its SHA-256 fingerprint in `server_fingerprints`
+together. `verify: false` without a pin is refused: the credentials would go
+to any server that answered.
+
+`auth` lists the methods the client will use. MS-CHAPv2 is the default, and
+it proves the server knows the password as well as the client; the server's
+proof is checked. PAP sends the password in the clear inside TLS, to
+whoever terminates it, and is used only when listed. EAP, MS-CHAPv1 and
+CHAP-MD5 are not implemented; a server that insists on one fails with its
+name. SoftEther proposes EAP first and moves to MS-CHAPv2 when refused, and
+it reads a `HUB\user` username as the virtual hub to log into.
+
+`mtu` is the largest IP packet either side sends; the server can lower it
+further. The default is 1280, IPv6's minimum, rather than the 1500 most
+servers offer: a server whose uplink is itself a tunnel can offer more than
+its far side carries, and shoes' userspace TCP does no path MTU discovery to
+find out, so oversized packets vanish and connections stall mid-handshake.
+Raise it only for a server known to carry more.
+
+`camouflage_secret` is for a Keenetic router with its SSTP server's
+"Camouflage mode" on (KeeneticOS 4.2 and later). Such a server answers the
+SSTP request only when it carries the secret, and is a plain web server to
+anything else, so a scanner cannot tell SSTP is there. The router shows the
+address as `https://<host>/?<secret>`; put the host in `address` and the
+part after `?` here. Without it, or with the wrong one, the connection fails
+with a 404 and the error says so. Only Keenetic is known to do this.
+
+`tcp_settings.no_delay` (default on) and `bind_interface` apply to the TCP
+connection; `transport` is refused.
+
+Things to know before relying on it:
+
+- **A network change ends every connection through the tunnel.** A TCP
+  connection does not survive its interface going away, and a new session
+  may be given a different address, so the session ends at once and the
+  next connection opens a new one. AmneziaWG keeps its connections; SSTP
+  cannot.
+- **It is TCP inside TCP.** On a lossy path, a loss on the outer connection
+  stalls everything inside it, and SSTP is slower there than AmneziaWG or
+  Hysteria2 to the same place. It is chosen for reach: HTTPS on 443 crosses
+  networks that block WireGuard's UDP.
+- **It is not camouflage on the wire.** Whoever terminates the TLS can tell
+  it is SSTP, and shoes' TLS handshake is not Windows'. A Keenetic with
+  `camouflage_secret` hides the server from probes, nothing more. Do not
+  choose it for censorship resistance.
+- **IPv4 only.** The server's IPv6 negotiation is refused, and IPv6
+  destinations are unreachable through it.
+- Names resolve through the configured resolver before the tunnel is asked
+  for a connection; the DNS servers the server offers are logged at `info`
+  but not used.
+
 ### mieru Client
 ```yaml
 protocol:

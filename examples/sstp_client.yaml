@@ -1,0 +1,36 @@
+# Route everything through an SSTP server: Windows RRAS, MikroTik,
+# SoftEther, accel-ppp, or a home router that offers SSTP.
+#
+# SSTP is a layer-3 tunnel that owns its transport, so it must be the only
+# hop in a chain. Its TLS settings live under the protocol's own tls block.
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "vpn.example.com:443"
+          protocol:
+            type: sstp
+            # DOMAIN\user for a Windows domain account; HUB\user for a
+            # SoftEther virtual hub.
+            username: "alice"
+            password: "a strong password"
+            # The default. Add 'pap' only if the server offers nothing else:
+            # it sends the password in the clear inside TLS.
+            auth: [mschapv2]
+            # The default, IPv6's minimum. Raise it only for a server known
+            # to carry more: shoes cannot discover a smaller path MTU.
+            mtu: 1280
+            # A Keenetic router with "Camouflage mode" on shows its address
+            # as https://<host>/?<secret>; the part after '?' goes here.
+            # camouflage_secret: "0123abcd"
+            tls:
+              # A server with a self-signed certificate is reached by pinning
+              # its SHA-256 fingerprint instead of verifying a chain: both
+              # settings, since with verify on a pin is checked on top of the
+              # chain, and a self-signed certificate has no chain to pass.
+              verify: false
+              server_fingerprints:
+                - "0d4c2a9f6b1e3d5c7a8b9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"

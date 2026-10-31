@@ -177,6 +177,18 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   then. Cost: a re-dispatch of the release workflow, or a manual publish,
   each time a fan-out job is cancelled.
 
+- **A name resolves to one address, with no say in its family** (2026-10-31,
+  the SSTP review). The rule engine resolves a name to match it against an
+  IP mask and keeps the first address in `ResolvedLocation`; nothing lets
+  a transport say which family it carries. The SSTP connector, IPv4 only,
+  resolves again when handed an IPv6 address (`src/sstp/connector.rs`,
+  `resolve_target`); AmneziaWG hands whatever it gets to a tunnel that may
+  have no address of that family. Fixing it means keeping every address in
+  `ResolvedLocation`, or a family hint on `Resolver`, and then both tunnel
+  connectors. Cost: one more resolver round trip, cached, per SSTP
+  connection to a dual-stack name, and an IPv6 destination failing inside
+  an IPv4-only AmneziaWG tunnel.
+
 ## Table of Contents
 
 - [Quality and correctness plan](#quality-and-correctness-plan)
@@ -191,6 +203,7 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Lessons from steer](#lessons-from-steer)
+- [Classic VPN clients: OpenConnect](#classic-vpn-clients-openconnect)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 - [Resolved: AmneziaWG upload was capped by the send window, and the drop was the outbound channel](#resolved-amneziawg-upload-was-capped-by-the-send-window-and-the-drop-was-the-outbound-channel)
@@ -205,16 +218,20 @@ That framing needs one update, though. sing-box 1.14 stopped being only a
 circumvention proxy: it added an **OpenVPN client *and server*, an OpenConnect
 client**, Snell, and a `bridge` outbound doing layer-3 forwarding. So the
 protocol gap has widened along an axis that did not exist a year ago — classic
-enterprise VPN — rather than along the one this list measures. Whether that
-axis matters to us is a product question nobody has asked yet; it is worth
-asking before it answers itself.
+enterprise VPN — rather than along the one this list measures. The first
+request on that axis came on 2026-10-30, for SSTP: the client is in, built
+to [docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md);
+it has been run against a production server, and its runs against SoftEther
+and accel-ppp are still to come. OpenConnect is next on that axis, planned
+in [Classic VPN clients: OpenConnect](#classic-vpn-clients-openconnect);
+OpenVPN, IKEv2 and L2TP are weighed there and left.
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
 TLS, WebSocket, HTTPUpgrade.
 
 Client: Direct, HTTP, SOCKS5, Shadowsocks, Snell, VMess, VLESS, Trojan, AnyTLS,
-NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1,
+NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1, SSTP,
 port-forward, plus TLS, Reality, ShadowTLS, WebSocket and HTTPUpgrade as
 wrapping layers.
 
@@ -1106,6 +1123,98 @@ Order: S.1 and S.2 came first, because they were bugs and configs that
 failed to load; both are in. S.3 and S.4 come next. Brutal (S.5, S.6) comes
 last: verifying it needs 4.3's interop rig against apernet, which is the
 part of 4.3 still to do.
+
+## Classic VPN clients: OpenConnect
+
+Written 2026-10-31, after SSTP landed (#135) and the four classic client
+protocols were weighed against what the tree now has. OpenConnect is the
+one worth building; the other three are below, with why not.
+
+**What it is.** The protocol of Cisco AnyConnect and of
+[ocserv](https://gitlab.com/openconnect/ocserv) (GPL), spoken by the
+[openconnect](https://gitlab.com/openconnect/openconnect) client (LGPL-2.1),
+whose maintainers document it at
+[infradead.org/openconnect/protocols.html](https://www.infradead.org/openconnect/protocols.html).
+Keenetic ships an ocserv-based server in KeeneticOS 4.x with the same
+camouflage mode SSTP has (`oc-server camouflage`, the secret as the URL's
+query string), so a Keenetic user has it beside SSTP. sing-box 1.14 added a
+client, [sing-openconnect](https://github.com/SagerNet/sing-openconnect),
+about 1 MB of Go over `pion/dtls`; its licence is unstated, so it is
+behaviour to read, not code.
+
+**The shape.** HTTPS throughout, which is why it crosses what blocks UDP:
+
+1. Authentication over ordinary HTTPS: an XML form exchange (`POST /`,
+   `<config-auth client="vpn" type="init">`, the server's form, the reply
+   with username and password), ending in a `webvpn` session cookie.
+2. The tunnel: `CONNECT /CSCOSSLC/tunnel` with `X-CSTP-*` headers (MTU,
+   address request, keepalive and DPD intervals) answered with the
+   assigned address, DNS, split routes and the server's own intervals;
+   then CSTP frames on the same TLS stream, an 8-byte header (`STF`, a
+   version byte, a 16-bit length, a type byte: data, DPD request and
+   response, keepalive, disconnect) in front of each IP packet.
+3. Optionally the data path moves to DTLS over UDP, negotiated by
+   `X-DTLS-*` headers: the server names the port, cipher and a session
+   identity the client resumes without a full handshake (the master
+   secret, or ocserv's PSK form). Same frames, one UDP datagram each.
+
+**What the tree gives it.** All of it from SSTP's shape: the shared
+netstack (`src/netstack.rs`), the TLS setup and pinning
+(`src/rustls_config_util.rs`), the HTTP parsing (`src/http_parse.rs`),
+the connector lifecycle with its cooldown and the network-change listener
+(`src/sstp/connector.rs`, to copy, or to extract into a trait now that a
+third tunnel needs it), the single-hop rule and the terminal-connector
+arm (`src/config/validate.rs`, `src/tcp/chain_builder.rs`), and the test
+server double's pattern (`src/sstp/testing.rs`). No PPP, no crypto
+binding: this is simpler than SSTP on the control plane.
+
+**What is new.**
+
+| Piece | Lands in | Size |
+| --- | --- | --- |
+| The auth exchange: form XML, the cookie, the error forms a server sends for a wrong password or a second factor it wants | `src/openconnect/auth.rs` | ~600 lines |
+| CSTP: the CONNECT, the headers both ways, the frame codec, DPD and keepalive on the server's intervals | `src/openconnect/cstp.rs`, `session.rs` | ~800 lines |
+| The connector and config: `type: openconnect`, username, password, `tls`, `camouflage_secret`, an optional server certificate pin as Keenetic users will need | `src/openconnect/connector.rs`, `src/config/` | ~400 lines |
+| The server double for the end-to-end tests: ocserv's side of the form exchange and CSTP, echoing from a smoltcp interface as SSTP's does | `src/openconnect/testing.rs` | ~600 lines |
+| DTLS: a stack (none in the tree; `dimpl`, DTLS 1.2/1.3, sans-IO, MIT/Apache, is the candidate), the `X-DTLS-*` negotiation, resuming the session the server named, the same frames over UDP, falling back to CSTP when DTLS does not come up within its timeout | `src/openconnect/dtls.rs` | 2–3 kLOC, and the risk |
+
+Without DTLS it is TCP in TCP, like SSTP, and the same path-MTU and
+loss costs apply; with it, the data path is UDP and the netstack's
+windows do what they do for AmneziaWG. The order of work is therefore
+CSTP first, as a complete client, measured; DTLS second, if the
+measurement says the TCP path is what limits a user. ocserv's session
+handoff to DTLS is not the standard resumption, and whether `dimpl`
+lets a client drive it is the question to answer before promising it.
+
+**Difficulty.** 3 of 5 for the CSTP client, 4 of 5 with DTLS, against
+SSTP's 2 (about 4,800 lines including tests, two days). Verification as
+for SSTP: a spec first, read from the openconnect client and ocserv with
+file-level citations; known-answer tests where the protocol computes
+anything; the in-process double; a live run against the user's Keenetic
+and against ocserv in a container, recorded in words.
+
+**Weighed and left, for now.**
+
+- **OpenVPN** (4 of 5; 8–12 kLOC). Nothing in it is standard: TLS inside
+  its own reliable transport, `tls-crypt` around the control channel, its
+  own key derivation and data-channel format, replay window, ping and
+  option push. There is no Rust implementation to lean on, and the OpenVPN
+  3 Core bindings on crates.io are AGPL, which a mobile library cannot
+  carry. sing-openvpn is 640 KB of Go. Keenetic's own documentation calls
+  OpenVPN resource-intensive and steers users to other types. Worth doing
+  only when a deployment that offers nothing else asks.
+- **IKEv2/IPsec** (5 of 5; 10–15 kLOC). The IKE state machine, userspace
+  ESP with anti-replay, NAT-T, rekeying, DPD, MOBIKE, fragmentation, and
+  then the quirks of Windows, Apple, strongSwan and Keenetic each. The one
+  Rust crate claiming a client (`ryke`) is eleven days old with no users;
+  `ipsec-parser` only parses. And every phone and desktop OS has a native
+  IKEv2 client already: on iOS the extension would be reimplementing what
+  `NEVPNManager` gives an app for free.
+- **L2TP/IPsec** (5 of 5 overall). L2TP alone is small (about 1.5 kLOC)
+  and would reuse SSTP's PPP and MS-CHAPv2 whole, but every server that
+  offers it, Keenetic's included, requires IPsec transport mode negotiated
+  with IKEv1, a separate and deprecated protocol from IKEv2. More work
+  than IKEv2 for a protocol every OS speaks natively.
 
 ## Explicitly not planned
 

@@ -548,7 +548,7 @@ pub unsafe extern "C" fn shoes_set_log_level(log_level: *const c_char) -> c_int 
 /// The number of tunnel endpoints that were told to rebind.
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_network_changed() -> c_int {
-    crate::amneziawg::notify_network_change() as c_int
+    crate::network_change::notify() as c_int
 }
 
 /// Get the last error message from the shoes service.

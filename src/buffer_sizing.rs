@@ -3,7 +3,7 @@
 //! Two stacks in this crate run smoltcp over a byte pipe and allocate their
 //! buffers up front, when a connection is opened rather than when it carries
 //! anything: the TUN stack in `src/tun/tcp_stack_direct.rs`, and the AmneziaWG
-//! virtual stack in `src/amneziawg/netstack.rs`. On a mobile VPN both are in
+//! virtual stack in `src/netstack.rs`. On a mobile VPN both are in
 //! series — a browser connection is accepted by the first and initiated through
 //! the second — so a number chosen in one of them is only half the bill.
 //!
@@ -68,7 +68,7 @@
 //! alone, but the real mechanism was the tunnel's outbound channel overflowing
 //! under the unpaced burst — the drop the ROADMAP could not place. The
 //! netstack's virtual device now backpressures instead of letting the channel
-//! drop (see `VirtualDevice::transmit` in src/amneziawg/netstack.rs), so the
+//! drop (see `VirtualDevice::transmit` in src/netstack.rs), so the
 //! send window scales cleanly and is sized per platform, apart from the
 //! receive window because the two spend memory against different limits.
 //!
@@ -391,7 +391,7 @@ mod tests {
         assert!(
             window_packets > default_outbound_queue_depth() / 2,
             "if the window has shrunk to fit the channel again, the device \
-             backpressure in src/amneziawg/netstack.rs may no longer be earning \
+             backpressure in src/netstack.rs may no longer be earning \
              its keep -- re-read this module's history before simplifying either",
         );
     }

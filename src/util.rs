@@ -81,7 +81,7 @@ pub async fn write_all<T: AsyncWriteExt + Unpin>(
 /// at first use, so the absolute values stay legible in diagnostics;
 /// after that only the monotonic clock moves it.
 ///
-/// Lives here rather than in either stack: the AmneziaWG netstack is not
+/// Lives here rather than in either stack: the tunnels' netstack is not
 /// gated on the TUN module, and a clock is nobody's device concern.
 pub fn smol_now() -> smoltcp::time::Instant {
     static BASE: std::sync::OnceLock<(std::time::Instant, smoltcp::time::Instant)> =
