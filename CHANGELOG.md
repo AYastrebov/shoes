@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.9.1
+
+An SSTP client outbound (`type: sstp`), verified against a production
+server, with `camouflage_secret` for a Keenetic router's camouflage mode
+(#135); `shoesd` on macOS keeps a network's search domains while a session
+is up (#133); and `MOBILE.md` says what makes the stopped callback fire
+(#134). The FFI is unchanged, so the Apple framework and the AAR are
+drop-ins. Also the CI and documentation work since the 0.9.0 bump (#123
+to #131), part of which landed before the 0.9.0 tag and is headed here,
+and the activity-tracker test that no longer fails on an oversleeping
+runner (#132). No configuration change beyond the new outbound.
 
 An SSTP client outbound (`type: sstp`): Microsoft's PPP over HTTPS, as
 Windows RRAS, MikroTik, SoftEther, accel-ppp and some routers serve it.
