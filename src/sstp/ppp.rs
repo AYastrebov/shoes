@@ -123,6 +123,10 @@ pub struct Link {
     pub dns: Vec<Ipv4Addr>,
     /// The server's MRU: the largest IP packet this side may send.
     pub peer_mru: u16,
+    /// This side's MRU as the server acknowledged it, which it may have
+    /// Configure-Naked down from the configured value: the largest packet
+    /// this side receives, so what the netstack advertises as MSS.
+    pub local_mru: u16,
 }
 
 fn malformed(what: &str) -> io::Error {
@@ -321,7 +325,15 @@ pub struct Ppp {
     auth_naks: u32,
     hlak: Option<Hlak>,
     echo_id: u8,
+    /// Set by the server's Terminate-Request, LCP or IPCP, once the
+    /// Terminate-Ack is on its way: the link is over, and nothing further
+    /// is answered.
+    terminated: Option<&'static str>,
 }
+
+/// The largest PPP frame an SSTP data packet carries: `FF 03`, the
+/// protocol and [`MAX_MRU`] bytes of information.
+const MAX_FRAME: usize = MAX_MRU as usize + 4;
 
 impl Ppp {
     pub fn new(credentials: Credentials, methods: Vec<AuthMethod>, mru: u16) -> Self {
@@ -353,6 +365,7 @@ impl Ppp {
             auth_naks: 0,
             hlak: None,
             echo_id: 0,
+            terminated: None,
         }
     }
 
@@ -400,7 +413,20 @@ impl Ppp {
                 .filter(|a| !a.is_unspecified())
                 .collect(),
             peer_mru: self.peer_mru,
+            local_mru: self
+                .lcp
+                .options
+                .iter()
+                .find(|(k, _)| *k == lcp_option::MRU)
+                .and_then(|(_, v)| <[u8; 2]>::try_from(v.as_slice()).ok())
+                .map_or(1500, u16::from_be_bytes),
         })
+    }
+
+    /// Why the server ended the link, once it has: the Terminate-Ack was
+    /// the last frame returned, and the caller closes after sending it.
+    pub fn terminated(&self) -> Option<&'static str> {
+        self.terminated
     }
 
     /// When [`Ppp::on_timer`] next has something to do.
@@ -458,7 +484,10 @@ impl Ppp {
         info: &[u8],
         now: Instant,
     ) -> io::Result<Vec<Vec<u8>>> {
-        match protocol {
+        if self.terminated.is_some() {
+            return Ok(Vec::new());
+        }
+        let replies = match protocol {
             protocol::LCP => self.lcp_input(info, now),
             protocol::CHAP if self.phase == Phase::Authenticate => self.chap_input(info),
             protocol::PAP if self.phase == Phase::Authenticate => self.pap_input(info),
@@ -470,7 +499,24 @@ impl Ppp {
             protocol::IPCP | protocol::CHAP | protocol::PAP | protocol::IPV4 => Ok(Vec::new()),
             other if self.phase != Phase::Establish => Ok(vec![self.protocol_reject(other, info)]),
             _ => Ok(Vec::new()),
-        }
+        }?;
+        // A reply echoing a maximal frame that came without `FF 03` would
+        // not fit a packet once this side puts them back; the 12-bit length
+        // would wrap and desynchronise the stream. Nothing is lost by not
+        // answering such a frame: the peer retransmits.
+        Ok(replies
+            .into_iter()
+            .filter(|frame| {
+                let fits = frame.len() <= MAX_FRAME;
+                if !fits {
+                    log::debug!(
+                        "PPP: not sending a {}-byte reply that cannot be framed",
+                        frame.len()
+                    );
+                }
+                fits
+            })
+            .collect())
     }
 
     /// LCP Protocol-Reject (§5.7) of a protocol this does not speak: IPv6CP,
@@ -541,10 +587,15 @@ impl Ppp {
                 }
                 Ok(vec![self.lcp.request(now)])
             }
-            code::TERMINATE_REQUEST => Err(failed(
-                io::ErrorKind::ConnectionAborted,
-                "PPP: the server terminated the link".into(),
-            )),
+            // RFC 1661 §5.6: a Terminate-Ack, then the link is down. The
+            // caller sends the Ack and ends the session on `terminated()`.
+            code::TERMINATE_REQUEST => {
+                self.terminated = Some("PPP: the server terminated the link");
+                Ok(vec![frame(
+                    protocol::LCP,
+                    &control(code::TERMINATE_ACK, packet.id, packet.data),
+                )])
+            }
             code::ECHO_REQUEST if self.phase != Phase::Establish => {
                 let mut data = self.magic.to_be_bytes().to_vec();
                 data.extend_from_slice(packet.data.get(4..).unwrap_or_default());
@@ -892,10 +943,13 @@ impl Ppp {
                 }
                 Ok(vec![self.ipcp.request(now)])
             }
-            code::TERMINATE_REQUEST => Err(failed(
-                io::ErrorKind::ConnectionAborted,
-                "PPP: the server closed IPCP".into(),
-            )),
+            code::TERMINATE_REQUEST => {
+                self.terminated = Some("PPP: the server closed IPCP");
+                Ok(vec![frame(
+                    protocol::IPCP,
+                    &control(code::TERMINATE_ACK, packet.id, packet.data),
+                )])
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -1316,6 +1370,7 @@ mod tests {
                 address: Ipv4Addr::new(10, 0, 0, 7),
                 dns: vec![Ipv4Addr::new(10, 0, 0, 53)],
                 peer_mru: 1400,
+                local_mru: 1500,
             })
         );
     }
@@ -1388,6 +1443,147 @@ mod tests {
         }
         now += RESTART;
         assert!(ppp.on_timer(now).is_err());
+    }
+
+    /// A server that Configure-Naks this side's MRU down gets it: the link
+    /// carries the acknowledged value, which bounds what this side
+    /// receives, so the netstack advertises an MSS the path can carry.
+    #[test]
+    fn a_naked_mru_reaches_the_link() {
+        let mut ppp = Ppp::new(credentials(), vec![AuthMethod::Pap], 1500);
+        let now = Instant::now();
+        let request = ppp.start(now);
+        let (_, _, id, _) = reply(&request, 0);
+        let out = ppp
+            .input(
+                &lcp(
+                    code::CONFIGURE_NAK,
+                    id,
+                    &vec![(lcp_option::MRU, 1000u16.to_be_bytes().to_vec())],
+                ),
+                now,
+            )
+            .unwrap();
+        let (_, code, id, options) = reply(&out, 0);
+        assert_eq!(code, code::CONFIGURE_REQUEST);
+        assert_eq!(
+            options[0],
+            (lcp_option::MRU, 1000u16.to_be_bytes().to_vec())
+        );
+        ppp.input(
+            &lcp(
+                code::CONFIGURE_REQUEST,
+                7,
+                &vec![(lcp_option::AUTH_PROTOCOL, vec![0xc0, 0x23])],
+            ),
+            now,
+        )
+        .unwrap();
+        let out = ppp
+            .input(&lcp(code::CONFIGURE_ACK, id, &Options::new()), now)
+            .unwrap();
+        let pap_id = reply(&out, 0).2;
+        ppp.input(&frame(protocol::PAP, &control(2, pap_id, &[0])), now)
+            .unwrap();
+        ppp.take_authenticated().unwrap();
+        let out = ppp.start_network(now);
+        let (_, _, id, options) = reply(&out, 0);
+        ppp.input(
+            &frame(
+                protocol::IPCP,
+                &control(
+                    code::CONFIGURE_REQUEST,
+                    1,
+                    &encode_options(&vec![(3, vec![10, 0, 0, 1])]),
+                ),
+            ),
+            now,
+        )
+        .unwrap();
+        let mut assigned = options.clone();
+        set_option(&mut assigned, 3, vec![10, 0, 0, 7]);
+        let out = ppp
+            .input(
+                &frame(
+                    protocol::IPCP,
+                    &control(
+                        code::CONFIGURE_NAK,
+                        id,
+                        &encode_options(&vec![(3, vec![10, 0, 0, 7])]),
+                    ),
+                ),
+                now,
+            )
+            .unwrap();
+        let (_, _, id, options) = reply(&out, 0);
+        ppp.input(
+            &frame(
+                protocol::IPCP,
+                &control(code::CONFIGURE_ACK, id, &encode_options(&options)),
+            ),
+            now,
+        )
+        .unwrap();
+        assert_eq!(ppp.link().unwrap().local_mru, 1000);
+    }
+
+    /// A maximal frame that came without `FF 03` draws a reply that would
+    /// not fit a packet with them; it is not sent, rather than framed with
+    /// a wrapped length.
+    #[test]
+    fn a_reply_that_cannot_be_framed_is_not_sent() {
+        let mut ppp = Ppp::new(credentials(), vec![AuthMethod::MsChapV2], 1500);
+        let now = Instant::now();
+        ppp.start(now);
+        // 4091 bytes: protocol, a 4-byte header, 4085 bytes of options of a
+        // type this side rejects, which a Configure-Reject echoes whole.
+        let mut options = Vec::new();
+        for _ in 0..16 {
+            options.push((0xaa, vec![0; 253]));
+        }
+        options.push((0xaa, vec![0; 3]));
+        let encoded = encode_options(&options);
+        assert_eq!(encoded.len(), 4085);
+        let mut compressed = protocol::LCP.to_be_bytes().to_vec();
+        compressed.extend_from_slice(&control(code::CONFIGURE_REQUEST, 1, &encoded));
+        assert_eq!(compressed.len(), MAX_FRAME);
+
+        let replies = ppp.input(&compressed, now).unwrap();
+        assert!(
+            replies.iter().all(|frame| frame.len() <= MAX_FRAME),
+            "a reply of {:?} bytes cannot be framed",
+            replies.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+    }
+
+    /// RFC 1661 §5.6: a Terminate-Request is answered with a Terminate-Ack
+    /// carrying its identifier, and the link is over from then on.
+    #[test]
+    fn a_terminate_request_gets_its_ack_and_ends_the_link() {
+        let mut ppp = Ppp::new(credentials(), vec![AuthMethod::MsChapV2], 1500);
+        establish(&mut ppp, vec![0xc2, 0x23, 0x81]);
+        let out = ppp
+            .input(
+                &frame(
+                    protocol::LCP,
+                    &control(code::TERMINATE_REQUEST, 0x42, b"bye"),
+                ),
+                Instant::now(),
+            )
+            .unwrap();
+        let (protocol, code, id, _) = reply(&out, 0);
+        assert_eq!(
+            (protocol, code, id),
+            (protocol::LCP, code::TERMINATE_ACK, 0x42)
+        );
+        assert!(ppp.terminated().is_some());
+        let after = ppp
+            .input(
+                &frame(protocol::LCP, &control(code::ECHO_REQUEST, 1, &[0; 4])),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(after.is_empty(), "nothing is answered after the link ended");
     }
 
     #[test]

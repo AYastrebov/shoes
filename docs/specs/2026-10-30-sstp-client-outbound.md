@@ -694,7 +694,8 @@ its secret.
 
 | Condition | Behaviour |
 | --- | --- |
-| TCP or TLS fails, or the certificate is refused | The build fails with rustls's or the socket's error, prefixed "SSTP: connecting to <host:port>". Cooldown starts |
+| TCP or TLS fails, or the certificate is refused | Every resolved address is tried for the TCP connection, in order, within the negotiation deadline, as the other outbounds do; then the build fails with rustls's or the socket's error, prefixed "SSTP: connecting to <host:port>". Cooldown starts |
+| The server sends LCP or IPCP Terminate-Request | Terminate-Ack with its identifier (RFC 1661 §5.6), flushed by the writer's teardown, then the session ends as dead |
 | HTTP status other than 200, or no header end within 8 KiB | "SSTP: the server answered the SSTP request with <status line>". The status line is the server's text, length-capped, control characters stripped |
 | Call Connect Nak | "SSTP: the server refused the call (status <id/status>)". [MS-SSTP] §3.2.5.3.3 lets a client retry, and its note <10> says the Windows client retries 3 times. It also says a Nak arrives only when the server does not carry PPP over SSTP, which a retry cannot change, so this does not retry |
 | Ack without the Crypto Binding Request, or offering no hash we support | Call Abort, then fail: "SSTP: the server offered no usable crypto binding" |

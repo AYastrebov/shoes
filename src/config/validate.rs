@@ -1471,6 +1471,14 @@ fn validate_client_config(
         // the name the certificate is checked against (`""` and `null` send
         // no SNI but still verify against it), and the connector unwraps
         // that name as validated: one rustls refuses must be refused here.
+        // `:443` parses to a hostname of "", which no header, name check or
+        // resolver can use; the connector would panic on it.
+        if client_config.address.address().hostname() == Some("") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSTP address needs a host: a hostname or an IP address before the port.",
+            ));
+        }
         let names_something = matches!(
             &sstp.tls.sni_hostname,
             crate::option_util::NoneOrOne::One(name) if !name.is_empty()
@@ -2931,6 +2939,28 @@ mod tests {
             sstp.tls.sni_hostname = NoneOrOne::One("vpn.example.com".into());
             super::super::validate_client_config(&mut config, &std::collections::HashMap::new())
                 .unwrap();
+        }
+
+        /// `:443` parses to an empty hostname, which the connector cannot
+        /// turn into a name to verify or a Host header.
+        #[test]
+        fn an_empty_address_hostname_is_refused_at_load() {
+            use crate::address::NetLocation;
+            use crate::config::ClientConfig;
+            let mut config = ClientConfig {
+                address: NetLocation::from_str(":443", None).unwrap(),
+                protocol: ClientProxyConfig::Sstp(Box::new(sstp())),
+                ..Default::default()
+            };
+            let err = super::super::validate_client_config(
+                &mut config,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("SSTP address needs a host"),
+                "{err}"
+            );
         }
 
         /// The secret rides the request line, so it is limited to what a

@@ -97,6 +97,10 @@ pub struct Stats {
     pub early_packets: AtomicUsize,
     /// Rung to make every live session send Call Disconnect.
     pub disconnect: Notify,
+    /// Rung to make every live session send an LCP Terminate-Request.
+    pub terminate: Notify,
+    /// LCP Terminate-Acks the client sent in answer.
+    pub terminate_acks: AtomicUsize,
     /// Rung to make every live session send three malformed PPP frames: an
     /// empty one, one of `FF 03` alone, and an LCP packet whose Length
     /// field runs past it. RFC 1661 §5 has the client discard them.
@@ -260,6 +264,12 @@ async fn serve(
             _ = stats.disconnect.notified() => {
                 server.send_control(packet::bare_control(message::CALL_DISCONNECT));
             }
+            _ = stats.terminate.notified() => {
+                server.send(
+                    protocol::LCP,
+                    &ppp::control(code::TERMINATE_REQUEST, 0x77, b"server going down"),
+                );
+            }
             _ = stats.garbage.notified() => {
                 for frame in [vec![], vec![0xff, 0x03], ppp::frame(protocol::LCP, &[9, 1, 0xff, 0xff])] {
                     let mut bytes = packet::data_header(frame.len()).to_vec();
@@ -405,6 +415,10 @@ impl Session {
                 protocol::LCP,
                 &ppp::control(code::TERMINATE_ACK, packet.id, &[]),
             ),
+            code::TERMINATE_ACK => {
+                assert_eq!(packet.id, 0x77, "the Ack carries the request's identifier");
+                self.stats.terminate_acks.fetch_add(1, Ordering::SeqCst);
+            }
             _ => {}
         }
         if self.lcp_acked_by_client && self.lcp_acked_client && !self.auth_started {

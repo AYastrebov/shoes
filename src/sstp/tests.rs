@@ -533,3 +533,73 @@ async fn a_camouflaged_server_needs_its_secret_on_the_request() {
     tcp_echo(&right, b"camouflaged").await.unwrap();
     assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 1);
 }
+
+/// A name whose first address refuses: the next is tried, within the one
+/// negotiation deadline, as the other outbounds do.
+#[derive(Debug)]
+struct DeadThenLive {
+    dead: SocketAddr,
+    live: SocketAddr,
+}
+
+impl Resolver for DeadThenLive {
+    fn resolve_location(
+        &self,
+        _location: &NetLocation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+    {
+        let (dead, live) = (self.dead, self.live);
+        Box::pin(async move { Ok(vec![dead, live]) })
+    }
+}
+
+#[tokio::test]
+async fn the_next_resolved_address_is_tried_when_the_first_refuses() {
+    let server = testing::start(Options::default()).await;
+    let dead = crate::quic_outbound::testing::reserve_tcp_port();
+    let resolver: Arc<dyn Resolver> = Arc::new(DeadThenLive {
+        dead,
+        live: server.address,
+    });
+    let config = config_for(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    let connector = SstpConnector::new(
+        NetLocation::from_str("sstp.test:443", None).unwrap(),
+        config,
+        None,
+        true,
+    )
+    .unwrap();
+    let mut stream = connector
+        .connect_tcp(&resolver, echo())
+        .await
+        .unwrap()
+        .client_stream;
+    stream.write_all(b"second address").await.unwrap();
+    let mut back = [0u8; 14];
+    tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back, b"second address");
+}
+
+/// The server's LCP Terminate-Request is answered with a Terminate-Ack
+/// before the session ends, and the next connection opens a new one.
+#[tokio::test]
+async fn a_terminate_request_is_acked_before_the_session_ends() {
+    let server = testing::start(Options::default()).await;
+    let connector = connector(&server, vec![SstpAuthMethod::Mschapv2], PASSWORD);
+    tcp_echo(&connector, b"first").await.unwrap();
+    server.stats.terminate.notify_waiters();
+    wait_until_dead(&connector).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.stats.terminate_acks.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never got its Terminate-Ack"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tcp_echo(&connector, b"second").await.unwrap();
+    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
+}

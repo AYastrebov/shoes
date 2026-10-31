@@ -55,27 +55,64 @@ pub struct Established {
     pub link: Link,
 }
 
-pub async fn establish(settings: &Settings, server: SocketAddr) -> io::Result<Established> {
-    match tokio::time::timeout(NEGOTIATION_TIMEOUT, run(settings, server)).await {
+/// `servers` are the address's resolved addresses, tried in order until one
+/// accepts the TCP connection; the whole of it is under the negotiation
+/// timeout.
+pub async fn establish(settings: &Settings, servers: &[SocketAddr]) -> io::Result<Established> {
+    match tokio::time::timeout(NEGOTIATION_TIMEOUT, run(settings, servers)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "SSTP: no link to {} within {} s",
-                server,
+                settings.address,
                 NEGOTIATION_TIMEOUT.as_secs()
             ),
         )),
     }
 }
 
-async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established> {
+/// The first of `servers` that accepts the connection, as
+/// `SocketConnectorImpl::connect` does for the other outbounds: a name's
+/// first answer being unreachable is no reason to fail while the rest are
+/// untried, and a rebuild against the same cached answer would fail the
+/// same way.
+async fn connect_any(
+    settings: &Settings,
+    servers: &[SocketAddr],
+) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    let mut last = None;
+    for &server in servers {
+        let attempt = async {
+            let socket = crate::socket_util::new_tcp_socket(
+                settings.bind_interface.as_deref(),
+                server.is_ipv6(),
+            )?;
+            socket.connect(server).await
+        };
+        match attempt.await {
+            Ok(tcp) => return Ok((tcp, server)),
+            Err(e) => {
+                debug!("SSTP: connecting to {server}: {e}; trying the next address");
+                last = Some(io::Error::new(
+                    e.kind(),
+                    format!("SSTP: connecting to {server}: {e}"),
+                ));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("SSTP: {} resolved to no address", settings.address),
+        )
+    }))
+}
+
+async fn run(settings: &Settings, servers: &[SocketAddr]) -> io::Result<Established> {
+    let (tcp, server) = connect_any(settings, servers).await?;
     let context =
         |e: io::Error| io::Error::new(e.kind(), format!("SSTP: connecting to {}: {e}", server));
-    let socket =
-        crate::socket_util::new_tcp_socket(settings.bind_interface.as_deref(), server.is_ipv6())
-            .map_err(context)?;
-    let tcp = socket.connect(server).await.map_err(context)?;
     if settings.no_delay {
         tcp.set_nodelay(true).map_err(context)?;
     }
@@ -139,7 +176,7 @@ async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established>
                 "SSTP: connected to {}: address {}, MTU {}, DNS {:?}",
                 server,
                 link.address,
-                link.peer_mru.min(settings.mtu),
+                link.peer_mru.min(link.local_mru).min(settings.mtu),
                 link.dns
             );
             return Ok(Established {
@@ -198,6 +235,10 @@ async fn run(settings: &Settings, server: SocketAddr) -> io::Result<Established>
                     None => frames,
                 };
                 write_frames(&mut stream, &[], &control).await?;
+                if let Some(reason) = ppp.terminated() {
+                    // The Terminate-Ack went out with that write.
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, reason));
+                }
             }
             Packet::Control(control) => match control.message {
                 message::ECHO_REQUEST => {

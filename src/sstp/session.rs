@@ -413,6 +413,11 @@ impl Reader {
                         out.extend_from_slice(&reply);
                         self.send_control(out)?;
                     }
+                    if let Some(reason) = self.ppp.terminated() {
+                        // The Terminate-Ack is queued; the writer flushes
+                        // it on its way out, under the stop deadline.
+                        return Err(io::Error::new(io::ErrorKind::ConnectionAborted, reason));
+                    }
                 }
                 Packet::Control(control) => match control.message {
                     message::ECHO_REQUEST => {

@@ -202,9 +202,15 @@ impl SstpConnector {
 
     async fn build(&self, resolver: &Arc<dyn Resolver>) -> std::io::Result<Live> {
         let t = &self.template;
-        let server = resolver::resolve_single_address(resolver, &t.address).await?;
-        let established = handshake::establish(t, server).await?;
-        let mtu = established.link.peer_mru.min(t.mtu);
+        let servers = resolver::resolve_addresses(resolver, &t.address).await?;
+        let established = handshake::establish(t, &servers).await?;
+        // What this side may send (the server's MRU), what it may receive
+        // (its own MRU as acknowledged), and what was configured.
+        let mtu = established
+            .link
+            .peer_mru
+            .min(established.link.local_mru)
+            .min(t.mtu);
 
         let (ip_to_tunnel_tx, ip_to_tunnel_rx) =
             mpsc::channel(crate::buffer_sizing::default_outbound_queue_depth());
