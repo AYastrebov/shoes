@@ -1,0 +1,37 @@
+# Route everything through an OpenConnect server: ocserv, a Cisco
+# AnyConnect gateway, or a Keenetic router's OpenConnect server.
+#
+# OpenConnect is a layer-3 tunnel that owns its transport, so it must be
+# the only hop in a chain. Its TLS settings live under the protocol's own
+# tls block. Only the TLS data path (CSTP) is spoken; DTLS is not.
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "vpn.example.com:443"
+          protocol:
+            type: openconnect
+            username: "alice"
+            password: "a strong password"
+            # When the server offers a choice of groups, the one to pick;
+            # unset takes the server's first.
+            # group: "Route"
+            # Where the login is posted; ocserv can read another path as a
+            # group name.
+            path: "/"
+            # The default, IPv6's minimum; the server can lower it. Raise
+            # it only for a server known to carry more.
+            mtu: 1280
+            # A Keenetic router or ocserv with camouflage on shows its
+            # address as https://<host>/?<secret>; the part after '?'.
+            # camouflage_secret: "0123abcd"
+            tls:
+              # A server with a self-signed certificate is reached by pinning
+              # its SHA-256 fingerprint; both settings, since with verify on
+              # a pin is checked on top of the chain.
+              verify: false
+              server_fingerprints:
+                - "0d4c2a9f6b1e3d5c7a8b9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"

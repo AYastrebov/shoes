@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+An OpenConnect client outbound (`type: openconnect`): Cisco AnyConnect's
+protocol as ocserv and the openconnect client speak it, over TLS (CSTP).
+Keenetic routers ship an ocserv-based server beside their SSTP one, with the
+same camouflage mode, so a Keenetic user has it beside `type: sstp`. Like
+WireGuard it is a layer-3 tunnel and the only hop in its chain; one session
+per hop carries every TCP and UDP connection through the shared smoltcp
+stack, IPv6 too when the server assigns an address. It is built to
+`docs/specs/2026-10-31-openconnect-client-outbound.md`, read from the
+openconnect client, ocserv, the protocol draft ocserv's author wrote, and
+two MIT Go clients. What it does:
+- the username-and-password exchange, with a group when the server offers
+  a choice; a second password, a one-time code, a client certificate, SSO
+  and the host scan are refused by name;
+- `CONNECT /CSCOSSLC/tunnel` and the frames on it, dead peer detection and
+  keepalives on the server's intervals, the goodbye on stop;
+- the session cookie kept across rebuilds, so a tunnel that dropped comes
+  back without a second login, and one fresh login when the server refuses
+  the cookie;
+- certificate pinning and `camouflage_secret`, as for SSTP.
+
+One rule the roadmap's plan did not know, read in ocserv: it reads one TLS
+record per frame and ends a session whose record holds anything else, so
+the writer gives each frame its own record where SSTP's batches, and a test
+counts records against frames. The DTLS data path is a later step, if a
+measurement says TCP is the limit. Not yet run against a real server.
+
 ## v0.9.2
 
 A patch for the SSTP client: the request's `Host` header follows
