@@ -298,13 +298,39 @@ async fn a_camouflaged_server_needs_its_secret_on_the_first_request() {
     right.camouflage_secret = Some(SECRET.to_string().into());
     let connector = connector_with(&server, right);
     tcp_echo(&connector, b"camouflaged").await.unwrap();
+    // ocserv under camouflage answers a refused cookie on CONNECT with 405
+    // (`worker-auth.c:1300-1304`); that is a refused cookie, not a wrong
+    // secret, and the client logs in again.
+    server.stats.disconnect.notify_waiters();
+    wait_until_dead(&connector).await;
+    server
+        .stats
+        .refuse_next_cookie
+        .store(true, Ordering::SeqCst);
+    tcp_echo(&connector, b"relogin").await.unwrap();
+    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 2);
     // The reconnect with the cookie makes no POST, so it carries no secret:
     // ocserv gates CONNECT on the cookie and would 404 a query on it.
     server.stats.disconnect.notify_waiters();
     wait_until_dead(&connector).await;
     tcp_echo(&connector, b"again").await.unwrap();
-    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 2);
-    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 1);
+    assert_eq!(server.stats.sessions.load(Ordering::SeqCst), 3);
+    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 2);
+
+    // With `camouflage_realm` set, ocserv's refusal is a 401 with a realm
+    // before any credential went out: the hint, not "wrong password".
+    let realm = testing::start(Options {
+        camouflage_secret: Some(SECRET),
+        camouflage_realm: true,
+        ..Options::default()
+    })
+    .await;
+    let unaware = connector_with(&realm, config_for(&realm, PASSWORD));
+    let err = tcp_echo(&unaware, b"x").await.unwrap_err();
+    assert!(
+        err.to_string().contains("401") && err.to_string().contains("set camouflage_secret"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -401,6 +427,67 @@ async fn every_frame_is_its_own_tls_record() {
     let frames = server.stats.client_frames.load(Ordering::SeqCst) - frames;
     assert!(frames > 100, "{frames} frames");
     assert_eq!(records, frames, "{frames} frames in {records} records");
+}
+
+/// The same rule under backpressure: the server stops reading, the
+/// client's socket fills, and a frame must still go out whole. (The TLS
+/// stream drains each record before the next write, so rustls's buffer
+/// limit never truncates a frame here; this guards the rule, not that
+/// mechanism, and fails on the batching defect as the test above does.)
+#[tokio::test]
+async fn every_frame_is_its_own_tls_record_under_backpressure() {
+    let server = testing::start(Options {
+        receive_buffer: Some(64 * 1024),
+        ..Options::default()
+    })
+    .await;
+    let connector = connector(&server);
+    tcp_echo(&connector, b"warm up").await.unwrap();
+    let records = server.stats.client_records.load(Ordering::SeqCst);
+    let frames = server.stats.client_frames.load(Ordering::SeqCst);
+    server.stats.stall_ms.store(1500, Ordering::SeqCst);
+    tcp_echo(&connector, &payload(4 * 1024 * 1024))
+        .await
+        .unwrap();
+    tcp_echo(&connector, b"flush").await.unwrap();
+    let records = server.stats.client_records.load(Ordering::SeqCst) - records;
+    let frames = server.stats.client_frames.load(Ordering::SeqCst) - frames;
+    assert!(frames > 100, "{frames} frames");
+    assert_eq!(records, frames, "{frames} frames in {records} records");
+}
+
+/// A server that kept its own larger MTU sends packets past the
+/// configured one; openconnect accepts them (`cstp.c:961-964`), and so
+/// does this: the configured MTU caps what goes out, not what comes in.
+#[tokio::test]
+async fn an_inbound_packet_past_the_configured_mtu_is_delivered() {
+    let server = testing::start(Options {
+        link_mtu: 1500,
+        ..Options::default()
+    })
+    .await;
+    let mut config = config_for(&server, PASSWORD);
+    config.mtu = 1280;
+    let connector = connector_with(&server, config);
+    let mut stream = connector
+        .connect_udp_bidirectional(&resolver(), echo())
+        .await
+        .unwrap();
+    let reply = crate::quic_outbound::testing::udp_echo_exchange(&mut stream, b"small")
+        .await
+        .unwrap();
+    assert_eq!(reply, b"small");
+    server.stats.big_packet.notify_waiters();
+    let mut buf = vec![0u8; 65535];
+    let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+    let read = std::future::poll_fn(|cx| {
+        std::pin::Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
+    });
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("the large datagram was dropped")
+        .unwrap();
+    assert_eq!(read_buf.filled().len(), 1400);
 }
 
 /// A frame of a type neither side knows is ignored, as ocserv ignores it.

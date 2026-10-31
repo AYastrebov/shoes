@@ -1715,10 +1715,9 @@ fn validate_openconnect(
             "OpenConnect username must be 1 to 256 characters.".into(),
         ));
     }
-    if openconnect.username.contains(['\0', '<', '>', '&']) {
-        return Err(invalid(
-            "OpenConnect username cannot contain '<', '>', '&' or NUL.".into(),
-        ));
+    // The XML escapes what needs escaping; only NUL has no place in it.
+    if openconnect.username.contains('\0') {
+        return Err(invalid("OpenConnect username cannot contain NUL.".into()));
     }
     let password = openconnect.password.expose();
     if password.is_empty() || password.len() > 256 {
@@ -1727,10 +1726,10 @@ fn validate_openconnect(
         ));
     }
     if let Some(group) = &openconnect.group
-        && (group.is_empty() || group.len() > 64 || group.contains(['<', '>', '&', '\0']))
+        && (group.is_empty() || group.len() > 64 || group.contains('\0'))
     {
         return Err(invalid(
-            "OpenConnect group must be 1 to 64 characters, without '<', '>', '&' or NUL.".into(),
+            "OpenConnect group must be 1 to 64 characters, without NUL.".into(),
         ));
     }
     // It goes on the request line: an absolute path, no query (the
@@ -2960,10 +2959,10 @@ mod tests {
             super::super::validate_openconnect(&mut openconnect()).unwrap();
             let cases: Vec<(&str, Plant)> = vec![
                 ("username", Box::new(|c| c.username = String::new())),
-                ("username", Box::new(|c| c.username = "a<b".into())),
+                ("username", Box::new(|c| c.username = "a\0b".into())),
                 ("password", Box::new(|c| c.password = String::new().into())),
                 ("group", Box::new(|c| c.group = Some(String::new()))),
-                ("group", Box::new(|c| c.group = Some("x&y".into()))),
+                ("group", Box::new(|c| c.group = Some("x\0y".into()))),
                 ("path", Box::new(|c| c.path = "vpn".into())),
                 ("path", Box::new(|c| c.path = "/?secret".into())),
                 ("path", Box::new(|c| c.path = "/a b".into())),
@@ -2992,6 +2991,11 @@ mod tests {
             pinned.tls.verify = false;
             pinned.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
             super::super::validate_openconnect(&mut pinned).unwrap();
+            // What the XML escapes is allowed; ocserv unescapes it.
+            let mut escaped = openconnect();
+            escaped.username = "r&d <alice>".into();
+            escaped.group = Some("Sales & Support".into());
+            super::super::validate_openconnect(&mut escaped).unwrap();
             let mut grouped = openconnect();
             grouped.group = Some("Route".into());
             grouped.path = "/Route".into();

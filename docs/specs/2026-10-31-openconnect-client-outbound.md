@@ -254,7 +254,12 @@ netstack ◄─ip_from_tunnel─ reader ◄─frames parsed as a stream── TC
 ```
 
 The writer drains what is queued, writes each frame with its own `write`
-and flushes once. No allocation per packet beyond the netstack's owned
+and flushes once. rustls' 64 KiB buffer limit, which truncates a plaintext
+write, is lifted on the connection so that the one-frame-per-record rule
+does not depend on the TLS stream draining each record before the next
+write, which it does today. Inbound, a frame is bounded by the codec's
+16 KiB and by the family the link carries, not by the configured MTU:
+openconnect accepts oversize frames on purpose (`cstp.c:961-964`). No allocation per packet beyond the netstack's owned
 `Vec`; one reusable frame buffer. Nothing drops: the reader waits on a full
 inbound channel, as SSTP's does, and the outer TCP paces.
 
@@ -289,7 +294,7 @@ false` only with a pin. `path` must start with `/` and carry no query.
 | 401 to the auth reply, or a form with `<error>` | Authentication failed, with the server's message; never the credentials |
 | A form asking for anything but username, password and group | "the server asks for a second factor (…), which this client does not do" |
 | An SSO form, a certificate request | Named and refused |
-| CONNECT 401 | Cookie refused: run the authentication again once |
+| CONNECT 401, or 405 under camouflage | Cookie refused: run the authentication again once, under the same negotiation deadline |
 | CONNECT 503 | Refused with the `X-Reason` |
 | No `X-CSTP-MTU`, no address | Refused, as openconnect does |
 | `X-CSTP-Content-Encoding` | Refused: none was offered |

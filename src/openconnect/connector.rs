@@ -165,8 +165,13 @@ impl OpenConnectConnector {
             ));
         }
         let servers = resolver::resolve_addresses(resolver, &self.template.address).await?;
+        // One negotiation deadline for the attempt with the cookie and the
+        // fresh login that may follow: the connector's lock is held
+        // throughout, and every other connection waits on it.
+        let deadline = tokio::time::Instant::now() + handshake::NEGOTIATION_TIMEOUT;
         let mut established =
-            handshake::establish(&self.template, &servers, state.cookies.as_deref()).await;
+            handshake::establish_by(&self.template, &servers, state.cookies.as_deref(), deadline)
+                .await;
         // `cstp.c:379-380`: a 401 to CONNECT is the cookie refused; the
         // credentials are still good, so authenticate again, once.
         if state.cookies.is_some()
@@ -179,7 +184,7 @@ impl OpenConnectConnector {
                 self.template.address
             );
             state.cookies = None;
-            established = handshake::establish(&self.template, &servers, None).await;
+            established = handshake::establish_by(&self.template, &servers, None, deadline).await;
         }
         match established {
             Ok(established) => {

@@ -202,16 +202,21 @@ pub fn spawn(established: Established, channels: Channels) -> Arc<SessionState> 
     state
 }
 
-/// Whether the link carries a packet of this family and size.
-fn carried(link: &Link, ip: &[u8]) -> bool {
-    if ip.len() > usize::from(link.mtu) {
-        return false;
-    }
+/// Whether the link has an address of this packet's family.
+fn family_carried(link: &Link, ip: &[u8]) -> bool {
     match ip.first().map(|b| b >> 4) {
         Some(4) => link.ipv4.is_some(),
         Some(6) => link.ipv6.is_some(),
         _ => false,
     }
+}
+
+/// Whether this side may send the packet: its family, and within the
+/// MTU. Inbound, only the family counts: openconnect accepts frames past
+/// the negotiated MTU on purpose (`cstp.c:961-964`), and a server that
+/// kept its own larger MTU sends them.
+fn carried(link: &Link, ip: &[u8]) -> bool {
+    ip.len() <= usize::from(link.mtu) && family_carried(link, ip)
 }
 
 /// What the keepalive logic decides at an instant (`mainloop.c:454-492`).
@@ -387,17 +392,21 @@ async fn finish(
     control: &mut mpsc::Receiver<Vec<u8>>,
     state: &SessionState,
 ) -> io::Result<()> {
-    let mut out = Vec::new();
+    // Each frame its own write, as always: a goodbye sharing a record
+    // with a DPD answer would be the one frame the server never reads.
+    let mut frames = Vec::new();
     while let Ok(packet) = control.try_recv() {
-        out.extend_from_slice(&packet);
+        frames.push(packet);
     }
     let leaving = !state.is_dead();
     if leaving {
-        out.extend_from_slice(&cstp::disconnect(BYE_REASON));
+        frames.push(cstp::disconnect(BYE_REASON));
     }
     let _ = tokio::time::timeout(STOP_WAIT, async {
-        if !out.is_empty() {
-            write.write_all(&out).await?;
+        for frame in &frames {
+            write.write_all(frame).await?;
+        }
+        if !frames.is_empty() {
             write.flush().await?;
         }
         Ok::<(), io::Error>(())
@@ -463,7 +472,7 @@ impl Reader {
             let (kind, payload) = cstp::parse(&self.buf[range]);
             match kind {
                 kind::DATA => {
-                    if !carried(&self.link, payload) {
+                    if !family_carried(&self.link, payload) {
                         debug!("OpenConnect: discarding a packet the link does not carry");
                         continue;
                     }
@@ -582,5 +591,8 @@ mod tests {
         assert!(!carried(&link, &[0x45; 101]));
         assert!(!carried(&link, &[0x60; 60]));
         assert!(!carried(&link, &[]));
+        // Inbound: the family only.
+        assert!(family_carried(&link, &[0x45; 1400]));
+        assert!(!family_carried(&link, &[0x60; 1400]));
     }
 }

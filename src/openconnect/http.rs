@@ -26,6 +26,29 @@ pub struct Request<'a> {
 }
 
 impl Request<'_> {
+    /// What [`Request::to_bytes`] would produce, in bytes, without
+    /// producing it: the padding is sized from this.
+    pub fn encoded_len(&self) -> usize {
+        let mut len = self.method.len() + 1 + self.target.len() + " HTTP/1.1\r\n".len();
+        len += "Host: ".len() + self.host.len() + 2;
+        len += "User-Agent: ".len() + self.user_agent.len() + 2;
+        if !self.cookies.is_empty() {
+            len += "Cookie: ".len() + 2;
+            for (i, (name, value)) in self.cookies.iter().enumerate() {
+                len += name.len() + 1 + value.len() + if i > 0 { 2 } else { 0 };
+            }
+        }
+        for (name, value) in self.headers {
+            len += name.len() + 2 + value.len() + 2;
+        }
+        if let Some((content_type, body)) = self.body {
+            len += "Content-Type: ".len() + content_type.len() + 2;
+            len += "Content-Length: ".len() + body.len().to_string().len() + 2;
+            len += body.len();
+        }
+        len + 2
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
         out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", self.method, self.target).as_bytes());
@@ -269,6 +292,16 @@ mod tests {
             "CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\nHost: vpn.example.com:8443\r\n\
              User-Agent: agent\r\nCookie: webvpn=abc\r\nX-CSTP-Version: 1\r\n\r\n"
         );
+        assert_eq!(request.encoded_len(), request.to_bytes().len());
+        let two_cookies = vec![
+            ("webvpn".to_string(), "abc".to_string()),
+            ("webvpncontext".to_string(), "d".to_string()),
+        ];
+        let request = Request {
+            cookies: &two_cookies,
+            ..request
+        };
+        assert_eq!(request.encoded_len(), request.to_bytes().len());
         let request = Request {
             method: "POST",
             target: "/",
@@ -283,6 +316,7 @@ mod tests {
                 .unwrap()
                 .ends_with("Content-Type: text/xml\r\nContent-Length: 4\r\n\r\n<x/>")
         );
+        assert_eq!(request.encoded_len(), request.to_bytes().len());
     }
 
     #[tokio::test]

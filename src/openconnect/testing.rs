@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -49,6 +49,9 @@ pub struct Options {
     /// ocserv's camouflage: the first request of a connection must carry
     /// this as its query string, else the answer is a web server's 404.
     pub camouflage_secret: Option<&'static str>,
+    /// With camouflage: answer the secretless request with ocserv's
+    /// `camouflage_realm` 401 instead of the 404.
+    pub camouflage_realm: bool,
     pub username: &'static str,
     pub password: &'static str,
     /// The groups offered in a `<select>`; none means no select.
@@ -63,12 +66,17 @@ pub struct Options {
     pub keepalive: u32,
     /// The link MTU, from which `X-CSTP-MTU` is derived as ocserv does.
     pub link_mtu: u16,
+    /// Shrink the accepted socket's receive buffer to this, so a stalled
+    /// server backs the client up within a few kilobytes instead of the
+    /// megabytes loopback otherwise absorbs.
+    pub receive_buffer: Option<usize>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             camouflage_secret: None,
+            camouflage_realm: false,
             username: "alice",
             password: "correct horse",
             groups: vec![],
@@ -77,6 +85,7 @@ impl Default for Options {
             dpd: 90,
             keepalive: 32400,
             link_mtu: 1434,
+            receive_buffer: None,
         }
     }
 }
@@ -108,6 +117,14 @@ pub struct Stats {
     pub refuse_next_cookie: AtomicBool,
     /// Stop answering DPD requests and sending anything: a dead peer.
     pub mute: AtomicBool,
+    /// Milliseconds the tunnel stops reading the client for, once: the
+    /// client's socket fills, and its TLS layer with it.
+    pub stall_ms: AtomicU64,
+    /// Rung to make the far side send a 1400-byte UDP datagram to the last
+    /// UDP peer it heard from.
+    pub big_packet: Notify,
+    /// The last UDP endpoint the far side received from.
+    last_udp_peer: Mutex<Option<smoltcp::wire::IpEndpoint>>,
     /// Rung to make every live session send DISCONNECT.
     pub disconnect: Notify,
     /// Rung to make every live session send TERMINATE.
@@ -288,6 +305,11 @@ async fn serve(
     options: Options,
     stats: Arc<Stats>,
 ) -> std::io::Result<()> {
+    if let Some(size) = options.receive_buffer {
+        socket2::SockRef::from(&tcp)
+            .set_recv_buffer_size(size)
+            .unwrap();
+    }
     let counted = RecordCounter {
         inner: tcp,
         stats: stats.clone(),
@@ -325,10 +347,19 @@ async fn serve(
                     camouflage_passed = true;
                 }
                 _ => {
-                    tls.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nServer: nginx\r\nContent-Length: 0\r\n\r\n",
-                    )
-                    .await?;
+                    // `worker-vpn.c:1066-1069`: a 401 with the realm when
+                    // one is configured, else a 404.
+                    if options.camouflage_realm {
+                        tls.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"intranet\"\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await?;
+                    } else {
+                        tls.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nServer: nginx\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
             }
@@ -541,7 +572,7 @@ async fn tunnel(
         }
     });
     let (ip_tx, ip_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    tokio::spawn(far_side(ip_rx, out_tx.clone(), options.ipv6));
+    tokio::spawn(far_side(ip_rx, out_tx.clone(), options.ipv6, stats.clone()));
     let send = |kind: u8, payload: &[u8]| {
         let mut frame = Vec::new();
         cstp::encode(&mut frame, kind, payload);
@@ -550,6 +581,10 @@ async fn tunnel(
 
     let mut chunk = [0u8; 4096];
     loop {
+        let stall = stats.stall_ms.swap(0, Ordering::SeqCst);
+        if stall > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+        }
         while let Some(len) = cstp::frame_len(&buf)? {
             if buf.len() < len {
                 break;
@@ -617,7 +652,9 @@ async fn far_side(
     mut ip_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     out: mpsc::UnboundedSender<Vec<u8>>,
     ipv6: bool,
+    stats: Arc<Stats>,
 ) {
+    let mut send_big = false;
     let mut device = Queue::default();
     let mut config = InterfaceConfig::new(HardwareAddress::Ip);
     config.random_seed = rand::random();
@@ -673,7 +710,13 @@ async fn far_side(
         }
         let socket = sockets.get_mut::<udp::Socket>(udp_handle);
         while let Ok((n, meta)) = socket.recv_slice(&mut scratch) {
+            *stats.last_udp_peer.lock().unwrap() = Some(meta.endpoint);
             let _ = socket.send_slice(&scratch[..n], meta.endpoint);
+        }
+        if std::mem::take(&mut send_big)
+            && let Some(peer) = *stats.last_udp_peer.lock().unwrap()
+        {
+            socket.send_slice(&[0x42; 1400], peer).unwrap();
         }
         iface.poll(now, &mut device, &mut sockets);
         for ip in device.tx.borrow_mut().drain(..) {
@@ -697,6 +740,7 @@ async fn far_side(
                 }
                 None => return,
             },
+            _ = stats.big_packet.notified() => send_big = true,
             _ = tokio::time::sleep(delay) => {}
         }
     }

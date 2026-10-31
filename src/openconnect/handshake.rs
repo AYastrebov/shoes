@@ -89,16 +89,19 @@ pub struct Established {
 }
 
 /// `servers` are the address's resolved addresses, tried in order; the
-/// whole of it is under the negotiation timeout. With `cookies` from a
-/// previous session the authentication is skipped, and a server that
-/// refuses them answers with `PermissionDenied`, which the connector
-/// turns into a fresh authentication.
-pub async fn establish(
+/// whole of it is under `deadline`, which the caller sets so that a
+/// cookie refused and the fresh login that follows share one negotiation
+/// timeout ([`NEGOTIATION_TIMEOUT`]) rather than taking two. With
+/// `cookies` from a previous session the authentication is skipped, and a
+/// server that refuses them answers with `PermissionDenied`, which the
+/// connector turns into a fresh authentication.
+pub async fn establish_by(
     settings: &Settings,
     servers: &[SocketAddr],
     cookies: Option<&[(String, Redacted<String>)]>,
+    deadline: tokio::time::Instant,
 ) -> io::Result<Established> {
-    match tokio::time::timeout(NEGOTIATION_TIMEOUT, run(settings, servers, cookies)).await {
+    match tokio::time::timeout_at(deadline, run(settings, servers, cookies)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -173,8 +176,19 @@ async fn run(
         tcp.set_nodelay(true).map_err(context)?;
     }
     let mut io: Box<dyn AsyncStream> = Box::new(tcp);
-    let client = rustls::ClientConnection::new(settings.tls.clone(), settings.server_name.clone())
-        .map_err(|e| context(io::Error::other(e)))?;
+    let mut client =
+        rustls::ClientConnection::new(settings.tls.clone(), settings.server_name.clone())
+            .map_err(|e| context(io::Error::other(e)))?;
+    // rustls truncates a plaintext write to the room under its 64 KiB
+    // buffer limit (`vecbuf.rs:65-72`, rustls 0.23), and a truncated frame
+    // would go out as two records, which ocserv ends the session on.
+    // `CryptoTlsStream::poll_write` drains each write's record to the
+    // socket before the next, so the limit cannot bite a frame today (a
+    // stalled server was tried, and no write was ever truncated); lifting
+    // it keeps the one-frame-per-record rule from depending on that. What
+    // rustls buffers is bounded by the writer, which hands it one frame at
+    // a time and flushes each burst.
+    client.set_buffer_limit(None);
     let mut connection = CryptoConnection::new_rustls_client(client);
     perform_crypto_handshake(&mut connection, &mut io, 16384)
         .await
@@ -277,6 +291,7 @@ async fn authenticate(
     let group_access = format!("https://{}{}", settings.host, settings.path);
     let mut document = auth::init_document(&group_access, settings.group.as_deref());
     let mut path = settings.path.clone();
+    let mut credentials_posted = false;
     for _ in 0..MAX_AUTH_ROUNDS {
         let (head, body) = post(
             settings,
@@ -290,7 +305,10 @@ async fn authenticate(
         jar.take(&head);
         match head.status {
             200 => {}
-            401 => {
+            // A 401 before any credential went out is not a refusal of the
+            // credentials: ocserv with `camouflage_realm` set answers the
+            // secretless request that way (`worker-vpn.c:1066-1069`).
+            401 if credentials_posted => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -349,6 +367,7 @@ async fn authenticate(
                     settings.password.expose(),
                     settings.group.as_deref(),
                 )?;
+                credentials_posted = true;
                 if let Some(action) = form.action.filter(|a| !a.is_empty()) {
                     path = action;
                 }
@@ -393,8 +412,7 @@ async fn post(
         headers: &headers,
         body: Some(("application/xml; charset=utf-8", document.as_bytes())),
     }
-    .to_bytes()
-    .len();
+    .encoded_len();
     // "X-Pad: " and "\r\n" are 9 bytes; the value fills the rest.
     let pad = (64 - (unpadded + 9) % 64) % 64;
     headers.push(("X-Pad", "0".repeat(pad)));
@@ -424,8 +442,10 @@ fn printable(text: &str) -> String {
 /// refused cookie under camouflage.
 fn refused(status: u16, head: &Head, camouflaged: bool) -> io::Error {
     let hint = match (status, camouflaged) {
-        (404, false) => " (a server with camouflage on answers this way: set camouflage_secret)",
-        (404 | 405, true) => " (the camouflage secret may be wrong)",
+        (401 | 404, false) => {
+            " (a server with camouflage on answers this way: set camouflage_secret)"
+        }
+        (401 | 404 | 405, true) => " (the camouflage secret may be wrong)",
         _ => "",
     };
     let reason = head.get("x-reason").unwrap_or(head.reason.as_str());
@@ -486,7 +506,9 @@ async fn connect(
     let head = reader.head(stream).await?;
     match head.status {
         200 => {}
-        401 => {
+        // `cstp.c:379-380`; and ocserv under camouflage answers a refused
+        // cookie with 405 instead (`worker-auth.c:1300-1304`).
+        401 | 405 => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "OpenConnect: the server refused the session cookie",
