@@ -1467,10 +1467,15 @@ fn validate_client_config(
 
     if let ClientProxyConfig::Sstp(sstp) = &mut client_config.protocol {
         validate_sstp(sstp)?;
-        // With sni_hostname unset, the address's hostname is the name the
-        // certificate is checked against, and the connector unwraps it as
-        // validated: a name rustls refuses must be refused here.
-        if sstp.tls.sni_hostname.is_unspecified() {
+        // Unless sni_hostname names something, the address's hostname is
+        // the name the certificate is checked against (`""` and `null` send
+        // no SNI but still verify against it), and the connector unwraps
+        // that name as validated: one rustls refuses must be refused here.
+        let names_something = matches!(
+            &sstp.tls.sni_hostname,
+            crate::option_util::NoneOrOne::One(name) if !name.is_empty()
+        );
+        if !names_something {
             validate_tls_server_name("SSTP", client_config.address.address().hostname())?;
         }
     }
@@ -2900,6 +2905,24 @@ mod tests {
                 err.to_string().contains("SSTP client sni_hostname"),
                 "{err}"
             );
+
+            // `""` and `null` send no SNI but still verify against the
+            // address's name, so they do not excuse it either.
+            for no_sni in [NoneOrOne::One(String::new()), NoneOrOne::None] {
+                let ClientProxyConfig::Sstp(sstp) = &mut config.protocol else {
+                    panic!("sstp");
+                };
+                sstp.tls.sni_hostname = no_sni;
+                let err = super::super::validate_client_config(
+                    &mut config,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("SSTP client sni_hostname"),
+                    "{err}"
+                );
+            }
 
             // An explicit, valid sni_hostname makes the address's name moot.
             let ClientProxyConfig::Sstp(sstp) = &mut config.protocol else {

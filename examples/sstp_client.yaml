@@ -28,6 +28,9 @@
             # camouflage_secret: "0123abcd"
             tls:
               # A server with a self-signed certificate is reached by pinning
-              # its SHA-256 fingerprint instead of verifying a chain.
+              # its SHA-256 fingerprint instead of verifying a chain: both
+              # settings, since with verify on a pin is checked on top of the
+              # chain, and a self-signed certificate has no chain to pass.
+              verify: false
               server_fingerprints:
                 - "0d4c2a9f6b1e3d5c7a8b9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"

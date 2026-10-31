@@ -386,10 +386,13 @@ The connector builds its `rustls::ClientConfig` with `create_client_config`
 (`src/rustls_config_util.rs:13`), allowing TLS 1.2 and 1.3. Windows Server
 2016 and older top out at 1.2.
 - Name verification uses the hop's host, or `sni_hostname`.
-- Pinning uses `server_fingerprints`. That is the SHA-256 of the
-  end-entity certificate (`src/rustls_config_util.rs:112-116`), the same
-  value SSTP's SHA-256 Cert Hash carries. A pinned deployment's fingerprint
-  is therefore what the server will check binding against.
+- Pinning uses `server_fingerprints` with `verify: false`; with `verify`
+  on, the pin is checked on top of the chain (`ServerFingerprintVerifier`
+  in `src/rustls_config_util.rs` runs webpki first), which a self-signed
+  certificate cannot pass. The pin is the SHA-256 of the end-entity
+  certificate (`src/rustls_config_util.rs:112-116`), the same value SSTP's
+  SHA-256 Cert Hash carries, so a pinned deployment's fingerprint is what
+  the server will check binding against.
 - [MS-SSTP] §3.2.4.1 wants `id-kp-serverAuth` or `anyExtendedKeyUsage`.
   webpki's server verification differs in both directions
   (`rustls-webpki` 0.103.16, `verify_cert.rs:388-399` and `:531`). It

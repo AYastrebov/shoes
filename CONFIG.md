@@ -1082,9 +1082,12 @@ the first connection, carries every connection through the hop. Design:
 `docs/specs/2026-10-30-sstp-client-outbound.md`.
 
 The server's certificate is checked as for the `tls` client, and its hash is
-what crypto binding sends, so an SSTP server with a self-signed certificate
-is reached by pinning it in `server_fingerprints`. `verify: false` without a
-pin is refused: the credentials would go to any server that answered.
+what crypto binding sends. With `verify` on, a pin in `server_fingerprints`
+is checked on top of the chain, so an SSTP server with a self-signed
+certificate (a Windows RRAS box, a router without a public name) is reached
+with `verify: false` and its SHA-256 fingerprint in `server_fingerprints`
+together. `verify: false` without a pin is refused: the credentials would go
+to any server that answered.
 
 `auth` lists the methods the client will use. MS-CHAPv2 is the default, and
 it proves the server knows the password as well as the client; the server's
