@@ -1167,6 +1167,53 @@ transport, session multiplexing, the low entropy encoding, port ranges and the
 transports and carrying its TCP framing over QUIC produces bytes no mieru
 server understands.
 
+### OpenConnect Client
+```yaml
+protocol:
+  type: openconnect             # Also 'anyconnect', 'ocserv'
+  username: string
+  password: string
+  group: string?               # The group to select when the server offers a choice
+  path: "/"                    # Default: "/". Where the login is posted
+  mtu: 1280                    # Default: 1280. Between 576 and 1500
+  tls:                         # Optional; the same block as SSTP's
+    verify: true               # Default: true
+    sni_hostname: string?      # Default: the host in `address`; "" sends none. Also the Host header
+    server_fingerprints: [string]?  # SHA-256 of the server certificate
+  camouflage_secret: string?   # ocserv's and Keenetic's camouflage: the part after '?'
+```
+
+A client for the protocol of Cisco AnyConnect and of ocserv, as the
+openconnect client speaks it, over TLS only (CSTP): the username and
+password exchange, then `CONNECT /CSCOSSLC/tunnel` on the same connection
+and IP packets in CSTP frames on it. Like WireGuard it is a layer-3 tunnel,
+so it must be the only hop in its chain; TCP and UDP to any destination go
+through it, IPv6 too when the server assigns an IPv6 address. One session,
+opened on the first connection, carries every connection through the hop.
+Design: `docs/specs/2026-10-31-openconnect-client-outbound.md`.
+
+The session cookie the login earns is kept: a tunnel that dropped (a
+network change, a server disconnect) comes back with `CONNECT` alone, and
+a cookie the server no longer accepts is followed by one fresh login.
+Dead peer detection and keepalives run on the intervals the server names.
+
+`group` is sent as the selection when the server's form offers groups;
+unset picks the server's first. A group the server does not offer fails
+with the list. `path` is where the login is posted, `/` for every server
+known; ocserv's `select-group-by-url` reads another path as a group.
+
+Not implemented, and refused by name when a server asks: a second
+password or one-time code, a client certificate, single sign-on, the
+server's CSD host scan, compression, and the DTLS data path (the tunnel
+stays on TLS; a server that offers DTLS is still reached). Split routes
+the server sends are logged and not applied: shoes routes by its own
+rules, and the hop carries whatever they send it.
+
+The certificate, `sni_hostname`, the `Host` header, `mtu`,
+`camouflage_secret`, `tcp_settings` and `bind_interface` behave as for
+SSTP above. The camouflage secret goes on the first request of each TLS
+connection, where ocserv checks it.
+
 ### WireGuard Client
 ```yaml
 protocol:

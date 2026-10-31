@@ -83,7 +83,7 @@ impl SstpConnector {
         // set, else the bare hostname or literal (rustls takes an IPv6
         // literal without brackets).
         let bare = address.address().to_string();
-        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&bare))?;
+        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&bare), "SSTP")?;
         // The `Host` header names the same server, as a browser's does: a
         // client that resolves the name itself and dials the literal keeps
         // the name in `sni_hostname`, and a `Host` built from the literal

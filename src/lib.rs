@@ -68,6 +68,7 @@ mod mixed_handler;
 mod naiveproxy;
 mod netstack;
 mod network_change;
+mod openconnect;
 mod option_util;
 #[cfg(feature = "control-stats")]
 mod outbound_counting_stream;

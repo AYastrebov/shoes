@@ -7,7 +7,8 @@ tunnel, so proxied TCP and UDP cross it through shoes' userspace TCP/IP
 stack.
 
 Written 2026-10-31 against `mobile` at `884938d` (v0.9.2), after the plan
-in `ROADMAP.md` ("Classic VPN clients: OpenConnect").
+in `ROADMAP.md` ("Classic VPN clients: OpenConnect"); built the same day,
+and the text below was corrected where building it taught otherwise.
 
 ## Sources
 
@@ -124,8 +125,11 @@ URL must carry `?<secret>` first in its query; otherwise the answer is a
 check passes by itself (`worker-vpn.c:827-831`), and CONNECT is not gated
 by the URL at all, only by the cookie (`worker-auth.c:1296-1312`, which
 answers 405 when camouflage is on and the cookie fails). So the secret goes
-on the first request of each TLS connection, and only there: on a later
-request ocserv would not strip it, and the query would change the route.
+on the first POST of each TLS connection, and only there: on a later
+request ocserv would not strip it, and the query would miss every handler
+(`worker-vpn.c:1076-1082`). CONNECT never carries it: ocserv compares that
+URL whole (`worker-vpn.c:2219-2226`) and gates the tunnel on the cookie,
+so a reconnect with the cookie sends no secret at all.
 
 ### CONNECT
 
@@ -231,9 +235,10 @@ like `src/sstp/`:
 | `src/openconnect/connector.rs` | The lifecycle: one session per hop, the cookie kept across rebuilds, the cooldown, the network-change listener |
 | `src/openconnect/testing.rs` | The in-process server double |
 
-XML parsing uses `quick-xml` (MIT), already a transitive dependency
-candidate; the documents are small and the client reads elements by name,
-as both references do.
+XML parsing is `src/openconnect/xml.rs`, two hundred lines of scanner
+producing a tree: the documents are a few hundred bytes of a known shape,
+ocserv reads them by substring search, and a parser crate would have been
+measured against the mobile size band for the sake of two document shapes.
 
 The netstack (`src/netstack.rs`) is given the IPv4 address with its
 netmask and, when assigned, the IPv6 address with its prefix; destinations
