@@ -445,16 +445,20 @@ fn printable(text: &str) -> String {
 /// gateway that echoes the username, or worse, into its refusal must not
 /// have it land in a log.
 fn server_text(settings: &Settings, text: &str) -> String {
-    let mut text = printable(text);
-    for secret in [
-        settings.password.expose().as_str(),
-        settings.username.as_str(),
-    ] {
+    redacted(text, &settings.username, settings.password.expose())
+}
+
+/// The redaction first, on the text as the server sent it, then the
+/// filtering and the cut: a password that straddles the cut, or one with
+/// a control character in it, would otherwise escape the match.
+fn redacted(text: &str, username: &str, password: &str) -> String {
+    let mut text = text.to_string();
+    for secret in [password, username] {
         if !secret.is_empty() {
             text = text.replace(secret, "[redacted]");
         }
     }
-    text
+    printable(&text)
 }
 
 /// A status other than 200 to an auth request or to `CONNECT`. A 404 is
@@ -596,7 +600,7 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
                     link.dns.push(ip);
                 }
             }
-            "mtu" => mtu = value.parse().ok(),
+            "mtu" => mtu = value.parse::<u16>().ok(),
             "dpd" => link.dpd = seconds(value).map(Duration::from_secs),
             "keepalive" => link.keepalive = seconds(value).map(Duration::from_secs),
             "banner" => link.banner = Some(printable(value)),
@@ -620,6 +624,14 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
             "OpenConnect: the server named no MTU",
         ));
     };
+    // Below IPv4's minimum reassembly size nothing can cross the tunnel;
+    // zero would refuse every packet the netstack offered.
+    if mtu < 576 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("OpenConnect: the server named an MTU of {mtu}, below 576"),
+        ));
+    }
     link.mtu = mtu.min(configured_mtu);
     link.ipv4 = ipv4.map(|a| (a, netmask4.map(prefix_of_netmask).unwrap_or(32)));
     // smoltcp's `IpCidr::new` panics on a prefix past 128; a server's
@@ -778,6 +790,37 @@ mod tests {
         .unwrap();
         assert_eq!(link.dpd, Some(Duration::from_secs(86_400)));
         assert_eq!(link.keepalive, None, "not a u64: no keepalive");
+    }
+
+    #[test]
+    fn a_tiny_mtu_is_refused() {
+        for bad in ["0", "575"] {
+            let err = parse_connect_reply(
+                &head(&[("x-cstp-address", "10.0.0.2"), ("x-cstp-mtu", bad)]),
+                1280,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("below 576"), "{bad}: {err}");
+        }
+    }
+
+    /// The credentials come out of server text before it is filtered or
+    /// cut: a password across the 200-character cut, or one carrying a
+    /// control character, must not survive as a fragment.
+    #[test]
+    fn credentials_are_redacted_before_the_text_is_cut_or_filtered() {
+        let password = "hunter2hunter2";
+        let straddling = format!("{}{password}", "x".repeat(195));
+        let out = redacted(&straddling, "alice", password);
+        assert!(!out.contains("hunter"), "{out}");
+        assert!(
+            out.len() <= 200 && out.ends_with("[reda"),
+            "the cut falls on the marker: {out}"
+        );
+        let tabbed = "a\tb";
+        let out = redacted("refused: a\tb for alice", "alice", tabbed);
+        assert_eq!(out, "refused: [redacted] for [redacted]");
+        assert_eq!(redacted("plain", "", ""), "plain");
     }
 
     #[test]

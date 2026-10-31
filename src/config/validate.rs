@@ -1720,6 +1720,9 @@ fn validate_openconnect(
         return Err(invalid("OpenConnect username cannot contain NUL.".into()));
     }
     let password = openconnect.password.expose();
+    if password.contains('\0') {
+        return Err(invalid("OpenConnect password cannot contain NUL.".into()));
+    }
     if password.is_empty() || password.len() > 256 {
         return Err(invalid(
             "OpenConnect password must be 1 to 256 characters.".into(),
@@ -2961,6 +2964,7 @@ mod tests {
                 ("username", Box::new(|c| c.username = String::new())),
                 ("username", Box::new(|c| c.username = "a\0b".into())),
                 ("password", Box::new(|c| c.password = String::new().into())),
+                ("NUL", Box::new(|c| c.password = "a\0b".to_string().into())),
                 ("group", Box::new(|c| c.group = Some(String::new()))),
                 ("group", Box::new(|c| c.group = Some("x\0y".into()))),
                 ("path", Box::new(|c| c.path = "vpn".into())),
