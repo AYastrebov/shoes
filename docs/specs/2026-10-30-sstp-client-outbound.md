@@ -385,7 +385,10 @@ time as an argument, so retransmission is tested without waiting for it.
 The connector builds its `rustls::ClientConfig` with `create_client_config`
 (`src/rustls_config_util.rs:13`), allowing TLS 1.2 and 1.3. Windows Server
 2016 and older top out at 1.2.
-- Name verification uses the hop's host, or `sni_hostname`.
+- Name verification uses the hop's host, or `sni_hostname`. The `Host`
+  header names the same server, so a hop dialled by literal with the name
+  in `sni_hostname` still reaches a server that routes on `Host` (added
+  after v0.9.1, which took `Host` from the address alone).
 - Pinning uses `server_fingerprints` with `verify: false`; with `verify`
   on, the pin is checked on top of the chain (`ServerFingerprintVerifier`
   in `src/rustls_config_util.rs` runs webpki first), which a self-signed

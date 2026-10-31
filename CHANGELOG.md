@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+The SSTP request's `Host` header now names the server the certificate is
+checked against, `tls.sni_hostname` when it is set, instead of always the
+host in `address`. A client that resolves the name itself and dials the
+literal (KVN does, on Android and desktop, so its own resolution cannot
+leak) kept the name only as the SNI, so its `Host` was the IP, and a server
+that routes on `Host`, such as a reverse proxy in front of RRAS or IIS with
+several sites, answered 404, which the error then blamed on camouflage.
+Without `sni_hostname`, or with `""`, `Host` is the address as before.
+
 ## v0.9.1
 
 An SSTP client outbound (`type: sstp`), verified against a production
