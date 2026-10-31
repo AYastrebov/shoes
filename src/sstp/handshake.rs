@@ -461,11 +461,13 @@ impl PacketReader {
     }
 }
 
-/// Settings from the outbound's config: the TLS client config, the name to
-/// verify, the `Host` header.
+/// Settings from the outbound's config: the TLS client config and the name
+/// to verify. `label` names the protocol in the errors; the OpenConnect
+/// outbound shares the config block and this.
 pub fn tls_settings(
     tls: &crate::config::SstpTlsConfig,
     host: Option<&str>,
+    label: &str,
 ) -> io::Result<(
     Arc<rustls::ClientConfig>,
     rustls::pki_types::ServerName<'static>,
@@ -490,13 +492,13 @@ pub fn tls_settings(
     let name = sni.or_else(|| host.map(str::to_string)).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SSTP: no name to verify the server certificate against",
+            format!("{label}: no name to verify the server certificate against"),
         )
     })?;
     let server_name = rustls::pki_types::ServerName::try_from(name).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("SSTP: invalid server name: {e}"),
+            format!("{label}: invalid server name: {e}"),
         )
     })?;
     Ok((config, server_name))

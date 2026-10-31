@@ -222,9 +222,10 @@ enterprise VPN — rather than along the one this list measures. The first
 request on that axis came on 2026-10-30, for SSTP: the client is in, built
 to [docs/specs/2026-10-30-sstp-client-outbound.md](./docs/specs/2026-10-30-sstp-client-outbound.md);
 it has been run against a production server, and its runs against SoftEther
-and accel-ppp are still to come. OpenConnect is next on that axis, planned
-in [Classic VPN clients: OpenConnect](#classic-vpn-clients-openconnect);
-OpenVPN, IKEv2 and L2TP are weighed there and left.
+and accel-ppp are still to come. OpenConnect followed, the CSTP client built to
+[docs/specs/2026-10-31-openconnect-client-outbound.md](./docs/specs/2026-10-31-openconnect-client-outbound.md)
+and not yet run live; its DTLS step and the three protocols weighed and
+left are in [Classic VPN clients: OpenConnect](#classic-vpn-clients-openconnect).
 
 Server: HTTP, SOCKS5, Mixed, Shadowsocks (including 2022-blake3), VMess AEAD,
 VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
@@ -1129,6 +1130,17 @@ part of 4.3 still to do.
 Written 2026-10-31, after SSTP landed (#135) and the four classic client
 protocols were weighed against what the tree now has. OpenConnect is the
 one worth building; the other three are below, with why not.
+
+**Status.** The CSTP client is built, later the same day, to the spec
+named above: about 3,900 lines including the server double and 50 tests,
+against this section's estimate of 2,400 for the pieces short of DTLS. What
+the plan below did not know: ocserv reads one TLS record per frame and
+ends a session whose record holds anything else, so the writer cannot
+batch frames as SSTP's does; and an IETF draft by ocserv's author
+(draft-mavrogiannopoulos-openconnect-04) documents the protocol, which the
+openconnect source alone does not. Still to do: a live run against the
+user's Keenetic and against ocserv in a container, and the DTLS step on
+the terms below.
 
 **What it is.** The protocol of Cisco AnyConnect and of
 [ocserv](https://gitlab.com/openconnect/ocserv) (GPL), spoken by the

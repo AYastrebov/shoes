@@ -495,6 +495,51 @@ impl SstpTlsConfig {
     }
 }
 
+/// OpenConnect client outbound: Cisco AnyConnect's protocol as ocserv and
+/// the openconnect client speak it, CSTP (the TLS data path) only. An L3
+/// tunnel that owns its transport. Design:
+/// docs/specs/2026-10-31-openconnect-client-outbound.md.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenConnectClientConfig {
+    pub username: String,
+    pub password: Redacted<String>,
+    /// The group to select when the server offers a choice (`group-select`
+    /// in the auth reply). Unset picks the server's first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The path the authentication is posted to; ocserv reads a path other
+    /// than `/` as a group name when configured to.
+    #[serde(
+        default = "default_openconnect_path",
+        skip_serializing_if = "is_default_openconnect_path"
+    )]
+    pub path: String,
+    /// The tunnel MTU proposed to the server, and the cap on what this side
+    /// sends; the server's `X-CSTP-MTU` can lower it.
+    #[serde(
+        default = "default_sstp_mtu",
+        skip_serializing_if = "is_default_sstp_mtu"
+    )]
+    pub mtu: u16,
+    /// The same block as SSTP's.
+    #[serde(default, skip_serializing_if = "SstpTlsConfig::is_default")]
+    pub tls: SstpTlsConfig,
+    /// ocserv's camouflage (Keenetic's OpenConnect server has it too): the
+    /// server answers only a request whose URI carries this secret as the
+    /// query string, and is a web server to anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camouflage_secret: Option<Redacted<String>>,
+}
+
+fn default_openconnect_path() -> String {
+    "/".to_string()
+}
+
+fn is_default_openconnect_path(path: &str) -> bool {
+    path == "/"
+}
+
 /// TUIC v5 client outbound.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -966,6 +1011,10 @@ pub enum ClientProxyConfig {
     /// SSTP client outbound (PPP over HTTPS, an L3 tunnel that owns its
     /// transport).
     Sstp(Box<SstpClientConfig>),
+    /// OpenConnect client outbound (AnyConnect's CSTP over TLS, an L3
+    /// tunnel that owns its transport).
+    #[serde(alias = "anyconnect", alias = "ocserv")]
+    OpenConnect(Box<OpenConnectClientConfig>),
 }
 
 impl ClientProxyConfig {
@@ -984,6 +1033,7 @@ impl ClientProxyConfig {
                 | ClientProxyConfig::Hysteria2(_)
                 | ClientProxyConfig::Tuic(_)
                 | ClientProxyConfig::Sstp(_)
+                | ClientProxyConfig::OpenConnect(_)
         )
     }
 
@@ -1012,6 +1062,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Hysteria2(..) => "Hysteria2",
             ClientProxyConfig::Tuic(..) => "TUIC",
             ClientProxyConfig::Sstp(..) => "SSTP",
+            ClientProxyConfig::OpenConnect(..) => "OpenConnect",
         }
     }
 }
@@ -1326,6 +1377,54 @@ tls:
         };
         assert_eq!(s.auth, [SstpAuthMethod::Pap, SstpAuthMethod::Mschapv2]);
         assert!(!s.tls.server_fingerprints.is_unspecified());
+    }
+
+    #[test]
+    fn test_client_proxy_config_openconnect_defaults_and_round_trip() {
+        let yaml = r#"
+type: openconnect
+username: alice
+password: hunter2
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ClientProxyConfig::OpenConnect(ref c) => {
+                assert_eq!(c.path, "/");
+                assert_eq!(c.group, None);
+                assert_eq!(c.mtu, DEFAULT_SSTP_MTU);
+                assert!(c.tls.verify);
+                assert!(c.camouflage_secret.is_none());
+            }
+            ref other => panic!("expected OpenConnect, got {other:?}"),
+        }
+        assert!(config.owns_transport());
+        assert_eq!(config.protocol_name(), "OpenConnect");
+        let written = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !written.contains("path") && !written.contains("mtu") && !written.contains("group"),
+            "{written}"
+        );
+        assert!(!format!("{config:?}").contains("hunter2"));
+
+        let yaml = r#"
+type: anyconnect
+username: alice
+password: secret
+group: Route
+path: /vpn
+camouflage_secret: abc
+tls:
+  server_fingerprint: "ab:cd"
+"#;
+        let ClientProxyConfig::OpenConnect(c) = serde_yaml::from_str(yaml).unwrap() else {
+            panic!("expected OpenConnect");
+        };
+        assert_eq!(
+            (c.group.as_deref(), c.path.as_str()),
+            (Some("Route"), "/vpn")
+        );
+        assert!(c.camouflage_secret.is_some());
+        assert!(!format!("{c:?}").contains("abc"));
     }
 
     /// The names are the TUIC reference's and sing-box's, including the

@@ -1272,6 +1272,9 @@ fn refuse_wrapped_transport_owner(layer: &str, inner: &ClientProxyConfig) -> std
         (ClientProxyConfig::Sstp(_), "TLS") => {
             " SSTP does its own TLS; put the settings under the sstp protocol's tls block."
         }
+        (ClientProxyConfig::OpenConnect(_), "TLS") => {
+            " OpenConnect does its own TLS; put the settings under the openconnect protocol's tls block."
+        }
         _ => "",
     };
     Err(std::io::Error::new(
@@ -1452,9 +1455,13 @@ fn validate_client_config(
                 format!("{proto} uses its own transport. Do not set 'transport'."),
             ));
         }
-        // SSTP's transport is TCP, so its socket settings apply to it.
+        // SSTP's and OpenConnect's transport is TCP, so its socket settings
+        // apply to them.
         if client_config.tcp_settings.is_some()
-            && !matches!(client_config.protocol, ClientProxyConfig::Sstp(_))
+            && !matches!(
+                client_config.protocol,
+                ClientProxyConfig::Sstp(_) | ClientProxyConfig::OpenConnect(_)
+            )
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1465,8 +1472,18 @@ fn validate_client_config(
         // 'transport: quic', so the QUIC block above has already rejected it.
     }
 
-    if let ClientProxyConfig::Sstp(sstp) = &mut client_config.protocol {
-        validate_sstp(sstp)?;
+    let own_tls = match &mut client_config.protocol {
+        ClientProxyConfig::Sstp(sstp) => {
+            validate_sstp(sstp)?;
+            Some(("SSTP", &sstp.tls))
+        }
+        ClientProxyConfig::OpenConnect(openconnect) => {
+            validate_openconnect(openconnect)?;
+            Some(("OpenConnect", &openconnect.tls))
+        }
+        _ => None,
+    };
+    if let Some((label, tls)) = own_tls {
         // Unless sni_hostname names something, the address's hostname is
         // the name the certificate is checked against (`""` and `null` send
         // no SNI but still verify against it), and the connector unwraps
@@ -1476,15 +1493,17 @@ fn validate_client_config(
         if client_config.address.address().hostname() == Some("") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "SSTP address needs a host: a hostname or an IP address before the port.",
+                format!(
+                    "{label} address needs a host: a hostname or an IP address before the port."
+                ),
             ));
         }
         let names_something = matches!(
-            &sstp.tls.sni_hostname,
+            &tls.sni_hostname,
             crate::option_util::NoneOrOne::One(name) if !name.is_empty()
         );
         if !names_something {
-            validate_tls_server_name("SSTP", client_config.address.address().hostname())?;
+            validate_tls_server_name(label, client_config.address.address().hostname())?;
         }
     }
 
@@ -1675,6 +1694,93 @@ fn validate_sstp(sstp: &mut super::types::SstpClientConfig) -> std::io::Result<(
     if !sstp.tls.verify && sstp.tls.server_fingerprints.is_empty() {
         return Err(invalid(
             "SSTP would send your credentials to any server that answers; pin its \
+             certificate with tls.server_fingerprints or leave tls.verify on."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The OpenConnect outbound's fields, against the spec's Configuration
+/// section (docs/specs/2026-10-31-openconnect-client-outbound.md).
+fn validate_openconnect(
+    openconnect: &mut super::types::OpenConnectClientConfig,
+) -> std::io::Result<()> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    // ocserv bounds a username at MAX_USERNAME_SIZE (64) and a password at
+    // MAX_PASSWORD_SIZE (64), `src/defs.h`; AnyConnect servers vary. The
+    // limits here are the XML's, so the error is the server's, not ours.
+    if openconnect.username.is_empty() || openconnect.username.len() > 256 {
+        return Err(invalid(
+            "OpenConnect username must be 1 to 256 characters.".into(),
+        ));
+    }
+    // The XML escapes what needs escaping; only NUL has no place in it.
+    if openconnect.username.contains('\0') {
+        return Err(invalid("OpenConnect username cannot contain NUL.".into()));
+    }
+    let password = openconnect.password.expose();
+    if password.contains('\0') {
+        return Err(invalid("OpenConnect password cannot contain NUL.".into()));
+    }
+    if password.is_empty() || password.len() > 256 {
+        return Err(invalid(
+            "OpenConnect password must be 1 to 256 characters.".into(),
+        ));
+    }
+    if let Some(group) = &openconnect.group
+        && (group.is_empty() || group.len() > 64 || group.contains('\0'))
+    {
+        return Err(invalid(
+            "OpenConnect group must be 1 to 64 characters, without NUL.".into(),
+        ));
+    }
+    // It goes on the request line: an absolute path, no query (the
+    // camouflage secret is the query), no whitespace.
+    if !openconnect.path.starts_with('/')
+        || openconnect.path.len() > 256
+        || openconnect
+            .path
+            .bytes()
+            .any(|b| b <= b' ' || b >= 0x7f || b == b'?' || b == b'#')
+    {
+        return Err(invalid(
+            "OpenConnect path must be an absolute path such as \"/\" or \"/group\", \
+             without a query, spaces or control characters."
+                .into(),
+        ));
+    }
+    // As for SSTP: above 1500 buys nothing, below 576 is under IPv4's
+    // minimum; ocserv refuses a link MTU under its own minimum anyway.
+    if !(576..=1500).contains(&openconnect.mtu) {
+        return Err(invalid(format!(
+            "OpenConnect mtu must be between 576 and 1500, not {}.",
+            openconnect.mtu
+        )));
+    }
+    if let Some(secret) = &openconnect.camouflage_secret {
+        let secret = secret.expose();
+        if secret.is_empty()
+            || !secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+        {
+            return Err(invalid(
+                "OpenConnect camouflage_secret must be the part after '?' in the address the \
+                 server shows: letters, digits, '-', '.', '_' or '~', and not empty."
+                    .into(),
+            ));
+        }
+    }
+    validate_server_fingerprints(&mut openconnect.tls.server_fingerprints)?;
+    let sni_hostname = match &openconnect.tls.sni_hostname {
+        crate::option_util::NoneOrOne::One(name) => Some(name.as_str()),
+        _ => None,
+    };
+    validate_tls_server_name("OpenConnect", sni_hostname)?;
+    if !openconnect.tls.verify && openconnect.tls.server_fingerprints.is_empty() {
+        return Err(invalid(
+            "OpenConnect would send your credentials to any server that answers; pin its \
              certificate with tls.server_fingerprints or leave tls.verify on."
                 .into(),
         ));
@@ -2547,7 +2653,7 @@ fn validate_amneziawg_chain_position(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
-                 Hysteria2, TUIC, SSTP) must be the only hop in a chain.",
+                 Hysteria2, TUIC, SSTP, OpenConnect) must be the only hop in a chain.",
                 chain_index
             ),
         ));
@@ -2564,7 +2670,7 @@ fn validate_amneziawg_chain_position(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "Chain {}: a protocol that owns its transport (WireGuard, AmneziaWG, \
-                     Hysteria2, TUIC, SSTP) cannot be mixed with other protocols in a pool.",
+                     Hysteria2, TUIC, SSTP, OpenConnect) cannot be mixed with other protocols in a pool.",
                     chain_index
                 ),
             ));
@@ -2830,6 +2936,75 @@ mod tests {
         fn a_descriptor_makes_the_name_irrelevant_rather_than_wrong() {
             validate_macos_tun_device(Some(7), Some("tun0"), None, None, None)
                 .expect("a name the platform ignores must not fail the config");
+        }
+    }
+
+    mod openconnect {
+        use crate::config::{OpenConnectClientConfig, SstpTlsConfig};
+        use crate::option_util::NoneOrSome;
+
+        fn openconnect() -> OpenConnectClientConfig {
+            OpenConnectClientConfig {
+                username: "alice".into(),
+                password: "pw".to_string().into(),
+                group: None,
+                path: "/".into(),
+                mtu: 1280,
+                tls: SstpTlsConfig::default(),
+                camouflage_secret: None,
+            }
+        }
+
+        type Plant = Box<dyn Fn(&mut OpenConnectClientConfig)>;
+
+        #[test]
+        fn the_fields_are_bounded_as_the_spec_says() {
+            super::super::validate_openconnect(&mut openconnect()).unwrap();
+            let cases: Vec<(&str, Plant)> = vec![
+                ("username", Box::new(|c| c.username = String::new())),
+                ("username", Box::new(|c| c.username = "a\0b".into())),
+                ("password", Box::new(|c| c.password = String::new().into())),
+                ("NUL", Box::new(|c| c.password = "a\0b".to_string().into())),
+                ("group", Box::new(|c| c.group = Some(String::new()))),
+                ("group", Box::new(|c| c.group = Some("x\0y".into()))),
+                ("path", Box::new(|c| c.path = "vpn".into())),
+                ("path", Box::new(|c| c.path = "/?secret".into())),
+                ("path", Box::new(|c| c.path = "/a b".into())),
+                ("mtu", Box::new(|c| c.mtu = 575)),
+                ("mtu", Box::new(|c| c.mtu = 1501)),
+                (
+                    "camouflage_secret",
+                    Box::new(|c| c.camouflage_secret = Some("a b".to_string().into())),
+                ),
+                ("would send", Box::new(|c| c.tls.verify = false)),
+                (
+                    "would send",
+                    Box::new(|c| {
+                        c.tls.verify = false;
+                        c.tls.server_fingerprints = NoneOrSome::Some(vec![]);
+                    }),
+                ),
+            ];
+            for (expected, plant) in cases {
+                let mut config = openconnect();
+                plant(&mut config);
+                let err = super::super::validate_openconnect(&mut config).unwrap_err();
+                assert!(err.to_string().contains(expected), "{expected}: {err}");
+            }
+            let mut pinned = openconnect();
+            pinned.tls.verify = false;
+            pinned.tls.server_fingerprints = NoneOrSome::One("ab".repeat(32));
+            super::super::validate_openconnect(&mut pinned).unwrap();
+            // What the XML escapes is allowed; ocserv unescapes it.
+            let mut escaped = openconnect();
+            escaped.username = "r&d <alice>".into();
+            escaped.group = Some("Sales & Support".into());
+            super::super::validate_openconnect(&mut escaped).unwrap();
+            let mut grouped = openconnect();
+            grouped.group = Some("Route".into());
+            grouped.path = "/Route".into();
+            grouped.camouflage_secret = Some("0123abcd".to_string().into());
+            super::super::validate_openconnect(&mut grouped).unwrap();
         }
     }
 

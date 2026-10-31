@@ -476,7 +476,8 @@ pub fn create_tcp_client_handler(
         | ClientProxyConfig::AmneziaWg(..)
         | ClientProxyConfig::Hysteria2(..)
         | ClientProxyConfig::Tuic(..)
-        | ClientProxyConfig::Sstp(..)) => {
+        | ClientProxyConfig::Sstp(..)
+        | ClientProxyConfig::OpenConnect(..)) => {
             panic!(
                 "{} owns its transport and should not use TcpClientHandler. \
                     It must be handled as a TerminalConnector in the chain builder.",

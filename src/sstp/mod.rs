@@ -13,3 +13,5 @@ mod testing;
 mod tests;
 
 pub use connector::SstpConnector;
+/// Shared with the OpenConnect outbound, whose `tls` block is the same.
+pub(crate) use handshake::tls_settings;
