@@ -51,6 +51,9 @@ const BYE_REASON: &str = "user disconnect";
 /// Frames a burst may hold before the writer flushes and returns to its
 /// stop check: a sustained upload refills the queue as fast as it drains.
 const BURST_FRAMES: usize = 64;
+/// TLS's largest record plaintext (RFC 8446 §5.1): a frame past it cannot
+/// be one record.
+const MAX_RECORD_PLAINTEXT: usize = 16384;
 
 /// A session's liveness, shared by its tasks and the connector.
 pub struct SessionState {
@@ -546,9 +549,18 @@ impl Reader {
                 }
                 kind::DPD_REQUEST => {
                     // ocserv answers with the request's contents
-                    // (`worker-vpn.c:2865-2868`); so does this.
-                    let mut answer = Vec::with_capacity(cstp::HEADER_LEN + payload.len());
-                    cstp::encode(&mut answer, kind::DPD_RESPONSE, payload);
+                    // (`worker-vpn.c:2865-2868`); so does this, unless the
+                    // answer would not fit one TLS record (16 KiB of
+                    // plaintext), which rustls would split and ocserv
+                    // refuse: then a bare response, which every server
+                    // takes as life.
+                    let echoed = if cstp::HEADER_LEN + payload.len() <= MAX_RECORD_PLAINTEXT {
+                        payload
+                    } else {
+                        &[]
+                    };
+                    let mut answer = Vec::with_capacity(cstp::HEADER_LEN + echoed.len());
+                    cstp::encode(&mut answer, kind::DPD_RESPONSE, echoed);
                     self.control.try_send(answer).map_err(|_| {
                         io::Error::other("the server sent DPD faster than it could be answered")
                     })?;

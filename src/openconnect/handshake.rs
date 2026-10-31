@@ -294,6 +294,7 @@ async fn authenticate(
     let mut document = auth::init_document(&group_access, settings.group.as_deref());
     let mut path = settings.path.clone();
     let mut credentials_posted = false;
+    let mut password_sent = false;
     for _ in 0..MAX_AUTH_ROUNDS {
         let (head, body) = post(
             settings,
@@ -322,7 +323,7 @@ async fn authenticate(
             status => return Err(refused(settings, status, &head)),
         }
         let body = String::from_utf8_lossy(&body);
-        match auth::parse_response(&body)? {
+        match auth::parse_response(&body).map_err(|e| redact_error(settings, e))? {
             Response::Success { session_token } => {
                 if let Some(token) = session_token
                     && jar.webvpn().is_none()
@@ -365,14 +366,32 @@ async fn authenticate(
                         ),
                     ));
                 }
+                // A second form asking for a password after one went out is
+                // a challenge or a one-time code (`auth.c:1011-1033`), not
+                // a place to send the same password again. A username-only
+                // form followed by a password-only one is an ordinary login
+                // in two rounds, and is not that.
+                let asks_password = form
+                    .inputs
+                    .iter()
+                    .any(|i| i.kind == "password" && i.name == "password");
+                if asks_password && password_sent {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "OpenConnect: the server asks for the password again (a challenge or a \
+                         one-time code), which this client does not do",
+                    ));
+                }
                 document = auth::reply_document(
                     &form,
                     opaque.as_ref(),
                     &settings.username,
                     settings.password.expose(),
                     settings.group.as_deref(),
-                )?;
+                )
+                .map_err(|e| redact_error(settings, e))?;
                 credentials_posted = true;
+                password_sent |= asks_password;
                 if let Some(action) = form.action.filter(|a| !a.is_empty()) {
                     path = action;
                 }
@@ -446,6 +465,25 @@ fn printable(text: &str) -> String {
 /// have it land in a log.
 fn server_text(settings: &Settings, text: &str) -> String {
     redacted(text, &settings.username, settings.password.expose())
+}
+
+/// An error built from the server's document (a form's labels, its group
+/// names, an auth id) may carry what the server echoed; it is redacted
+/// whole, without the cut, since the text is this client's own.
+fn redact_error(settings: &Settings, e: io::Error) -> io::Error {
+    let mut text = e.to_string();
+    for secret in [
+        settings.password.expose().as_str(),
+        settings.username.as_str(),
+    ] {
+        if !secret.is_empty() {
+            text = text.replace(secret, "[redacted]");
+        }
+    }
+    io::Error::new(
+        e.kind(),
+        text.chars().filter(|c| !c.is_control()).collect::<String>(),
+    )
 }
 
 /// The redaction first, on the text as the server sent it, then the

@@ -122,6 +122,9 @@ fn escape_into(text: &str, out: &mut String) {
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
             '"' => out.push_str("&quot;"),
+            // A literal CR is normalised to LF by every XML parser (XML 1.0
+            // §2.11); as a reference it survives.
+            '\r' => out.push_str("&#13;"),
             _ => out.push(c),
         }
     }
@@ -432,6 +435,18 @@ mod tests {
         assert_eq!(
             parse(&doc).unwrap().child("password").unwrap().text(),
             "p<&>\"w"
+        );
+    }
+
+    /// A carriage return in a credential would be read as a line feed by
+    /// the server's parser; as a character reference it comes back whole.
+    #[test]
+    fn a_carriage_return_survives_the_round_trip() {
+        let cr = Element::new("password").with_text("a\rb").to_xml();
+        assert_eq!(cr, "<password>a&#13;b</password>");
+        assert_eq!(
+            parse(&cr).unwrap().children,
+            vec![Node::Text("a\rb".into())]
         );
     }
 

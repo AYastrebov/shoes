@@ -190,13 +190,49 @@ async fn a_wrong_password_fails_without_the_password_in_the_error() {
 async fn a_second_factor_is_named_and_refused() {
     let server = testing::start(Options {
         second_password: true,
+        echo_credentials: true,
         ..Options::default()
     })
     .await;
     let connector = connector(&server);
     let err = tcp_echo(&connector, b"x").await.unwrap_err();
-    assert!(err.to_string().contains("secondary_password"), "{err}");
-    assert!(err.to_string().contains("Password2"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("secondary_password"), "{text}");
+    assert!(text.contains("Password2"), "{text}");
+    // The form's label echoed the password; the error does not.
+    assert!(!text.contains(PASSWORD), "{text}");
+}
+
+/// A server that asks for the password again after taking one wants a
+/// challenge answer or a one-time code, not the same password: refused by
+/// saying so, and the password is not sent twice.
+#[tokio::test]
+async fn a_repeated_password_prompt_is_refused() {
+    let server = testing::start(Options {
+        ask_password_again: true,
+        ..Options::default()
+    })
+    .await;
+    let err = tcp_echo(&connector(&server), b"x").await.unwrap_err();
+    assert!(err.to_string().contains("password again"), "{err}");
+    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
+}
+
+/// A DPD request whose echo would not fit one TLS record gets a bare
+/// response: still an answer, still one record.
+#[tokio::test]
+async fn a_big_dpd_request_gets_a_bare_answer() {
+    let server = testing::start(Options::default()).await;
+    let connector = connector(&server);
+    tcp_echo(&connector, b"x").await.unwrap();
+    let records = server.stats.client_records.load(Ordering::SeqCst);
+    let frames = server.stats.client_frames.load(Ordering::SeqCst);
+    server.stats.big_dpd.notify_waiters();
+    wait_for(&server.stats.client_dpd_responses, 1, "no DPD response").await;
+    assert!(connector.session_alive().await);
+    let records = server.stats.client_records.load(Ordering::SeqCst) - records;
+    let frames = server.stats.client_frames.load(Ordering::SeqCst) - frames;
+    assert_eq!((frames, records), (1, 1), "one bare response in one record");
 }
 
 #[tokio::test]

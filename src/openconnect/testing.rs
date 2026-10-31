@@ -59,9 +59,13 @@ pub struct Options {
     /// Ask for a second password in a second form, as ocserv with two
     /// passwords configured does.
     pub second_password: bool,
-    /// Echo the submitted username and password in the 401's reason, as a
-    /// careless gateway might; the client's error must not repeat them.
+    /// Echo the submitted username and password in the 401's reason and in
+    /// a second form's label, as a careless gateway might; the client's
+    /// error must not repeat them.
     pub echo_credentials: bool,
+    /// After a correct login, ask for the password again in a form, as a
+    /// challenge or one-time-code server does.
+    pub ask_password_again: bool,
     /// Assign an IPv6 address too.
     pub ipv6: bool,
     /// `X-CSTP-DPD` and `X-CSTP-Keepalive`, in seconds; 0 omits the header.
@@ -85,6 +89,7 @@ impl Default for Options {
             groups: vec![],
             second_password: false,
             echo_credentials: false,
+            ask_password_again: false,
             ipv6: false,
             dpd: 90,
             keepalive: 32400,
@@ -135,6 +140,9 @@ pub struct Stats {
     pub terminate: Notify,
     /// Rung to make every live session send a DPD request with a payload.
     pub dpd: Notify,
+    /// Rung to make every live session send a DPD request whose echo would
+    /// not fit one TLS record.
+    pub big_dpd: Notify,
     /// Rung to make every live session send a frame of an unknown type and
     /// then a data packet.
     pub unknown_frame: Notify,
@@ -262,9 +270,14 @@ fn login_form(options: &Options, message: &str, second: bool) -> String {
         "{FORM_HEAD}<auth id=\"main\">\n<message>{message}</message>\n<form method=\"post\" action=\"/auth\">\n"
     );
     if second {
-        doc.push_str(
-            "<input type=\"password\" name=\"secondary_password\" label=\"Password2:\" />\n",
-        );
+        let label = if options.echo_credentials {
+            format!("Password2 ({}):", options.password)
+        } else {
+            "Password2:".to_string()
+        };
+        doc.push_str(&format!(
+            "<input type=\"password\" name=\"secondary_password\" label=\"{label}\" />\n",
+        ));
     } else {
         doc.push_str("<input type=\"text\" name=\"username\" label=\"Username:\" />\n");
         doc.push_str("<input type=\"password\" name=\"password\" label=\"Password:\" />\n");
@@ -465,6 +478,17 @@ async fn serve(
                             .await?;
                             continue;
                         }
+                        if options.ask_password_again {
+                            auth_state = AuthState::AskedSecond;
+                            let challenge = format!(
+                                "{FORM_HEAD}<auth id=\"main\">\n<message>Enter the next token</message>\n\
+                                 <form method=\"post\" action=\"/auth\">\n\
+                                 <input type=\"password\" name=\"password\" label=\"Challenge:\" />\n\
+                                 </form></auth>\n</config-auth>"
+                            );
+                            respond(&mut tls, "200 OK", &[set_context], &challenge).await?;
+                            continue;
+                        }
                         auth_state = AuthState::Done;
                         let cookie: String = (0..16)
                             .map(|_| format!("{:02x}", rand::random::<u8>()))
@@ -618,9 +642,9 @@ async fn tunnel(
                     }
                 }
                 kind::DPD_RESPONSE => {
-                    assert_eq!(
-                        payload, b"probe",
-                        "the response carries the request's contents"
+                    assert!(
+                        payload == b"probe" || payload.is_empty(),
+                        "the response carries the request's contents, or nothing for a request too big to echo"
                     );
                     stats.client_dpd_responses.fetch_add(1, Ordering::SeqCst);
                 }
@@ -652,6 +676,7 @@ async fn tunnel(
                 return Ok(());
             }
             _ = stats.dpd.notified() => send(kind::DPD_REQUEST, b"probe"),
+            _ = stats.big_dpd.notified() => send(kind::DPD_REQUEST, &[0x41; cstp::MAX_PAYLOAD]),
             _ = stats.unknown_frame.notified() => {
                 send(42, b"what is this");
                 send(kind::KEEPALIVE, &[]);

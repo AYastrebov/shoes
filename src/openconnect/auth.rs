@@ -96,6 +96,13 @@ pub enum Response {
     },
 }
 
+fn unsupported(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("OpenConnect: the server requires {what}, which this client does not do"),
+    )
+}
+
 fn text_child(element: &Element, name: &str) -> Option<String> {
     element
         .child(name)
@@ -115,6 +122,30 @@ pub fn parse_response(body: &str) -> io::Result<Response> {
     } else {
         (Some(&root), None)
     };
+    // What this client cannot do, named before anything else is read: a
+    // certificate request (`auth.c:632-645`), single sign-on
+    // (`auth.c:445-449`), the CSD host scan (`auth.c:480-500`).
+    if let Some(root) = config_auth {
+        if root.child("client-cert-request").is_some()
+            || root.child("multiple-client-cert-request").is_some()
+        {
+            return Err(unsupported("a client certificate"));
+        }
+        if root.child("host-scan").is_some() {
+            return Err(unsupported("the CSD host scan"));
+        }
+    }
+    if let Some(auth) = auth {
+        if auth.child("sso-v2-login").is_some() {
+            return Err(unsupported("single sign-on"));
+        }
+        if auth.elements().any(|e| {
+            e.name == "csd"
+                && (e.attribute("starturl").is_some() || e.attribute("waiturl").is_some())
+        }) {
+            return Err(unsupported("the CSD host scan"));
+        }
+    }
     let Some(auth) = auth else {
         if let Some(root) = config_auth
             && let Some(error) = text_child(root, "error")
@@ -208,9 +239,10 @@ pub fn unsupported_inputs(form: &Form) -> Vec<String> {
     form.inputs
         .iter()
         .filter(|input| !fillable(input))
-        .map(|input| match &input.label {
-            Some(label) => format!("{} ({})", input.name, label.trim_end_matches(':')),
-            None => input.name.clone(),
+        .map(|input| match (&input.kind[..], &input.label) {
+            ("sso", _) => format!("single sign-on ({})", input.name),
+            (_, Some(label)) => format!("{} ({})", input.name, label.trim_end_matches(':')),
+            (_, None) => input.name.clone(),
         })
         .collect()
 }
@@ -428,6 +460,67 @@ mod tests {
         ));
         assert!(reply.contains("<tgroup>x</tgroup>"));
         assert!(!reply.contains("group-select"));
+    }
+
+    /// What the PR promises to refuse by name: a certificate request,
+    /// single sign-on (ocserv's sso-v2 form, `worker-auth.c:450-466`), the
+    /// host scan.
+    #[test]
+    fn unsupported_mechanisms_are_named() {
+        for (doc, what) in [
+            (
+                "<config-auth client=\"vpn\" type=\"auth-request\"><client-cert-request/></config-auth>",
+                "client certificate",
+            ),
+            (
+                "<config-auth client=\"vpn\" type=\"auth-request\"><multiple-client-cert-request>\
+                 <hash-algorithm>sha256</hash-algorithm></multiple-client-cert-request>\
+                 <cert-authenticated/></config-auth>",
+                "client certificate",
+            ),
+            (
+                "<config-auth client=\"vpn\" type=\"auth-request\"><auth id=\"main\">\
+                 <message>Complete authentication in the browser</message>\
+                 <sso-v2-login>https://idp.example/login</sso-v2-login>\
+                 <form><input type=\"sso\" name=\"sso-token\"/></form></auth></config-auth>",
+                "single sign-on",
+            ),
+            (
+                "<config-auth client=\"vpn\" type=\"auth-request\"><auth id=\"main\">\
+                 <csd token=\"t\" ticket=\"k\"/><csd starturl=\"/start\" waiturl=\"/wait\"/>\
+                 <form><input type=\"text\" name=\"username\"/></form></auth></config-auth>",
+                "host scan",
+            ),
+            (
+                "<config-auth client=\"vpn\" type=\"auth-request\"><host-scan><host-scan-base-uri>x</host-scan-base-uri>\
+                 </host-scan><auth id=\"main\"/></config-auth>",
+                "host scan",
+            ),
+        ] {
+            let err = parse_response(doc).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{doc}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+        // A `csd` element carrying only a token is metadata, not a demand.
+        let doc = "<config-auth client=\"vpn\" type=\"auth-request\"><auth id=\"main\">\
+            <csd token=\"t\" ticket=\"k\"/><form><input type=\"text\" name=\"username\"/>\
+            <input type=\"password\" name=\"password\"/></form></auth></config-auth>";
+        assert!(matches!(
+            parse_response(doc).unwrap(),
+            Response::Auth { .. }
+        ));
+        // An SSO input in an otherwise ordinary form is named as such.
+        let form = Form {
+            action: None,
+            inputs: vec![Input {
+                name: "sso-token".into(),
+                kind: "sso".into(),
+                value: None,
+                label: None,
+            }],
+            select: None,
+        };
+        assert_eq!(unsupported_inputs(&form), ["single sign-on (sso-token)"]);
     }
 
     #[test]

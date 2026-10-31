@@ -130,14 +130,9 @@ impl Head {
             .next()
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|_| version.starts_with("HTTP/1."))
-            .ok_or_else(|| {
-                let printable: String = status_line
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(120)
-                    .collect();
-                invalid(&format!("not an HTTP response: {printable:?}"))
-            })?;
+            // Not quoted: a line that is not a status line is whatever the
+            // peer chose to send, credentials echoed back included.
+            .ok_or_else(|| invalid("not an HTTP response"))?;
         let reason = fields.next().unwrap_or_default().to_string();
         let mut headers = Vec::new();
         for line in lines {
