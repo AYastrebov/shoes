@@ -31,6 +31,8 @@ pub const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_AUTH_ROUNDS: usize = 4;
 /// The tunnel path, `cstp.c:243`.
 const TUNNEL_PATH: &str = "/CSCOSSLC/tunnel";
+/// The longest DPD or keepalive interval honoured, in seconds.
+const MAX_INTERVAL_SECS: u64 = 86_400;
 /// Headers on every auth request (`cstp.c:1280-1290`): the version of the
 /// aggregate-auth exchange this client speaks.
 const AUTH_HEADERS: [(&str, &str); 4] = [
@@ -313,11 +315,11 @@ async fn authenticate(
                     io::ErrorKind::PermissionDenied,
                     format!(
                         "OpenConnect: authentication failed ({})",
-                        printable(&head.reason)
+                        server_text(settings, &head.reason)
                     ),
                 ));
             }
-            status => return Err(refused(status, &head, settings.camouflage_secret.is_some())),
+            status => return Err(refused(settings, status, &head)),
         }
         let body = String::from_utf8_lossy(&body);
         match auth::parse_response(&body)? {
@@ -345,7 +347,7 @@ async fn authenticate(
                 let Some(form) = form else {
                     let what = error
                         .or(message)
-                        .map(|m| printable(&m))
+                        .map(|m| server_text(settings, &m))
                         .unwrap_or_else(|| format!("auth {id:?} with no form"));
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -357,7 +359,10 @@ async fn authenticate(
                     // a refusal; the credentials are what they are.
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        format!("OpenConnect: authentication failed: {}", printable(error)),
+                        format!(
+                            "OpenConnect: authentication failed: {}",
+                            server_text(settings, error)
+                        ),
                     ));
                 }
                 document = auth::reply_document(
@@ -436,11 +441,28 @@ fn printable(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
+/// Server-supplied text for an error, with the credentials taken out: a
+/// gateway that echoes the username, or worse, into its refusal must not
+/// have it land in a log.
+fn server_text(settings: &Settings, text: &str) -> String {
+    let mut text = printable(text);
+    for secret in [
+        settings.password.expose().as_str(),
+        settings.username.as_str(),
+    ] {
+        if !secret.is_empty() {
+            text = text.replace(secret, "[redacted]");
+        }
+    }
+    text
+}
+
 /// A status other than 200 to an auth request or to `CONNECT`. A 404 is
 /// what a camouflaged server says without its secret; ocserv's `401` with
 /// a realm is the same with `camouflage_realm` set, and its `405` is a
 /// refused cookie under camouflage.
-fn refused(status: u16, head: &Head, camouflaged: bool) -> io::Error {
+fn refused(settings: &Settings, status: u16, head: &Head) -> io::Error {
+    let camouflaged = settings.camouflage_secret.is_some();
     let hint = match (status, camouflaged) {
         (401 | 404, false) => {
             " (a server with camouflage on answers this way: set camouflage_secret)"
@@ -453,7 +475,7 @@ fn refused(status: u16, head: &Head, camouflaged: bool) -> io::Error {
         io::ErrorKind::ConnectionRefused,
         format!(
             "OpenConnect: the server answered {status} {}{hint}",
-            printable(reason)
+            server_text(settings, reason)
         ),
     )
 }
@@ -514,7 +536,7 @@ async fn connect(
                 "OpenConnect: the server refused the session cookie",
             ));
         }
-        status => return Err(refused(status, &head, settings.camouflage_secret.is_some())),
+        status => return Err(refused(settings, status, &head)),
     }
     parse_connect_reply(&head, settings.mtu)
 }
@@ -529,9 +551,18 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
     let mut ipv4: Option<Ipv4Addr> = None;
     let mut netmask4: Option<Ipv4Addr> = None;
     let mut ipv6: Option<Ipv6Addr> = None;
-    let mut prefix6: Option<u8> = None;
+    let mut prefix6: Option<u16> = None;
     let mut mtu: Option<u16> = None;
-    let seconds = |v: &str| v.trim().parse::<u64>().ok().filter(|s| *s > 0);
+    // A day is longer than any interval a server means; past it the
+    // deadline arithmetic (`2 * dpd`, `Instant + keepalive`) would overflow
+    // on a value a server chose badly or maliciously.
+    let seconds = |v: &str| {
+        v.trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|s| *s > 0)
+            .map(|s| s.min(MAX_INTERVAL_SECS))
+    };
     for (name, value) in &head.headers {
         let Some(key) = name.strip_prefix("x-cstp-") else {
             continue;
@@ -549,7 +580,7 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
                 if let Ok(m) = value.parse::<Ipv4Addr>() {
                     netmask4 = Some(m);
                 } else if let Some((_, p)) = value.split_once('/') {
-                    prefix6 = p.parse().ok();
+                    prefix6 = Some(p.parse::<u16>().unwrap_or(u16::MAX));
                 }
             }
             "address-ip6" => {
@@ -557,7 +588,7 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
                     && let Ok(a) = a.parse::<Ipv6Addr>()
                 {
                     ipv6 = Some(a);
-                    prefix6 = p.parse().ok();
+                    prefix6 = Some(p.parse::<u16>().unwrap_or(u16::MAX));
                 }
             }
             "dns" | "dns-ip6" => {
@@ -591,7 +622,17 @@ pub fn parse_connect_reply(head: &Head, configured_mtu: u16) -> io::Result<Link>
     };
     link.mtu = mtu.min(configured_mtu);
     link.ipv4 = ipv4.map(|a| (a, netmask4.map(prefix_of_netmask).unwrap_or(32)));
-    link.ipv6 = ipv6.map(|a| (a, prefix6.unwrap_or(128)));
+    // smoltcp's `IpCidr::new` panics on a prefix past 128; a server's
+    // reply must fail, not the process.
+    if let Some(prefix) = prefix6
+        && prefix > 128
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("OpenConnect: the server's IPv6 prefix /{prefix} is not valid"),
+        ));
+    }
+    link.ipv6 = ipv6.map(|a| (a, prefix6.map(|p| p as u8).unwrap_or(128)));
     if link.ipv4.is_none() && link.ipv6.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -696,6 +737,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("compression"), "{err}");
+    }
+
+    /// A prefix smoltcp would panic on fails the reply instead, and one
+    /// that is not a number is not silently /128.
+    #[test]
+    fn an_invalid_ipv6_prefix_is_refused() {
+        for bad in ["fd00::7/129", "fd00::7/300", "fd00::7/x"] {
+            let err = parse_connect_reply(
+                &head(&[("x-cstp-address-ip6", bad), ("x-cstp-mtu", "1300")]),
+                1280,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("prefix"), "{bad}: {err}");
+        }
+        let link = parse_connect_reply(
+            &head(&[
+                ("x-cstp-address", "fd00::7"),
+                ("x-cstp-netmask", "fd00::/127"),
+                ("x-cstp-mtu", "1300"),
+            ]),
+            1280,
+        )
+        .unwrap();
+        assert_eq!(link.ipv6, Some(("fd00::7".parse().unwrap(), 127)));
+    }
+
+    /// An interval past a day is a day: `2 * dpd` must not overflow.
+    #[test]
+    fn an_absurd_interval_is_clamped() {
+        let link = parse_connect_reply(
+            &head(&[
+                ("x-cstp-address", "10.0.0.2"),
+                ("x-cstp-mtu", "1300"),
+                ("x-cstp-dpd", "18446744073709551615"),
+                ("x-cstp-keepalive", "99999999999999999999999"),
+            ]),
+            1280,
+        )
+        .unwrap();
+        assert_eq!(link.dpd, Some(Duration::from_secs(86_400)));
+        assert_eq!(link.keepalive, None, "not a u64: no keepalive");
     }
 
     #[test]

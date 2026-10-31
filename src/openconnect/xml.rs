@@ -136,9 +136,24 @@ fn unescape(text: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(end) = rest.find(';') else {
-            out.push_str(rest);
-            return out;
+        // An entity is at most `&#x10FFFF;`: ten characters. Looking no
+        // further keeps a run of ampersands linear, and a `&` before the
+        // `;` starts a new scan rather than ending this one.
+        let mut end = None;
+        for (j, c) in rest[1..].char_indices().take(10) {
+            match c {
+                ';' => {
+                    end = Some(1 + j);
+                    break;
+                }
+                '&' => break,
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
         };
         let entity = &rest[1..end];
         let decoded = match entity {
@@ -428,6 +443,18 @@ mod tests {
         .unwrap();
         assert_eq!(root.text(), "<raw>");
         assert!(root.child("e").is_some());
+    }
+
+    /// A run of ampersands is decoded in linear time, and an entity longer
+    /// than any real one is left as written.
+    #[test]
+    fn a_run_of_ampersands_is_linear() {
+        let run = "&".repeat(200_000) + ";";
+        let started = std::time::Instant::now();
+        assert_eq!(unescape(&run), run);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(unescape("&notanentityatall;"), "&notanentityatall;");
+        assert_eq!(unescape("&amp;&lt;&#x10FFFF;x"), "&<\u{10FFFF}x");
     }
 
     #[test]

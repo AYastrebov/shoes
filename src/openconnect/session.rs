@@ -48,6 +48,9 @@ const CONTROL_QUEUE: usize = 16;
 const STOP_WAIT: Duration = Duration::from_secs(1);
 /// What the writer tells the server on a stop (`cstp.c:1237-1278`).
 const BYE_REASON: &str = "user disconnect";
+/// Frames a burst may hold before the writer flushes and returns to its
+/// stop check: a sustained upload refills the queue as fast as it drains.
+const BURST_FRAMES: usize = 64;
 
 /// A session's liveness, shared by its tasks and the connector.
 pub struct SessionState {
@@ -278,6 +281,22 @@ impl Timers {
     }
 }
 
+/// A write raced against the session's end: a write parked on a socket
+/// whose interface is gone, or whose peer is dead, would otherwise hold
+/// this task until the kernel gave up, minutes later on a phone. `false`
+/// is the session ending mid-write, after which nothing can follow
+/// cleanly and the connection just closes.
+async fn raced<F: std::future::Future<Output = io::Result<()>>>(
+    state: &SessionState,
+    write: F,
+) -> io::Result<bool> {
+    tokio::select! {
+        biased;
+        _ = state.changed() => Ok(false),
+        done = write => done.map(|()| true),
+    }
+}
+
 async fn writer(
     mut write: WriteHalf<TlsStream>,
     mut ip_to_tunnel: mpsc::Receiver<Vec<u8>>,
@@ -308,14 +327,24 @@ async fn writer(
             }
             Upkeep::Dpd => {
                 debug!("OpenConnect: sending a DPD request");
-                write.write_all(&cstp::bare(kind::DPD_REQUEST)).await?;
-                write.flush().await?;
+                let probe = async {
+                    write.write_all(&cstp::bare(kind::DPD_REQUEST)).await?;
+                    write.flush().await
+                };
+                if !raced(state, probe).await? {
+                    return Ok(());
+                }
                 timers.last_tx = now;
                 continue;
             }
             Upkeep::Keepalive => {
-                write.write_all(&cstp::bare(kind::KEEPALIVE)).await?;
-                write.flush().await?;
+                let keepalive = async {
+                    write.write_all(&cstp::bare(kind::KEEPALIVE)).await?;
+                    write.flush().await
+                };
+                if !raced(state, keepalive).await? {
+                    return Ok(());
+                }
                 timers.last_tx = now;
                 continue;
             }
@@ -327,61 +356,74 @@ async fn writer(
             biased;
             _ = state.changed() => continue,
             Some(packet) = control.recv() => {
-                write.write_all(&packet).await?;
+                if !raced(state, write.write_all(&packet)).await? {
+                    return Ok(());
+                }
                 wrote = true;
             }
             packet = ip_to_tunnel.recv() => match packet {
-                Some(ip) => wrote |= write_ip(&mut write, &mut frame, &ip, link).await?,
+                Some(ip) => match write_ip(&mut write, &mut frame, &ip, link, state).await? {
+                    Some(sent) => wrote |= sent,
+                    None => return Ok(()),
+                },
                 // The netstack is gone; so is the session.
                 None => return Ok(()),
             },
             _ = tokio::time::sleep_until(wake_at) => continue,
         }
-        // Everything already queued joins this flush, each frame in its
-        // own record.
-        loop {
+        // What is already queued joins this flush, each frame in its own
+        // record, up to a burst: a sustained upload refills the queue as
+        // fast as it drains, and the stop check must come round.
+        let mut burst = 1;
+        while burst < BURST_FRAMES {
             if let Ok(packet) = control.try_recv() {
-                write.write_all(&packet).await?;
+                if !raced(state, write.write_all(&packet)).await? {
+                    return Ok(());
+                }
                 wrote = true;
+                burst += 1;
                 continue;
             }
             match ip_to_tunnel.try_recv() {
-                Ok(ip) => wrote |= write_ip(&mut write, &mut frame, &ip, link).await?,
+                Ok(ip) => match write_ip(&mut write, &mut frame, &ip, link, state).await? {
+                    Some(sent) => wrote |= sent,
+                    None => return Ok(()),
+                },
                 Err(_) => break,
             }
+            burst += 1;
         }
         if wrote {
-            // A write parked on a socket whose interface is gone would hold
-            // this task until the kernel gave up; the session is dead by
-            // then and has a successor.
-            tokio::select! {
-                biased;
-                _ = state.changed() => return Ok(()),
-                flushed = write.flush() => flushed?,
+            if !raced(state, write.flush()).await? {
+                return Ok(());
             }
             timers.last_tx = Instant::now();
         }
     }
 }
 
-/// One IP packet as one data frame, if the link carries it.
+/// One IP packet as one data frame, if the link carries it: `Some(sent)`,
+/// or `None` when the session ended mid-write.
 async fn write_ip(
     write: &mut WriteHalf<TlsStream>,
     frame: &mut Vec<u8>,
     ip: &[u8],
     link: &Link,
-) -> io::Result<bool> {
+    state: &SessionState,
+) -> io::Result<Option<bool>> {
     if !carried(link, ip) {
         debug!(
             "OpenConnect: dropping a packet the link cannot carry ({} bytes)",
             ip.len()
         );
-        return Ok(false);
+        return Ok(Some(false));
     }
     frame.clear();
     cstp::encode(frame, kind::DATA, ip);
-    write.write_all(frame).await?;
-    Ok(true)
+    if !raced(state, write.write_all(frame)).await? {
+        return Ok(None);
+    }
+    Ok(Some(true))
 }
 
 /// The writer's last act: whatever the reader queued last, then, if this
@@ -440,11 +482,31 @@ impl Reader {
                 self.end -= self.start;
                 self.start = 0;
             }
+            // Dead peer detection lives here, not in the writer: a writer
+            // parked on a stalled socket must not stop it, and a server
+            // that has sent nothing for two DPD intervals is gone whether
+            // or not the probes got out (`mainloop.c:466-470`).
+            let dead_at = self
+                .link
+                .dpd
+                .map(|dpd| tokio::time::Instant::from_std(state.last_received() + 2 * dpd));
             let read = tokio::select! {
                 // A stop keeps reading until the goodbye is out; a death
                 // ends it at once.
                 _ = state.dead() => return Ok(()),
-                read = self.read.read(&mut self.buf[self.end..]) => read,
+                read = async {
+                    match dead_at {
+                        Some(at) => tokio::time::timeout_at(at, self.read.read(&mut self.buf[self.end..]))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "nothing from the server for two DPD intervals",
+                                ))
+                            }),
+                        None => self.read.read(&mut self.buf[self.end..]).await,
+                    }
+                } => read,
             };
             match read? {
                 0 => {

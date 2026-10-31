@@ -59,6 +59,9 @@ pub struct Options {
     /// Ask for a second password in a second form, as ocserv with two
     /// passwords configured does.
     pub second_password: bool,
+    /// Echo the submitted username and password in the 401's reason, as a
+    /// careless gateway might; the client's error must not repeat them.
+    pub echo_credentials: bool,
     /// Assign an IPv6 address too.
     pub ipv6: bool,
     /// `X-CSTP-DPD` and `X-CSTP-Keepalive`, in seconds; 0 omits the header.
@@ -81,6 +84,7 @@ impl Default for Options {
             password: "correct horse",
             groups: vec![],
             second_password: false,
+            echo_credentials: false,
             ipv6: false,
             dpd: 90,
             keepalive: 32400,
@@ -434,8 +438,18 @@ async fn serve(
                             && password.as_deref() == Some(options.password);
                         if !ok {
                             // `worker-auth.c:2287-2297`.
+                            let reason = if options.echo_credentials {
+                                format!(
+                                    "Authentication failed for {}:{}",
+                                    username.unwrap_or_default(),
+                                    password.unwrap_or_default()
+                                )
+                            } else {
+                                "Authentication failed".to_string()
+                            };
                             tls.write_all(
-                                b"HTTP/1.1 401 Authentication failed\r\nContent-Length: 0\r\n\r\n",
+                                format!("HTTP/1.1 401 {reason}\r\nContent-Length: 0\r\n\r\n")
+                                    .as_bytes(),
                             )
                             .await?;
                             return Ok(());

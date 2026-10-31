@@ -164,9 +164,15 @@ async fn ipv6_destinations_cross_when_the_server_assigns_an_address() {
     assert!(err.to_string().contains("IPv4 only"), "{err}");
 }
 
+/// Even when the server echoes what was sent, as a careless gateway
+/// might, the error does not.
 #[tokio::test]
 async fn a_wrong_password_fails_without_the_password_in_the_error() {
-    let server = testing::start(Options::default()).await;
+    let server = testing::start(Options {
+        echo_credentials: true,
+        ..Options::default()
+    })
+    .await;
     let wrong = "not the password";
     let connector = connector_with(&server, config_for(&server, wrong));
     let err = tcp_echo(&connector, b"x").await.unwrap_err();

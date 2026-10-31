@@ -241,7 +241,8 @@ impl Reader {
                 .map_err(|_| invalid("a chunk size that is not hexadecimal"))?;
             self.buf.drain(..line_end + 2);
             if size == 0 {
-                // The trailer: headers, then a blank line.
+                // The trailer: headers, then a blank line, bounded like a
+                // head.
                 loop {
                     if let Some(end) = self.buf.windows(2).position(|w| w == b"\r\n") {
                         self.buf.drain(..end + 2);
@@ -250,10 +251,15 @@ impl Reader {
                         }
                         continue;
                     }
+                    if self.buf.len() > MAX_HEAD {
+                        return Err(invalid("a chunk trailer without end"));
+                    }
                     self.fill(stream).await?;
                 }
             }
-            if body.len() + size > MAX_BODY {
+            // Against the room left, so a size near `usize::MAX` neither
+            // overflows the sum nor the `size + 2` below.
+            if size > MAX_BODY - body.len() {
                 return Err(invalid("the response body is too large"));
             }
             while self.buf.len() < size + 2 {
@@ -352,6 +358,28 @@ mod tests {
         let head = reader.head(&mut stream).await.unwrap();
         assert_eq!(reader.body(&mut stream, &head).await.unwrap(), b"abcde");
         assert_eq!(reader.into_pending(), b"tail");
+    }
+
+    /// A chunk size near `usize::MAX`, and a trailer that never ends: each
+    /// is refused, not overflowed or read forever.
+    #[tokio::test]
+    async fn hostile_chunking_is_refused() {
+        let mut reader = Reader::default();
+        let mut stream = std::io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n"
+                .to_vec(),
+        );
+        let head = reader.head(&mut stream).await.unwrap();
+        let err = reader.body(&mut stream, &head).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        let mut reader = Reader::default();
+        let mut trailer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        trailer.extend(std::iter::repeat_n(b'x', MAX_HEAD + 100));
+        let mut stream = std::io::Cursor::new(trailer);
+        let head = reader.head(&mut stream).await.unwrap();
+        let err = reader.body(&mut stream, &head).await.unwrap_err();
+        assert!(err.to_string().contains("trailer"), "{err}");
     }
 
     #[tokio::test]
