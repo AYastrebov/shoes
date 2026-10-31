@@ -79,30 +79,29 @@ impl SstpConnector {
         bind_interface: Option<String>,
         no_delay: bool,
     ) -> std::io::Result<Self> {
-        // The `Host` header: the name, or the literal, which for IPv6 needs
-        // its brackets (RFC 7230 §5.4).
-        let host = match address.address().hostname() {
-            Some(name) => name.to_string(),
-            None => {
-                let literal = address.address().to_string();
-                if literal.contains(':') {
-                    format!("[{literal}]")
-                } else {
-                    literal
-                }
+        // The name the certificate is checked against: `sni_hostname` when
+        // set, else the bare hostname or literal (rustls takes an IPv6
+        // literal without brackets).
+        let bare = address.address().to_string();
+        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&bare))?;
+        // The `Host` header names the same server, as a browser's does: a
+        // client that resolves the name itself and dials the literal keeps
+        // the name in `sni_hostname`, and a `Host` built from the literal
+        // 404s at a server that routes on it, which here reads as
+        // camouflage. An IPv6 literal keeps its brackets, and the port
+        // follows unless it is the scheme's default (RFC 7230 §5.4).
+        let host = match &server_name {
+            rustls::pki_types::ServerName::IpAddress(ip)
+                if std::net::IpAddr::from(*ip).is_ipv6() =>
+            {
+                format!("[{}]", server_name.to_str())
             }
+            _ => server_name.to_str().into_owned(),
         };
-        // RFC 7230 §5.4: the port too, unless it is the scheme's default. A
-        // server that routes on Host would 404 without it, and a 404 here
-        // reads as camouflage.
         let host = match address.port() {
             443 => host,
             port => format!("{host}:{port}"),
         };
-        // The name the certificate is checked against is the bare hostname
-        // or literal: rustls takes an IPv6 literal without brackets.
-        let bare = address.address().to_string();
-        let (tls, server_name) = handshake::tls_settings(&config.tls, Some(&bare))?;
         let methods = config
             .auth
             .iter()
@@ -374,6 +373,38 @@ mod tests {
                 literal,
                 "{address}: a literal is verified as an IP address, a name as a DNS name"
             );
+        }
+    }
+
+    /// A client that resolves the name itself dials the literal and keeps
+    /// the name in `sni_hostname`; `Host` follows the name, so a server that
+    /// routes on it still finds its site. `""` sends no SNI, and then the
+    /// address is all there is to name.
+    #[test]
+    fn the_host_header_follows_the_sni_hostname() {
+        for (address, sni, host) in [
+            ("192.0.2.1:443", Some("vpn.example.com"), "vpn.example.com"),
+            (
+                "192.0.2.1:8443",
+                Some("vpn.example.com"),
+                "vpn.example.com:8443",
+            ),
+            (
+                "[2001:db8::1]:443",
+                Some("vpn.example.com"),
+                "vpn.example.com",
+            ),
+            ("vpn.example.com:443", Some("2001:db8::1"), "[2001:db8::1]"),
+            ("192.0.2.1:443", Some(""), "192.0.2.1"),
+            ("192.0.2.1:443", None, "192.0.2.1"),
+        ] {
+            let mut config = config();
+            if let Some(sni) = sni {
+                config.tls.sni_hostname = crate::option_util::NoneOrOne::One(sni.to_string());
+            }
+            let location = NetLocation::from_str(address, None).unwrap();
+            let connector = SstpConnector::new(location, config, None, true).unwrap();
+            assert_eq!(connector.template.host, host, "{address} with {sni:?}");
         }
     }
 }

@@ -1069,7 +1069,7 @@ protocol:
   mtu: 1280                    # Default: 1280. Between 576 and 1500
   tls:                         # Optional
     verify: true               # Default: true
-    sni_hostname: string?      # Default: the host in `address`; "" sends none
+    sni_hostname: string?      # Default: the host in `address`; "" sends none. Also the Host header
     server_fingerprints: [string]?  # SHA-256 of the server certificate
   camouflage_secret: string?   # Keenetic's camouflage mode: the part after '?'
 ```
@@ -1082,7 +1082,11 @@ the first connection, carries every connection through the hop. Design:
 `docs/specs/2026-10-30-sstp-client-outbound.md`.
 
 The server's certificate is checked as for the `tls` client, and its hash is
-what crypto binding sends. With `verify` on, a pin in `server_fingerprints`
+what crypto binding sends. The request's `Host` header names the same server
+the certificate is checked against: `sni_hostname` when set, else the host in
+`address`. A client that resolves the name itself and dials the literal keeps
+the name in `sni_hostname`, and a server that routes on `Host` still finds
+its site. With `verify` on, a pin in `server_fingerprints`
 is checked on top of the chain, so an SSTP server with a self-signed
 certificate (a Windows RRAS box, a router without a public name) is reached
 with `verify: false` and its SHA-256 fingerprint in `server_fingerprints`
