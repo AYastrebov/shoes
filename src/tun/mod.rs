@@ -343,6 +343,19 @@ pub async fn run_tun_server(
     if let Some(responder) = &fake_ip {
         tcp_stack.set_fake_ip_pool(responder.pool().clone());
     }
+    {
+        // A fake IP stands for a domain the rules judge by name, so the
+        // address alone never decides it.
+        let selector = proxy_selector.clone();
+        let fake_ip_pool = fake_ip.as_ref().map(|responder| responder.pool().clone());
+        tcp_stack.set_syn_refusal(Arc::new(move |dst: std::net::SocketAddr| {
+            let fake = match (dst.ip(), &fake_ip_pool) {
+                (std::net::IpAddr::V4(v4), Some(pool)) => pool.is_fake_ip(v4),
+                _ => false,
+            };
+            !fake && selector.blocks_outright(dst)
+        }));
+    }
 
     let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();

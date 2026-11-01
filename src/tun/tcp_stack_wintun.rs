@@ -155,6 +155,11 @@ impl TcpStackWintun {
         self.handle.set_fake_ip_pool(pool)
     }
 
+    /// Refuse SYNs the rules block outright (see `StackHandle`).
+    pub fn set_syn_refusal(&mut self, refusal: super::stack_common::SynRefusal) {
+        self.handle.set_syn_refusal(refusal)
+    }
+
     /// Check if the stack thread is still running.
     pub fn is_running(&self) -> bool {
         self.handle.is_running()
