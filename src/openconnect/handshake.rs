@@ -525,9 +525,14 @@ fn redact_error(settings: &Settings, e: io::Error) -> io::Error {
 /// a control character in it, would otherwise escape the match.
 fn redacted(text: &str, username: &str, password: &str) -> String {
     let mut text = text.to_string();
+    // The parser trims an element's text, so a secret that begins or ends
+    // in whitespace comes back without it when it sits at the edge of a
+    // message: the trimmed form is matched too.
     for secret in [password, username] {
-        if !secret.is_empty() {
-            text = text.replace(secret, "[redacted]");
+        for form in [secret, secret.trim()] {
+            if !form.is_empty() {
+                text = text.replace(form, "[redacted]");
+            }
         }
     }
     printable(&text)

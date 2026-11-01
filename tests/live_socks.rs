@@ -33,7 +33,7 @@
 )]
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
@@ -199,14 +199,41 @@ fn the_outbound_carries_tcp_by_name_and_literal_udp_and_a_burst() {
         return;
     };
     let _shoes = spawn(live.socks);
-    eprintln!("check: a request by hostname exits through the server");
-    a_request_by_hostname_exits_through_the_server(&live);
-    eprintln!("check: a request by IPv4 literal is carried");
-    a_request_by_ipv4_literal_is_carried(&live);
-    eprintln!("check: a DNS query over UDP ASSOCIATE is answered");
-    a_dns_query_over_udp_associate_is_answered(&live);
-    eprintln!("check: eight connections at once all complete");
-    eight_connections_at_once_all_complete(&live);
+    // Every check runs and is reported before the verdict, so a run with a
+    // wrong password shows that each path refused it, not only the first:
+    // a UDP or literal-address route around the outbound would otherwise
+    // hide behind the first check's panic.
+    type Check = fn(&Live);
+    let checks: [(&str, Check); 4] = [
+        (
+            "a request by hostname exits through the server",
+            a_request_by_hostname_exits_through_the_server,
+        ),
+        (
+            "a request by IPv4 literal is carried",
+            a_request_by_ipv4_literal_is_carried,
+        ),
+        (
+            "a DNS query over UDP ASSOCIATE is answered",
+            a_dns_query_over_udp_associate_is_answered,
+        ),
+        (
+            "eight connections at once all complete",
+            eight_connections_at_once_all_complete,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, check) in checks {
+        let outcome = std::panic::catch_unwind(|| check(&live));
+        match outcome {
+            Ok(()) => eprintln!("pass: {name}"),
+            Err(_) => {
+                eprintln!("FAIL: {name}");
+                failed.push(name);
+            }
+        }
+    }
+    assert!(failed.is_empty(), "failed checks: {failed:?}");
 }
 
 fn a_request_by_hostname_exits_through_the_server(live: &Live) {
@@ -265,7 +292,16 @@ fn a_dns_query_over_udp_associate_is_answered(live: &Live) {
     };
     let mut port = [0u8; 2];
     control.read_exact(&mut port).unwrap();
-    let relay = SocketAddr::from((relay_ip, u16::from_be_bytes(port)));
+    let port = u16::from_be_bytes(port);
+    // A link-local listener's scope does not travel in the reply; the relay
+    // was bound with the listener's (`handle_udp_associate`), so it is the
+    // listener's here too.
+    let relay = match (relay_ip, live.socks) {
+        (IpAddr::V6(ip), SocketAddr::V6(listener)) => {
+            SocketAddr::V6(SocketAddrV6::new(ip, port, 0, listener.scope_id()))
+        }
+        (ip, _) => SocketAddr::from((ip, port)),
+    };
 
     // An A query for example.com, id 0x4242.
     let mut query = vec![0x42, 0x42, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];

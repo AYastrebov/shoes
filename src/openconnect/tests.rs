@@ -246,6 +246,33 @@ async fn a_password_with_a_line_break_echoed_in_the_retry_form_is_redacted() {
     );
 }
 
+/// The parser trims the message, so a password ending in a line break,
+/// echoed at the message's edge, comes back without it: the trimmed form
+/// is redacted too. The double trims what it reads as well, so it is
+/// given the trimmed password and accepts the client's longer one.
+#[tokio::test]
+async fn a_password_ending_in_a_line_break_echoed_at_the_message_edge_is_redacted() {
+    const TRAILING: &str = "first\nsecond\n";
+    let server = testing::start(Options {
+        password: TRAILING.trim(),
+        ask_password_again: true,
+        password_again_message: "Login failed for first\nsecond\n",
+        ..Options::default()
+    })
+    .await;
+    let err = tcp_echo(
+        &connector_with(&server, config_for(&server, TRAILING)),
+        b"x",
+    )
+    .await
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    // "second password" is the error's own wording; the secret's words are
+    // "first" and "second" together.
+    assert!(!text.contains("first"), "{text}");
+}
+
 /// ocserv answers a wrong password with the same password-only form, no
 /// `<error>`, and "Login failed." in the message (seen live, 2026-11-02):
 /// the error carries that text, so the user reads a refused login rather
