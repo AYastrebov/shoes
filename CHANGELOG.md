@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.9.3
+
+Three changes since 0.9.2. The `shoesd` daemon's stop is bounded: open
+watch streams get two seconds and the revert always runs, so a desktop
+client left open no longer leaves routes and the Windows NRPT rule behind
+at an upgrade or a shutdown (#142). The TUN refuses a SYN the rules block
+outright, so an app falls back to its next address instead of seeing an
+established connection reset (#141); this is in the AAR and the Apple
+framework. An OpenConnect client outbound, `type: openconnect`, Cisco
+AnyConnect's protocol as ocserv speaks it (#140): a new configuration
+structure, not yet run against a real server. No FFI change.
 
 **A `shoesd` stop no longer waits on its clients.** tonic's graceful exit
 waited for every connection to finish, and the watch streams -- status,
