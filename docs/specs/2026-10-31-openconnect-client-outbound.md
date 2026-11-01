@@ -292,6 +292,7 @@ false` only with a pin. `path` must start with `/` and carry no query.
 | 404 or 401 with camouflage off | "the server may have camouflage on: set camouflage_secret" |
 | 404 with camouflage on | "the camouflage secret may be wrong" |
 | 401 to the auth reply, or a form with `<error>` | Authentication failed, with the server's message; never the credentials |
+| A password-only form after the password went out | "did not accept the login and asks for a password again", with the server's message: ocserv's shape for both a refused password ("Login failed.", `worker-auth.c:2248-2262` then `558-586`) and a one-time code, told apart only by the text; the password is not sent twice |
 | A form asking for anything but username, password and group | "the server asks for a second factor (…), which this client does not do" |
 | An SSO form, a certificate request | Named and refused |
 | CONNECT 401, or 405 under camouflage | Cookie refused: run the authentication again once, under the same negotiation deadline |
@@ -322,7 +323,15 @@ false` only with a pin. `path` must start with `/` and carry no query.
   re-authenticates; camouflage with, without and with the wrong secret;
   the pin; the selector path from YAML; DPD answered; a dead peer detected.
 - A live run against the user's Keenetic and against ocserv, recorded in
-  words only.
+  words only. **Run 2026-11-02 against ocserv 1.6.0 on the user's VPS**
+  (camouflage on, TLS verified against a public certificate, IPv4-only
+  tunnel, DTLS off on the server): `tests/live_socks.rs` passed all four
+  checks, and a shell loop around the same config saw the session on the
+  server, held it for over three minutes with the server's DPD answered,
+  rebuilt it on the next request after `occtl disconnect user`, and saw it
+  gone after the client's stop. A 10 MB download ran at the home link's
+  ceiling. A destination with only an IPv6 address was refused by name, as
+  "Error handling" asks. The Keenetic run is still owed.
 
 ## Out of scope
 

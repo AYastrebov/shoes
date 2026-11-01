@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+**A repeatable live check, and the first live runs of the OpenConnect and
+mieru clients against real servers.** `tests/live_socks.rs` drives the
+built binary with any client config that fronts an outbound with a SOCKS
+listener (`SHOES_LIVE_CONFIG`, `SHOES_LIVE_SOCKS`, optionally
+`SHOES_LIVE_EXIT_IP`), and checks a request by hostname exits through the
+server, a request by IPv4 literal is carried, a DNS query over UDP
+ASSOCIATE is answered, and eight connections at once all complete; without
+the variables it passes doing nothing, so CI is unchanged. With a wrong
+password every check fails, as it must. Run on 2026-11-02 against the
+user's VPS: ocserv 1.6.0 with camouflage on, over TLS verified against a
+public certificate, and mita 3.39.0 over TCP. Both passed every check;
+through OpenConnect a session was also seen on the server, held for over
+three minutes with its dead-peer probes answered, rebuilt on the next
+request after the server dropped it, and gone from the server's list after
+the client's stop. A destination with only an IPv6 address is refused by
+name through an IPv4-only OpenConnect session, which is the behaviour the
+spec asks for. Nothing from the runs is in the tree.
+
+The runs with a wrong password found two reports that said the wrong
+thing, both fixed. ocserv answers a wrong password with the same
+password-only form it uses for a one-time code, no `<error>`, and "Login
+failed." as the message; the client reported an unsupported second
+factor. It now says the server did not accept the login and asks for a
+password again, with the server's message (redacted as all its text is),
+and names the one-time-code reading as the other possibility; a double
+that answers as ocserv does pins it. A mieru server cannot tell a wrong
+key from noise and closes the connection without a word; the client's
+error said so, but as "unexpected end of file", which the connection-end
+rule logs at debug, so a release build refusing every connection logged
+nothing at all. It is now a connection refused that names the two causes
+that look like this, a wrong username or password and a clock off by more
+than two minutes, logged at error.
+
 ## v0.9.3
 
 Three changes since 0.9.2. The `shoesd` daemon's stop is bounded: open

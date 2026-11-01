@@ -385,11 +385,20 @@ encapsulation was compared line by line against
 length, the 65535 ceiling, the `0xff` suffix and the rejection of a wrong
 marker at either end all match.
 
+A second run, 2026-11-02, against the official `mita` 3.39.0 image on the
+user's VPS (TCP transport, server MTU 1280, one user): `tests/live_socks.rs`
+passed all four checks (exit by name, IPv4 literal, DNS over UDP ASSOCIATE,
+eight connections at once), a 10 MB download and a 5 MB upload ran at the
+home link's ceiling, and a destination with an IPv6 address was reached
+through the server's IPv6 exit. With the password off by one character every
+check failed.
+
 ### What is still not guaranteed
 
-A single manual run is not a regression test. The next change to the codec is
-unguarded, so `ROADMAP.md` keeps a `mita`-in-CI entry as the next step, with a
-mieru server here as the more thorough alternative.
+A manual run is not a regression test, though `tests/live_socks.rs` now makes
+it a one-line one for anyone with a server. The next change to the codec is
+unguarded in CI, so `ROADMAP.md` keeps a `mita`-in-CI entry as the next step,
+with a mieru server here as the more thorough alternative.
 
 The run also covered one server configuration. A deployment using mieru's UDP
 transport, a configured traffic pattern, session multiplexing, port ranges or

@@ -64,8 +64,11 @@ pub struct Options {
     /// error must not repeat them.
     pub echo_credentials: bool,
     /// After a correct login, ask for the password again in a form, as a
-    /// challenge or one-time-code server does.
+    /// challenge or one-time-code server does -- and as ocserv does after
+    /// a wrong password, with a different message.
     pub ask_password_again: bool,
+    /// The `<message>` of that second form.
+    pub password_again_message: &'static str,
     /// Assign an IPv6 address too.
     pub ipv6: bool,
     /// `X-CSTP-DPD` and `X-CSTP-Keepalive`, in seconds; 0 omits the header.
@@ -90,6 +93,7 @@ impl Default for Options {
             second_password: false,
             echo_credentials: false,
             ask_password_again: false,
+            password_again_message: "Enter the next token",
             ipv6: false,
             dpd: 90,
             keepalive: 32400,
@@ -481,10 +485,11 @@ async fn serve(
                         if options.ask_password_again {
                             auth_state = AuthState::AskedSecond;
                             let challenge = format!(
-                                "{FORM_HEAD}<auth id=\"main\">\n<message>Enter the next token</message>\n\
+                                "{FORM_HEAD}<auth id=\"main\">\n<message>{}</message>\n\
                                  <form method=\"post\" action=\"/auth\">\n\
                                  <input type=\"password\" name=\"password\" label=\"Challenge:\" />\n\
-                                 </form></auth>\n</config-auth>"
+                                 </form></auth>\n</config-auth>",
+                                options.password_again_message
                             );
                             respond(&mut tls, "200 OK", &[set_context], &challenge).await?;
                             continue;

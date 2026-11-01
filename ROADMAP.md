@@ -1138,9 +1138,11 @@ the plan below did not know: ocserv reads one TLS record per frame and
 ends a session whose record holds anything else, so the writer cannot
 batch frames as SSTP's does; and an IETF draft by ocserv's author
 (draft-mavrogiannopoulos-openconnect-04) documents the protocol, which the
-openconnect source alone does not. Still to do: a live run against the
-user's Keenetic and against ocserv in a container, and the DTLS step on
-the terms below.
+openconnect source alone does not. Run live on 2026-11-02 against ocserv
+1.6.0 on the user's VPS, camouflage on: every check of
+`tests/live_socks.rs` passed, a session held through DPD, was rebuilt
+after a server-side disconnect and left cleanly. Still to do: the user's
+Keenetic, and the DTLS step on the terms below.
 
 **What it is.** The protocol of Cisco AnyConnect and of
 [ocserv](https://gitlab.com/openconnect/ocserv) (GPL), spoken by the

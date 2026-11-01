@@ -1156,7 +1156,9 @@ time rounded to two minutes.
 That last part is worth knowing before debugging a failure. A client and
 server whose clocks differ by more than about four minutes cannot agree on a
 key, and a device that has not synchronised its clock cannot connect at all.
-The error says so rather than reporting a generic authentication failure.
+A mieru server cannot tell a wrong key from noise, so a wrong password and
+a wrong clock look the same from outside: the server closes the connection
+without answering, and the error names both causes.
 
 UDP destinations work: mieru carries socks5 UDP-associate inside the same TCP
 session, so no separate transport is involved.

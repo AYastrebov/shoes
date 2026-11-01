@@ -367,19 +367,35 @@ async fn authenticate(
                     ));
                 }
                 // A second form asking for a password after one went out is
-                // a challenge or a one-time code (`auth.c:1011-1033`), not
-                // a place to send the same password again. A username-only
-                // form followed by a password-only one is an ordinary login
-                // in two rounds, and is not that.
+                // not a place to send the same password again. ocserv sends
+                // exactly this shape for two different things, told apart
+                // only by the message: a refused password, re-asked with the
+                // auth module's text ("Login failed." -- `worker-auth.c`:
+                // `ERR_AUTH_CONTINUE` at 2248-2262 reaches `get_auth_handler2`,
+                // whose password-only form is 558-586), and a challenge or
+                // one-time code (`auth.c:1011-1033` in openconnect). The
+                // message is the server's, so it is passed on redacted, and
+                // the error names both readings. A username-only form
+                // followed by a password-only one is an ordinary login in
+                // two rounds, and is not this.
                 let asks_password = form
                     .inputs
                     .iter()
                     .any(|i| i.kind == "password" && i.name == "password");
                 if asks_password && password_sent {
+                    let said = message
+                        .as_deref()
+                        .map(|m| server_text(settings, m))
+                        .filter(|m| !m.is_empty())
+                        .map(|m| format!(" and says: {m}"))
+                        .unwrap_or_default();
                     return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "OpenConnect: the server asks for the password again (a challenge or a \
-                         one-time code), which this client does not do",
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "OpenConnect: the server did not accept the login and asks for a \
+                             password again{said}; if it wants a one-time code or a second \
+                             password, this client does not do that"
+                        ),
                     ));
                 }
                 document = auth::reply_document(
@@ -457,7 +473,25 @@ async fn post(
 }
 
 fn printable(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(200).collect()
+    // Redaction has already run on `text`: the secrets were matched whole,
+    // line breaks included, so only now may a line break become a space.
+    let flat: String = text
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| !c.is_control())
+        .collect();
+    flat.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Server-supplied text for an error, with the credentials taken out: a
@@ -491,9 +525,14 @@ fn redact_error(settings: &Settings, e: io::Error) -> io::Error {
 /// a control character in it, would otherwise escape the match.
 fn redacted(text: &str, username: &str, password: &str) -> String {
     let mut text = text.to_string();
+    // The parser trims an element's text, so a secret that begins or ends
+    // in whitespace comes back without it when it sits at the edge of a
+    // message: the trimmed form is matched too.
     for secret in [password, username] {
-        if !secret.is_empty() {
-            text = text.replace(secret, "[redacted]");
+        for form in [secret, secret.trim()] {
+            if !form.is_empty() {
+                text = text.replace(form, "[redacted]");
+            }
         }
     }
     printable(&text)

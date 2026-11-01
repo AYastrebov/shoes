@@ -205,7 +205,8 @@ async fn a_second_factor_is_named_and_refused() {
 
 /// A server that asks for the password again after taking one wants a
 /// challenge answer or a one-time code, not the same password: refused by
-/// saying so, and the password is not sent twice.
+/// saying so, with the server's own prompt, and the password is not sent
+/// twice.
 #[tokio::test]
 async fn a_repeated_password_prompt_is_refused() {
     let server = testing::start(Options {
@@ -214,7 +215,82 @@ async fn a_repeated_password_prompt_is_refused() {
     })
     .await;
     let err = tcp_echo(&connector(&server), b"x").await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(err.to_string().contains("password again"), "{err}");
+    assert!(err.to_string().contains("Enter the next token"), "{err}");
+    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
+}
+
+/// The server's message is redacted before its line breaks are flattened:
+/// a password that spans a line, echoed back, must not survive as two
+/// words with a space between.
+#[tokio::test]
+async fn a_password_with_a_line_break_echoed_in_the_retry_form_is_redacted() {
+    const TWO_LINES: &str = "first\nsecond";
+    let server = testing::start(Options {
+        password: TWO_LINES,
+        ask_password_again: true,
+        password_again_message: "Login failed for first\nsecond. Please enter your password.",
+        ..Options::default()
+    })
+    .await;
+    let config = config_for(&server, TWO_LINES);
+    let err = tcp_echo(&connector_with(&server, config), b"x")
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(
+        !text.contains("first second") && !text.contains(TWO_LINES),
+        "{text}"
+    );
+}
+
+/// The parser trims the message, so a password ending in a line break,
+/// echoed at the message's edge, comes back without it: the trimmed form
+/// is redacted too. The double trims what it reads as well, so it is
+/// given the trimmed password and accepts the client's longer one.
+#[tokio::test]
+async fn a_password_ending_in_a_line_break_echoed_at_the_message_edge_is_redacted() {
+    const TRAILING: &str = "first\nsecond\n";
+    let server = testing::start(Options {
+        password: TRAILING.trim(),
+        ask_password_again: true,
+        password_again_message: "Login failed for first\nsecond\n",
+        ..Options::default()
+    })
+    .await;
+    let err = tcp_echo(
+        &connector_with(&server, config_for(&server, TRAILING)),
+        b"x",
+    )
+    .await
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    // "second password" is the error's own wording; the secret's words are
+    // "first" and "second" together.
+    assert!(!text.contains("first"), "{text}");
+}
+
+/// ocserv answers a wrong password with the same password-only form, no
+/// `<error>`, and "Login failed." in the message (seen live, 2026-11-02):
+/// the error carries that text, so the user reads a refused login rather
+/// than an unsupported second factor, and never the password.
+#[tokio::test]
+async fn ocservs_login_failed_form_is_reported_as_the_refusal_it_is() {
+    let server = testing::start(Options {
+        ask_password_again: true,
+        password_again_message: "Login failed.\nPlease enter your password.",
+        ..Options::default()
+    })
+    .await;
+    let err = tcp_echo(&connector(&server), b"x").await.unwrap_err();
+    let text = err.to_string();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(text.contains("did not accept the login"), "{text}");
+    assert!(text.contains("Login failed."), "{text}");
+    assert!(!text.contains(PASSWORD), "{text}");
     assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
 }
 
