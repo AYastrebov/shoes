@@ -152,9 +152,18 @@ impl MieruStream {
         loop {
             let n = inner.read(&mut buf).await?;
             if n == 0 {
+                // A mieru server cannot tell a wrong key from noise, so a
+                // wrong username or password, or a clock more than about
+                // two minutes off, ends here with nothing said (seen live
+                // against mita 3.39.0, 2026-11-02). Not `UnexpectedEof`,
+                // which the connection-end rule logs at debug: a server
+                // refusing every connection must be visible in a release
+                // log.
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "the mieru server closed the connection before answering the session request",
+                    std::io::ErrorKind::ConnectionRefused,
+                    "the mieru server closed the connection without answering the session \
+                     request: a wrong username or password, or a clock more than two minutes \
+                     off, looks exactly like this",
                 ));
             }
             pending.extend_from_slice(&buf[..n]);
@@ -827,6 +836,48 @@ mod tests {
         let _ = server_tcp.write_all(&response).await;
 
         assert!(client.await.unwrap().is_err());
+    }
+
+    /// A server that hangs up without answering is what a wrong password
+    /// or a wrong clock looks like from outside (mita cannot tell a wrong
+    /// key from noise): the error names those causes, and its kind is one
+    /// the connection-end rule logs at error, not the EOF it logs at debug.
+    #[tokio::test]
+    async fn test_a_server_that_hangs_up_unanswered_is_a_refusal_naming_the_causes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            MieruStream::open(
+                Box::new(tcp),
+                b"the wrong password",
+                TEST_USERNAME,
+                1000,
+                &[],
+            )
+            .await
+        });
+
+        let (mut server_tcp, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = server_tcp.read(&mut buf).await.unwrap();
+        drop(server_tcp);
+
+        let Err(err) = client.await.unwrap() else {
+            panic!("open should fail")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            crate::util::connection_end_level(&err),
+            log::Level::Error,
+            "a refusal is logged at error in a release build"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("password") && text.contains("clock"),
+            "{text}"
+        );
     }
 
     /// Every segment the server end has received so far, decoded.

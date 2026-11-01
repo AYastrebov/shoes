@@ -367,19 +367,35 @@ async fn authenticate(
                     ));
                 }
                 // A second form asking for a password after one went out is
-                // a challenge or a one-time code (`auth.c:1011-1033`), not
-                // a place to send the same password again. A username-only
-                // form followed by a password-only one is an ordinary login
-                // in two rounds, and is not that.
+                // not a place to send the same password again. ocserv sends
+                // exactly this shape for two different things, told apart
+                // only by the message: a refused password, re-asked with the
+                // auth module's text ("Login failed." -- `worker-auth.c`:
+                // `ERR_AUTH_CONTINUE` at 2248-2262 reaches `get_auth_handler2`,
+                // whose password-only form is 558-586), and a challenge or
+                // one-time code (`auth.c:1011-1033` in openconnect). The
+                // message is the server's, so it is passed on redacted, and
+                // the error names both readings. A username-only form
+                // followed by a password-only one is an ordinary login in
+                // two rounds, and is not this.
                 let asks_password = form
                     .inputs
                     .iter()
                     .any(|i| i.kind == "password" && i.name == "password");
                 if asks_password && password_sent {
+                    let said = message
+                        .as_deref()
+                        .map(|m| server_text(settings, &m.replace(['\r', '\n'], " ")))
+                        .filter(|m| !m.is_empty())
+                        .map(|m| format!(" and says: {m}"))
+                        .unwrap_or_default();
                     return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "OpenConnect: the server asks for the password again (a challenge or a \
-                         one-time code), which this client does not do",
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "OpenConnect: the server did not accept the login and asks for a \
+                             password again{said}; if it wants a one-time code or a second \
+                             password, this client does not do that"
+                        ),
                     ));
                 }
                 document = auth::reply_document(

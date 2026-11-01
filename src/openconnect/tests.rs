@@ -205,7 +205,8 @@ async fn a_second_factor_is_named_and_refused() {
 
 /// A server that asks for the password again after taking one wants a
 /// challenge answer or a one-time code, not the same password: refused by
-/// saying so, and the password is not sent twice.
+/// saying so, with the server's own prompt, and the password is not sent
+/// twice.
 #[tokio::test]
 async fn a_repeated_password_prompt_is_refused() {
     let server = testing::start(Options {
@@ -214,7 +215,30 @@ async fn a_repeated_password_prompt_is_refused() {
     })
     .await;
     let err = tcp_echo(&connector(&server), b"x").await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(err.to_string().contains("password again"), "{err}");
+    assert!(err.to_string().contains("Enter the next token"), "{err}");
+    assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
+}
+
+/// ocserv answers a wrong password with the same password-only form, no
+/// `<error>`, and "Login failed." in the message (seen live, 2026-11-02):
+/// the error carries that text, so the user reads a refused login rather
+/// than an unsupported second factor, and never the password.
+#[tokio::test]
+async fn ocservs_login_failed_form_is_reported_as_the_refusal_it_is() {
+    let server = testing::start(Options {
+        ask_password_again: true,
+        password_again_message: "Login failed.\nPlease enter your password.",
+        ..Options::default()
+    })
+    .await;
+    let err = tcp_echo(&connector(&server), b"x").await.unwrap_err();
+    let text = err.to_string();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(text.contains("did not accept the login"), "{text}");
+    assert!(text.contains("Login failed."), "{text}");
+    assert!(!text.contains(PASSWORD), "{text}");
     assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
 }
 

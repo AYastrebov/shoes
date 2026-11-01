@@ -35,6 +35,31 @@ description: How to test shoes against a reference implementation (sing-box, Xra
   AnyTLS): a client that survives only one server lifetime is a defect
   (NA-N1 was found this way).
 
+## The repeatable check
+
+`tests/live_socks.rs` is the check to reach for first: it drives the built
+binary with a client config kept outside the tree and proves the four
+things a tunnel must do (a request by name exits through the server, one by
+IPv4 literal is carried, DNS over UDP ASSOCIATE is answered, eight
+connections at once complete). It skips itself without the variables.
+
+```bash
+SHOES_LIVE_CONFIG=/outside/the/tree/client.yaml \
+SHOES_LIVE_SOCKS=127.0.0.1:11080 \
+SHOES_LIVE_EXIT_IP=<the server's public address> \
+cargo test --locked --test live_socks -- --nocapture --test-threads=1
+```
+
+The config is an `examples/*_client.yaml` shape: a `socks` listener at
+`SHOES_LIVE_SOCKS` with the outbound under test in its chain. Generate it
+from the server's own client profile with a script that writes an
+owner-only file and never prints a value. Run it once more with the
+password changed by one character: every check must fail, or the run proved
+nothing. Lifecycle checks the harness does not cover (a session visible on
+the server, a hold through dead-peer probes, a server-side disconnect
+followed by a rebuild, the session gone after a stop) are a shell loop
+around the same config, `ssh` to the server and its own control tool.
+
 ## Reading the result
 
 - A mismatched obfuscation password produces no error at all and looks
