@@ -38,6 +38,19 @@ const MIN_STATS_INTERVAL: Duration = Duration::from_millis(100);
 /// How many messages a stream buffers before its sender waits.
 const STREAM_BUFFER: usize = 32;
 
+/// How long a stop waits for open streams after it has stopped accepting.
+///
+/// tonic's graceful exit waits for every connection to finish, and
+/// `WatchStatus`, `WatchStats` and `WatchLogs` never finish while their
+/// client lives -- the desktop app holds the first two for as long as it
+/// runs. The supervisor reverts the session only after `serve` returns, so
+/// an unbounded wait is a daemon that launchd, systemd or the Service
+/// Control Manager kills without the revert: routes and, on Windows, the NRPT
+/// rule that outlives a reboot stay behind. Two seconds is time for a unary
+/// call in flight to answer; a stream is dropped, which its client already
+/// treats as the daemon going away.
+pub const STOP_GRACE: Duration = Duration::from_secs(2);
+
 pub struct DaemonService {
     authorizer: Authorizer,
     supervisor: Supervisor,
@@ -488,10 +501,14 @@ pub async fn serve(
     };
     let incoming = crate::socket::incoming(listener);
 
-    let result = tonic::transport::Server::builder()
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+    let server = tonic::transport::Server::builder()
         .add_service(DaemonServer::new(service))
-        .serve_with_incoming_shutdown(incoming, shutdown_signal())
-        .await;
+        .serve_with_incoming_shutdown(incoming, async move {
+            shutdown_signal().await;
+            let _ = stopping_tx.send(());
+        });
+    let result = bounded_by(server, stopping_rx, STOP_GRACE).await;
 
     // The socket file outlives the listener, and launchd restarts the daemon.
     // Leaving it behind is survivable -- `bind` removes a stale one -- but it
@@ -503,6 +520,41 @@ pub async fn serve(
     }
 
     result.map_err(std::io::Error::other)
+}
+
+/// Run `server` until it has exited gracefully, or until `grace` after
+/// `stopping` fired, whichever is first.
+///
+/// `stopping` is completed by the same future the server was given as its
+/// shutdown signal, so the grace is measured from the moment the server
+/// stopped accepting. When it runs out, the server future is dropped: the
+/// listener closes with it, and the streams still open end as a transport
+/// error at their clients once the process exits -- which it does right
+/// after, having reverted the session. A connection task tonic spawned is
+/// not ended by the drop; it ends when the supervisor's shutdown closes the
+/// broadcasts the streams read from.
+async fn bounded_by<F>(
+    server: F,
+    stopping: tokio::sync::oneshot::Receiver<()>,
+    grace: Duration,
+) -> Result<(), tonic::transport::Error>
+where
+    F: std::future::Future<Output = Result<(), tonic::transport::Error>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = async {
+            let _ = stopping.await;
+            tokio::time::sleep(grace).await;
+        } => {
+            log::info!(
+                "open streams did not end within {}s of the stop; dropping them",
+                grace.as_secs()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// `SIGTERM` from launchd, or `SIGINT` from a terminal.
@@ -849,6 +901,21 @@ mod tests {
         proto::daemon_client::DaemonClient<tonic::transport::Channel>,
         tokio::sync::oneshot::Sender<()>,
     ) {
+        let (client, shutdown, _server) = serve_for_test_with_server(authorizer, access).await;
+        (client, shutdown)
+    }
+
+    /// `serve_for_test`, and the server task itself, for a test about how
+    /// the server exits. It serves exactly as `serve` does: the shutdown the
+    /// sender triggers is bounded by `STOP_GRACE`.
+    async fn serve_for_test_with_server(
+        authorizer: Authorizer,
+        access: crate::socket::Access,
+    ) -> (
+        proto::daemon_client::DaemonClient<tonic::transport::Channel>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
         let path = std::env::temp_dir().join(format!(
             "shoesd-svc-{}-{:?}.sock",
             std::process::id(),
@@ -861,13 +928,15 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         let service = service_with(authorizer);
-        tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
+        let server = tokio::spawn(async move {
+            let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel();
+            let server = tonic::transport::Server::builder()
                 .add_service(DaemonServer::new(service))
                 .serve_with_incoming_shutdown(crate::socket::incoming(listener), async {
                     let _ = rx.await;
-                })
-                .await;
+                    let _ = stopping_tx.send(());
+                });
+            bounded_by(server, stopping_rx, STOP_GRACE).await
         });
 
         // The URI is ignored -- the connector below decides where this goes --
@@ -885,7 +954,7 @@ mod tests {
             .await
             .expect("the daemon should be accepting");
 
-        (proto::daemon_client::DaemonClient::new(channel), tx)
+        (proto::daemon_client::DaemonClient::new(channel), tx, server)
     }
 
     /// Serve with a rule that admits the account running the tests -- the one
@@ -1178,5 +1247,46 @@ mod tests {
         assert_eq!(first.state, proto::status::State::Stopped as i32);
 
         let _ = shutdown.send(());
+    }
+
+    /// A stop with a `WatchStatus` stream open returns within the grace,
+    /// rather than waiting for the client to hang up.
+    ///
+    /// The stream never ends on its own, which is what a desktop client's
+    /// looks like for as long as it runs; before the bound, `serve` waited on
+    /// it forever and the supervisor's revert -- which runs only after
+    /// `serve` returns -- never did. The deadline here is the grace plus
+    /// room for the runtime, well short of the forever this guards against.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_with_a_stream_open_returns_within_the_grace() {
+        use tokio_stream::StreamExt;
+
+        let (authorizer, access) = admitting_me();
+        let (mut client, shutdown, server) = serve_for_test_with_server(authorizer, access).await;
+
+        let mut stream = client
+            .watch_status(proto::StatusRequest {})
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the current state arrives")
+            .expect("the stream is not empty")
+            .expect("and carries a status");
+
+        let stopped = std::time::Instant::now();
+        let _ = shutdown.send(());
+        let result = tokio::time::timeout(STOP_GRACE + Duration::from_secs(3), server)
+            .await
+            .expect("a stop with a stream open still returns")
+            .expect("the server task does not panic");
+        assert!(result.is_ok(), "a bounded stop is not an error: {result:?}");
+        assert!(
+            stopped.elapsed() >= STOP_GRACE,
+            "the grace is given in full before the streams are dropped"
+        );
+        // The stream is still held: the server did not wait for it.
+        drop(stream);
     }
 }

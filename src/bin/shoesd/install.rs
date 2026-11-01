@@ -880,9 +880,16 @@ pub const INSTALLED_BINARY: &str = "%ProgramFiles%\\shoesd\\shoesd.exe";
 #[cfg(windows)]
 pub const LABEL: &str = crate::win_service::SERVICE_NAME;
 
-/// How long to wait for the service to report RUNNING, or STOPPED.
+/// How long to wait for the service to report RUNNING, or STOPPED: the
+/// longer of the two hints the service gives the SCM, plus room. It was a
+/// flat 15 s once, shorter than the 20 s stop hint, so an `install` over a
+/// running service could give up on a stop still inside the budget the
+/// service had asked for.
 #[cfg(windows)]
-const SERVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+fn service_wait() -> std::time::Duration {
+    crate::win_service::START_HINT.max(crate::win_service::STOP_HINT)
+        + std::time::Duration::from_secs(10)
+}
 
 /// `%ProgramFiles%\shoesd` -- everything the daemon installs or writes.
 ///
@@ -1355,7 +1362,8 @@ fn wait_for(
 ) -> std::io::Result<()> {
     use windows_service::service::ServiceState;
 
-    let deadline = std::time::Instant::now() + SERVICE_WAIT;
+    let wait = service_wait();
+    let deadline = std::time::Instant::now() + wait;
     loop {
         let status = service.query_status().map_err(service_error)?;
         if status.current_state == state {
@@ -1379,7 +1387,7 @@ fn wait_for(
                 format!(
                     "the {LABEL} service is {:?}, not {state:?}, after {}s",
                     status.current_state,
-                    SERVICE_WAIT.as_secs()
+                    wait.as_secs()
                 ),
             ));
         }

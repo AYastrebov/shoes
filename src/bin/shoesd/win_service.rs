@@ -47,11 +47,12 @@ fn log_file() -> Option<std::path::PathBuf> {
 }
 
 /// How long the SCM is told startup may take before the socket is bound.
-const START_HINT: Duration = Duration::from_secs(30);
+pub const START_HINT: Duration = Duration::from_secs(30);
 
-/// How long the SCM is told a stop may take: the engine's own stop timeout
-/// (`control::STOP_TIMEOUT`, 5 s) plus the revert, with room to spare.
-const STOP_HINT: Duration = Duration::from_secs(20);
+/// How long the SCM is told a stop may take: the grace open streams get
+/// (`service::STOP_GRACE`, 2 s), the engine's own stop timeout
+/// (`control::STOP_TIMEOUT`, 5 s) and the revert, with room to spare.
+pub const STOP_HINT: Duration = Duration::from_secs(20);
 
 /// Woken by the SCM's Stop or Shutdown. `notify_one` stores a permit, so a
 /// stop that arrives before anything is waiting is not lost.
