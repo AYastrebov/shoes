@@ -221,6 +221,31 @@ async fn a_repeated_password_prompt_is_refused() {
     assert_eq!(server.stats.logins.load(Ordering::SeqCst), 0);
 }
 
+/// The server's message is redacted before its line breaks are flattened:
+/// a password that spans a line, echoed back, must not survive as two
+/// words with a space between.
+#[tokio::test]
+async fn a_password_with_a_line_break_echoed_in_the_retry_form_is_redacted() {
+    const TWO_LINES: &str = "first\nsecond";
+    let server = testing::start(Options {
+        password: TWO_LINES,
+        ask_password_again: true,
+        password_again_message: "Login failed for first\nsecond. Please enter your password.",
+        ..Options::default()
+    })
+    .await;
+    let config = config_for(&server, TWO_LINES);
+    let err = tcp_echo(&connector_with(&server, config), b"x")
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(
+        !text.contains("first second") && !text.contains(TWO_LINES),
+        "{text}"
+    );
+}
+
 /// ocserv answers a wrong password with the same password-only form, no
 /// `<error>`, and "Login failed." in the message (seen live, 2026-11-02):
 /// the error carries that text, so the user reads a refused login rather

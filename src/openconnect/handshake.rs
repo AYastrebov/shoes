@@ -385,7 +385,7 @@ async fn authenticate(
                 if asks_password && password_sent {
                     let said = message
                         .as_deref()
-                        .map(|m| server_text(settings, &m.replace(['\r', '\n'], " ")))
+                        .map(|m| server_text(settings, m))
                         .filter(|m| !m.is_empty())
                         .map(|m| format!(" and says: {m}"))
                         .unwrap_or_default();
@@ -473,7 +473,25 @@ async fn post(
 }
 
 fn printable(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(200).collect()
+    // Redaction has already run on `text`: the secrets were matched whole,
+    // line breaks included, so only now may a line break become a space.
+    let flat: String = text
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| !c.is_control())
+        .collect();
+    flat.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Server-supplied text for an error, with the credentials taken out: a

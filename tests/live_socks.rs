@@ -33,7 +33,7 @@
 )]
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
@@ -73,7 +73,15 @@ fn live() -> Option<Live> {
     Some(Live { socks, exit_ip })
 }
 
+/// Start shoes on the config and wait for its listener. Something already
+/// accepting at the address is refused first, else a stale client would
+/// be the one tested while the new one failed to bind; and a child that
+/// exits while we wait is reported with its status, not as a timeout.
 fn spawn(socks: SocketAddr) -> Child {
+    assert!(
+        TcpStream::connect_timeout(&socks, Duration::from_millis(200)).is_err(),
+        "something already accepts at {socks}; stop it, or point SHOES_LIVE_SOCKS elsewhere"
+    );
     let config = std::env::var_os("SHOES_LIVE_CONFIG").unwrap();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
         .arg("--no-reload")
@@ -81,9 +89,12 @@ fn spawn(socks: SocketAddr) -> Child {
         .stdin(std::process::Stdio::null())
         .spawn()
         .expect("shoes starts");
-    let child = Child(child);
+    let mut child = Child(child);
     let deadline = Instant::now() + START_TIMEOUT;
     while TcpStream::connect_timeout(&socks, Duration::from_millis(200)).is_err() {
+        if let Some(status) = child.0.try_wait().expect("the child can be polled") {
+            panic!("shoes exited with {status} before listening on {socks}");
+        }
         assert!(
             Instant::now() < deadline,
             "shoes did not listen on {socks} within {START_TIMEOUT:?}"
@@ -177,13 +188,28 @@ fn exit_address(socks: SocketAddr) -> String {
     ip
 }
 
+/// The four checks in sequence, through one child, because every check
+/// needs the same listener: parallel tests each spawning a child on the
+/// one port would probe each other's, and a finishing test's guard would
+/// kill the proxy another was still using.
 #[test]
-fn a_request_by_hostname_exits_through_the_server() {
+fn the_outbound_carries_tcp_by_name_and_literal_udp_and_a_burst() {
     let Some(live) = live() else {
         eprintln!("SHOES_LIVE_CONFIG unset: live check skipped");
         return;
     };
     let _shoes = spawn(live.socks);
+    eprintln!("check: a request by hostname exits through the server");
+    a_request_by_hostname_exits_through_the_server(&live);
+    eprintln!("check: a request by IPv4 literal is carried");
+    a_request_by_ipv4_literal_is_carried(&live);
+    eprintln!("check: a DNS query over UDP ASSOCIATE is answered");
+    a_dns_query_over_udp_associate_is_answered(&live);
+    eprintln!("check: eight connections at once all complete");
+    eight_connections_at_once_all_complete(&live);
+}
+
+fn a_request_by_hostname_exits_through_the_server(live: &Live) {
     let ip = exit_address(live.socks);
     eprintln!("exit address: {ip}");
     if let Some(expected) = &live.exit_ip {
@@ -191,13 +217,7 @@ fn a_request_by_hostname_exits_through_the_server() {
     }
 }
 
-#[test]
-fn a_request_by_ipv4_literal_is_carried() {
-    let Some(live) = live() else {
-        eprintln!("SHOES_LIVE_CONFIG unset: live check skipped");
-        return;
-    };
-    let _shoes = spawn(live.socks);
+fn a_request_by_ipv4_literal_is_carried(live: &Live) {
     let mut stream = socks_connect(live.socks, &ipv4(LITERAL), 80);
     let response = http_get(&mut stream, &LITERAL.to_string(), "/");
     let status = status_of(&response);
@@ -207,14 +227,7 @@ fn a_request_by_ipv4_literal_is_carried() {
     );
 }
 
-#[test]
-fn a_dns_query_over_udp_associate_is_answered() {
-    let Some(live) = live() else {
-        eprintln!("SHOES_LIVE_CONFIG unset: live check skipped");
-        return;
-    };
-    let _shoes = spawn(live.socks);
-
+fn a_dns_query_over_udp_associate_is_answered(live: &Live) {
     let mut control = TcpStream::connect_timeout(&live.socks, IO_TIMEOUT).unwrap();
     control.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
     control.write_all(&[5, 1, 0]).unwrap();
@@ -222,15 +235,37 @@ fn a_dns_query_over_udp_associate_is_answered() {
     control.read_exact(&mut reply).unwrap();
     assert_eq!(reply, [5, 0]);
     control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
-    let mut head = [0u8; 10];
+    let mut head = [0u8; 4];
     control.read_exact(&mut head).unwrap();
     assert_eq!(head[1], 0, "UDP ASSOCIATE refused with reply {}", head[1]);
-    assert_eq!(head[3], 1, "the relay is given as IPv4");
-    let mut relay_ip = Ipv4Addr::new(head[4], head[5], head[6], head[7]);
-    if relay_ip.is_unspecified() {
-        relay_ip = Ipv4Addr::LOCALHOST;
-    }
-    let relay = SocketAddr::from((relay_ip, u16::from_be_bytes([head[8], head[9]])));
+    // The relay is given in the listener's family; an unspecified address
+    // means the listener's own.
+    let relay_ip: IpAddr = match head[3] {
+        1 => {
+            let mut a = [0u8; 4];
+            control.read_exact(&mut a).unwrap();
+            let ip = Ipv4Addr::from(a);
+            if ip.is_unspecified() {
+                live.socks.ip()
+            } else {
+                IpAddr::V4(ip)
+            }
+        }
+        4 => {
+            let mut a = [0u8; 16];
+            control.read_exact(&mut a).unwrap();
+            let ip = Ipv6Addr::from(a);
+            if ip.is_unspecified() {
+                live.socks.ip()
+            } else {
+                IpAddr::V6(ip)
+            }
+        }
+        other => panic!("relay address type {other}"),
+    };
+    let mut port = [0u8; 2];
+    control.read_exact(&mut port).unwrap();
+    let relay = SocketAddr::from((relay_ip, u16::from_be_bytes(port)));
 
     // An A query for example.com, id 0x4242.
     let mut query = vec![0x42, 0x42, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -244,7 +279,14 @@ fn a_dns_query_over_udp_associate_is_answered() {
     datagram.extend_from_slice(&53u16.to_be_bytes());
     datagram.extend_from_slice(&query);
 
-    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp = UdpSocket::bind(SocketAddr::from((
+        match relay {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        },
+        0,
+    )))
+    .unwrap();
     udp.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
     udp.send_to(&datagram, relay).unwrap();
     let mut answer = [0u8; 1500];
@@ -261,13 +303,7 @@ fn a_dns_query_over_udp_associate_is_answered() {
     eprintln!("udp: {answers} answer(s) from {RESOLVER}");
 }
 
-#[test]
-fn eight_connections_at_once_all_complete() {
-    let Some(live) = live() else {
-        eprintln!("SHOES_LIVE_CONFIG unset: live check skipped");
-        return;
-    };
-    let _shoes = spawn(live.socks);
+fn eight_connections_at_once_all_complete(live: &Live) {
     let socks = live.socks;
     let handles: Vec<_> = (0..8)
         .map(|_| {

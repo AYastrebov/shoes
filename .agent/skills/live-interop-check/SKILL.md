@@ -38,16 +38,18 @@ description: How to test shoes against a reference implementation (sing-box, Xra
 ## The repeatable check
 
 `tests/live_socks.rs` is the check to reach for first: it drives the built
-binary with a client config kept outside the tree and proves the four
-things a tunnel must do (a request by name exits through the server, one by
-IPv4 literal is carried, DNS over UDP ASSOCIATE is answered, eight
-connections at once complete). It skips itself without the variables.
+binary with a client config kept outside the tree and proves, in one test
+through one child, the four things a tunnel must do (a request by name
+exits through the server, one by IPv4 literal is carried, DNS over UDP
+ASSOCIATE is answered, eight connections at once complete). It skips itself
+without the variables, and refuses to run while something else already
+accepts at `SHOES_LIVE_SOCKS`.
 
 ```bash
 SHOES_LIVE_CONFIG=/outside/the/tree/client.yaml \
 SHOES_LIVE_SOCKS=127.0.0.1:11080 \
 SHOES_LIVE_EXIT_IP=<the server's public address> \
-cargo test --locked --test live_socks -- --nocapture --test-threads=1
+cargo test --locked --test live_socks -- --nocapture
 ```
 
 The config is an `examples/*_client.yaml` shape: a `socks` listener at
