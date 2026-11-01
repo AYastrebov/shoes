@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A `shoesd` stop no longer waits on its clients.** tonic's graceful exit
+waited for every connection to finish, and the watch streams -- status,
+stats, logs -- never finish while their client lives; the desktop app holds
+two of them for as long as it runs. The supervisor reverts the session only
+after serving ends, so with the app open a stop never got there: on Windows
+the Service Control Manager saw StopPending until it gave up, a KVN upgrade's
+`shoesd install` failed after 15 s with "the shoesd service is StopPending,
+not Stopped", and at system shutdown the process was killed with the revert
+skipped and the NRPT rule left for the next boot's recovery to find; launchd
+and systemd end a SIGTERM that does not finish with SIGKILL the same way.
+Now a stop gives open streams two seconds (`service::STOP_GRACE`) after it
+stops accepting and then drops the server; the streams end at the client
+as the daemon going away, which clients already handle, and the revert
+runs. The Windows `install`'s wait for the service is the longer of its
+start and stop hints plus ten seconds, instead of a flat 15 s shorter than
+the 20 s stop hint the service itself asks for. Found by KVN on Windows 11
+against 0.9.2 (its `docs/shoes-upstream-issues.md` §12). A test holds a
+`WatchStatus` stream open across a stop.
+
 The TUN refuses a SYN the rules block outright, instead of completing the
 handshake and then closing the connection. A connection blocked after the
 handshake reaches the app as established and then reset, and apps fall back
@@ -21,6 +40,7 @@ the refusal never disagrees with `judge`. The stack's shared state (the
 connection channel, the fake-IP pool, the refusal) is now seeded before
 its thread starts, where setters after the start left a window in which a
 queued SYN was judged by an empty state.
+||||||| parent of 7caed90 (shoesd: bound a stop by a grace for open streams)
 
 An OpenConnect client outbound (`type: openconnect`): Cisco AnyConnect's
 protocol as ocserv and the openconnect client speak it, over TLS (CSTP).
