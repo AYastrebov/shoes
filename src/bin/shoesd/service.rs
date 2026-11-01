@@ -531,8 +531,10 @@ pub async fn serve(
 /// listener closes with it, and the streams still open end as a transport
 /// error at their clients once the process exits -- which it does right
 /// after, having reverted the session. A connection task tonic spawned is
-/// not ended by the drop; it ends when the supervisor's shutdown closes the
-/// broadcasts the streams read from.
+/// not ended by the drop, and neither are the stream tasks behind it: the
+/// status broadcast's sender lives in every `Supervisor` handle, the log
+/// sender in the logger, and `WatchStats` polls. They are cancelled when
+/// `run_daemon` drops the runtime on its way out, after the revert.
 async fn bounded_by<F>(
     server: F,
     stopping: tokio::sync::oneshot::Receiver<()>,
