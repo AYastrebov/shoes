@@ -13,8 +13,14 @@ for an unmapped fake IP and over the connection limit, whenever the rules
 decide by address alone (`ClientProxySelector::blocks_outright`): a hostname
 mask or a rule set on an allow rule ahead of the first address match could
 still match a sniffed name, so those connections are accepted and judged as
-before, and a fake IP is always judged by its name. A test checks that the
-refusal never disagrees with `judge`.
+before, and a fake IP is always judged by its name. With fake IP on, DNS
+over TCP is not refused either: it is answered locally from the pool, and
+a query that needs the upstream meets the rules there, so a LAN resolver
+under a private-range deny stays reachable on port 53. A test checks that
+the refusal never disagrees with `judge`. The stack's shared state (the
+connection channel, the fake-IP pool, the refusal) is now seeded before
+its thread starts, where setters after the start left a window in which a
+queued SYN was judged by an empty state.
 
 An OpenConnect client outbound (`type: openconnect`): Cisco AnyConnect's
 protocol as ocserv and the openconnect client speak it, over TLS (CSTP).

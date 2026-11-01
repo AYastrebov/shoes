@@ -63,7 +63,7 @@ pub type PacketBuffer = Vec<u8>;
 pub type StackWaker = Arc<dyn Fn() + Send + Sync>;
 
 /// Whether a SYN to this destination is refused before a socket exists: see
-/// `StackHandle::set_syn_refusal`.
+/// `SharedState::syn_refusal`.
 pub type SynRefusal = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
 
 /// The one way anything off the stack thread gets its attention.
@@ -469,6 +469,11 @@ pub struct NewTcpConnection {
 }
 
 /// Shared state for communication between main thread and stack thread.
+///
+/// Seeded when the stack is built (`StackHandle::spawn`), before its thread
+/// reads a packet: a SYN that arrived between the thread's start and a
+/// setter would have been judged by a state the setter had not reached.
+#[derive(Default)]
 pub struct SharedState {
     /// Channel for UDP responses to write to TUN. Bounded, with
     /// drop-on-full at the sender: a stalled stack thread must shed
@@ -624,8 +629,6 @@ pub struct StackHandle {
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
     udp_rx: Option<Receiver<PooledBuffer>>,
-    /// Shared state with the stack thread
-    shared_state: Arc<Mutex<SharedState>>,
 }
 
 impl StackHandle {
@@ -648,6 +651,7 @@ impl StackHandle {
         options: TcpStackOptions,
         wake: StackWaker,
         make_device: F,
+        initial: SharedState,
     ) -> io::Result<Self>
     where
         D: StackDevice,
@@ -656,12 +660,7 @@ impl StackHandle {
         let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(UDP_INGRESS_QUEUE);
         let running = Arc::new(AtomicBool::new(true));
         let notifier = StackNotifier::new(wake);
-        let shared_state = Arc::new(Mutex::new(SharedState {
-            udp_response_rx: None,
-            new_conn_tx: None,
-            fake_ip_pool: None,
-            syn_refusal: None,
-        }));
+        let shared_state = Arc::new(Mutex::new(initial));
 
         let thread_handle = {
             let running = running.clone();
@@ -699,7 +698,6 @@ impl StackHandle {
             notifier,
             running,
             udp_rx: Some(udp_rx),
-            shared_state,
         })
     }
 
@@ -715,41 +713,6 @@ impl StackHandle {
     pub fn waker(&self) -> StackWaker {
         let notifier = self.notifier.clone();
         Arc::new(move || notifier.notify())
-    }
-
-    /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.udp_response_rx = Some(rx);
-        }
-        self.notifier.notify();
-    }
-
-    /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: UnboundedSender<NewTcpConnection>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.new_conn_tx = Some(tx);
-        }
-        self.notifier.notify();
-    }
-
-    /// Give the stack the session's fake-IP pool, so a SYN to an unmapped
-    /// address in it draws a reset.
-    pub fn set_fake_ip_pool(&mut self, pool: Arc<FakeIpPool>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.fake_ip_pool = Some(pool);
-        }
-    }
-
-    /// Refuse a SYN to every destination `refusal` answers true for, before
-    /// a socket exists, instead of completing the handshake and then
-    /// closing the connection when the rules block it. An app falls back to
-    /// its next address on a refused connect; one that was accepted and then
-    /// closed reads as a reset, and browsers stop there.
-    pub fn set_syn_refusal(&mut self, refusal: SynRefusal) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.syn_refusal = Some(refusal);
-        }
     }
 
     /// Check if the stack thread is still running.
