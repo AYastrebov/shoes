@@ -16,7 +16,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, TxToken},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
-use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BUFFER_OVERFLOW, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -24,8 +24,8 @@ use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMulti
 use wintun_bindings::Session;
 
 use super::stack_common::{
-    MAX_POLL_WAIT_MILLIS, NewTcpConnection, PacketBuffer, PooledBuffer, PooledRxToken, StackDevice,
-    StackHandle, StackWaker, TcpStackOptions, ip_capabilities,
+    MAX_POLL_WAIT_MILLIS, PooledBuffer, PooledRxToken, SharedState, StackDevice, StackHandle,
+    StackWaker, TcpStackOptions, ip_capabilities,
 };
 use super::wintun_device::OpenedWintun;
 
@@ -114,7 +114,13 @@ impl TcpStackWintun {
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface,
     /// waiting on the session's read event for event-driven I/O.
-    pub fn new(tun: OpenedWintun, options: TcpStackOptions) -> std::io::Result<Self> {
+    /// `state` is what the thread consults, in place before it reads a
+    /// packet (see `TcpStackDirect::new`).
+    pub fn new(
+        tun: OpenedWintun,
+        options: TcpStackOptions,
+        state: SharedState,
+    ) -> std::io::Result<Self> {
         let tun = Arc::new(tun);
         let wake_event = WakeEvent::new();
 
@@ -128,9 +134,13 @@ impl TcpStackWintun {
         // stack thread itself: raw HANDLEs are not Send, and nothing outside
         // that thread needs them. The wake event travels as an Arc, whose
         // Send is the deliberate exception WakeEvent exists to declare.
-        let handle = StackHandle::spawn("shoes-smoltcp-wintun", options, wake, move || {
-            WintunDevice::new(session, device_wake, options.mtu)
-        })?;
+        let handle = StackHandle::spawn(
+            "shoes-smoltcp-wintun",
+            options,
+            wake,
+            move || WintunDevice::new(session, device_wake, options.mtu),
+            state,
+        )?;
 
         Ok(Self { handle, tun })
     }
@@ -138,26 +148,6 @@ impl TcpStackWintun {
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
     pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.handle.take_udp_rx()
-    }
-
-    /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
-        self.handle.set_udp_response_tx(rx)
-    }
-
-    /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: UnboundedSender<NewTcpConnection>) {
-        self.handle.set_new_conn_tx(tx)
-    }
-
-    /// Give the stack the session's fake-IP pool (see `StackHandle`).
-    pub fn set_fake_ip_pool(&mut self, pool: Arc<crate::dns::fake_ip::FakeIpPool>) {
-        self.handle.set_fake_ip_pool(pool)
-    }
-
-    /// Refuse SYNs the rules block outright (see `StackHandle`).
-    pub fn set_syn_refusal(&mut self, refusal: super::stack_common::SynRefusal) {
-        self.handle.set_syn_refusal(refusal)
     }
 
     /// Check if the stack thread is still running.
@@ -448,6 +438,7 @@ mod tests {
                 orphan_timeout: std::time::Duration::from_secs(60),
                 icmp_enabled: true,
             },
+            SharedState::default(),
         )
         .unwrap();
         let _udp_rx = stack.take_udp_rx();

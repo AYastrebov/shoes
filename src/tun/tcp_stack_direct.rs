@@ -28,11 +28,11 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, TxToken},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
-use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
 
 use super::stack_common::{
-    MAX_POLL_WAIT_MILLIS, NewTcpConnection, PacketBuffer, PooledBuffer, PooledRxToken, StackDevice,
-    StackHandle, StackWaker, TcpStackOptions, ip_capabilities,
+    MAX_POLL_WAIT_MILLIS, PooledBuffer, PooledRxToken, SharedState, StackDevice, StackHandle,
+    StackWaker, TcpStackOptions, ip_capabilities,
 };
 #[cfg(target_os = "linux")]
 use super::vnet::{MAX_OFFLOAD_PACKET, TxCoalescer, VNET_HDR_LEN};
@@ -101,7 +101,9 @@ impl TcpStackDirect {
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
     /// The thread uses `poll()` on the fd for efficient event-driven I/O.
-    pub fn new(fd: RawFd, options: TcpStackOptions) -> io::Result<Self> {
+    /// `state` is what the thread consults, in place before it reads a
+    /// packet: the connection channel, the fake-IP pool, the SYN refusal.
+    pub fn new(fd: RawFd, options: TcpStackOptions, state: SharedState) -> io::Result<Self> {
         // Here rather than on the stack thread, where a failure would only be
         // logged: a descriptor framed in a way this file cannot read is a
         // start that fails, not a stack that comes up and garbles packets.
@@ -137,18 +139,24 @@ impl TcpStackDirect {
         // it only while the thread is parked.
         let wake = pipe_waker(wake_tx);
 
-        let handle = match StackHandle::spawn("shoes-smoltcp-direct", options, wake, move || {
-            // Sets fd to non-blocking mode once at startup for performance.
-            set_nonblocking(fd)
-                .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
-            Ok(FdDevice::new(
-                fd,
-                wake_rx,
-                &options,
-                #[cfg(target_os = "linux")]
-                vnet,
-            ))
-        }) {
+        let handle = match StackHandle::spawn(
+            "shoes-smoltcp-direct",
+            options,
+            wake,
+            move || {
+                // Sets fd to non-blocking mode once at startup for performance.
+                set_nonblocking(fd)
+                    .map_err(|e| io::Error::other(format!("set TUN fd non-blocking: {e}")))?;
+                Ok(FdDevice::new(
+                    fd,
+                    wake_rx,
+                    &options,
+                    #[cfg(target_os = "linux")]
+                    vnet,
+                ))
+            },
+            state,
+        ) {
             Ok(handle) => handle,
             Err(e) => {
                 // Self was never built, so Drop -- the only other closer of
@@ -186,26 +194,6 @@ impl TcpStackDirect {
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
     pub fn take_udp_rx(&mut self) -> Option<Receiver<PooledBuffer>> {
         self.handle.take_udp_rx()
-    }
-
-    /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: tokio::sync::mpsc::Receiver<PacketBuffer>) {
-        self.handle.set_udp_response_tx(rx)
-    }
-
-    /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: UnboundedSender<NewTcpConnection>) {
-        self.handle.set_new_conn_tx(tx)
-    }
-
-    /// Give the stack the session's fake-IP pool (see `StackHandle`).
-    pub fn set_fake_ip_pool(&mut self, pool: std::sync::Arc<crate::dns::fake_ip::FakeIpPool>) {
-        self.handle.set_fake_ip_pool(pool)
-    }
-
-    /// Refuse SYNs the rules block outright (see `StackHandle`).
-    pub fn set_syn_refusal(&mut self, refusal: super::stack_common::SynRefusal) {
-        self.handle.set_syn_refusal(refusal)
     }
 
     /// Check if the stack thread is still running.
@@ -942,7 +930,7 @@ mod tests {
             close_fd_on_drop: true,
             ..owning_options()
         };
-        assert!(TcpStackDirect::new(fd, options).is_err());
+        assert!(TcpStackDirect::new(fd, options, SharedState::default()).is_err());
     }
 
     /// Stack options for a test that hands its descriptor over to the stack.
@@ -971,7 +959,8 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
+        let stack =
+            TcpStackDirect::new(client_fd, owning_options(), SharedState::default()).unwrap();
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -1003,6 +992,7 @@ mod tests {
                 close_fd_on_drop: false,
                 ..owning_options()
             },
+            SharedState::default(),
         )
         .unwrap();
 
@@ -1093,6 +1083,7 @@ mod tests {
                 orphan_timeout: Duration::from_secs(60),
                 icmp_enabled: true,
             },
+            SharedState::default(),
         )
         .unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -1156,6 +1147,7 @@ mod tests {
                 close_fd_on_drop: false,
                 ..owning_options()
             },
+            SharedState::default(),
         )
         .unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -1179,7 +1171,8 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
+        let stack =
+            TcpStackDirect::new(client_fd, owning_options(), SharedState::default()).unwrap();
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running());
@@ -1213,7 +1206,8 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
+        let stack =
+            TcpStackDirect::new(client_fd, owning_options(), SharedState::default()).unwrap();
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running());
 
@@ -1258,9 +1252,12 @@ mod tests {
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         let client_fd = client.into_raw_fd();
 
-        let mut stack = TcpStackDirect::new(client_fd, owning_options()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        stack.set_udp_response_tx(rx);
+        let state = SharedState {
+            udp_response_rx: Some(rx),
+            ..SharedState::default()
+        };
+        let stack = TcpStackDirect::new(client_fd, owning_options(), state).unwrap();
         let waker = stack.udp_waker();
 
         // Let the loop reach its idle wait, so the timeout path cannot be
@@ -1351,7 +1348,8 @@ mod tests {
         use std::io::Write;
 
         let (mut server, client) = UnixStream::pair().expect("socket pair");
-        let stack = TcpStackDirect::new(client.into_raw_fd(), options).unwrap();
+        let stack =
+            TcpStackDirect::new(client.into_raw_fd(), options, SharedState::default()).unwrap();
         thread::sleep(Duration::from_millis(100));
 
         server.write_all(sent).unwrap();
@@ -1420,9 +1418,12 @@ mod tests {
     #[test]
     fn a_udp_response_is_framed_for_utun() {
         let (mut server, client) = UnixStream::pair().expect("socket pair");
-        let mut stack = TcpStackDirect::new(client.into_raw_fd(), utun_options()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        stack.set_udp_response_tx(rx);
+        let state = SharedState {
+            udp_response_rx: Some(rx),
+            ..SharedState::default()
+        };
+        let stack = TcpStackDirect::new(client.into_raw_fd(), utun_options(), state).unwrap();
         let waker = stack.udp_waker();
         thread::sleep(Duration::from_millis(100));
 

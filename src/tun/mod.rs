@@ -75,7 +75,7 @@ use crate::option_util::NoneOrSome;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use stack_common::{NewTcpConnection, TcpStackOptions};
+use stack_common::{NewTcpConnection, SharedState, SynRefusal, TcpStackOptions};
 #[cfg(unix)]
 use tcp_stack_direct::TcpStackDirect;
 #[cfg(windows)]
@@ -320,42 +320,33 @@ pub async fn run_tun_server(
         icmp_enabled: config.icmp_enabled,
     };
 
-    // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the
-    // platform's readiness primitive).
-    #[cfg(unix)]
-    let mut tcp_stack = TcpStackDirect::new(fd, stack_options)?;
-    #[cfg(windows)]
-    let mut tcp_stack = TcpStackWintun::new(wintun, stack_options)?;
-
-    // Get UDP receiver (stack thread filters UDP and sends here)
-    let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
-
     // Channel for sending UDP responses back (stack thread will write to
     // TUN). Bounded with drop-on-full at the sender: if the stack thread
     // stalls, datagrams are shed rather than queued without limit. Sizing
     // notes live at the constant.
     let (udp_to_stack_tx, udp_to_stack_rx) =
         mpsc::channel::<PacketBuffer>(stack_common::UDP_RESPONSE_QUEUE);
-    tcp_stack.set_udp_response_tx(udp_to_stack_rx);
-
     let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
-    tcp_stack.set_new_conn_tx(tcp_conn_tx);
-    if let Some(responder) = &fake_ip {
-        tcp_stack.set_fake_ip_pool(responder.pool().clone());
-    }
-    {
-        // A fake IP stands for a domain the rules judge by name, so the
-        // address alone never decides it.
-        let selector = proxy_selector.clone();
-        let fake_ip_pool = fake_ip.as_ref().map(|responder| responder.pool().clone());
-        tcp_stack.set_syn_refusal(Arc::new(move |dst: std::net::SocketAddr| {
-            let fake = match (dst.ip(), &fake_ip_pool) {
-                (std::net::IpAddr::V4(v4), Some(pool)) => pool.is_fake_ip(v4),
-                _ => false,
-            };
-            !fake && selector.blocks_outright(dst)
-        }));
-    }
+    let fake_ip_pool = fake_ip.as_ref().map(|responder| responder.pool().clone());
+    // Everything the stack thread consults is in place before it starts: a
+    // SYN queued on the device by the time the thread reads it is judged
+    // by this state, not by whatever a later setter would have installed.
+    let state = SharedState {
+        udp_response_rx: Some(udp_to_stack_rx),
+        new_conn_tx: Some(tcp_conn_tx),
+        fake_ip_pool: fake_ip_pool.clone(),
+        syn_refusal: Some(syn_refusal(proxy_selector.clone(), fake_ip_pool)),
+    };
+
+    // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the
+    // platform's readiness primitive).
+    #[cfg(unix)]
+    let mut tcp_stack = TcpStackDirect::new(fd, stack_options, state)?;
+    #[cfg(windows)]
+    let mut tcp_stack = TcpStackWintun::new(wintun, stack_options, state)?;
+
+    // Get UDP receiver (stack thread filters UDP and sends here)
+    let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
 
     let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
@@ -812,6 +803,106 @@ fn build_session_selector(
 ) -> Arc<ClientProxySelector> {
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     Arc::new(create_tcp_client_proxy_selector(rules, resolver))
+}
+
+/// The SYN refusal for a session: what the rules block by address alone,
+/// except what the address alone cannot decide. A fake IP stands for a
+/// domain the rules judge by name. With fake IP on, DNS over TCP to any
+/// resolver is answered locally from the pool (FI-1, `handle_dns_over_tcp`)
+/// and only a query that needs the upstream goes through the rules, so a
+/// resolver address the rules block, a LAN resolver under a private-range
+/// deny, must still be reachable on port 53.
+fn syn_refusal(
+    selector: Arc<ClientProxySelector>,
+    fake_ip_pool: Option<Arc<FakeIpPool>>,
+) -> SynRefusal {
+    Arc::new(move |dst: std::net::SocketAddr| {
+        let Some(pool) = &fake_ip_pool else {
+            return selector.blocks_outright(dst);
+        };
+        if dst.port() == fake_ip::DNS_PORT {
+            return false;
+        }
+        let fake = match dst.ip() {
+            std::net::IpAddr::V4(v4) => pool.is_fake_ip(v4),
+            std::net::IpAddr::V6(_) => false,
+        };
+        !fake && selector.blocks_outright(dst)
+    })
+}
+
+#[cfg(test)]
+mod syn_refusal_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use super::syn_refusal;
+    use crate::address::NetLocationMask;
+    use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+    use crate::dns::fake_ip::{FakeIpNetwork, FakeIpPool};
+    use crate::resolver::NativeResolver;
+    use crate::tcp::chain_builder::build_client_chain_group;
+
+    fn rule(masks: &[&str], action: ConnectAction) -> ConnectRule {
+        let masks = masks
+            .iter()
+            .map(|m| NetLocationMask::from(m).expect("a mask"))
+            .collect();
+        ConnectRule::new(masks, vec![], action)
+    }
+
+    /// A mobile session's rules: the LAN blocked, the rest allowed.
+    fn selector() -> Arc<ClientProxySelector> {
+        let resolver: Arc<dyn crate::resolver::Resolver> = Arc::new(NativeResolver::new());
+        let chain = build_client_chain_group(crate::option_util::NoneOrSome::None, resolver);
+        Arc::new(ClientProxySelector::new(vec![
+            rule(&["192.168.0.0/16"], ConnectAction::new_block()),
+            rule(&["0.0.0.0/0"], ConnectAction::new_allow(None, chain)),
+        ]))
+    }
+
+    fn pool() -> Arc<FakeIpPool> {
+        Arc::new(
+            FakeIpPool::new(
+                FakeIpNetwork::parse("198.18.0.0/16").expect("a network"),
+                16,
+            )
+            .expect("a pool"),
+        )
+    }
+
+    fn at(s: &str) -> SocketAddr {
+        s.parse().expect("an address")
+    }
+
+    /// With fake IP on, port 53 to a blocked resolver is not refused: the
+    /// query is answered locally, and only an upstream one meets the rules.
+    #[test]
+    fn dns_over_tcp_is_not_refused_when_fake_ip_answers_it() {
+        let refusal = syn_refusal(selector(), Some(pool()));
+        assert!(
+            !refusal(at("192.168.1.1:53")),
+            "a LAN resolver, answered locally"
+        );
+        assert!(
+            refusal(at("192.168.1.1:443")),
+            "the same host, any other port"
+        );
+        assert!(
+            !refusal(at("198.18.0.7:443")),
+            "a fake IP is judged by its name"
+        );
+        assert!(!refusal(at("1.1.1.1:443")));
+    }
+
+    /// Without fake IP there is no local answer, so the rules decide port
+    /// 53 like any other.
+    #[test]
+    fn dns_over_tcp_is_refused_like_anything_else_without_fake_ip() {
+        let refusal = syn_refusal(selector(), None);
+        assert!(refusal(at("192.168.1.1:53")));
+        assert!(!refusal(at("1.1.1.1:53")));
+    }
 }
 
 #[cfg(test)]
