@@ -1663,3 +1663,109 @@ async fn test_a_hostname_resolving_outside_the_rule_is_allowed() {
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     assert!(matches!(decision, ConnectDecision::Allow { .. }));
 }
+
+/// The rules a mobile client writes when its tunnel has no IPv6: the private
+/// ranges blocked, IPv4 allowed as two halves, everything else blocked last.
+fn v4_only_tunnel_rules() -> Vec<ConnectRule> {
+    vec![
+        block_rule(vec!["10.0.0.0/8", "192.168.0.0/16", "fc00::/7"]),
+        allow_rule(vec!["0.0.0.0/1", "128.0.0.0/1"], "proxy"),
+        block_rule(vec!["::/0"]),
+    ]
+}
+
+fn at(ip: &str) -> SocketAddr {
+    SocketAddr::new(ip.parse().unwrap(), 443)
+}
+
+#[test]
+fn an_address_only_the_block_rules_match_is_blocked_outright() {
+    let selector = ClientProxySelector::new(v4_only_tunnel_rules());
+    assert!(selector.blocks_outright(at("2a02:6b8::2:242")));
+    assert!(selector.blocks_outright(at("192.168.1.1")));
+    assert!(selector.blocks_outright(at("fd00::1")));
+    assert!(!selector.blocks_outright(at("77.88.44.242")));
+}
+
+#[test]
+fn no_rule_matching_is_blocked_outright() {
+    let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/1"], "proxy")]);
+    assert!(selector.blocks_outright(at("203.0.113.1")));
+    assert!(!selector.blocks_outright(at("1.1.1.1")));
+}
+
+/// A sniffed name could match the hostname rule, which allows it: only the
+/// accepted connection can tell, so the SYN must not be refused.
+#[test]
+fn an_allow_rule_that_could_match_by_name_first_is_not_blocked_outright() {
+    let mut rules = v4_only_tunnel_rules();
+    rules.insert(0, allow_rule(vec!["example.com"], "proxy"));
+    let selector = ClientProxySelector::new(rules);
+    assert!(!selector.blocks_outright(at("2a02:6b8::2:242")));
+}
+
+#[test]
+fn an_allow_rule_with_a_rule_set_first_is_not_blocked_outright() {
+    let mut rules = v4_only_tunnel_rules();
+    rules.insert(
+        0,
+        ConnectRule::new(
+            vec![],
+            vec![telegram_rule_set()],
+            ConnectAction::new_allow(None, mock_chain_group()),
+        ),
+    );
+    let selector = ClientProxySelector::new(rules);
+    assert!(!selector.blocks_outright(at("2a02:6b8::2:242")));
+}
+
+/// A block rule that might match by name blocks if it does and falls
+/// through if it does not, so it cannot turn a block into an allow.
+#[test]
+fn a_block_rule_that_could_match_by_name_first_is_passed_over() {
+    let mut rules = v4_only_tunnel_rules();
+    rules.insert(0, block_rule(vec!["ads.example"]));
+    let selector = ClientProxySelector::new(rules);
+    assert!(selector.blocks_outright(at("2a02:6b8::2:242")));
+    assert!(!selector.blocks_outright(at("77.88.44.242")));
+}
+
+/// Whatever `blocks_outright` refuses, `judge` would have blocked too: the
+/// SYN refusal only moves the decision earlier, never changes it.
+#[tokio::test]
+async fn blocks_outright_never_disagrees_with_judge() {
+    let selector = ClientProxySelector::new(v4_only_tunnel_rules());
+    let resolver = mock_resolver();
+    for ip in [
+        "2a02:6b8::2:242",
+        "::1",
+        "fd00::2",
+        "::ffff:1.2.3.4",
+        "192.168.1.1",
+        "10.1.2.3",
+        "77.88.44.242",
+        "1.1.1.1",
+        "255.255.255.255",
+    ] {
+        let addr = at(ip);
+        let location = NetLocation::new(
+            match addr.ip() {
+                IpAddr::V4(v4) => Address::Ipv4(v4),
+                IpAddr::V6(v6) => Address::Ipv6(v6),
+            },
+            addr.port(),
+        );
+        let judged = selector.judge(location.into(), &resolver).await.unwrap();
+        if selector.blocks_outright(addr) {
+            assert!(
+                matches!(judged, ConnectDecision::Block),
+                "{ip}: refused but judged Allow"
+            );
+        } else {
+            assert!(
+                matches!(judged, ConnectDecision::Allow { .. }),
+                "{ip}: judged Block but not refused"
+            );
+        }
+    }
+}

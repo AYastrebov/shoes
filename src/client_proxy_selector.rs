@@ -367,6 +367,53 @@ impl ClientProxySelector {
         }
     }
 
+    /// Whether every connection to `addr` is blocked, whatever name sniffing
+    /// could later put on it.
+    ///
+    /// For the TUN stack, which answers a SYN before any rule is asked: a
+    /// connection blocked only after the handshake reaches the app as one
+    /// that was established and then closed, and clients fall back to the
+    /// next address on a connect that fails, not on one that resets. Where
+    /// this answers true the SYN can be refused instead.
+    ///
+    /// Synchronous and conservative. A hostname mask or a rule set can match
+    /// a sniffed name, or the address once resolved, so an Allow rule with
+    /// one ahead of the first address match makes the answer false; a Block
+    /// rule with one is passed over, since it blocks if it matches. No rule
+    /// matching is a block, as in [`Self::judge`].
+    pub fn blocks_outright(&self, addr: std::net::SocketAddr) -> bool {
+        let ip = ip_to_u128(addr.ip());
+        for rule in &self.rules {
+            let blocks = matches!(rule.action, ConnectAction::Block);
+            let mut could_match = !rule.rule_sets.is_empty();
+            for mask in &rule.masks {
+                let NetLocationMask {
+                    address_mask: AddressMask { address, netmask },
+                    port,
+                } = mask;
+                if *port > 0 && *port != addr.port() {
+                    continue;
+                }
+                let matched = *netmask == 0
+                    || match address {
+                        Address::Ipv4(rule_ip) => ipv4_to_u128(*rule_ip) & netmask == ip & netmask,
+                        Address::Ipv6(rule_ip) => ipv6_to_u128(*rule_ip) & netmask == ip & netmask,
+                        Address::Hostname(_) => {
+                            could_match = true;
+                            false
+                        }
+                    };
+                if matched {
+                    return blocks;
+                }
+            }
+            if could_match && !blocks {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Convert a cached decision back to a ConnectDecision.
     #[inline]
     fn cached_to_decision(

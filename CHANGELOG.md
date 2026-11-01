@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+The TUN refuses a SYN the rules block outright, instead of completing the
+handshake and then closing the connection. A connection blocked after the
+handshake reaches the app as established and then reset, and apps fall back
+to their next address on a connect that fails, not on one that resets: over
+a mobile tunnel whose config ends in `::/0 block`, Chrome showed
+`ERR_CONNECTION_RESET` for every site with an AAAA record, and the block was
+logged only at debug level. Now the stack resets the SYN, as it already does
+for an unmapped fake IP and over the connection limit, whenever the rules
+decide by address alone (`ClientProxySelector::blocks_outright`): a hostname
+mask or a rule set on an allow rule ahead of the first address match could
+still match a sniffed name, so those connections are accepted and judged as
+before, and a fake IP is always judged by its name. A test checks that the
+refusal never disagrees with `judge`.
+
 An OpenConnect client outbound (`type: openconnect`): Cisco AnyConnect's
 protocol as ocserv and the openconnect client speak it, over TLS (CSTP).
 Keenetic routers ship an ocserv-based server beside their SSTP one, with the

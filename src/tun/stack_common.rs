@@ -62,6 +62,10 @@ pub type PacketBuffer = Vec<u8>;
 /// on Windows.
 pub type StackWaker = Arc<dyn Fn() + Send + Sync>;
 
+/// Whether a SYN to this destination is refused before a socket exists: see
+/// `StackHandle::set_syn_refusal`.
+pub type SynRefusal = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
 /// The one way anything off the stack thread gets its attention.
 ///
 /// The stack thread sleeps inside the platform wait — `poll()` on Unix,
@@ -476,6 +480,9 @@ pub struct SharedState {
     /// that stands for no domain is reset here, before a socket exists
     /// (SF-2).
     pub fake_ip_pool: Option<Arc<FakeIpPool>>,
+    /// Destinations the rules block whatever the connection turns out to
+    /// carry. A SYN to one is reset here, like an unmapped fake IP.
+    pub syn_refusal: Option<SynRefusal>,
 }
 
 pub const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
@@ -653,6 +660,7 @@ impl StackHandle {
             udp_response_rx: None,
             new_conn_tx: None,
             fake_ip_pool: None,
+            syn_refusal: None,
         }));
 
         let thread_handle = {
@@ -730,6 +738,17 @@ impl StackHandle {
     pub fn set_fake_ip_pool(&mut self, pool: Arc<FakeIpPool>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.fake_ip_pool = Some(pool);
+        }
+    }
+
+    /// Refuse a SYN to every destination `refusal` answers true for, before
+    /// a socket exists, instead of completing the handshake and then
+    /// closing the connection when the rules block it. An app falls back to
+    /// its next address on a refused connect; one that was accepted and then
+    /// closed reads as a reset, and browsers stop there.
+    pub fn set_syn_refusal(&mut self, refusal: SynRefusal) {
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.syn_refusal = Some(refusal);
         }
     }
 
@@ -957,6 +976,14 @@ pub fn run_stack_loop<D: StackDevice>(
                                     // where a dial to the literal address
                                     // would stall it until its timeout.
                                     fake_ip::note_unmapped(dst_addr);
+                                } else if is_syn
+                                    && slot.is_none()
+                                    && is_refused(&shared_state, dst_addr)
+                                {
+                                    // Also left to smoltcp's reset, so the
+                                    // app's connect fails and it tries its
+                                    // next address.
+                                    debug!("Refusing SYN to {}: blocked by the rules", dst_addr);
                                 } else if is_syn && slot.is_none() {
                                     // debug, not info: one line per connection
                                     // at info level fills a mobile log file
@@ -1419,6 +1446,15 @@ fn is_unmapped_fake_ip(shared_state: &Mutex<SharedState>, dst: SocketAddr) -> bo
         .is_some_and(|pool| pool.is_unmapped(v4))
 }
 
+/// True if the session's rules block `dst` outright (`SharedState::syn_refusal`).
+fn is_refused(shared_state: &Mutex<SharedState>, dst: SocketAddr) -> bool {
+    shared_state
+        .lock()
+        .ok()
+        .and_then(|state| state.syn_refusal.clone())
+        .is_some_and(|refusal| refusal(dst))
+}
+
 /// Create a new TCP connection in the smoltcp stack.
 fn create_tcp_connection(
     src_addr: SocketAddr,
@@ -1817,7 +1853,7 @@ mod tests {
 
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    use super::test_util::{is_syn_ack, segment_from_server, syn_packet, tcp_packet};
+    use super::test_util::{is_syn_ack, segment_from_server, syn_packet, syn6_packet, tcp_packet};
     use super::*;
 
     thread_local! {
@@ -2011,6 +2047,15 @@ mod tests {
             tcp_timeout: Option<SmolDuration>,
             fake_ip_pool: Option<Arc<FakeIpPool>>,
         ) -> Self {
+            Self::spawn_with_state(options, tcp_timeout, fake_ip_pool, None)
+        }
+
+        fn spawn_with_state(
+            options: TcpStackOptions,
+            tcp_timeout: Option<SmolDuration>,
+            fake_ip_pool: Option<Arc<FakeIpPool>>,
+            syn_refusal: Option<SynRefusal>,
+        ) -> Self {
             let (script_tx, script_rx) = std_mpsc::channel();
             let written = Arc::new(Mutex::new(Vec::new()));
             let running = Arc::new(AtomicBool::new(true));
@@ -2030,6 +2075,7 @@ mod tests {
                 udp_response_rx: Some(udp_response_rx),
                 new_conn_tx: Some(conn_tx),
                 fake_ip_pool,
+                syn_refusal,
             }));
 
             // The scripted device's `wait` sleeps on the script channel, which
@@ -2285,6 +2331,37 @@ mod tests {
             .unwrap();
         let conn = recv_within(&mut harness.conn_rx, "the mapped connection");
         assert_eq!(conn.remote_addr, SocketAddr::from((target, 443)));
+        harness.stop();
+    }
+
+    /// A SYN the rules refuse is reset by the stack, so the app's connect
+    /// fails and it moves on to its next address, instead of a handshake
+    /// that completes and is then closed; a SYN to anything else connects.
+    #[test]
+    fn a_syn_the_rules_refuse_draws_a_reset() {
+        let _guard = counter_guard();
+        // syn_packet goes to 93.184.216.34:443 and syn6_packet to
+        // [2001:db8::1]:443; refuse the v6 one only.
+        let refusal: SynRefusal = Arc::new(|dst: SocketAddr| dst.is_ipv6());
+        let mut harness = Harness::spawn_with_state(Harness::options(), None, None, Some(refusal));
+
+        harness
+            .script_tx
+            .send(Script::Packet(syn6_packet(20401)))
+            .unwrap();
+        harness.wait_for_written("a RST for the refused SYN", |w| {
+            w.iter().any(|p| {
+                segment_from_server(p).is_some_and(|s| s.rst && !s.syn)
+                    && TcpPacket::new_checked(&p[40..]).is_ok_and(|t| t.dst_port() == 20401)
+            })
+        });
+        assert!(harness.conn_rx.try_recv().is_err(), "no connection to dial");
+
+        harness
+            .script_tx
+            .send(Script::Packet(syn_packet(20402)))
+            .unwrap();
+        recv_within(&mut harness.conn_rx, "the connection that is not refused");
         harness.stop();
     }
 
