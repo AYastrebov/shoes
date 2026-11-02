@@ -1896,7 +1896,7 @@ fn validate_client_proxy_config(
 }
 
 /// Keys and prefixes are checked as the config is parsed (`WgKey`,
-/// `IpPrefix`); what is left is the MTU.
+/// `IpPrefix`); what is left is the MTU and the Phobos block.
 fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> std::io::Result<()> {
     if config.mtu < 576 {
         return Err(std::io::Error::new(
@@ -1904,7 +1904,35 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
             format!("WireGuard mtu {} is too small (minimum 576)", config.mtu),
         ));
     }
+    if let Some(phobos) = &config.phobos {
+        // Converted now, with the reference's ranges (`config.c` in
+        // Ground-Zerro/Phobos, through awgtun), so a bad value is a startup
+        // error and not a tunnel that never answers. The error names the
+        // field and never the key.
+        let converted = crate::amneziawg::convert_phobos_config(phobos)?;
+        let frame = crate::amneziawg::phobos_frame_overhead(&converted);
+        if let Some(warning) = phobos_mtu_warning(config.mtu, frame) {
+            log::warn!("{warning}");
+        }
+    }
     Ok(())
+}
+
+/// The fragmentation warning for a WireGuard tunnel behind a Phobos frame
+/// of `frame` bytes, when full-size packets cross a 1500-byte path. A
+/// transport packet reaches the wire at mtu + 32 (WireGuard) + 28 (UDP,
+/// IPv4) + the frame; the random tail is never added at that size.
+fn phobos_mtu_warning(mtu: u16, frame: usize) -> Option<String> {
+    let wire_size = usize::from(mtu) + 60 + frame;
+    if wire_size <= 1500 {
+        return None;
+    }
+    Some(format!(
+        "WireGuard mtu {mtu} behind a {frame}-byte Phobos frame puts full-size packets at \
+         {wire_size} bytes on the wire, past a standard 1500-byte path MTU -- every large \
+         packet will fragment. Lower mtu to {}.",
+        1440usize.saturating_sub(frame)
+    ))
 }
 
 /// The fragmentation warning for `mtu` and `s4`, if full-size packets cross
@@ -3444,6 +3472,7 @@ mod tests {
                         allowed_ips: OneOrSome::One("0.0.0.0/0".parse().unwrap()),
                         persistent_keepalive: None,
                         mtu: 1280,
+                        phobos: None,
                     },
                 )),
                 quic_settings: Some(ClientQuicConfig::default()),
@@ -5910,6 +5939,87 @@ mod amneziawg_mtu_tests {
         )
         .unwrap();
         let _ = validate_amneziawg_config(&config);
+    }
+}
+
+#[cfg(test)]
+mod phobos_validation_tests {
+    use crate::config::load_config_str;
+
+    fn validate(protocol: &str, phobos: &str) -> std::io::Result<()> {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: "203.0.113.9:51822"
+        protocol:
+          type: {protocol}
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          phobos:
+{phobos}
+"#
+        );
+        let configs = load_config_str(&yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    #[test]
+    fn a_wireguard_outbound_with_phobos_loads() {
+        validate(
+            "wireguard",
+            "            key: \"synthetic-preset-key\"\n            masking: STUN\n            max_dummy: 16",
+        )
+        .unwrap();
+    }
+
+    /// The reference refuses `max-dummy` above 1024 (`config.c`,
+    /// `MAX_DUMMY_LENGTH_TOTAL`). The refusal names the field, never the
+    /// key.
+    #[test]
+    fn an_out_of_range_value_is_refused_without_the_key() {
+        let secret = "synthetic-preset-key";
+        let err = validate(
+            "wireguard",
+            &format!("            key: \"{secret}\"\n            max_dummy: 2000"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max-dummy"), "{err}");
+        assert!(!err.contains(secret), "{err}");
+    }
+
+    /// A Phobos server forwards to plain WireGuard and decodes only the plain
+    /// message types, so `amneziawg` has no `phobos` block to accept.
+    #[test]
+    fn phobos_on_amneziawg_is_refused() {
+        let err = validate("amneziawg", "            key: \"k\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phobos"), "{err}");
+    }
+
+    #[test]
+    fn the_mtu_warning_counts_the_frame() {
+        assert_eq!(super::phobos_mtu_warning(1280, 24), None);
+        assert_eq!(
+            super::phobos_mtu_warning(1416, 24),
+            None,
+            "1500 exactly fits"
+        );
+        let warning = super::phobos_mtu_warning(1420, 24).unwrap();
+        assert!(warning.contains("Lower mtu to 1416"), "{warning}");
+        assert_eq!(super::phobos_mtu_warning(1420, 12), None, "RTP's 12 fit");
+        let rtp = super::phobos_mtu_warning(1430, 12).unwrap();
+        assert!(rtp.contains("Lower mtu to 1428"), "{rtp}");
+        assert_eq!(super::phobos_mtu_warning(1440, 0), None);
     }
 }
 

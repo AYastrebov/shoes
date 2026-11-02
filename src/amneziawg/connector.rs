@@ -9,7 +9,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
-use crate::config::{AmneziaWgClientConfig, ClientProxyConfig, WireGuardClientConfig};
+use crate::config::{
+    AmneziaWgClientConfig, ClientProxyConfig, PhobosClientConfig, WireGuardClientConfig,
+};
 use crate::resolver::{self, Resolver};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
@@ -38,6 +40,10 @@ enum TunnelProtocol {
 pub struct AmneziaWgConnector {
     config: AmneziaWgClientConfig,
     protocol: TunnelProtocol,
+    /// Phobos obfuscation, from a `wireguard` outbound's `phobos:` block.
+    /// Kept beside the converted config rather than in it: `amneziawg`
+    /// cannot carry it (`docs/specs/2026-11-02-phobos-obfuscation.md`).
+    phobos: Option<PhobosClientConfig>,
     endpoint: NetLocation,
     state: Mutex<ConnectorState>,
 }
@@ -62,6 +68,7 @@ impl std::fmt::Debug for AmneziaWgConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AmneziaWgConnector")
             .field("protocol", &self.protocol)
+            .field("phobos", &self.phobos.is_some())
             .field("endpoint", &self.endpoint)
             .finish()
     }
@@ -90,12 +97,14 @@ impl AmneziaWgConnector {
         Self {
             config,
             protocol: TunnelProtocol::AmneziaWg,
+            phobos: None,
             endpoint,
             state: Mutex::new(ConnectorState::default()),
         }
     }
 
     fn from_wireguard(wg: WireGuardClientConfig, endpoint: NetLocation) -> Self {
+        let phobos = wg.phobos;
         // Convert WireGuard config to AmneziaWG config with default (no-op) obfuscation
         let config = AmneziaWgClientConfig {
             private_key: wg.private_key,
@@ -137,6 +146,7 @@ impl AmneziaWgConnector {
         Self {
             config,
             protocol: TunnelProtocol::WireGuard,
+            phobos,
             endpoint,
             state: Mutex::new(ConnectorState::default()),
         }
@@ -205,6 +215,7 @@ impl AmneziaWgConnector {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<(TunnelState, mpsc::Sender<NetStackRequest>)> {
         let variant = match self.protocol {
+            TunnelProtocol::WireGuard if self.phobos.is_some() => "WireGuard over Phobos",
             TunnelProtocol::WireGuard => "WireGuard",
             TunnelProtocol::AmneziaWg if self.config.awg.uses_awg31() => "AmneziaWG 3.1",
             TunnelProtocol::AmneziaWg if self.config.awg.uses_awg3() => "AmneziaWG 3.0",
@@ -213,6 +224,11 @@ impl AmneziaWgConnector {
         info!("{}: initializing tunnel to {}", variant, self.endpoint);
 
         let runtime_config = AwgRuntimeConfig::from_client_config(&self.config)?;
+        let phobos = self
+            .phobos
+            .as_ref()
+            .map(crate::amneziawg::convert_phobos_config)
+            .transpose()?;
         let endpoint_addr = resolver::resolve_single_address(resolver, &self.endpoint).await?;
 
         let tunnel_runtime = TunnelRuntime::start(
@@ -222,6 +238,7 @@ impl AmneziaWgConnector {
             runtime_config.persistent_keepalive,
             runtime_config.amnezia,
             endpoint_addr,
+            phobos,
         )
         .await?;
 

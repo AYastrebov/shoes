@@ -285,7 +285,8 @@ Transports and obfuscation: TCP, UDP and QUIC — though not every protocol take
 every one, since mieru is TCP-only and Hysteria2 and TUIC are QUIC-native
 terminal connectors. XTLS Reality (a hand-written TLS 1.3 stack, `src/reality/`),
 XTLS Vision, ShadowTLS v3, H2MUX, SagerNet UDP-over-TCP, XUDP, QUIC Salamander
-obfuscation and Hysteria2 port hopping.
+obfuscation, Hysteria2 port hopping, and Phobos obfuscation for WireGuard
+(client; [docs/specs/2026-11-02-phobos-obfuscation.md](./docs/specs/2026-11-02-phobos-obfuscation.md)).
 
 TUN mode with a Fake IP pool, on Linux, Android, iOS, Windows 11 and macOS.
 macOS has two hosts: the Network Extension system extension, and `shoesd`, a

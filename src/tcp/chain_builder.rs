@@ -472,6 +472,7 @@ mod tests {
                 allowed_ips: OneOrSome::One("0.0.0.0/0".parse().unwrap()),
                 persistent_keepalive: None,
                 mtu: 1280,
+                phobos: None,
             })),
             ..Default::default()
         }

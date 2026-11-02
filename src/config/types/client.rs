@@ -92,6 +92,38 @@ pub struct WireGuardClientConfig {
     pub persistent_keepalive: Option<u16>,
     #[serde(default = "default_amneziawg_mtu")]
     pub mtu: u16,
+    /// Phobos obfuscation in front of a plain WireGuard server. Only here,
+    /// not on `amneziawg`: a Phobos server forwards to kernel WireGuard, and
+    /// its decoder needs the plain message types
+    /// (`docs/specs/2026-11-02-phobos-obfuscation.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phobos: Option<PhobosClientConfig>,
+}
+
+/// Phobos obfuscation parameters, one server preset's.
+///
+/// The reference's client keys (`ObfuscatorConfigParser.kt`), with `-`
+/// written `_`. Ranges and meanings are the reference's `config.c`, enforced
+/// by `awgtun::phobos::PhobosConfig::set`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhobosClientConfig {
+    /// The preset's key, used as text: a base64-looking key is not decoded.
+    pub key: Redacted<String>,
+    /// `none`, `stun`, `media`, `auto` or `tls`, in any case. `auto` and
+    /// `tls` frame nothing on a UDP client. Unset is the reference's `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_dummy: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfuscate_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_pt: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_ssrc: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_clock: Option<u16>,
 }
 
 /// AmneziaWG client configuration (2.0 and 3.0).

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use awgtun::amnezia::Amnezia3Config;
 use awgtun::noise::{Tunn, TunnResult};
+use awgtun::phobos::PhobosConfig;
 use awgtun::x25519;
 use futures::FutureExt;
 use log::{debug, error, info, warn};
@@ -17,6 +18,7 @@ use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::mpsc;
 
 use super::endpoint::{EndpointSocket, is_route_gone};
+use super::phobos::PhobosLayer;
 
 /// Maximum UDP datagram size (outer AmneziaWG packets).
 const MAX_UDP_SIZE: usize = 65536;
@@ -316,7 +318,17 @@ impl TunnelRuntime {
         persistent_keepalive: Option<u16>,
         amnezia: Amnezia3Config,
         endpoint_addr: SocketAddr,
+        phobos: Option<PhobosConfig>,
     ) -> std::io::Result<Arc<Self>> {
+        // Built first so a bad Phobos config fails before anything binds.
+        let phobos = phobos.map(PhobosLayer::new).transpose()?;
+        // Set by a rebind, taken by the encapsulate loop: a Phobos server
+        // drops everything but a handshake from an address it has not seen
+        // complete one, so after a rebind the first thing sent must be an
+        // initiation. A flag rather than a queued marker, so a full queue
+        // cannot leave the next packets going out as data the server drops.
+        let handshake_pending = phobos.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
+
         // Create the awgtun tunnel
         let private_key_copy = private_key.clone();
         let amnezia_copy = amnezia.clone();
@@ -388,7 +400,8 @@ impl TunnelRuntime {
         // Rebindable rather than a plain UdpSocket: on mobile the address this
         // is bound to stops existing every time the device changes network.
         // See src/amneziawg/endpoint.rs.
-        let udp_socket = EndpointSocket::connect(endpoint_addr).await?;
+        // With Phobos, the socket also wraps and unwraps every datagram.
+        let udp_socket = EndpointSocket::connect(endpoint_addr, phobos).await?;
         #[cfg(test)]
         let test_endpoint = udp_socket.clone();
 
@@ -449,8 +462,18 @@ impl TunnelRuntime {
             let offered = packets_offered.clone();
             let trailers = trailers_on.clone();
             let failures = send_failures.clone();
+            let pending = handshake_pending.clone();
             tokio::spawn(async move {
-                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered, trailers, failures).await;
+                encapsulate_loop(
+                    tunn,
+                    udp,
+                    ip_to_tunnel_rx,
+                    offered,
+                    trailers,
+                    failures,
+                    pending,
+                )
+                .await;
             })
         };
 
@@ -477,6 +500,7 @@ impl TunnelRuntime {
             let rebinds = rebinds_completed.clone();
             let announce = ip_to_tunnel_tx.clone();
             let announce_offered = outbound_offered.clone();
+            let pending = handshake_pending.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
                 rebinds.fetch_add(1, Ordering::Relaxed);
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
@@ -499,10 +523,29 @@ impl TunnelRuntime {
                 // queue is full, the traffic filling it announces instead.
                 // Counted like any other packet offered to the queue, so the
                 // watchdog does not quietly narrow what it considers traffic.
+                //
+                // Behind Phobos the announcement must be a handshake instead
+                // (see `handshake_pending`); the empty payload is still queued,
+                // to wake an idle loop.
+                if let Some(pending) = &pending {
+                    pending.store(true, Ordering::Release);
+                }
                 announce_offered.fetch_add(1, Ordering::Relaxed);
                 let _ = announce.try_send(Vec::new());
             }))
         };
+
+        // Task 4b: Phobos control traffic, when the masking has any.
+        let phobos_control_task = udp_socket
+            .phobos()
+            .and_then(|layer| layer.control_interval())
+            .map(|interval| {
+                tokio::spawn(phobos_control_loop(
+                    tunn.clone(),
+                    udp_socket.clone(),
+                    interval,
+                ))
+            });
 
         // Task 5: the liveness watchdog. The recv task catches a socket
         // that fails loudly; this catches one that fails silently.
@@ -529,6 +572,9 @@ impl TunnelRuntime {
             rebind_task.abort_handle(),
             liveness_task.abort_handle(),
         ];
+        if let Some(task) = phobos_control_task {
+            abort_handles.push(task.abort_handle());
+        }
 
         // Task 6: only for a tunnel that asked for AmneziaWG 3.1 random
         // trailers, which is the one setting here that cannot be wrong on its
@@ -854,6 +900,7 @@ async fn encapsulate_loop(
     packets_offered: Arc<AtomicUsize>,
     trailers_on: Arc<AtomicBool>,
     send_failures: Arc<AtomicUsize>,
+    handshake_pending: Option<Arc<AtomicBool>>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
@@ -865,27 +912,39 @@ async fn encapsulate_loop(
         // whether it has ever moved.
         packets_offered.fetch_add(1, Ordering::Relaxed);
 
-        let (result, decoys) = locked_call(&tunn, |tunn| tunn.encapsulate(&ip_packet, &mut out));
-        let has_packet = {
-            match result {
-                TunnResult::WriteToNetwork(data) => {
-                    packet.clear();
-                    packet.extend_from_slice(data);
-                    true
-                }
-                TunnResult::Done => false,
-                TunnResult::Err(e) => {
-                    debug!("AmneziaWG encapsulate error: {:?}", e);
-                    false
-                }
-                _ => {
-                    debug!("AmneziaWG encapsulate: unexpected tunnel write result");
-                    false
-                }
+        // Phobos, after a rebind: an initiation from the new address before
+        // anything else, even with a live session. `force_resend` makes awgtun
+        // send one regardless of a handshake already in flight from the old
+        // address; the current session stays usable until the new one
+        // replaces it.
+        if handshake_pending
+            .as_ref()
+            .is_some_and(|pending| pending.swap(false, Ordering::AcqRel))
+        {
+            let (result, decoys) = locked_call(&tunn, |tunn| {
+                tunn.format_handshake_initiation(&mut out, true)
+            });
+            if take_datagram(result, &mut packet, "rebind handshake") {
+                send_to_network(
+                    &tunn,
+                    &udp,
+                    &decoys,
+                    &packet,
+                    "rebind handshake",
+                    &trailers_on,
+                    &send_failures,
+                )
+                .await;
             }
-        };
+            // The announcement's empty payload has done its job; a keepalive
+            // after the initiation would only be dropped.
+            if ip_packet.is_empty() {
+                continue;
+            }
+        }
 
-        if has_packet {
+        let (result, decoys) = locked_call(&tunn, |tunn| tunn.encapsulate(&ip_packet, &mut out));
+        if take_datagram(result, &mut packet, "encapsulate") {
             send_to_network(
                 &tunn,
                 &udp,
@@ -896,6 +955,64 @@ async fn encapsulate_loop(
                 &send_failures,
             )
             .await;
+        }
+    }
+}
+
+/// Copy a sending call's datagram into `packet`, reporting whether there is
+/// one. Copied rather than sent from `out`: the result borrows `out`, which
+/// the next call needs.
+fn take_datagram(result: TunnResult<'_>, packet: &mut Vec<u8>, context: &str) -> bool {
+    match result {
+        TunnResult::WriteToNetwork(data) => {
+            packet.clear();
+            packet.extend_from_slice(data);
+            true
+        }
+        TunnResult::Done => false,
+        TunnResult::Err(e) => {
+            debug!("AmneziaWG {context} error: {:?}", e);
+            false
+        }
+        _ => {
+            debug!("AmneziaWG {context}: unexpected tunnel write result");
+            false
+        }
+    }
+}
+
+/// How recent a handshake must be for the Phobos control traffic to run:
+/// WireGuard's `REJECT_AFTER_TIME`, past which the session is unusable.
+const PHOBOS_CONTROL_SESSION_WINDOW: Duration = Duration::from_secs(180);
+
+/// Send a STUN Binding Request every `interval` while the session is up,
+/// as the reference does for each handshaked client.
+///
+/// Quiet while it is down: the reference stops when the server drops the
+/// idle client entry, and a phone should not power its radio every few
+/// seconds for a tunnel nobody uses. The loop itself still ticks, which
+/// costs nothing beside the timer loop's 4 Hz. A failure is only logged:
+/// the request carries nothing the server needs, and the tunnel's own
+/// sends report the path.
+async fn phobos_control_loop(
+    tunn: Arc<ParkingMutex<Tunn>>,
+    udp: Arc<EndpointSocket>,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let session_up = tunn
+            .lock()
+            .stats()
+            .0
+            .is_some_and(|age| age < PHOBOS_CONTROL_SESSION_WINDOW);
+        let Some(layer) = udp.phobos() else { return };
+        if !session_up {
+            continue;
+        }
+        let request = layer.binding_request();
+        if let Err(e) = udp.send_control(&request).await {
+            debug!("Phobos binding request send failed: {e}");
         }
     }
 }
@@ -1233,10 +1350,17 @@ mod tests {
         let (_, server_public) = keypair(2);
         let config = convert_amnezia_config(&real_world_params(), 1420).unwrap();
 
-        let runtime =
-            TunnelRuntime::start(client_secret, server_public, None, None, config, peer_addr)
-                .await
-                .unwrap();
+        let runtime = TunnelRuntime::start(
+            client_secret,
+            server_public,
+            None,
+            None,
+            config,
+            peer_addr,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Idle until the rebind: nothing has asked the tunnel to send, so
         // anything the peer receives after this is the announcement.
@@ -1536,6 +1660,7 @@ mod tests {
             Some(25),
             config,
             addr,
+            None,
         )
         .await
         .unwrap();
@@ -1918,3 +2043,9 @@ mod tests {
         );
     }
 }
+
+/// The runtime against a Phobos server double. A child of this module so it
+/// can reach the test-only endpoint handle.
+#[cfg(test)]
+#[path = "phobos_e2e_tests.rs"]
+mod phobos_e2e_tests;

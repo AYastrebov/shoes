@@ -1237,12 +1237,40 @@ protocol:
   allowed_ips: [string]        # What goes into the tunnel
   persistent_keepalive: int?   # Seconds; unset sends none
   mtu: 1280                    # Default: 1280
+  phobos:                      # Optional; a Phobos server's obfuscation
+    key: string                # The preset's key, used as text
+    masking: auto              # none | stun | media | auto | tls, any case
+    max_dummy: 4               # 0-1024
+    obfuscate_bytes: 0         # 0 = all; becomes 16 under media
+    media_pt: 0                # 0-127; 0 = a random preset
+    media_ssrc: 0              # 0 = random
+    media_clock: 0             # fps, 0-1000; 0 = a random preset
 ```
 
 A user-space WireGuard tunnel (via awgtun). It owns its transport, so it
 must be the only hop in its chain, and `transport` is rejected. The
 endpoint's hostname is resolved by the TUN's `dns:` group when there is
 one, and again whenever the tunnel is rebuilt.
+
+`phobos` reaches a [Phobos](https://github.com/Ground-Zerro/Phobos)
+server: plain WireGuard behind an obfuscating UDP proxy, which XORs each
+datagram with a key-derived stream, appends random bytes, and frames it as
+STUN or RTP. The endpoint is the preset's obfuscator port, not WireGuard's.
+
+The fields are the preset's client keys with `-` written `_`, and their
+ranges are the reference's (`config.c`). `masking: auto` (the reference's
+default) and `tls` frame nothing on a UDP client, the same as `none`.
+`key`, `masking` and `obfuscate_bytes` must match the preset. A mismatch
+is never reported: the server drops everything, which looks exactly like an
+unreachable server.
+
+A STUN frame adds 24 bytes and an RTP frame 12, so keep `mtu <= 1416`
+(STUN) or `1428` (RTP) on a 1500-byte path; shoes warns when it is not.
+After a network change, the tunnel sends a new handshake rather than a
+keepalive, because the server drops anything else from an address it
+hasn't seen complete one. `phobos` is not accepted on `amneziawg`: the
+server forwards to plain WireGuard. `examples/wireguard_phobos_client.yaml`
+has one block per masking.
 
 ### AmneziaWG Client
 ```yaml

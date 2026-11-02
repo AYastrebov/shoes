@@ -7,9 +7,11 @@
 mod config;
 mod connector;
 mod endpoint;
+mod phobos;
 mod tunnel;
 
 pub use config::convert_amnezia_config;
+pub use phobos::{convert_phobos_config, frame_overhead as phobos_frame_overhead};
 // Used by the mobile FFI, which is compiled only for Android and iOS; nothing
 // on a desktop target calls it.
 pub use connector::AmneziaWgConnector;

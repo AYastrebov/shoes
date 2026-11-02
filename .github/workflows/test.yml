@@ -104,9 +104,9 @@ jobs:
           "$bin" --version
           configs="socks_basic multi_hop_chain sniff hysteria2_client tuic_client mieru_client sstp_client openconnect_client reality_client socks_through_wss_vmess dns_tuning"
           case "$RUNNER_OS" in
-            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client transparent_proxy" ;;
+            Linux) configs="$configs tun_vpn tun_fake_ip tun_windows amneziawg_client wireguard_phobos_client transparent_proxy" ;;
             Windows) configs="$configs tun_windows" ;;
-            macOS) configs="$configs amneziawg_client tun_macos" ;;
+            macOS) configs="$configs amneziawg_client wireguard_phobos_client tun_macos" ;;
           esac
           for cfg in $configs; do
             echo "==> dry run: examples/$cfg.yaml"
