@@ -459,8 +459,7 @@ impl RealityServerConnection {
         }
 
         log::debug!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
+            "REALITY: Client authentication successful - version: {:?}, timestamp: {}",
             client_version,
             client_timestamp
         );
