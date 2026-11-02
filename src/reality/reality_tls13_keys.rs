@@ -276,8 +276,6 @@ pub fn derive_handshake_keys(
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
     let master_secret = hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
-    log::debug!("  master_secret: {:?}", &master_secret[..8]);
-
     Ok(Tls13HandshakeKeys {
         client_handshake_traffic_secret,
         server_handshake_traffic_secret,
