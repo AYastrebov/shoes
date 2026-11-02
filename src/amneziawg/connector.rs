@@ -350,3 +350,104 @@ async fn resolve_target(
     }
     resolver::resolve_single_address(resolver, target.location()).await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+
+    use super::AmneziaWgConnector;
+    use crate::address::NetLocation;
+    use crate::amneziawg::tunnel::phobos_e2e_tests::{
+        Seen, ip_packet, keypair, spawn_double, until,
+    };
+    use crate::config::ClientProxyConfig;
+    use crate::resolver::{NativeResolver, Resolver};
+
+    /// A `wireguard` outbound as YAML, with the keys the server double
+    /// expects, and `phobos` appended as given.
+    fn wireguard_yaml(phobos: &str) -> ClientProxyConfig {
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let (client, _) = keypair(1);
+        let (_, server) = keypair(2);
+        let yaml = format!(
+            "type: wireguard\n\
+             private_key: \"{}\"\n\
+             peer_public_key: \"{}\"\n\
+             local_addresses: \"10.8.0.2/32\"\n\
+             allowed_ips: \"0.0.0.0/0\"\n\
+             {phobos}",
+            b64(client.as_bytes()),
+            b64(server.as_bytes()),
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    fn phobos_config() -> awgtun::phobos::PhobosConfig {
+        let mut config =
+            awgtun::phobos::PhobosConfig::new(b"synthetic-preset-key".to_vec()).unwrap();
+        config.masking = awgtun::phobos::Masking::Stun;
+        config
+    }
+
+    /// The `phobos:` block, parsed from YAML and built through the connector
+    /// the way the factory builds it, obfuscates the tunnel: a packet crosses
+    /// a Phobos server double. The runtime-level tests hand `TunnelRuntime`
+    /// a codec config directly, so a connector that dropped the block would
+    /// pass them all while sending plain WireGuard (shoes#151 review).
+    #[tokio::test]
+    async fn a_parsed_phobos_block_obfuscates_the_tunnel() {
+        let (server, mut seen) = spawn_double(phobos_config(), false).await;
+        let config = wireguard_yaml("phobos:\n  key: \"synthetic-preset-key\"\n  masking: stun\n");
+        let connector = AmneziaWgConnector::from_client_config(
+            config,
+            NetLocation::from_ip_addr(server.ip(), server.port()),
+        )
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let (tunnel, _requests) = connector.build_tunnel(&resolver).await.unwrap();
+
+        let packet = ip_packet(b"from yaml");
+        tunnel
+            .runtime
+            .ip_to_tunnel_tx
+            .send(packet.clone())
+            .await
+            .unwrap();
+        let events = until(&mut seen, |e| matches!(e, Seen::Delivered(_))).await;
+        assert_eq!(events.last(), Some(&Seen::Delivered(packet)));
+        assert!(events.contains(&Seen::BindingRequest), "{events:?}");
+    }
+
+    /// The control: the same outbound without `phobos:` sends plain
+    /// WireGuard, which the double cannot decode. Without this, a double
+    /// that accepted plain WireGuard would let the test above pass whatever
+    /// the connector did.
+    #[tokio::test]
+    async fn without_the_block_the_double_does_not_understand_the_tunnel() {
+        let (server, mut seen) = spawn_double(phobos_config(), false).await;
+        let connector = AmneziaWgConnector::from_client_config(
+            wireguard_yaml(""),
+            NetLocation::from_ip_addr(server.ip(), server.port()),
+        )
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let (tunnel, _requests) = connector.build_tunnel(&resolver).await.unwrap();
+
+        tunnel
+            .runtime
+            .ip_to_tunnel_tx
+            .send(ip_packet(b"plain"))
+            .await
+            .unwrap();
+        let events = until(&mut seen, |e| {
+            matches!(
+                e,
+                Seen::Undecodable | Seen::Delivered(_) | Seen::Message { .. }
+            )
+        })
+        .await;
+        assert_eq!(events.last(), Some(&Seen::Undecodable), "{events:?}");
+    }
+}

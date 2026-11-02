@@ -2028,7 +2028,8 @@ mod tests {
 }
 
 /// The runtime against a Phobos server double. A child of this module so it
-/// can reach the test-only endpoint handle.
+/// can reach the test-only endpoint handle; `pub(super)` so the connector's
+/// tests can put the same double behind a parsed config.
 #[cfg(test)]
 #[path = "phobos_e2e_tests.rs"]
-mod phobos_e2e_tests;
+pub(super) mod phobos_e2e_tests;

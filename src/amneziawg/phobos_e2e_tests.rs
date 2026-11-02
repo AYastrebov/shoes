@@ -22,7 +22,7 @@ use super::TunnelRuntime;
 
 /// What the double saw, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Seen {
+pub(crate) enum Seen {
     /// A raw STUN Binding Request from the client.
     BindingRequest,
     /// A raw STUN Binding Success from the client: its answer to ours.
@@ -37,7 +37,7 @@ enum Seen {
     Undecodable,
 }
 
-fn keypair(seed: u8) -> (x25519::StaticSecret, x25519::PublicKey) {
+pub(crate) fn keypair(seed: u8) -> (x25519::StaticSecret, x25519::PublicKey) {
     let secret = x25519::StaticSecret::from([seed; 32]);
     let public = x25519::PublicKey::from(&secret);
     (secret, public)
@@ -51,7 +51,7 @@ fn phobos(key: &[u8], masking: Masking) -> PhobosConfig {
 
 /// A minimal IPv4/UDP packet from the tunnel address, so the server's
 /// WireGuard has something routable to deliver.
-fn ip_packet(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn ip_packet(payload: &[u8]) -> Vec<u8> {
     let total = 28 + payload.len();
     let mut p = vec![0u8; total];
     p[0] = 0x45;
@@ -71,7 +71,7 @@ fn ip_packet(payload: &[u8]) -> Vec<u8> {
 /// reports everything it sees. With `ask_binding`, it sends the client one
 /// Binding Request once the handshake completes, as the server's control
 /// timer does.
-async fn spawn_double(
+pub(crate) async fn spawn_double(
     config: PhobosConfig,
     ask_binding: bool,
 ) -> (SocketAddr, mpsc::UnboundedReceiver<Seen>) {
@@ -173,7 +173,10 @@ async fn start_client(server: SocketAddr, config: PhobosConfig) -> Arc<TunnelRun
 
 /// Wait for the first event matching `want`, returning everything seen up
 /// to and including it. Bounded: an in-process exchange takes milliseconds.
-async fn until(rx: &mut mpsc::UnboundedReceiver<Seen>, want: impl Fn(&Seen) -> bool) -> Vec<Seen> {
+pub(crate) async fn until(
+    rx: &mut mpsc::UnboundedReceiver<Seen>,
+    want: impl Fn(&Seen) -> bool,
+) -> Vec<Seen> {
     let mut seen = Vec::new();
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = rx.recv().await {
