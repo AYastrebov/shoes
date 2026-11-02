@@ -897,8 +897,9 @@ async fn encapsulate_loop(
         // other message until one has gone out (EndpointSocket::send), so
         // this is what lets traffic resume. Asked before every packet, so a
         // full queue cannot starve it. The socket counts the initiation as
-        // sent once it is handed over; one the network loses is resent by
-        // awgtun's own handshake retry (`rekey_timeout`). `force_resend`
+        // sent once its send succeeds, so one that fails to leave is asked
+        // for again on the next packet; one the network loses after that is
+        // resent by awgtun's own handshake retry (`rekey_timeout`). `force_resend`
         // makes awgtun send one regardless of a handshake in flight from the
         // old address; the current session stays usable until the new one
         // replaces it.

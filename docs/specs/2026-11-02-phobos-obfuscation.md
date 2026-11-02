@@ -121,8 +121,10 @@ changes.
   more per rebind, in the same `watch` value as the socket. `send` takes
   both from one snapshot. From a generation that no initiation has gone out
   on yet, it holds back every other WireGuard message (`Ok(0)`, nothing
-  sent), which is exactly what the server would discard. The encapsulate
-  loop asks `needs_initiation()` before every packet and, when it is owed,
+  sent), which is exactly what the server would discard. A generation
+  counts as initiated only once an initiation's send on it has succeeded:
+  while that send is pending, and after it fails, the gate stays shut. The
+  encapsulate loop asks `needs_initiation()` before every packet and, when it is owed,
   sends `format_handshake_initiation(out, true)` first. The announcement's
   empty payload still wakes an idle loop.
 
@@ -171,9 +173,12 @@ second names a loopback port shoes doesn't need.
   than STUN's 16-bit DATA length) is an `InvalidInput` error, so the send
   path's failure accounting sees it. The tunnel's own messages can't reach
   either case past validation.
-- STUN carries a WireGuard message of at most 65535 bytes
-  (`Masking::max_message_len`, awgtun). An `mtu` whose full-size message
-  (`mtu + 32`) exceeds that is refused when the config loads.
+- An `mtu` whose full-size packet cannot be sent at all is refused when the
+  config loads. The message (`mtu + 32`) must fit the masking's own limit
+  (STUN's 16-bit DATA length, `Masking::max_message_len` in awgtun), and
+  the framed datagram (`mtu + 32 + frame`) must fit one IPv4 UDP payload,
+  65507 bytes. That caps `mtu` at 65451 (STUN), 65463 (RTP) and
+  65475 (none).
 - Validation warns when `mtu + 60 + frame` exceeds 1500, in the shape of the
   AmneziaWG `s4` warning.
 

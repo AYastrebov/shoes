@@ -197,6 +197,8 @@ impl EndpointSocket {
     /// have discarded, held back here instead: `Ok(0)`, nothing sent. The
     /// socket and its generation come from one snapshot, so a rebind landing
     /// mid-call cannot let a transport message reach the new socket first.
+    /// The gate opens only after the initiation's send has succeeded: while
+    /// it is pending, and after it fails, the generation still owes one.
     /// The tunnel sends the initiation as soon as [`needs_initiation`]
     /// says so (`tunnel.rs`, the encapsulate loop).
     ///
@@ -214,10 +216,8 @@ impl EndpointSocket {
         let Some(layer) = &self.phobos else {
             return self.send_on(&bound, datagram).await;
         };
-        if is_initiation(datagram) {
-            self.initiated_generation
-                .fetch_max(bound.generation, Ordering::AcqRel);
-        } else if self.initiated_generation.load(Ordering::Acquire) < bound.generation {
+        let initiation = is_initiation(datagram);
+        if !initiation && self.initiated_generation.load(Ordering::Acquire) < bound.generation {
             debug!(
                 "Phobos: holding back a {}-byte datagram until the handshake \
                  initiation from the rebound socket",
@@ -233,7 +233,18 @@ impl EndpointSocket {
                 {
                     debug!("Phobos binding request send failed: {e}");
                 }
-                self.send_on(&bound, &wire).await
+                let sent = self.send_on(&bound, &wire).await;
+                // The gate opens only once the initiation is on the
+                // socket. Marked earlier, a sender passing it while this
+                // send was still pending (behind the Binding Request, or an
+                // ENOBUFS retry) could queue its datagram ahead of the
+                // initiation, and a failed send would leave the gate open
+                // with nothing sent (shoes#151 review).
+                if initiation && sent.is_ok() {
+                    self.initiated_generation
+                        .fetch_max(bound.generation, Ordering::AcqRel);
+                }
+                sent
             }
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -712,6 +723,49 @@ mod tests {
         assert_ne!(from, before, "the datagram came from the old socket");
         assert_eq!(after, 1, "the first message from the new socket");
         assert_eq!(next_type(&mut server).await.0, 4);
+    }
+
+    /// An initiation that fails to go out does not open the gate: the
+    /// generation still owes one, and transport stays held back. Marked
+    /// before the send, as it first was, the failure left the gate open
+    /// with nothing sent (shoes#151 review).
+    #[tokio::test]
+    async fn a_failed_initiation_keeps_the_rebound_socket_gated() {
+        use awgtun::phobos::{Masking, PhobosConfig};
+
+        let (_peer_socket, peer_addr) = peer().await;
+        let mut config = PhobosConfig::new(b"synthetic-preset-key".to_vec()).unwrap();
+        config.masking = Masking::Stun;
+        let endpoint = EndpointSocket::connect(peer_addr, Some(PhobosLayer::new(config).unwrap()))
+            .await
+            .unwrap();
+
+        let before_local = endpoint.local_addr().unwrap();
+        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
+        endpoint.request_rebind();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while endpoint.local_addr().unwrap() == before_local {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rebind never happened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Longer than STUN's 16-bit DATA length: the send fails for certain.
+        let mut too_long = vec![1u8, 0, 0, 0];
+        too_long.resize(65_536, 7);
+        assert!(endpoint.send(&too_long).await.is_err());
+        assert!(
+            endpoint.needs_initiation(),
+            "a failed initiation opened the gate"
+        );
+        assert_eq!(endpoint.send(&[4, 0, 0, 0, 1, 2, 3, 4]).await.unwrap(), 0);
+
+        let mut initiation = vec![1u8, 0, 0, 0];
+        initiation.resize(148, 7);
+        endpoint.send(&initiation).await.unwrap();
+        assert!(!endpoint.needs_initiation());
     }
 
     /// A datagram the codec cannot frame is an error, not `Ok(0)`: the

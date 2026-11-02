@@ -1910,31 +1910,43 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
         // error and not a tunnel that never answers. The error names the
         // field and never the key.
         let converted = crate::amneziawg::convert_phobos_config(phobos)?;
-        // STUN's DATA length is 16 bits, so a full-size transport message
-        // (mtu + 32) past awgtun's `Masking::max_message_len` cannot be
-        // framed at all. Refused here rather than discovered per packet.
-        let message = usize::from(config.mtu) + 32;
-        if let Some(max) = converted.masking.max_message_len()
-            && message > max
+        let frame = crate::amneziawg::phobos_frame_overhead(&converted);
+        if let Some(max_mtu) = phobos_max_mtu(converted.masking.max_message_len(), frame)
+            && usize::from(config.mtu) > max_mtu
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "WireGuard mtu {} is too large for Phobos {:?} masking: a full-size \
-                     message is {message} bytes, and it carries at most {max} \
-                     (mtu at most {})",
-                    config.mtu,
-                    converted.masking,
-                    max - 32
+                     packet could not be sent (mtu at most {max_mtu})",
+                    config.mtu, converted.masking
                 ),
             ));
         }
-        let frame = crate::amneziawg::phobos_frame_overhead(&converted);
         if let Some(warning) = phobos_mtu_warning(config.mtu, frame) {
             log::warn!("{warning}");
         }
     }
     Ok(())
+}
+
+/// The largest IPv4 UDP payload: 65535 less the 20-byte IP and 8-byte UDP
+/// headers. The endpoint may resolve to either family, and IPv4's is the
+/// smaller limit.
+const MAX_UDP_PAYLOAD: usize = 65_507;
+
+/// The largest `mtu` whose full-size packet a Phobos tunnel can send, if
+/// any `u16` mtu could not be. A full-size transport message is mtu + 32
+/// (WireGuard's header and tag), and it must fit both the masking's own
+/// limit (`max_message`, STUN's 16-bit DATA length) and, framed, one UDP
+/// datagram. The random tail is never added at that size. Past this, every
+/// large packet is refused by the codec or fails with EMSGSIZE, so it is a
+/// config error rather than a warning.
+fn phobos_max_mtu(max_message: Option<usize>, frame: usize) -> Option<usize> {
+    let by_udp = MAX_UDP_PAYLOAD - frame;
+    let message = max_message.map_or(by_udp, |codec| codec.min(by_udp));
+    let max_mtu = message - 32;
+    (max_mtu < usize::from(u16::MAX)).then_some(max_mtu)
 }
 
 /// The fragmentation warning for a WireGuard tunnel behind a Phobos frame
@@ -6025,22 +6037,25 @@ mod phobos_validation_tests {
         assert!(err.contains("phobos"), "{err}");
     }
 
-    /// STUN's 16-bit DATA length carries a WireGuard message of at most
-    /// 65535 bytes, so mtu 65503 is the largest that frames. RTP has no such
-    /// field and is not bounded here.
+    /// The full-size packet must fit the masking's own limit and one IPv4
+    /// UDP datagram (65507 bytes): mtu + 32 + frame. STUN's frame is 24 and
+    /// its DATA length would allow 65503, but UDP allows only 65451; RTP's
+    /// frame is 12, and none has no frame.
     #[test]
-    fn an_mtu_stun_cannot_frame_is_refused() {
-        for (masking, mtu, ok) in [
-            ("stun", 65_503u32, true),
-            ("stun", 65_504, false),
-            ("media", 65_535, true),
-        ] {
-            let result = validate_with_mtu(mtu, masking);
-            assert_eq!(result.is_ok(), ok, "{masking} mtu {mtu}: {result:?}");
-            if let Err(err) = result {
-                assert!(err.to_string().contains("mtu at most 65503"), "{err}");
-            }
+    fn an_mtu_whose_packets_cannot_be_sent_is_refused() {
+        for (masking, max) in [("stun", 65_451u32), ("media", 65_463), ("none", 65_475)] {
+            assert!(
+                validate_with_mtu(max, masking).is_ok(),
+                "{masking} mtu {max} must load"
+            );
+            let err = validate_with_mtu(max + 1, masking).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("mtu at most {max}")),
+                "{masking}: {err}"
+            );
         }
+        assert_eq!(super::phobos_max_mtu(Some(65_535), 24), Some(65_451));
+        assert_eq!(super::phobos_max_mtu(None, 0), Some(65_475));
     }
 
     fn validate_with_mtu(mtu: u32, masking: &str) -> std::io::Result<()> {
