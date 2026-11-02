@@ -20,6 +20,15 @@ why, in `docs/specs/2026-11-02-preloaded-intermediates.md`. Tested with a
 generated CA, a check that each shipped certificate chains to a
 compiled-in root, and live against the Keenetic server with no pin.
 
+**The eight eMudhra intermediates with public private keys are refused.**
+Their keys were found in October 2026 to be small integers, so anyone can
+sign with them; browsers blocked them by revocation, which shoes does not
+check. A chain whose leaf or presented intermediates carry one of those
+keys now fails with `Revoked`, matched by SPKI SHA-256 from Go's list
+(golang/go#82345), so the Sectigo cross-signed copies are caught too.
+`webpki-roots` 1.0.11 holds none of the roots they chain to, so shoes was
+most likely not exposed; the list no longer depends on that.
+
 ## v0.9.4
 
 Upstream fixes and one new obfuscation since 0.9.3; no FFI change. The

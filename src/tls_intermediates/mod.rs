@@ -17,6 +17,12 @@
 //! server could have sent itself. Downloaded from
 //! <https://letsencrypt.org/certificates/> on 2026-11-02; each was checked
 //! to chain to ISRG Root X1 or X2.
+//!
+//! The other half is the reverse: intermediates no chain may pass through,
+//! whatever root they reach. `webpki-roots` mirrors the roots of Mozilla's
+//! store but not its revocations, so an intermediate the browsers blocked
+//! by OneCRL is still trusted here while its root is. See
+//! [`DISTRUSTED_SPKI_SHA256`].
 
 use std::sync::Arc;
 
@@ -76,36 +82,113 @@ pub(crate) static LETS_ENCRYPT: [(&str, CertificateDer<'static>); 18] = [
     ("E9", CertificateDer::from_slice(include_bytes!("e9.der"))),
 ];
 
-/// A webpki verifier that retries a chain it could not complete, with the
-/// preloaded intermediates added after the ones the server sent.
+/// SHA-256 of the DER `SubjectPublicKeyInfo` of the eight eMudhra
+/// intermediates whose private keys turned out to be small integers, found
+/// in October 2026: anyone can sign with them, for any name. Browsers
+/// blocked them by revocation (OneCRL, CRLSet), not by removing a root, and
+/// eMudhra revoked them on 2026-10-18; shoes checks no revocation, so it
+/// refuses them by key instead. The list is Go's (`distrustedSPKIHashes` in
+/// `crypto/x509/verify.go`, golang/go#82345, commit `7f86f957`), each hash
+/// checked against the certificate on crt.sh. Matching the key catches
+/// every copy of an intermediate: each also has a cross-sign by Sectigo's
+/// AAA Certificate Services with the same key.
+pub(crate) static DISTRUSTED_SPKI_SHA256: [(&str, &str); 8] = [
+    (
+        "EM DV TLS CA - G3B",
+        "ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105",
+    ),
+    (
+        "EM DV TLS CA - G3C",
+        "49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f",
+    ),
+    (
+        "EM EV TLS CA - G3B",
+        "e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41",
+    ),
+    (
+        "EM EV TLS CA - G3C",
+        "5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0",
+    ),
+    (
+        "EM OV TLS CA - G3B",
+        "43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b",
+    ),
+    (
+        "EM OV TLS CA - G3C",
+        "63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8",
+    ),
+    (
+        "EM OV CS CA - G3B",
+        "ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6",
+    ),
+    (
+        "EM OV CS CA - G3C",
+        "92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30",
+    ),
+];
+
+/// The hex SHA-256 of a certificate's DER `SubjectPublicKeyInfo`, or None
+/// when it does not parse (webpki then refuses the chain itself).
+fn spki_sha256(cert: &CertificateDer<'_>) -> Option<String> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, parsed.public_key().raw);
+    Some(digest.as_ref().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The webpki verifier every client uses, with two additions around it.
 ///
-/// Only `UnknownIssuer` is retried: every other verdict, a wrong name or an
+/// First, a chain carrying a distrusted key is refused before any path is
+/// built. Only the certificates the server sent are checked, which is
+/// enough: shoes never fetches an intermediate, so a chain through a
+/// distrusted one can only be built from one the server presented.
+///
+/// Second, a chain webpki could not complete is tried once more with the
+/// preloaded intermediates added after the server's own. Only
+/// `UnknownIssuer` is retried: every other verdict, a wrong name or an
 /// expired leaf among them, is the server's own and is returned as it was.
 /// A server that sends its chain never reaches the preload, so its
 /// verification is exactly what it was before.
 #[derive(Debug)]
-pub(crate) struct PreloadingVerifier {
+pub(crate) struct ChainVerifier {
     inner: Arc<WebPkiServerVerifier>,
     preloaded: Vec<CertificateDer<'static>>,
+    distrusted: Vec<(&'static str, String)>,
 }
 
-impl PreloadingVerifier {
-    pub(crate) fn lets_encrypt(inner: Arc<WebPkiServerVerifier>) -> Self {
-        Self::with(inner, LETS_ENCRYPT.iter().map(|(_, der)| der.clone()))
+impl ChainVerifier {
+    pub(crate) fn new(inner: Arc<WebPkiServerVerifier>) -> Self {
+        Self::with(
+            inner,
+            LETS_ENCRYPT.iter().map(|(_, der)| der.clone()),
+            DISTRUSTED_SPKI_SHA256
+                .iter()
+                .map(|(name, hash)| (*name, (*hash).to_string())),
+        )
     }
 
     fn with(
         inner: Arc<WebPkiServerVerifier>,
         preloaded: impl IntoIterator<Item = CertificateDer<'static>>,
+        distrusted: impl IntoIterator<Item = (&'static str, String)>,
     ) -> Self {
         Self {
             inner,
             preloaded: preloaded.into_iter().collect(),
+            distrusted: distrusted.into_iter().collect(),
         }
+    }
+
+    /// The name of the distrusted key `cert` carries, if it carries one.
+    fn distrusted_name(&self, cert: &CertificateDer<'_>) -> Option<&'static str> {
+        let hash = spki_sha256(cert)?;
+        self.distrusted
+            .iter()
+            .find(|(_, distrusted)| *distrusted == hash)
+            .map(|(name, _)| *name)
     }
 }
 
-impl ServerCertVerifier for PreloadingVerifier {
+impl ServerCertVerifier for ChainVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -114,6 +197,15 @@ impl ServerCertVerifier for PreloadingVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
+        if let Some(name) = std::iter::once(end_entity)
+            .chain(intermediates)
+            .find_map(|cert| self.distrusted_name(cert))
+        {
+            log::warn!(
+                "TLS: refusing a certificate chain through {name}, an intermediate whose private key is public"
+            );
+            return Err(Error::InvalidCertificate(CertificateError::Revoked));
+        }
         match self.inner.verify_server_cert(
             end_entity,
             intermediates,
@@ -252,21 +344,21 @@ mod tests {
             Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))
         ));
 
-        let preloading = PreloadingVerifier::with(plain, [pki.intermediate]);
+        let preloading = ChainVerifier::with(plain, [pki.intermediate], []);
         verify(&preloading, &pki.leaf, &[], "vpn.test").unwrap();
     }
 
     #[test]
     fn a_complete_chain_never_needs_the_preload() {
         let pki = pki("Test");
-        let preloading = PreloadingVerifier::with(webpki(&pki.root), []);
+        let preloading = ChainVerifier::with(webpki(&pki.root), [], []);
         verify(&preloading, &pki.leaf, &[pki.intermediate], "vpn.test").unwrap();
     }
 
     #[test]
     fn the_preload_does_not_excuse_a_wrong_name() {
         let pki = pki("Test");
-        let preloading = PreloadingVerifier::with(webpki(&pki.root), [pki.intermediate]);
+        let preloading = ChainVerifier::with(webpki(&pki.root), [pki.intermediate], []);
         let error = verify(&preloading, &pki.leaf, &[], "other.test").unwrap_err();
         assert!(
             matches!(
@@ -281,11 +373,112 @@ mod tests {
     fn a_leaf_from_a_ca_nobody_preloaded_still_fails() {
         let trusted = pki("Trusted");
         let stranger = pki("Stranger");
-        let preloading = PreloadingVerifier::with(webpki(&trusted.root), [trusted.intermediate]);
+        let preloading = ChainVerifier::with(webpki(&trusted.root), [trusted.intermediate], []);
         assert!(matches!(
             verify(&preloading, &stranger.leaf, &[], "vpn.test"),
             Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))
         ));
+    }
+
+    #[test]
+    fn a_chain_through_a_distrusted_key_is_refused_though_it_verifies() {
+        let pki = pki("Test");
+        let plain = webpki(&pki.root);
+        verify(
+            plain.as_ref(),
+            &pki.leaf,
+            std::slice::from_ref(&pki.intermediate),
+            "vpn.test",
+        )
+        .unwrap();
+
+        let hash = spki_sha256(&pki.intermediate).unwrap();
+        let verifier = ChainVerifier::with(plain, [], [("Test Intermediate", hash)]);
+        assert!(matches!(
+            verify(&verifier, &pki.leaf, &[pki.intermediate], "vpn.test"),
+            Err(Error::InvalidCertificate(CertificateError::Revoked))
+        ));
+    }
+
+    #[test]
+    fn a_distrusted_intermediate_cannot_slip_in_beside_a_good_one() {
+        // The server may send extra certificates; path building could pick
+        // either, so any distrusted one among them refuses the chain.
+        let good = pki("Good");
+        let bad = pki("Bad");
+        let hash = spki_sha256(&bad.intermediate).unwrap();
+        let verifier = ChainVerifier::with(webpki(&good.root), [], [("Bad", hash)]);
+        assert!(matches!(
+            verify(
+                &verifier,
+                &good.leaf,
+                &[good.intermediate, bad.intermediate],
+                "vpn.test"
+            ),
+            Err(Error::InvalidCertificate(CertificateError::Revoked))
+        ));
+    }
+
+    /// The real certificates, from crt.sh: each under emSign's G3 root, and
+    /// one cross-signed by AAA Certificate Services. Test-only, so they cost
+    /// the binary nothing.
+    #[test]
+    fn every_emudhra_certificate_is_caught_by_its_key() {
+        let verifier = ChainVerifier::new(webpki(&pki("Unused").root));
+        let fixtures: [(&str, &[u8]); 9] = [
+            (
+                "EM DV TLS CA - G3B",
+                include_bytes!("distrusted/em-dv-tls-g3b.der"),
+            ),
+            (
+                "EM DV TLS CA - G3C",
+                include_bytes!("distrusted/em-dv-tls-g3c.der"),
+            ),
+            (
+                "EM EV TLS CA - G3B",
+                include_bytes!("distrusted/em-ev-tls-g3b.der"),
+            ),
+            (
+                "EM EV TLS CA - G3C",
+                include_bytes!("distrusted/em-ev-tls-g3c.der"),
+            ),
+            (
+                "EM OV TLS CA - G3B",
+                include_bytes!("distrusted/em-ov-tls-g3b.der"),
+            ),
+            (
+                "EM OV TLS CA - G3C",
+                include_bytes!("distrusted/em-ov-tls-g3c.der"),
+            ),
+            (
+                "EM OV CS CA - G3B",
+                include_bytes!("distrusted/em-ov-cs-g3b.der"),
+            ),
+            (
+                "EM OV CS CA - G3C",
+                include_bytes!("distrusted/em-ov-cs-g3c.der"),
+            ),
+            // The same key as the first, under Sectigo's cross-sign.
+            (
+                "EM DV TLS CA - G3B",
+                include_bytes!("distrusted/em-dv-tls-g3b-by-aaa.der"),
+            ),
+        ];
+        for (name, der) in fixtures {
+            assert_eq!(
+                verifier.distrusted_name(&CertificateDer::from_slice(der)),
+                Some(name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_chain_carries_no_distrusted_key() {
+        let verifier = ChainVerifier::new(webpki(&pki("Unused").root));
+        for (name, der) in &LETS_ENCRYPT {
+            assert_eq!(verifier.distrusted_name(der), None, "{name}");
+        }
     }
 
     /// A preloaded certificate that a byte flip or a wrong download had
