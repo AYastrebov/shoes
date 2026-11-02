@@ -20,7 +20,7 @@ use log::{debug, error};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
@@ -287,10 +287,13 @@ impl SocketConnector for SocketConnectorImpl {
                 next_endpoint_index,
                 sni_hostname,
             } => {
-                let domain = match sni_hostname {
-                    Some(s) => s.as_str(),
-                    None => address.address().hostname().unwrap_or("example.com"),
-                };
+                // The certificate is checked against the hop's own address
+                // when no SNI is configured: an IP hop was verified against
+                // "example.com" before, which no certificate matched, or
+                // every one named that way did (upstream cfal/shoes#255).
+                let verification_name =
+                    quic_verification_name(sni_hostname.as_deref(), address.address());
+                let domain = verification_name.as_str();
 
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
@@ -456,8 +459,35 @@ impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
 
 impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 
+/// What a QUIC hop's certificate is checked against: the configured SNI,
+/// else the dialled address itself, hostname or IP literal.
+fn quic_verification_name(sni_hostname: Option<&str>, address: &Address) -> String {
+    match sni_hostname {
+        Some(sni) => sni.to_string(),
+        None => address.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Without an SNI the certificate is checked against the hop itself, an
+    /// IP literal included; before, an IP hop was checked against
+    /// "example.com" (upstream cfal/shoes#255).
+    #[test]
+    fn a_quic_hop_without_sni_is_verified_against_its_own_address() {
+        use crate::address::NetLocation;
+        let name = |addr: &str, sni: Option<&str>| {
+            super::quic_verification_name(sni, NetLocation::from_str(addr, None).unwrap().address())
+        };
+        assert_eq!(name("203.0.113.7:443", None), "203.0.113.7");
+        assert_eq!(name("[2001:db8::7]:443", None), "2001:db8::7");
+        assert_eq!(name("vpn.example.com:443", None), "vpn.example.com");
+        assert_eq!(
+            name("203.0.113.7:443", Some("vpn.example.com")),
+            "vpn.example.com"
+        );
+    }
+
     use super::*;
 
     #[test]
