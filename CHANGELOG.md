@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+**A server that leaves its intermediate out still verifies, when the
+intermediate is Let's Encrypt's.** webpki builds a path only from what
+the server sends, so a leaf sent alone failed with `UnknownIssuer` even
+when valid; a Keenetic router's OpenConnect server does exactly that, with
+a leaf under the new YR1, while its SSTP server sends the whole chain. The
+only way through was a pin with `verify: false`, which breaks at every
+renewal. Let's Encrypt's intermediates now ship in the binary (YR1-YR3,
+YE1-YE3, the cross-signs of Root YR by X1 and Root YE by X2, R10-R14,
+E5-E9; 18 files, 19 KB), and a chain that fails with `UnknownIssuer` is
+tried once more with them after the server's own. Nothing else changes:
+every other verdict is returned as it was, a server that sends its chain
+never reaches the retry, and no root is added, so a chain must still end
+at one in `webpki-roots`. It covers every webpki client, DoT and DoH
+included. AIA fetching and other CAs' intermediates are left out, with
+why, in `docs/specs/2026-11-02-preloaded-intermediates.md`. Tested with a
+generated CA, a check that each shipped certificate chains to a
+compiled-in root, and live against the Keenetic server with no pin.
+
 ## v0.9.4
 
 Upstream fixes and one new obfuscation since 0.9.3; no FFI change. The

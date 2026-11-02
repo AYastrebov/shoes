@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 
 use rustls::pki_types::pem::PemObject;
 
+use crate::tls_intermediates::PreloadingVerifier;
+
 pub fn create_client_config(
     verify_webpki: bool,
     server_fingerprints: &[String],
@@ -28,22 +30,19 @@ pub fn create_client_config(
     };
 
     let builder = if verify_webpki {
-        let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            get_root_cert_store(),
-            get_crypto_provider(),
-        )
-        .build()
-        .unwrap();
+        let webpki_verifier = get_webpki_verifier();
         if !server_fingerprints.is_empty() {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                     supported_algs: get_supported_algorithms(),
                     server_fingerprints: process_fingerprints(server_fingerprints).unwrap(),
-                    webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
+                    webpki_verifier: Some(webpki_verifier),
                 }))
         } else {
-            builder.with_webpki_verifier(webpki_verifier)
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(webpki_verifier)
         }
     } else if !server_fingerprints.is_empty() {
         builder
@@ -87,7 +86,7 @@ pub fn create_client_config(
 pub struct ServerFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
     server_fingerprints: BTreeSet<Vec<u8>>,
-    webpki_verifier: Option<rustls::client::WebPkiServerVerifier>,
+    webpki_verifier: Option<Arc<PreloadingVerifier>>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
@@ -213,6 +212,23 @@ fn get_disabled_verifier() -> Arc<DisabledVerifier> {
         .clone()
 }
 
+/// The webpki verifier every client uses, completing a chain the server
+/// sent short from the preloaded intermediates (`tls_intermediates`).
+fn get_webpki_verifier() -> Arc<PreloadingVerifier> {
+    static INSTANCE: OnceLock<Arc<PreloadingVerifier>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                get_root_cert_store(),
+                get_crypto_provider(),
+            )
+            .build()
+            .unwrap();
+            Arc::new(PreloadingVerifier::lets_encrypt(webpki))
+        })
+        .clone()
+}
+
 fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
     static INSTANCE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
     INSTANCE
@@ -231,7 +247,8 @@ pub fn create_dns_client_config() -> rustls::ClientConfig {
     rustls::ClientConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
         .unwrap()
-        .with_root_certificates((*get_root_cert_store()).clone())
+        .dangerous()
+        .with_custom_certificate_verifier(get_webpki_verifier())
         .with_no_client_auth()
 }
 

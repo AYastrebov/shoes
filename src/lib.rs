@@ -104,6 +104,7 @@ mod sync_adapter;
 mod tcp;
 mod thread_util;
 mod tls_client_handler;
+mod tls_intermediates;
 mod tls_server_handler;
 mod tproxy;
 mod trojan_handler;
