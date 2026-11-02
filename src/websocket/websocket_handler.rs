@@ -61,11 +61,24 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        // An unparseable request is answered too (section 4.2.1), as every
+        // other refusal here is; it was closed on silently.
         let ParsedHttpData {
             first_line,
             headers: mut request_headers,
             stream_reader,
-        } = ParsedHttpData::parse(&mut server_stream).await?;
+        } = match ParsedHttpData::parse(&mut server_stream).await {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Err(refuse(
+                    &mut server_stream,
+                    "400 Bad Request",
+                    "",
+                    format!("unreadable http request: {e}"),
+                )
+                .await);
+            }
+        };
 
         let Some((method, request_path)) = parse_request_line(&first_line) else {
             return Err(refuse(
@@ -99,11 +112,38 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             )
             .await);
         }
+        // Section 4.2.1 item 2 and RFC 9112 section 3.2: exactly one Host.
+        // The parser joins a repeated field into one list, so a comma is a
+        // second Host.
         if request_headers
+            .get("host")
+            .is_none_or(|host| host.trim().is_empty() || host.contains(','))
+        {
+            return Err(refuse(
+                &mut server_stream,
+                "400 Bad Request",
+                "",
+                "missing or repeated host header".to_string(),
+            )
+            .await);
+        }
+        // A missing or repeated version is a malformed request (400); only a
+        // single version this server does not speak is 426 (section 4.4).
+        // A missing one was answered 426 before.
+        let Some(version) = request_headers
             .get("sec-websocket-version")
             .map(|v| v.trim())
-            != Some("13")
-        {
+            .filter(|v| !v.is_empty() && !v.contains(','))
+        else {
+            return Err(refuse(
+                &mut server_stream,
+                "400 Bad Request",
+                "",
+                "missing or repeated websocket version".to_string(),
+            )
+            .await);
+        };
+        if version != "13" {
             // Section 4.4: name the version this server speaks.
             return Err(refuse(
                 &mut server_stream,
@@ -113,12 +153,18 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             )
             .await);
         }
-        let Some(websocket_key) = request_headers.remove("sec-websocket-key") else {
+        // Section 4.2.1 item 5: the key is the base64 of 16 bytes. A
+        // repeated key arrives joined with a comma and fails this too.
+        let Some(websocket_key) = request_headers.remove("sec-websocket-key").filter(|key| {
+            BASE64
+                .decode(key.trim())
+                .is_ok_and(|nonce| nonce.len() == 16)
+        }) else {
             return Err(refuse(
                 &mut server_stream,
                 "400 Bad Request",
                 "",
-                "missing websocket key header".to_string(),
+                "missing or malformed websocket key header".to_string(),
             )
             .await);
         };
@@ -512,6 +558,74 @@ mod tests {
     use super::*;
     use crate::async_stream::testing::TestStream;
     use tokio::io::{AsyncWriteExt, duplex};
+
+    /// Each invalid upgrade gets its HTTP error, flushed, before the close:
+    /// a missing or repeated Host, a missing or repeated version (400, where
+    /// a missing one was 426), a key that is not the base64 of 16 bytes,
+    /// and a request that does not parse. Adapted from upstream cfal/shoes
+    /// ef0e7612's `invalid_upgrades_receive_flushed_http_errors`.
+    #[tokio::test]
+    async fn invalid_upgrades_receive_flushed_http_errors() {
+        use crate::async_stream::test_streams::FlushGatedStream;
+        use tokio::io::AsyncReadExt;
+        let valid = "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        for (case, request, status) in [
+            ("no upgrade", valid.replace("Upgrade: websocket\r\n", ""), "400"),
+            ("no connection", valid.replace("Connection: Upgrade\r\n", ""), "400"),
+            ("no host", valid.replace("Host: example.com\r\n", ""), "400"),
+            (
+                "two hosts",
+                valid.replace("Host: example.com", "Host: example.com\r\nHost: other"),
+                "400",
+            ),
+            ("no version", valid.replace("Sec-WebSocket-Version: 13\r\n", ""), "400"),
+            (
+                "two versions",
+                valid.replace("Version: 13", "Version: 13\r\nSec-WebSocket-Version: 13"),
+                "400",
+            ),
+            ("version 12", valid.replace("Version: 13", "Version: 12"), "426"),
+            ("bad key", valid.replace("dGhlIHNhbXBsZSBub25jZQ==", "invalid"), "400"),
+            (
+                "two keys",
+                valid.replace(
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+                ),
+                "400",
+            ),
+            ("unparseable", "GET / HTTP/1.1\r\nno colon here\r\n\r\n".to_string(), "400"),
+            (
+                "no target",
+                valid.replace("Connection: Upgrade", "Connection: keep-alive, uPgRaDe"),
+                "404",
+            ),
+        ] {
+            let (mut client, server) = duplex(2048);
+            client.write_all(request.as_bytes()).await.unwrap();
+            let result = WebsocketTcpServerHandler::new(vec![])
+                .setup_server_stream(Box::new(FlushGatedStream::new(server)))
+                .await;
+            assert!(result.is_err(), "{case}");
+            let mut response = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.read_to_string(&mut response),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: no response before the close"))
+            .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{case}: {response}"
+            );
+            assert_eq!(
+                response.contains("Sec-WebSocket-Version: 13"),
+                status == "426",
+                "{case}"
+            );
+        }
+    }
 
     /// The same shape that panicked in the HTTPUpgrade server: `GET HTTP/1.1`
     /// passes a prefix test and a suffix test while carrying no request target.
