@@ -550,14 +550,17 @@ The `dns:` block chooses the resolver for everything this TUN session
 resolves: client-chain hostnames on connect, UDP destinations, and the
 WireGuard/AmneziaWG endpoint's re-resolution on tunnel rebuilds. (A
 network-change rebind reuses the already-resolved address; a rebuild
-resolves again.) Without the block, the system resolver is used, as before,
-and never reuses a finished answer, so a failed-over endpoint is followed on
-the next lookup; lookups of one name that overlap share a single system call.
+resolves again.) Without the block, the system resolver is used, as before:
+every lookup asks the OS, so a failed-over endpoint is followed on the next
+lookup, and one stranded by a network change is not shared with later ones.
 
 Outside TUN, a listener without `dns:` reuses a system answer for 60 seconds
-(the OS gives no TTL to honour). An explicit `url: system` server asks the OS
-every time unless it sets `native_cache_secs: N`; that option is for `system`
-only, since the other servers honour record TTLs.
+(the OS gives no TTL to honour), and concurrent lookups of one name share one
+OS call. An explicit `url: system` server asks the OS every time unless it
+sets `native_cache_secs: N`; that option is for `system` only, since the other
+servers honour record TTLs. In a group that also has hickory servers, the
+group is rebuilt after a minute idle, which empties the system cache, so an
+age much over 60 seconds buys little there.
 
 Two TUN-specific rules:
 

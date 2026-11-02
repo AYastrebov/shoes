@@ -68,8 +68,9 @@ pub enum DnsServerSpec {
         #[serde(default = "default_attempts")]
         attempts: usize,
         /// How long a `system` server reuses a completed OS lookup, in
-        /// seconds. `system` only; omitted or 0 caches nothing (lookups in
-        /// flight are still shared). Upstream cfal/shoes#227.
+        /// seconds; concurrent lookups of one name then share one OS call.
+        /// `system` only. Omitted or 0: every lookup asks the OS on its own,
+        /// as before. Upstream cfal/shoes#227.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_cache_secs: Option<u32>,
     },

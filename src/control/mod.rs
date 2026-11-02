@@ -802,7 +802,7 @@ pub async fn run_prepared(
     // line that makes a TUN entry's `dns:` block real. Without the block,
     // get_for_tun(None) answers a fresh uncached system resolver -- the
     // pre-`dns:` TUN behaviour, kept because the caching default would
-    // pin WireGuard endpoints to a dead address for up to an hour.
+    // pin WireGuard endpoints to a dead address for its 60-second age.
     #[cfg(any(unix, windows))]
     let result = {
         let tun_resolver = dns_registry.get_for_tun(tun_config.dns.as_ref());

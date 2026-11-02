@@ -74,8 +74,11 @@
 
 # Native OS lookup memoization is separate from the hickory tuning above and
 # from DNS record TTLs. A listener without `dns:` reuses an OS answer for 60
-# seconds; an explicit `url: system` reuses nothing unless it sets an age.
-# Concurrent lookups of one name share one OS call either way.
+# seconds; an explicit `url: system` asks the OS every time unless it sets an
+# age. Where answers are reused, concurrent lookups of one name also share
+# one OS call. In a group that also has hickory servers, the group is rebuilt
+# after a minute idle, which empties this cache, so an age much over 60
+# seconds buys little there.
 - dns_group: native-short-cache
   dns_servers:
     - url: system
