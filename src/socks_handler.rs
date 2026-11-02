@@ -145,10 +145,14 @@ pub async fn setup_socks_server_stream_inner(
 
     let method_len = stream_reader.read_u8(&mut server_stream).await? as usize;
     if method_len < 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+        // No method offered is no acceptable method: answered X'FF', as
+        // below, rather than a silent close.
+        return Err(refuse(
+            &mut server_stream,
+            &[VER_SOCKS5, METHOD_INVALID],
             format!("Invalid method length: {method_len}"),
-        ));
+        )
+        .await);
     }
 
     let methods = stream_reader
@@ -179,20 +183,26 @@ pub async fn setup_socks_server_stream_inner(
     server_stream.flush().await?;
 
     if let Some((target_username, target_password)) = auth_info {
+        // A malformed RFC 1929 request is a failed login: a failure status,
+        // then the close, as for wrong credentials. These closed silently.
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
         if auth_version != VER_AUTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unsupported SOCKS auth version",
-            ));
+            return Err(refuse(
+                &mut server_stream,
+                &[VER_AUTH, RESULT_FAILURE],
+                "Unsupported SOCKS auth version".to_string(),
+            )
+            .await);
         }
 
         let username_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if username_len == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unsupported SOCKS username length",
-            ));
+            return Err(refuse(
+                &mut server_stream,
+                &[VER_AUTH, RESULT_FAILURE],
+                "Unsupported SOCKS username length".to_string(),
+            )
+            .await);
         }
 
         let username = stream_reader
@@ -203,10 +213,12 @@ pub async fn setup_socks_server_stream_inner(
 
         let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if password_len == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unsupported SOCKS password length",
-            ));
+            return Err(refuse(
+                &mut server_stream,
+                &[VER_AUTH, RESULT_FAILURE],
+                "Unsupported SOCKS password length".to_string(),
+            )
+            .await);
         }
 
         let password = stream_reader
@@ -831,6 +843,22 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
 /// The SOCKS5 address form of `location`, which other protocols here share.
 /// A hostname is length-prefixed with one byte, so one over 255 bytes is an
 /// error rather than a length that wraps and misframes everything after it.
+/// Answer a handshake the server will not go on with, then hand back the
+/// error to close on. The reply is best effort and bounded: a client that
+/// is not reading must not hold the connection open (upstream cfal/shoes
+/// 212d50ca bounds its failure replies the same way).
+async fn refuse(stream: &mut Box<dyn AsyncStream>, reply: &[u8], reason: String) -> std::io::Error {
+    let _ = tokio::time::timeout(REFUSAL_REPLY_TIMEOUT, async {
+        write_all(stream, reply).await?;
+        stream.flush().await
+    })
+    .await;
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, reason)
+}
+
+/// How long a refusal reply may take to send.
+const REFUSAL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>> {
     let (address, port) = location.components();
     let mut vec = match address {
@@ -962,6 +990,35 @@ mod tests {
         let (reply, result) = server_reply(credentials, &[0x05, 0x01, METHOD_NONE]).await;
         assert!(result.is_err());
         assert_eq!(reply, [0x05, 0xFF]);
+    }
+
+    /// Malformed negotiation is answered before the close, not closed on
+    /// silently: no method offered gets X'FF' (RFC 1928), and a bad auth
+    /// version or an empty username or password a failure status (RFC 1929).
+    /// Rows from upstream cfal/shoes 212d50ca's
+    /// `negative_negotiation_replies_are_flushed_before_close`.
+    #[tokio::test]
+    async fn malformed_negotiation_is_answered_before_the_close() {
+        let credentials = || Some(("user".to_string(), "pass".to_string()));
+        let (reply, result) = server_reply(None, &[0x05, 0x00]).await;
+        assert!(result.is_err());
+        assert_eq!(reply, [0x05, 0xFF], "no method offered");
+
+        let login = [0x05, 0x01, METHOD_USERNAME];
+        for (case, auth) in [
+            (
+                "bad auth version",
+                &[0x02, 4, b'u', b's', b'e', b'r', 4, b'p', b'a', b's', b's'][..],
+            ),
+            ("empty username", &[0x01, 0, 4, b'p', b'a', b's', b's'][..]),
+            ("empty password", &[0x01, 4, b'u', b's', b'e', b'r', 0][..]),
+        ] {
+            let mut request = login.to_vec();
+            request.extend_from_slice(auth);
+            let (reply, result) = server_reply(credentials(), &request).await;
+            assert!(result.is_err(), "{case}");
+            assert_eq!(reply, [0x05, METHOD_USERNAME, 0x01, 0x01], "{case}");
+        }
     }
 
     /// RFC 1929: a failed login is answered with a non-zero status.
