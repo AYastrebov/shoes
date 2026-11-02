@@ -432,9 +432,14 @@ where
                 // Extract components from CryptoTlsStream
                 let (io, session) = tls_stream.into_inner();
 
-                // Create VISION stream (will send VLESS response automatically on first write)
+                // Create VISION stream (will send VLESS response automatically on first write).
+                // XUDP frames are not TLS: each write is padded whole, as the
+                // client's are and Xray's VisionWriter does. The record search
+                // held back a reply ending in a byte that could begin a TLS
+                // record (upstream cfal/shoes 947704ea, 2c8472f3).
                 let vision_stream =
-                    VisionStream::new_server(io, session, user_uuid, unparsed_data)?;
+                    VisionStream::new_server(io, session, user_uuid, unparsed_data)?
+                        .pad_whole_writes();
 
                 // Wrap VISION stream in XUDP stream
                 let xudp_stream = XudpMessageStream::new(Box::new(vision_stream), resolver.clone());
