@@ -106,6 +106,40 @@ not in a strict client.
   server with no pin and `verify` left on: all four checks pass. The same
   config on v0.9.4 fails all four with `UnknownIssuer`.
 
+## Distrusted intermediates
+
+The same verifier refuses a chain that carries one of eight known-bad
+keys. In October 2026 eight eMudhra intermediates were found to have
+private keys that are small integers, recoverable from the public
+certificate in under a second; anyone holding one can sign a certificate
+for any name. Browsers blocked them by revocation (Mozilla's OneCRL,
+Chrome's CRLSet) and eMudhra revoked them on 2026-10-18. shoes checks no
+revocation, so a revoked intermediate under a trusted root would still
+verify here.
+
+`webpki-roots` 1.0.9 to 1.0.11 hold none of the roots these chain to
+(emSign Root TLS CA - G3, emSign Root CS CA - G3, and Sectigo's AAA
+Certificate Services, which cross-signs each), so shoes was most likely
+not exposed. The list makes that independent of the root set.
+
+- **The list** is Go's `distrustedSPKIHashes` (`crypto/x509/verify.go`,
+  golang/go#82345, commit `7f86f957`): the SHA-256 of each certificate's
+  DER `SubjectPublicKeyInfo`. Each hash was checked against the
+  certificate fetched from crt.sh, including one AAA cross-sign, which has
+  the same key. Matching the key rather than the certificate covers every
+  copy.
+- **The check** runs before path building, over the leaf and every
+  certificate the server sent: shoes never fetches an intermediate, so a
+  chain through a distrusted one can only use one the server presented.
+  Any match fails with `CertificateError::Revoked` and a warning naming
+  the CA, never the key.
+- **Tests**: a chain that verifies is refused once its intermediate's key
+  is listed; a listed intermediate sent beside a good one still refuses
+  the chain; each of the nine real certificates (test-only fixtures, not in
+  the binary) is caught; no preloaded Let's Encrypt certificate is.
+  Planted defects: checking the leaf only turns two red, and one wrong hex
+  digit turns the fixture test red.
+
 ## Upkeep
 
 Let's Encrypt announces new intermediates ahead of use. When it does, add

@@ -135,17 +135,14 @@ Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
   sends a leaf from one alone fails with `UnknownIssuer` again until they
   are added. R10-R14 and E5-E9 expire on 2027-03-12, the Y generation on
   2028-09-02. Other CAs are not covered at all (see the spec for why).
-- **No revocation, and no distrust beyond the root list.** Clients trust
-  what `webpki-roots` lists and check neither CRLs nor OCSP, and nothing
-  mirrors the browsers' intermediate block lists (Mozilla's OneCRL). When
-  six eMudhra intermediates were found with trivially weak keys in
-  October 2026, browsers blocked them within days by revocation, not by
-  removing the root, and `webpki-roots` 1.0.11 still lists eMudhra's
-  emSign roots; if those intermediates chain to one of them, a certificate
-  forged with one of their keys would verify here (not checked). A
-  deny-list of known-bad intermediates by SPKI hash, applied in the same
-  verifier, would close the known cases; CRLite-style revocation would
-  close the class and is much larger.
+- **No revocation.** Clients trust what `webpki-roots` lists and check
+  neither CRLs nor OCSP, and nothing follows the browsers' intermediate
+  block lists (Mozilla's OneCRL, Chrome's CRLSet). The one known case is
+  handled by hand: the eight eMudhra intermediates with public keys
+  (October 2026) are refused by SPKI hash in `src/tls_intermediates/`
+  (`DISTRUSTED_SPKI_SHA256`, Go's list). The next such incident needs the
+  same edit, and a revoked intermediate nobody lists still verifies.
+  CRLite-style revocation would close the class and is much larger.
 
 - **hickory is pinned to a git fork** (2026-11-02, DNS cache port). The
   `[patch.crates-io]` entries take hickory-net, -proto and -resolver from
