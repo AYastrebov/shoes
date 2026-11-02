@@ -43,6 +43,29 @@ neither path), and the fixes already made here independently (Snell's
 16-byte salts, bracketed IPv6, macOS reload notifications, the XUDP
 session echo).
 
+**Fixes from upstream's unmerged work, ported.** A second pass looked
+past upstream's master, at its open hardening PR (#149) and its
+`fix/protocol-correctness` branch, against this tree; most of it was
+already fixed here. What changed:
+- TUIC: the reply fragmenter subtracted the header from the peer's
+  datagram size unchecked, so a peer advertising a small one could divide
+  by zero, an abort in a mobile build; a reply needing more than 255
+  fragments wrapped the count. Both are now Hysteria2's rule: no room is
+  an error, too many fragments drops that reply;
+- TUIC and Hysteria2: a reply over the path's current datagram size ended
+  the association's reply loop, leaving it one-way; that reply is now
+  dropped, and the size is read per reply rather than once;
+- TUIC and Hysteria2: no cap on UDP associations per connection, each a
+  socket and a task the client opens by choosing an id; now 4096, as
+  upstream (#149). A failed socket drops the packet rather than ending
+  the loop;
+- TUIC in `quic` relay mode: a blocked or unresolvable UDP destination
+  closed the whole connection, TCP streams included; it drops the packet;
+- AnyTLS server: no cap on streams per session; past 256 a SYN gets an
+  error SYNACK and a FIN (#149);
+- VLESS: an addon field length near u64::MAX wrapped the bounds check in
+  release builds and panicked on the slice, after authentication (#149).
+
 **A repeatable live check, and the first live runs of the OpenConnect and
 mieru clients against real servers.** `tests/live_socks.rs` drives the
 built binary with any client config that fronts an outbound with a SOCKS
