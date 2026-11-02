@@ -63,10 +63,11 @@ const MAX_UDP_SESSIONS: usize = 4096;
 /// A connection's associations, and the slots that bound how many it has.
 ///
 /// A slot is taken before an association's routing and DNS are awaited and
-/// travels inside the session's reply worker, so it comes back once that
-/// worker is gone however the session went (swept, removed, dropped after
-/// losing an insert race), and not while a blocked worker still holds its
-/// socket. A count checked
+/// shared by the session and its reply worker, so it comes back only once
+/// both are gone: not while a blocked worker still holds its socket after
+/// the session left (swept, removed, dropped after losing an insert race),
+/// and not while the session still holds its socket after the worker
+/// ended on an error. A count checked
 /// before those awaits was not a bound: concurrent uni streams could all see
 /// room and all insert.
 struct UdpSessions {
@@ -453,6 +454,9 @@ struct UdpSession {
     /// credit) held its socket and its slot on regardless. `None` only in
     /// tests.
     task: Option<tokio::task::AbortHandle>,
+    /// This association's place under MAX_UDP_SESSIONS, shared with the
+    /// reply worker; see `UdpSessions`. `None` only in tests.
+    _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 /// A session's reply loop ends with it, however it leaves: swept, removed
@@ -640,15 +644,17 @@ impl UdpSession {
         parent_cancel_token: &CancellationToken,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
+        let slot = Arc::new(slot);
+        let worker_slot = Arc::clone(&slot);
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
         let send_socket = client_socket.clone();
         let worker_cancel_token = session_cancel_token.clone();
 
-        // The slot lives in the worker, so it comes back when the worker is
-        // gone, not merely when the session leaves the map.
+        // The worker holds the slot too, so it comes back only once both the
+        // worker and the session are gone.
         let task = crate::connections::spawn(async move {
-            let _slot = slot;
+            let _slot = worker_slot;
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 connection,
@@ -667,6 +673,7 @@ impl UdpSession {
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token,
             task: Some(task.abort_handle()),
+            _slot: Some(slot),
         }
     }
 
@@ -678,15 +685,17 @@ impl UdpSession {
         parent_cancel_token: &CancellationToken,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
+        let slot = Arc::new(slot);
+        let worker_slot = Arc::clone(&slot);
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
         let send_socket = client_socket.clone();
         let worker_cancel_token = session_cancel_token.clone();
 
-        // The slot lives in the worker, so it comes back when the worker is
-        // gone, not merely when the session leaves the map.
+        // The worker holds the slot too, so it comes back only once both the
+        // worker and the session are gone.
         let task = crate::connections::spawn(async move {
-            let _slot = slot;
+            let _slot = worker_slot;
             if let Err(e) = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
@@ -705,6 +714,7 @@ impl UdpSession {
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token,
             task: Some(task.abort_handle()),
+            _slot: Some(slot),
         }
     }
 
@@ -1635,6 +1645,7 @@ mod sweep_tests {
                 .expect("an idle time the clock can hold"),
             cancel_token: parent.child_token(),
             task: None,
+            _slot: None,
         }
     }
 
@@ -1654,14 +1665,16 @@ mod sweep_tests {
         let held: Vec<_> = (1..MAX_UDP_SESSIONS)
             .map(|_| sessions.slots.clone().try_acquire_owned().unwrap())
             .collect();
-        let slot = sessions.slots.clone().try_acquire_owned().unwrap();
+        let slot = Arc::new(sessions.slots.clone().try_acquire_owned().unwrap());
+        let worker_slot = Arc::clone(&slot);
         // Ignores its token, as a worker parked in `open_uni` does.
         let worker = tokio::spawn(async move {
-            let _slot = slot;
+            let _slot = worker_slot;
             std::future::pending::<()>().await;
         });
         let mut session = detached_session(&parent, Duration::ZERO);
         session.task = Some(worker.abort_handle());
+        session._slot = Some(slot);
         sessions.insert(7, session);
 
         assert!(
@@ -1676,6 +1689,41 @@ mod sweep_tests {
         assert!(
             sessions.slots.clone().try_acquire_owned().is_ok(),
             "the slot came back with the worker"
+        );
+        drop(held);
+    }
+
+    /// A worker that ends on its own (an error, such as a datagram too small
+    /// for a reply header) leaves the slot held while the association is
+    /// still registered with its socket; it comes back when the association
+    /// goes. With the slot in the worker alone, a peer could end workers
+    /// that way under new ids and keep their sockets past the cap.
+    #[tokio::test]
+    async fn a_worker_that_ends_first_leaves_the_slot_with_its_association() {
+        let parent = CancellationToken::new();
+        let sessions = UdpSessions::new();
+        let held: Vec<_> = (1..MAX_UDP_SESSIONS)
+            .map(|_| sessions.slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        let slot = Arc::new(sessions.slots.clone().try_acquire_owned().unwrap());
+        let worker_slot = Arc::clone(&slot);
+        let worker = tokio::spawn(async move {
+            let _slot = worker_slot;
+        });
+        let mut session = detached_session(&parent, Duration::ZERO);
+        session.task = Some(worker.abort_handle());
+        session._slot = Some(slot);
+        sessions.insert(7, session);
+
+        worker.await.unwrap();
+        assert!(
+            sessions.slots.clone().try_acquire_owned().is_err(),
+            "the registered association still holds its slot"
+        );
+        sessions.remove(&7);
+        assert!(
+            sessions.slots.clone().try_acquire_owned().is_ok(),
+            "the slot came back with the association"
         );
         drop(held);
     }
