@@ -1840,6 +1840,24 @@ fn validate_client_proxy_config(
             }
             validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
 
+            // Vision's first padded write carries the VLESS header and must
+            // go out as one TLS record; a buffer limit smaller than that
+            // split it, and a queued KeyUpdate reply ate into the same
+            // budget (upstream cfal/shoes 40e8f568, 438866c2). The server
+            // side already has this floor; other TLS clients keep any size.
+            if tls_config.vision
+                && let Some(size) = tls_config.tls_buffer_size
+                && size < MIN_TLS_BUFFER_SIZE
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "TLS buffer size must be at least {MIN_TLS_BUFFER_SIZE} with vision \
+                         (got {size})"
+                    ),
+                ));
+            }
+
             validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
         }
 
@@ -3207,6 +3225,24 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// A Vision client's TLS buffer has the server's floor; a plain TLS
+    /// client keeps whatever size it sets.
+    #[test]
+    fn a_vision_client_tls_buffer_under_the_floor_is_refused() {
+        let config = |vision: bool, size: usize| -> ClientProxyConfig {
+            serde_yaml::from_str(&format!(
+                "type: tls\nvision: {vision}\ntls_buffer_size: {size}\nprotocol: \
+                 {{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0}}"
+            ))
+            .unwrap()
+        };
+        let pems = HashMap::new();
+        let err = validate_client_proxy_config(&mut config(true, 4096), &pems).unwrap_err();
+        assert!(err.to_string().contains("with vision"), "{err}");
+        validate_client_proxy_config(&mut config(true, MIN_TLS_BUFFER_SIZE), &pems).unwrap();
+        validate_client_proxy_config(&mut config(false, 4096), &pems).unwrap();
     }
 
     mod quic_outbounds {
