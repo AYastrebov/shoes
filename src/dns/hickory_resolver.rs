@@ -333,9 +333,10 @@ fn net_error(error: hickory_resolver::net::NetError) -> std::io::Error {
 mod tests {
     use super::*;
 
-    /// A lookup that times out or finds no connection makes the refreshing
-    /// resolver rebuild and retry once; a server's NXDOMAIN does not. The
-    /// kinds are what the refresh policy reads (upstream cfal/shoes#242).
+    /// A lookup that times out, finds no connection, or loses its connection
+    /// mid-request makes the refreshing resolver rebuild and retry once; a
+    /// server's NXDOMAIN does not. The kinds are what the refresh policy
+    /// reads (upstream cfal/shoes#242).
     #[tokio::test]
     async fn hostname_lookup_refreshes_only_transport_failures() {
         use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};
@@ -350,13 +351,19 @@ mod tests {
         enum Failure {
             Timeout,
             NoConnections,
+            ConnectionClosed,
             NxDomain,
         }
 
         let location = NetLocation::from_str("recovery.example.:443", None).unwrap();
         let expected_addresses: [SocketAddr; 1] = ["198.51.100.7:443".parse().unwrap()];
 
-        for failure in [Failure::Timeout, Failure::NoConnections, Failure::NxDomain] {
+        for failure in [
+            Failure::Timeout,
+            Failure::NoConnections,
+            Failure::ConnectionClosed,
+            Failure::NxDomain,
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
@@ -371,6 +378,15 @@ mod tests {
                 } else {
                     None
                 };
+                // Reads the query and hangs up without answering, so the
+                // request is in flight when its connection dies.
+                if matches!(failure, Failure::ConnectionClosed) {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u16().await.unwrap();
+                    let mut bytes = vec![0; length as usize];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    drop(stream);
+                }
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let length = stream.read_u16().await.unwrap();
                 let mut bytes = vec![0; length as usize];
@@ -441,7 +457,7 @@ mod tests {
                     assert_eq!(error.kind(), std::io::ErrorKind::Other);
                     assert_eq!(builds.load(Ordering::Relaxed), 1);
                 }
-                Failure::Timeout | Failure::NoConnections => {
+                Failure::Timeout | Failure::NoConnections | Failure::ConnectionClosed => {
                     assert_eq!(result.unwrap(), expected_addresses);
                     assert_eq!(builds.load(Ordering::Relaxed), 2);
                     assert_eq!(
@@ -453,6 +469,98 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    /// A lookup after the server closed an idle connection gets an answer,
+    /// as when a network change kills an encrypted resolver's idle
+    /// connection. Hickory notices this close and reconnects with or without
+    /// the fork pinned in Cargo.toml; the fork's fix is for a close racing a
+    /// request into the exchange, which its own tests cover and
+    /// `a_closed_connection_is_a_kind_the_refresh_policy_reads` maps.
+    #[tokio::test]
+    async fn a_lookup_after_the_server_closed_an_idle_connection_is_answered() {
+        use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};
+        use hickory_resolver::proto::{
+            op::Message,
+            rr::{RData, Record, rdata},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn answer_one(stream: &mut tokio::net::TcpStream) {
+            let length = stream.read_u16().await.unwrap();
+            let mut bytes = vec![0; length as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let mut reply = Message::from_vec(&bytes).unwrap().into_response();
+            reply.add_answer(Record::from_rdata(
+                reply.queries[0].name.clone(),
+                60,
+                RData::A(rdata::A("198.51.100.7".parse().unwrap())),
+            ));
+            let bytes = reply.to_vec().unwrap();
+            stream.write_u16(bytes.len() as u16).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            // The first connection answers once, then the server closes it
+            // while it is idle.
+            let (mut first, _) = listener.accept().await.unwrap();
+            answer_one(&mut first).await;
+            drop(first);
+            let _ = closed_tx.send(());
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move { answer_one(&mut stream).await });
+            }
+        }));
+
+        let factory: ResolverFactory = Arc::new(move || {
+            Box::pin(async move {
+                let bootstrap: Arc<dyn ShoesResolver> =
+                    Arc::new(crate::resolver::NativeResolver::new());
+                let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                    bootstrap.clone(),
+                ));
+                let options = HickoryResolverOptions {
+                    ip_strategy: IpStrategy::Ipv4Only,
+                    request_timeout: Some(Duration::from_millis(500)),
+                    attempts: 0,
+                    ..Default::default()
+                };
+                let resolver = HickoryResolver::tcp(address, chain, bootstrap, options)?;
+                Ok(Arc::new(resolver) as Arc<dyn ShoesResolver>)
+            })
+        });
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(3600),
+                max_age: Duration::from_secs(3600),
+                retry_after_failure: Duration::from_secs(1),
+                retry_once_after_refresh: true,
+            },
+            "closed idle connection regression".into(),
+        )
+        .await
+        .unwrap();
+
+        let first = NetLocation::from_str("first.example.:443", None).unwrap();
+        resolver.resolve_location(&first).await.unwrap();
+        closed_rx.await.unwrap();
+        // Let the client side see the close before the next request.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second = NetLocation::from_str("second.example.:443", None).unwrap();
+        let answer =
+            tokio::time::timeout(Duration::from_secs(3), resolver.resolve_location(&second))
+                .await
+                .expect("the second lookup finished")
+                .expect("the second lookup was answered");
+        assert_eq!(answer, ["198.51.100.7:443".parse::<SocketAddr>().unwrap()]);
+        drop(server);
     }
 
     /// DN-D1: every hickory-backed resolver randomises the query name's case.
@@ -468,6 +576,24 @@ mod tests {
         )
         .unwrap();
         assert!(resolver.inner.options().case_randomization);
+    }
+
+    /// A connection that dies under a request is `NetError::ConnectionClosed`
+    /// with the hickory fork pinned in Cargo.toml (hickory-dns/hickory-dns
+    /// #3861, upstream cfal/shoes#222), where stock 0.26.3 said `Busy` or a
+    /// string cancellation that nothing retried. It must reach the refresh
+    /// policy as a kind it reads, and `Busy` must stay one it does not.
+    #[test]
+    fn a_closed_connection_is_a_kind_the_refresh_policy_reads() {
+        use hickory_resolver::net::NetError;
+        assert_eq!(
+            net_error(NetError::ConnectionClosed).kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            net_error(NetError::Busy).kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

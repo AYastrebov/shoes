@@ -361,3 +361,12 @@ panic = "abort"
 # bounds, fast-retransmit retry, zero-window probe timers, scaled-window clamp) and
 # two commits preserving ACK sequencing during retransmission (upstream cfal/shoes#197).
 smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "042e568bfa39d0f111a23a4718ec257e474fd1e7" }
+# A DNS connection that dies drops its in-flight requests; stock hickory 0.26.3
+# reports them with a string cancellation that neither its server pool nor our
+# RefreshingResolver recognises, so the lookup fails instead of failing over
+# or rebuilding. This is hickory 0.26.3 plus hickory-dns/hickory-dns#3861
+# (still open upstream), reporting NetError::ConnectionClosed and carrying H3
+# closes through pool failover, as upstream cfal/shoes#222 pins it.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
