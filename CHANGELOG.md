@@ -66,6 +66,29 @@ already fixed here. What changed:
 - VLESS: an addon field length near u64::MAX wrapped the bounds check in
   release builds and panicked on the slice, after authentication (#149).
 
+The rest of that pass, correctness rather than crashes:
+- REALITY: debug logs no longer carry the handshake key and IV, Finished
+  verify data, master secret, expected HMAC or the client's short id
+  (#149); exported mobile logs carried them;
+- AnyTLS server: authentication padding of 32-64 KiB was refused (read in
+  one 32 KiB buffer), and a client naming no padding scheme was not sent
+  ours, as anytls-go's server does;
+- Vision+XUDP server: writes are padded whole, as the client's are; a
+  reply ending in a byte that could begin a TLS record waited for the
+  next one;
+- Shadowsocks: an oversized first message left a partial chunk in the
+  stream ahead of the next message; it is refused before encryption. An
+  AEAD-2022 server writing before the request was read aborted on an
+  assert; it is an error;
+- SOCKS: malformed negotiation (no method, bad auth version, empty
+  username or password) is answered before the close, not closed on;
+- WebSocket server: an unparseable request, a missing or repeated Host or
+  version, and a malformed key get 400 (a missing version got 426);
+- config: a Vision TLS client's `tls_buffer_size` must be at least 16384,
+  the server's floor; a smaller one split Vision's first record.
+`write_all` also fails with WriteZero on a write that takes nothing,
+rather than looping.
+
 **A repeatable live check, and the first live runs of the OpenConnect and
 mieru clients against real servers.** `tests/live_socks.rs` drives the
 built binary with any client config that fronts an outbound with a SOCKS
