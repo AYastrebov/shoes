@@ -71,3 +71,17 @@
     - masks: "0.0.0.0/0"
       action: allow
       client_chain: dns-tunnel
+
+# Native OS lookup memoization is separate from the hickory tuning above and
+# from DNS record TTLs. A listener without `dns:` reuses an OS answer for 60
+# seconds; an explicit `url: system` reuses nothing unless it sets an age.
+# Concurrent lookups of one name share one OS call either way.
+- dns_group: native-short-cache
+  dns_servers:
+    - url: system
+      native_cache_secs: 15
+
+- dns_group: native-no-cache
+  dns_servers:
+    - url: system
+      native_cache_secs: 0
