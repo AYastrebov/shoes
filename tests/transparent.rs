@@ -140,17 +140,28 @@ fn spawn_shoes_as_nobody(dir: &Path, config: &Path, transparent: bool) -> Child 
         // In a directory from `capable_dir`, or the capability is ignored.
         run(&format!("setcap cap_net_raw+ep {}", bin.display()));
     }
-    Child(
-        Command::new(&bin)
-            .arg("--no-reload")
-            .arg(config)
-            .uid(NOBODY)
-            .gid(NOBODY)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    )
+    let mut command = Command::new(&bin);
+    command
+        .arg("--no-reload")
+        .arg(config)
+        .uid(NOBODY)
+        .gid(NOBODY)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // The copy was open for writing a moment ago, and a test on another
+    // thread that forks in that moment holds the descriptor until its child
+    // execs: exec of the copy then fails with ETXTBSY (rust-lang/rust#114554).
+    // The window is short, so a few retries ride it out.
+    for _ in 0..50 {
+        match command.spawn() {
+            Ok(child) => return Child(child),
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawning shoes as nobody: {e}"),
+        }
+    }
+    panic!("the copy of shoes stayed busy (ETXTBSY) for a second");
 }
 
 /// Wait until `shoes` is listening on `addr`.
