@@ -270,7 +270,7 @@ impl ShoesResolver for HickoryResolver {
                     elapsed,
                     e
                 );
-                std::io::Error::other(format!("DNS lookup failed: {e}"))
+                net_error(e)
             })?;
 
             let addrs: Vec<SocketAddr> = response
@@ -310,9 +310,150 @@ impl ShoesResolver for HickoryResolver {
     }
 }
 
+/// A hickory transport failure as an `io::Error` whose kind says what
+/// happened. Every failure was `Other` before, so `RefreshingResolver`'s
+/// refresh-and-retry, which reads the kind, never saw a timeout or a lost
+/// connection, and a DoT or DoH resolver whose connection had died stayed
+/// dead until it idled out (upstream cfal/shoes#242). A refusal from the
+/// server (NXDOMAIN and the like) stays `Other`: nothing to refresh for.
+fn net_error(error: hickory_resolver::net::NetError) -> std::io::Error {
+    use hickory_resolver::net::NetError;
+    let kind = match &error {
+        NetError::Timeout => std::io::ErrorKind::TimedOut,
+        NetError::Io(error) => error.kind(),
+        NetError::Busy => std::io::ErrorKind::WouldBlock,
+        NetError::NoConnections => std::io::ErrorKind::NotConnected,
+        _ if error.is_connection_closed() => std::io::ErrorKind::ConnectionAborted,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup that times out or finds no connection makes the refreshing
+    /// resolver rebuild and retry once; a server's NXDOMAIN does not. The
+    /// kinds are what the refresh policy reads (upstream cfal/shoes#242).
+    #[tokio::test]
+    async fn hostname_lookup_refreshes_only_transport_failures() {
+        use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};
+        use hickory_resolver::proto::{
+            op::{Message, ResponseCode},
+            rr::{RData, Record, rdata},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Timeout,
+            NoConnections,
+            NxDomain,
+        }
+
+        let location = NetLocation::from_str("recovery.example.:443", None).unwrap();
+        let expected_addresses: [SocketAddr; 1] = ["198.51.100.7:443".parse().unwrap()];
+
+        for failure in [Failure::Timeout, Failure::NoConnections, Failure::NxDomain] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                // Keeps the unanswered connection open so the lookup fails by
+                // timeout, not EOF.
+                let _unanswered_connection = if matches!(failure, Failure::Timeout) {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u16().await.unwrap();
+                    let mut bytes = vec![0; length as usize];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    Some(stream)
+                } else {
+                    None
+                };
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u16().await.unwrap();
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let mut reply = Message::from_vec(&bytes).unwrap().into_response();
+                if matches!(failure, Failure::NxDomain) {
+                    reply.metadata.response_code = ResponseCode::NXDomain;
+                } else {
+                    reply.add_answer(Record::from_rdata(
+                        reply.queries[0].name.clone(),
+                        60,
+                        RData::A(rdata::A("198.51.100.7".parse().unwrap())),
+                    ));
+                }
+                let bytes = reply.to_vec().unwrap();
+                stream.write_u16(bytes.len() as u16).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }));
+            let builds = Arc::new(AtomicUsize::new(0));
+            let factory_builds = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                let generation = factory_builds.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    let bootstrap: Arc<dyn ShoesResolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                        bootstrap.clone(),
+                    ));
+                    let options = HickoryResolverOptions {
+                        ip_strategy: IpStrategy::Ipv4Only,
+                        request_timeout: Some(Duration::from_millis(250)),
+                        attempts: 0,
+                        ..Default::default()
+                    };
+                    let resolver = if matches!(failure, Failure::NoConnections) && generation == 0 {
+                        HickoryResolver::build_pooled(
+                            vec![],
+                            chain,
+                            bootstrap,
+                            options,
+                            "empty test pool".into(),
+                        )?
+                    } else {
+                        HickoryResolver::tcp(address, chain, bootstrap, options)?
+                    };
+                    Ok(Arc::new(resolver) as Arc<dyn ShoesResolver>)
+                })
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(3600),
+                    max_age: Duration::from_secs(3600),
+                    retry_after_failure: Duration::from_secs(1),
+                    retry_once_after_refresh: true,
+                },
+                "hostname refresh regression".into(),
+            )
+            .await
+            .unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), resolver.resolve_location(&location))
+                    .await
+                    .unwrap();
+            match failure {
+                Failure::NxDomain => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert_eq!(builds.load(Ordering::Relaxed), 1);
+                }
+                Failure::Timeout | Failure::NoConnections => {
+                    assert_eq!(result.unwrap(), expected_addresses);
+                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                    assert_eq!(
+                        resolver.resolve_location(&location).await.unwrap(),
+                        expected_addresses
+                    );
+                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                }
+            }
+            server.await.unwrap();
+        }
+    }
 
     /// DN-D1: every hickory-backed resolver randomises the query name's case.
     #[tokio::test]
