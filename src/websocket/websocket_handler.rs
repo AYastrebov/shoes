@@ -572,16 +572,41 @@ mod tests {
         String::from_utf8(request[..n].to_vec()).unwrap()
     }
 
+    /// An inner handler that takes the upgraded stream as it is.
+    #[derive(Debug)]
+    struct AcceptsStream;
+
+    #[async_trait]
+    impl TcpClientHandler for AcceptsStream {
+        async fn setup_client_tcp_stream(
+            &self,
+            client_stream: Box<dyn AsyncStream>,
+            _remote_location: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            Ok(TcpClientSetupResult {
+                client_stream,
+                early_data: None,
+            })
+        }
+    }
+
     /// The client's verdict on a 101 whose headers are `extra_headers`,
     /// with a correct Sec-WebSocket-Accept computed from the key it sent.
     async fn client_verdict_on_101(extra_headers: &str) -> std::io::Result<()> {
+        client_verdict_on_101_with(extra_headers, Box::new(NeverCalled)).await
+    }
+
+    async fn client_verdict_on_101_with(
+        extra_headers: &str,
+        inner: Box<dyn TcpClientHandler>,
+    ) -> std::io::Result<()> {
         let handler = WebsocketTcpClientHandler::new(
             "proxy.example.com:443".to_string(),
             Some("/ws".to_string()),
             None,
             WebsocketPingType::default(),
             None,
-            Box::new(NeverCalled),
+            inner,
         );
         let (near, mut far) = duplex(8192);
         let task = tokio::spawn(async move {
@@ -612,6 +637,22 @@ mod tests {
 
     /// A 101 without `Upgrade: websocket` or without `Connection: Upgrade`
     /// is not an upgrade (RFC 6455 §4.1), however good its accept key.
+    /// `Connection` is list-valued and may arrive as two fields; a 101 with
+    /// `Connection: Upgrade` on one line and `keep-alive` on another is a
+    /// valid upgrade, as is one with both in a single field.
+    #[tokio::test]
+    async fn a_101_with_the_connection_field_split_in_two_is_accepted() {
+        for headers in [
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nConnection: keep-alive\r\n",
+            "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n",
+            "Connection: keep-alive\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+        ] {
+            client_verdict_on_101_with(headers, Box::new(AcceptsStream))
+                .await
+                .unwrap_or_else(|e| panic!("{headers:?}: {e}"));
+        }
+    }
+
     #[tokio::test]
     async fn a_101_without_the_upgrade_headers_is_refused() {
         let err = client_verdict_on_101("Connection: Upgrade\r\n")

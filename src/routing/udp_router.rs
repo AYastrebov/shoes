@@ -472,11 +472,17 @@ impl<'a> UdpRouter<'a> {
         let mut remote_writes_progress = false;
 
         loop {
-            self.cancel_closed_routes();
-
             // Read packet from server directly into pool buffer
             let mut read_buf = ReadBuf::new(&mut buf);
-            let packet = match self.server.poll_read_message(cx, &mut read_buf) {
+            let polled = self.server.poll_read_message(cx, &mut read_buf);
+            // The stream learns of an End while it is polled, so the routes
+            // it closed are dropped now, whatever the poll returned: an
+            // End-only read returns Pending, and a drain before the poll
+            // would leave the remote and its budget held until some later
+            // wakeup, with a new route for the same client refused against
+            // the old one's share.
+            self.cancel_closed_routes();
+            let packet = match polled {
                 Poll::Ready(Ok(p)) => {
                     server_read_progress = true;
                     debug!(
