@@ -280,6 +280,11 @@ pub struct DnsConfigGroup {
     pub dns_group: String,
     #[serde(alias = "dns_server")]
     pub dns_servers: NoneOrSome<DnsServerSpec>,
+    /// Fake IP for every listener that names this group: one pool, shared,
+    /// so a client's DNS and its connections may reach different listeners.
+    /// A TUN keeps its own `fake_ip` key and cannot name such a group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fake_ip: Option<super::tun::FakeIpConfig>,
 }
 
 /// DNS configuration for servers.
@@ -288,8 +293,17 @@ pub struct DnsConfigGroup {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
-    #[serde(alias = "server")]
+    #[serde(default, alias = "server")]
     pub servers: NoneOrSome<DnsServerSpec>,
+    /// Fake IP for this listener alone: a pool of its own, whatever group
+    /// `servers` names. A TUN's top-level `fake_ip` is an alias of this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fake_ip: Option<super::tun::FakeIpConfig>,
+    /// The registry's name for this block's own pool, assigned by
+    /// validation (`__fake_ip_N`), so the pool's identity is the config and
+    /// not the number of times a resolver was asked for. Never in YAML.
+    #[serde(skip)]
+    pub fake_ip_context: Option<String>,
 }
 
 impl DnsConfig {
@@ -359,6 +373,8 @@ impl DnsBootstrap {
 pub struct ExpandedDnsGroup {
     pub name: String,
     pub specs: Vec<ExpandedDnsSpec>,
+    /// The group's own fake IP settings; listeners naming it share one pool.
+    pub fake_ip: Option<super::tun::FakeIpConfig>,
 }
 
 #[cfg(test)]
@@ -512,6 +528,8 @@ servers: my-dns-group
     fn test_dns_config_resolved_group() {
         // After validation, servers should be a single group name
         let config = DnsConfig {
+            fake_ip: None,
+            fake_ip_context: None,
             servers: NoneOrSome::One(DnsServerSpec::Simple("my-resolved-group".to_string())),
         };
         assert_eq!(config.resolved_group(), Some("my-resolved-group"));

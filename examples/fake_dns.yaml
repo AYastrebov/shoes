@@ -1,0 +1,31 @@
+# Fake IP on SOCKS listeners (see CONFIG.md, "Fake IP on listeners").
+#
+# DNS that reaches shoes through a listener (SOCKS UDP ASSOCIATE to port 53,
+# for one) is answered with addresses from a private range; a connection to
+# one of them is routed by the name it stands for, so hostname rules match
+# and the proxy resolves the name at the far end.
+
+# One pool shared by both listeners below.
+- dns_group: fake-dns
+  dns_servers: "udp://1.1.1.1"
+  fake_ip:
+    network: "198.18.0.0/16"
+    bypass_domains: ["*.lan"]
+
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  dns:
+    servers: fake-dns
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+
+- address: "127.0.0.1:8080"
+  protocol:
+    type: http
+  dns:
+    servers: fake-dns

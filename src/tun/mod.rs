@@ -38,7 +38,6 @@
     reason = "predates the lint; see the [lints] note in Cargo.toml"
 )]
 
-mod dns_tcp;
 mod stack_common;
 mod tcp_conn;
 #[cfg(unix)]
@@ -69,8 +68,8 @@ use tokio::task::JoinHandle;
 use crate::address::NetLocation;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::selection::ConfigSelection;
-use crate::config::{FakeIpConfig, RuleConfig, TunConfig};
-use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpResponder};
+use crate::config::{RuleConfig, TunConfig};
+use crate::dns::fake_ip::{self, FakeIpPool, FakeIpResponder};
 use crate::option_util::NoneOrSome;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
@@ -385,7 +384,7 @@ pub async fn run_tun_server(
                     if let Some(responder) = fake_ip_responder
                         && remote_addr.port() == fake_ip::DNS_PORT
                     {
-                        if let Err(e) = dns_tcp::handle_dns_over_tcp(
+                        if let Err(e) = fake_ip::handle_dns_over_tcp(
                             traffic::TrafficCountingStream::new(new_conn.connection),
                             target,
                             responder,
@@ -691,27 +690,6 @@ pub async fn start_tun_server(
     Ok(handle)
 }
 
-/// Build the Fake IP responder for one TUN session.
-///
-/// Errors here are config errors and are reported as such; `validate` already
-/// rejects the same inputs, so reaching an error at this point means the config
-/// was not validated.
-fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpResponder>> {
-    let network = FakeIpNetwork::parse(&config.network)?;
-    let pool = Arc::new(FakeIpPool::new(network, config.max_entries)?);
-    let bypass = BypassList::new(config.bypass_domains.iter(), config.bypass_defaults);
-
-    info!(
-        "Fake IP enabled: network={}, capacity={}, bypass_patterns={}, local names bypassed={}",
-        network,
-        pool.capacity(),
-        config.bypass_domains.len(),
-        config.bypass_defaults
-    );
-
-    Ok(Arc::new(FakeIpResponder::new(pool, bypass)))
-}
-
 /// Run TUN server from config with external shutdown control.
 ///
 /// `resolver` reaches everything in the session that resolves: the
@@ -767,15 +745,12 @@ pub async fn run_tun_from_config(
         tun_server_config = tun_server_config.destination(dest);
     }
 
-    // Built here rather than in run_tun_server so it lives exactly as long as
-    // one TUN session. A process-lifetime singleton would carry one VPN
-    // session's mappings into the next, which on mobile means a restart could
-    // resolve a stale address to the wrong domain.
-    let fake_ip_responder = config
-        .fake_ip
-        .as_ref()
-        .map(build_fake_ip_responder)
-        .transpose()?;
+    // The responder is the resolver's: the registry built one per TUN
+    // session for the TUN's own `fake_ip` (an alias of its dns block's), or
+    // the group's shared one when the TUN names a group with a pool. It
+    // lives as long as the registry, one engine start, so a restart does not
+    // carry a session's mappings into the next.
+    let fake_ip_responder = resolver.fake_ip().cloned();
 
     // Resolved once per TUN session rather than per connection.
     let sniff = config.sniff.as_ref().and_then(|s| s.to_settings());
@@ -1143,9 +1118,10 @@ mod tests {
         );
         let configs: Vec<crate::config::Config> = serde_yaml::from_str(&yaml).unwrap();
         let validated = crate::config::create_server_configs(configs).unwrap();
-        let registry = crate::dns::build_dns_registry(validated.dns_groups)
-            .await
-            .unwrap();
+        let registry =
+            crate::dns::build_dns_registry(validated.dns_groups, validated.inline_fake_ips)
+                .await
+                .unwrap();
         let mut registry = registry;
         let tun = validated
             .configs

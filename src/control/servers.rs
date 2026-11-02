@@ -84,10 +84,11 @@ pub async fn prepare_servers(configs: Vec<Config>) -> Result<PreparedServers, Pr
     let ValidatedConfigs {
         configs,
         dns_groups,
+        inline_fake_ips,
         outbounds,
     } = create_server_configs(configs).map_err(PrepareError::Validation)?;
 
-    let dns_registry = build_dns_registry(dns_groups)
+    let dns_registry = build_dns_registry(dns_groups, inline_fake_ips)
         .await
         .map_err(PrepareError::Dns)?;
 

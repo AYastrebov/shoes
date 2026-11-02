@@ -130,7 +130,7 @@ impl crate::async_stream::SocketPassthrough for H2MuxServerStream {}
 impl AsyncStream for H2MuxServerStream {}
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::unwrap_used, reason = "tests")]
     use super::*;
     use crate::h2mux::h2mux_stream::H2MuxStream;
@@ -142,7 +142,7 @@ mod tests {
 
     /// One h2 stream between a client and an `H2MuxServerStream`, with the
     /// client's receive window set to `receive_window` bytes.
-    async fn stream_pair(
+    pub(crate) async fn stream_pair(
         receive_window: u32,
         drivers: &mut JoinSet<()>,
     ) -> (H2MuxServerStream, h2::RecvStream, h2::SendStream<Bytes>) {
@@ -182,7 +182,7 @@ mod tests {
         )
     }
 
-    async fn read_response_body(response: &mut h2::RecvStream) -> Vec<u8> {
+    pub(crate) async fn read_response_body(response: &mut h2::RecvStream) -> Vec<u8> {
         let mut body = Vec::new();
         while let Some(chunk) = response.data().await {
             let chunk = chunk.unwrap();

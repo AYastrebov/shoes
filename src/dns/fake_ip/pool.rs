@@ -34,6 +34,18 @@ pub const DEFAULT_MAX_ENTRIES: usize = 8192;
 /// that cannot honour it answers with the real address instead.
 pub const MIN_REUSE_AGE: Duration = Duration::from_secs(600);
 
+/// How often a live flow to a fake address marks its mapping used: once a
+/// minute, well inside [`MIN_REUSE_AGE`], rather than a pool lock per
+/// datagram. A mapping can therefore look this much older than its last
+/// use, which bounds how long a session keyed by a fake address may idle.
+pub const MAPPING_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The longest a UDP session keyed by a fake address may sit idle: the
+/// reuse guard, less the slack the throttled refresh leaves. Past it, the
+/// address may already belong to another name.
+pub const MAX_SESSION_IDLE: Duration =
+    Duration::from_secs(MIN_REUSE_AGE.as_secs() - MAPPING_REFRESH_INTERVAL.as_secs());
+
 /// The smallest prefix accepted. Anything wider is almost certainly a typo, and
 /// the pool would reserve a quarter of the IPv4 space.
 const MIN_PREFIX_LEN: u8 = 8;
@@ -279,6 +291,28 @@ impl FakeIpPool {
             mapping.last_used = Instant::now();
         }
         Some(domain)
+    }
+
+    /// Mark the mapping behind `ip` used, as [`lookup`](Self::lookup) does,
+    /// without reading the domain out. A router keeps a live session's fake
+    /// address fresh with this, so the reuse guard sees it in use and does
+    /// not hand it to another name while the client still sends to it.
+    ///
+    /// Returns whether `ip` stands for a domain, so a caller that must refuse
+    /// an unmapped address takes the lock once.
+    pub fn touch(&self, ip: Ipv4Addr) -> bool {
+        if !self.is_fake_ip(ip) {
+            return false;
+        }
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let Some(domain) = state.ip_to_domain.get(&ip) else {
+            return false;
+        };
+        if let Some(mapping) = state.domain_to_ip.get_mut(domain.as_ref()) {
+            mapping.last_used = Instant::now();
+        }
+        true
     }
 
     /// True if `ip` is in the pool's range but stands for no domain: never
