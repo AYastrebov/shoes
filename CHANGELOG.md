@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+**Ten defects fixed upstream since the fork diverged, ported.** The fork
+and cfal/shoes parted on 2026-08-10 and both rewrote the same subsystems,
+so a merge is not possible and no upstream patch applies as it is; each
+of upstream's fixes since v0.3.0 was judged against this tree and the
+ones whose defect is here were redone, with upstream's regression tests
+where they fit and tests of our own where they did not. What changed:
+- h2mux: a frame partly written under backpressure survived the reader's
+  padding transition no longer, and a write with credit for the status
+  byte alone reported zero bytes instead of waiting (#174);
+- DNS: a timeout or a lost connection on a DoT or DoH resolver became an
+  error of kind Other, which the refreshing resolver's retry does not
+  read, so the resolver stayed dead until it idled out (#242);
+- TLS: a QUIC hop given by IP with no SNI was verified against
+  "example.com"; the WebSocket client took any 101 with a good accept
+  key for an upgrade, without the Upgrade and Connection headers (#255);
+- Vision: a write stopped by backpressure lost the TLS recognition and
+  fell back to END where DIRECT was due; DIRECT was allowed for any TLS
+  1.3 suite but one, now the four Xray and Mihomo allow; the ServerHello
+  parser read past the message into a coalesced next one (#187);
+- SOCKS5: the client sent greeting, credentials and CONNECT in one burst,
+  which servers such as Cloudflare WARP's local proxy drop, and now waits
+  for each reply; our SOCKS, mixed and WebSocket inbounds and ShadowTLS
+  flush their handshake replies, so a client that waits is not stalled
+  (#192); one round trip more through a SOCKS upstream;
+- REALITY: bytes read along with the ClientHello were dropped, on
+  fallback and before the handshake (#165, the preread part);
+- XUDP: a client session sending to two destinations had the second's
+  packets sent to the first's remote, and a reused session id landed on
+  the old one; every (session, destination) pair is now its own route,
+  closed when the client ends the session, at most 1024 per stream;
+- TUN: smoltcp comes from the cfal fork, 0.14.0 plus the upstream smoltcp
+  TCP fixes since and two commits preserving ACK sequencing during
+  retransmission (#197).
+Not ported, with why: upstream's native DNS cache rework (an
+improvement, not a defect), its TLS record ownership rewrite beyond the
+preread bytes (inferred, not observed), its REALITY rustls fork, lost
+TLS writer wakeups and AnyTLS stale-session recovery (our code has
+neither path), and the fixes already made here independently (Snell's
+16-byte salts, bracketed IPv6, macOS reload notifications, the XUDP
+session echo).
+
 **A repeatable live check, and the first live runs of the OpenConnect and
 mieru clients against real servers.** `tests/live_socks.rs` drives the
 built binary with any client config that fronts an outbound with a SOCKS

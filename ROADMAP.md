@@ -88,6 +88,30 @@ the plan's status table says which PR closed what.
   - PH-2: a TLS listener with no default target refuses an unknown name;
   - PH-3: the HTTP proxy is silent on an origin-form `GET`.
 
+## Upstream: cfal/shoes
+
+This repository forked [cfal/shoes](https://github.com/cfal/shoes) and the
+two lines parted on 2026-08-10 (merge base `7a5a8ee`). Measured on
+2026-11-02: this line 581 commits ahead, upstream 116 (v0.3.0 to v0.3.6),
+162 files changed on both sides, a trial merge with 151 conflicts and
+not one upstream patch that applies as it is. Upstream became a desktop
+and server project (its Android and iOS packaging removed in its #207, a
+rustls fork for REALITY, XHTTP, Sudoku masking, ACME, a Clash API,
+url-test and fallback groups, rule sources, its own WireGuard, Hysteria2
+and TUIC clients, a managed Linux TUN); this line has shoesd, the
+mobile FFI, AmneziaWG, SSTP, OpenConnect, mieru and TPROXY. A merge is
+not coming back.
+
+What is done instead: upstream's fix commits are judged one by one
+against this tree, and a defect that is here is fixed here, with
+upstream's regression tests where they fit. The 2026-11-02 pass covered
+everything to upstream `dd2f370a` and ported ten (the changelog lists
+them). Left as not applying: the DNS cache rework (an improvement), the
+TLS record ownership rewrite beyond the preread bytes, the rustls-fork
+REALITY fixes, lost TLS writer wakeups and AnyTLS stale-session recovery
+(neither path exists here). The remote is `upstream`; the next pass
+starts from `git log dd2f370a..upstream/master`.
+
 ## Recorded debt
 
 Known and deliberately left, so that nobody rediscovers it as a surprise.
