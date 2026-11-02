@@ -66,6 +66,12 @@ pub async fn write_all<T: AsyncWriteExt + Unpin>(
     let n = buf.len();
     while i < n {
         let n = stream.write(&buf[i..]).await?;
+        // A stream that takes nothing from a non-empty buffer will take
+        // nothing again: without this the loop spun forever. Same error as
+        // tokio's write_all, and as upstream's TLS writer (de3139b4).
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
         i += n;
     }
     Ok(())
@@ -171,6 +177,40 @@ pub const MAX_INFLIGHT_PER_LISTENER: usize = 4096;
 
 #[cfg(test)]
 mod tests {
+    /// A write that accepts nothing is an error, not an endless loop.
+    #[tokio::test]
+    async fn write_all_to_a_stream_that_takes_nothing_is_write_zero() {
+        struct TakesNothing;
+        impl tokio::io::AsyncWrite for TakesNothing {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(0))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::write_all(&mut TakesNothing, b"data"),
+        )
+        .await
+        .expect("write_all returned rather than spinning");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WriteZero);
+    }
+
     use super::*;
 
     /// Seconds, not milliseconds. Protocols compare this against a peer's
