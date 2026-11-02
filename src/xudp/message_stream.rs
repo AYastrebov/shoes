@@ -15,7 +15,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
-    AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage,
+    AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage, MessageSessionId,
 };
 use crate::resolver::{Resolver, ResolverCache};
 
@@ -35,6 +35,30 @@ use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork, dec
 /// buffer and its own XUDP writer skips anything over 8192 - 666
 /// (common/xudp/xudp.go, PacketWriter.WriteMultiBuffer).
 const MAX_RESPONSE_LEN: usize = 8192 - 666;
+
+/// Routes open at once across every wire session of one stream: a client
+/// sending to a new destination past this has its packet dropped, since
+/// each route is a remote socket (upstream cfal/shoes, "bound XUDP
+/// destination routes").
+pub(crate) const MAX_XUDP_ROUTES: usize = 1024;
+
+/// One of the client's sessions, as the wire names it, and the routes it
+/// has been given: one per destination it sends to.
+///
+/// A session id belongs to the client, and one session may carry packets to
+/// several destinations (a Keep frame names one). The router keeps one
+/// remote per id it is told, rule-checked for that remote's destination,
+/// so reporting every destination under the one wire id sent the second
+/// destination's packets to the first destination's remote, and a reused
+/// wire id landed on the old remote (upstream cfal/shoes, "isolate XUDP
+/// routing sessions"). Each (wire session, destination) pair is its own
+/// route id to the router; the wire id is put back on the response.
+struct WireSession {
+    /// The target of the last frame that named one, for Keep frames that
+    /// carry no address.
+    target: NetLocation,
+    routes: HashMap<NetLocation, MessageSessionId>,
+}
 
 /// A decoded payload frame: the client's session id, the payload, and the
 /// target as the client named it (may be a hostname).
@@ -54,9 +78,16 @@ pub struct XudpMessageStream {
     /// Write buffer for outgoing XUDP frames
     write_buffer: BytesMut,
 
-    /// Open sessions: the client's session id -> the target of its last
-    /// frame, used by Keep frames that carry no address.
-    sessions: HashMap<u16, NetLocation>,
+    /// Open wire sessions by the client's session id.
+    wire_sessions: HashMap<u16, WireSession>,
+
+    /// Every open route, back to its wire session.
+    routes: HashMap<MessageSessionId, u16>,
+
+    /// Routes whose wire session the client ended, for the router to drop.
+    closed_routes: VecDeque<MessageSessionId>,
+
+    next_route_id: MessageSessionId,
 
     /// Resolver cache for hostname targets
     resolver_cache: ResolverCache,
@@ -76,7 +107,10 @@ impl XudpMessageStream {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
             write_buffer: BytesMut::with_capacity(65536),
-            sessions: HashMap::new(),
+            wire_sessions: HashMap::new(),
+            routes: HashMap::new(),
+            closed_routes: VecDeque::new(),
+            next_route_id: 1,
             resolver_cache: ResolverCache::new(resolver),
             incoming_frame: None,
             is_eof: false,
@@ -96,6 +130,55 @@ impl XudpMessageStream {
         );
         self.read_buffer.extend_from_slice(data);
         Ok(())
+    }
+
+    /// The client ended a session: its routes are closed and handed to the
+    /// router, so no response and no reuse of the id reaches them.
+    fn close_wire_session(&mut self, wire_session_id: u16) {
+        let Some(session) = self.wire_sessions.remove(&wire_session_id) else {
+            return;
+        };
+        for route in session.routes.into_values() {
+            self.routes.remove(&route);
+            self.closed_routes.push_back(route);
+        }
+    }
+
+    fn start_wire_session(&mut self, wire_session_id: u16, target: NetLocation) {
+        self.close_wire_session(wire_session_id);
+        self.wire_sessions.insert(
+            wire_session_id,
+            WireSession {
+                target,
+                routes: HashMap::new(),
+            },
+        );
+    }
+
+    /// The route for a packet of `wire_session_id` to `target`, made on
+    /// first use. `None` when the session is not open or the stream is at
+    /// its route limit: the packet is dropped, and said so.
+    fn admit_route(
+        &mut self,
+        wire_session_id: u16,
+        target: &NetLocation,
+    ) -> Option<MessageSessionId> {
+        let session = self.wire_sessions.get_mut(&wire_session_id)?;
+        if let Some(route) = session.routes.get(target) {
+            return Some(*route);
+        }
+        if self.routes.len() >= MAX_XUDP_ROUTES {
+            log::warn!(
+                "[XUDP READ] Dropping a packet for new destination {target} at the \
+                 {MAX_XUDP_ROUTES}-route limit"
+            );
+            return None;
+        }
+        let route = self.next_route_id;
+        self.next_route_id = self.next_route_id.checked_add(1)?;
+        session.routes.insert(target.clone(), route);
+        self.routes.insert(route, wire_session_id);
+        Some(route)
     }
 
     /// Queue an End for a session the client keeps using but this side does
@@ -143,7 +226,7 @@ impl XudpMessageStream {
 
             match metadata.status {
                 SessionStatus::End => {
-                    self.sessions.remove(&metadata.session_id);
+                    self.close_wire_session(metadata.session_id);
                     continue;
                 }
                 SessionStatus::KeepAlive => continue,
@@ -161,22 +244,22 @@ impl XudpMessageStream {
                             "New frame without a target",
                         )
                     })?;
-                    self.sessions.insert(metadata.session_id, target);
+                    self.start_wire_session(metadata.session_id, target);
                 }
                 SessionStatus::Keep => {
                     if data.is_none() {
                         continue;
                     }
-                    if !self.sessions.contains_key(&metadata.session_id) {
+                    let Some(session) = self.wire_sessions.get_mut(&metadata.session_id) else {
                         log::debug!(
                             "[XUDP READ] Keep for unknown session {}, answering End",
                             metadata.session_id
                         );
                         self.queue_end(metadata.session_id)?;
                         continue;
-                    }
+                    };
                     if let Some(target) = metadata.target {
-                        self.sessions.insert(metadata.session_id, target);
+                        session.target = target;
                     }
                 }
             }
@@ -193,7 +276,7 @@ impl XudpMessageStream {
                 continue;
             };
 
-            let target = self.sessions[&metadata.session_id].clone();
+            let target = self.wire_sessions[&metadata.session_id].target.clone();
             return Ok(Some(InboundFrame {
                 session_id: metadata.session_id,
                 data: data.to_vec(),
@@ -254,7 +337,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
         let this = self.get_mut();
 
         loop {
@@ -279,6 +362,12 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 }
             };
 
+            // The route is admitted before the name resolves, so a packet
+            // the stream cannot carry is dropped without a lookup.
+            let Some(route) = this.admit_route(frame.session_id, &frame.target) else {
+                continue;
+            };
+
             let socket_addr = match this.resolver_cache.poll_resolve_location(cx, &frame.target) {
                 Poll::Ready(Ok(addr)) => addr,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -297,8 +386,12 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             }
 
             buf.put_slice(&frame.data);
-            return Poll::Ready(Ok((frame.session_id, socket_addr)));
+            return Poll::Ready(Ok((route, socket_addr)));
         }
+    }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        self.closed_routes.pop_front()
     }
 }
 
@@ -338,7 +431,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
     fn poll_write_session_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        session_id: u16,
+        session_id: MessageSessionId,
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
@@ -350,11 +443,17 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             ready!(self.as_mut().poll_flush_message(cx))?;
         }
 
+        // A route the client has ended gets no response.
+        let Some(&wire_session_id) = self.routes.get(&session_id) else {
+            log::debug!("[XUDP SESSION WRITE] Dropping a response for closed route {session_id}");
+            return Poll::Ready(Ok(()));
+        };
+
         if buf.len() > MAX_RESPONSE_LEN {
             log::debug!(
                 "[XUDP SESSION WRITE] Dropping a {}-byte response for session {}: over {MAX_RESPONSE_LEN}",
                 buf.len(),
-                session_id
+                wire_session_id
             );
             return Poll::Ready(Ok(()));
         }
@@ -364,7 +463,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
         };
         let metadata = FrameMetadata {
-            session_id,
+            session_id: wire_session_id,
             status: SessionStatus::Keep,
             option: FrameOption::new().with_data(),
             target: Some(NetLocation::new(address, target.port())),
@@ -418,7 +517,7 @@ mod tests {
         NetLocation::new(Address::Ipv4("1.1.1.1".parse().unwrap()), 53)
     }
 
-    async fn read(stream: &mut XudpMessageStream) -> (u16, SocketAddr, Vec<u8>) {
+    async fn read(stream: &mut XudpMessageStream) -> (MessageSessionId, SocketAddr, Vec<u8>) {
         let mut storage = vec![0u8; 65535];
         let mut buf = ReadBuf::new(&mut storage);
         let (id, addr) =
@@ -466,10 +565,10 @@ mod tests {
         assert_eq!(stream.read_buffer.len(), whole.len() - 3);
     }
 
-    /// Two client sessions to one destination stay two sessions, each under
-    /// the client's id, and a response comes back as a Keep under that id.
-    /// Before, ids were invented per destination and mux.cool clients dropped
-    /// every response.
+    /// Two client sessions to one destination stay two routes, and a
+    /// response written under a route comes back as a Keep under the
+    /// client's own id for it. Before, ids were invented per destination
+    /// and mux.cool clients dropped every response.
     #[tokio::test]
     async fn the_clients_session_ids_are_reported_and_echoed() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
@@ -486,13 +585,18 @@ mod tests {
             .unwrap();
 
         let source: SocketAddr = "1.1.1.1:53".parse().unwrap();
-        assert_eq!(read(&mut stream).await, (7, source, b"a".to_vec()));
-        assert_eq!(read(&mut stream).await, (9, source, b"b".to_vec()));
-        assert_eq!(read(&mut stream).await, (7, source, b"c".to_vec()));
+        let (route_7, got_source, data) = read(&mut stream).await;
+        assert_eq!((got_source, data), (source, b"a".to_vec()));
+        let (route_9, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"b");
+        assert_ne!(route_7, route_9, "two client sessions are two routes");
+        assert_eq!(read(&mut stream).await, (route_7, source, b"c".to_vec()));
 
-        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 9, b"reply", &source))
-            .await
-            .unwrap();
+        poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_session_message(cx, route_9, b"reply", &source)
+        })
+        .await
+        .unwrap();
 
         let mut written = BytesMut::new();
         written.resize(64, 0);
@@ -519,8 +623,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (id, _, data) = read(&mut stream).await;
-        assert_eq!((id, data.as_slice()), (6, &b"ok"[..]));
+        let (_, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"ok");
 
         let mut written = BytesMut::new();
         written.resize(64, 0);
@@ -550,13 +654,19 @@ mod tests {
         let (near, mut far) = tokio::io::duplex(1 << 16);
         let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
         let source: SocketAddr = "1.1.1.1:53".parse().unwrap();
-
-        let too_big = vec![0u8; MAX_RESPONSE_LEN + 1];
-        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 1, &too_big, &source))
+        far.write_all(&frame_for(1, SessionStatus::New, Some(dns_server()), b"q"))
             .await
             .unwrap();
+        let (route, _, _) = read(&mut stream).await;
+
+        let too_big = vec![0u8; MAX_RESPONSE_LEN + 1];
+        poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_session_message(cx, route, &too_big, &source)
+        })
+        .await
+        .unwrap();
         let fits = vec![0u8; MAX_RESPONSE_LEN];
-        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, 1, &fits, &source))
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_session_message(cx, route, &fits, &source))
             .await
             .unwrap();
         drop(stream);
@@ -567,5 +677,166 @@ mod tests {
         FrameMetadata::decode(&mut written).unwrap().unwrap();
         assert_eq!(written.get_u16() as usize, MAX_RESPONSE_LEN);
         assert_eq!(written.len(), MAX_RESPONSE_LEN);
+    }
+
+    /// One client session sending to two destinations is two routes, each
+    /// rule-checked and connected for its own destination by the router;
+    /// a response under either goes out under the one wire id. Before, the
+    /// second destination's packets went to the first destination's remote
+    /// (upstream cfal/shoes, "isolate XUDP routing sessions").
+    #[tokio::test]
+    async fn two_destinations_on_one_wire_session_are_two_routes() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
+        let other = NetLocation::new(Address::Ipv4("9.9.9.9".parse().unwrap()), 53);
+
+        far.write_all(&frame_for(3, SessionStatus::New, Some(dns_server()), b"a"))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(
+            3,
+            SessionStatus::Keep,
+            Some(other.clone()),
+            b"b",
+        ))
+        .await
+        .unwrap();
+        far.write_all(&frame_for(3, SessionStatus::Keep, Some(dns_server()), b"c"))
+            .await
+            .unwrap();
+
+        let (route_a, source_a, _) = read(&mut stream).await;
+        let (route_b, source_b, _) = read(&mut stream).await;
+        let (route_c, _, _) = read(&mut stream).await;
+        assert_eq!(source_a, "1.1.1.1:53".parse().unwrap());
+        assert_eq!(source_b, "9.9.9.9:53".parse().unwrap());
+        assert_ne!(route_a, route_b, "a second destination is a second route");
+        assert_eq!(route_a, route_c, "the same destination is the same route");
+
+        poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_session_message(cx, route_b, b"reply", &source_b)
+        })
+        .await
+        .unwrap();
+        let mut written = BytesMut::new();
+        written.resize(64, 0);
+        let n = far.read(&mut written).await.unwrap();
+        written.truncate(n);
+        let metadata = FrameMetadata::decode(&mut written).unwrap().unwrap();
+        assert_eq!(metadata.session_id, 3, "the response carries the wire id");
+        assert_eq!(metadata.target, Some(other));
+    }
+
+    /// An End closes every route of the session: the router is told, and a
+    /// response under a closed route is dropped, so a reused id cannot
+    /// reach the old remote (upstream cfal/shoes, "cancel closed XUDP
+    /// routes").
+    #[tokio::test]
+    async fn an_end_closes_the_sessions_routes() {
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
+        let other = NetLocation::new(Address::Ipv4("9.9.9.9".parse().unwrap()), 53);
+
+        far.write_all(&frame_for(4, SessionStatus::New, Some(dns_server()), b"a"))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(4, SessionStatus::Keep, Some(other), b"b"))
+            .await
+            .unwrap();
+        let (route_a, source, _) = read(&mut stream).await;
+        let (route_b, _, _) = read(&mut stream).await;
+        assert!(stream.take_closed_session().is_none());
+
+        far.write_all(&frame_for(4, SessionStatus::End, None, b""))
+            .await
+            .unwrap();
+        far.write_all(&frame_for(
+            4,
+            SessionStatus::New,
+            Some(dns_server()),
+            b"again",
+        ))
+        .await
+        .unwrap();
+        let (route_again, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"again");
+        let mut closed = [
+            stream.take_closed_session().unwrap(),
+            stream.take_closed_session().unwrap(),
+        ];
+        closed.sort();
+        let mut expected = [route_a, route_b];
+        expected.sort();
+        assert_eq!(closed, expected, "both routes of the ended session");
+        assert!(stream.take_closed_session().is_none());
+        assert!(
+            !expected.contains(&route_again),
+            "the reused id is a new route"
+        );
+
+        poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_session_message(cx, route_a, b"late", &source)
+        })
+        .await
+        .unwrap();
+        poll_fn(|cx| {
+            Pin::new(&mut stream).poll_write_session_message(cx, route_again, b"ok", &source)
+        })
+        .await
+        .unwrap();
+        drop(stream);
+        let mut written = Vec::new();
+        far.read_to_end(&mut written).await.unwrap();
+        let mut written = BytesMut::from(&written[..]);
+        let metadata = FrameMetadata::decode(&mut written).unwrap().unwrap();
+        assert_eq!(metadata.session_id, 4);
+        assert_eq!(
+            &written[..],
+            b"\x00\x02ok",
+            "only the live route's response went out"
+        );
+    }
+
+    /// Past the route limit a packet for a new destination is dropped and
+    /// the stream carries on; one for a known destination still arrives.
+    #[tokio::test]
+    async fn a_new_destination_past_the_route_limit_is_dropped() {
+        let (near, mut far) = tokio::io::duplex(1 << 20);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
+        far.write_all(&frame_for(
+            1,
+            SessionStatus::New,
+            Some(dns_server()),
+            b"first",
+        ))
+        .await
+        .unwrap();
+        let mut frames = BytesMut::new();
+        for i in 1..=MAX_XUDP_ROUTES as u32 {
+            let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i);
+            frames.extend_from_slice(&frame_for(
+                1,
+                SessionStatus::Keep,
+                Some(NetLocation::new(Address::Ipv4(ip), 53)),
+                b"x",
+            ));
+        }
+        frames.extend_from_slice(&frame_for(
+            1,
+            SessionStatus::Keep,
+            Some(dns_server()),
+            b"known",
+        ));
+        far.write_all(&frames).await.unwrap();
+
+        let (_, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"first");
+        // The limit admits 1024 routes in all; the first destination holds one.
+        for _ in 1..MAX_XUDP_ROUTES {
+            let (_, _, data) = read(&mut stream).await;
+            assert_eq!(data, b"x");
+        }
+        let (_, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"known", "the one past the limit was dropped");
     }
 }

@@ -11,6 +11,7 @@ use tokio_util::time::{DelayQueue, delay_queue};
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncMessageStream;
+use crate::async_stream::MessageSessionId;
 
 /// Session identifier - incrementing counter, never reused
 pub(super) type SessionKey = usize;
@@ -29,7 +30,7 @@ pub(super) enum LookupKey {
     /// For Targeted streams: use destination
     Destination(NetLocation),
     /// For SessionBased streams: use protocol session_id
-    SessionId(u16),
+    SessionId(MessageSessionId),
 }
 
 /// Session lookup strategy - determined by server stream type
@@ -37,7 +38,7 @@ pub(super) enum SessionLookup {
     /// For Targeted: destination -> KeyState
     ByDestination(FxHashMap<NetLocation, KeyState>),
     /// For SessionBased: session_id -> KeyState
-    BySessionId(FxHashMap<u16, KeyState>),
+    BySessionId(FxHashMap<MessageSessionId, KeyState>),
 }
 
 /// A routing session (one per unique flow)
@@ -46,7 +47,7 @@ pub(super) struct RoutingSession {
     pub(super) destination: NetLocation,
 
     /// The session's session id if this is a session UDP stream
-    pub(super) session_id: u16,
+    pub(super) session_id: MessageSessionId,
 
     /// Resolved address for response source field
     pub(super) resolved_addr: SocketAddr,
@@ -90,7 +91,7 @@ pub(super) struct RoutingSession {
 impl RoutingSession {
     pub(super) fn new(
         destination: NetLocation,
-        session_id: u16,
+        session_id: MessageSessionId,
         resolved_addr: SocketAddr,
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
