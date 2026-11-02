@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.9.4
+
+Upstream fixes and one new obfuscation since 0.9.3; no FFI change. The
+WireGuard outbound reaches Phobos servers through a `phobos:` block
+(#151). DNS shares system lookups in flight and keeps native answers for
+60 seconds, with `native_cache_secs` on an explicit `url: system` server;
+hickory comes from cfal's 0.26.3 fork for its closed-connection failover
+(#148). Upstream's fixes are ported in three passes (#145 to #147, #150):
+crashes and unbounded resources in TUIC, AnyTLS, VLESS and the UDP
+sessions, and correctness in REALITY, AnyTLS, Vision, Shadowsocks, SOCKS
+and WebSocket. One refuses a config accepted before: a Vision TLS
+client's `tls_buffer_size` below 16384.
 
 **WireGuard reaches Phobos servers.** A `phobos:` block on the `wireguard`
 outbound speaks the obfuscation a
