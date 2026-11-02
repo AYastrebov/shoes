@@ -305,7 +305,7 @@ fn udp_asks_for_mux_under_the_vision_flow() {
 /// a Vision XUDP session, under its target; the reply comes back through it.
 #[tokio::test]
 async fn udp_rides_the_vision_flow_as_xudp() {
-    udp_round_trip(b"query").await;
+    udp_round_trip(b"query", b"answer").await;
 }
 
 /// A datagram ending in a byte that could begin a TLS record is still sent
@@ -313,13 +313,23 @@ async fn udp_rides_the_vision_flow_as_xudp() {
 /// does, rather than holding the tail back for a record that never comes.
 #[tokio::test]
 async fn a_datagram_ending_in_a_tls_prefix_is_sent_whole() {
-    udp_round_trip(b"query\x16").await;
-    udp_round_trip(b"query\x16\x03\x03").await;
+    udp_round_trip(b"query\x16", b"answer").await;
+    udp_round_trip(b"query\x16\x03\x03", b"answer").await;
+}
+
+/// The same for the server's replies: it pads each XUDP write whole too.
+/// Only the client did, so a reply ending in a byte that could begin a TLS
+/// record had that tail held back by the server's record search, and the
+/// reply waited on the next one (upstream cfal/shoes 947704ea, 2c8472f3).
+#[tokio::test]
+async fn a_reply_ending_in_a_tls_prefix_is_sent_whole() {
+    udp_round_trip(b"query", b"answer\x16").await;
+    udp_round_trip(b"query", b"answer\x16\x03\x03").await;
 }
 
 /// One datagram to the server and one back, with nothing else written in
 /// between: the server must see it on its own.
-async fn udp_round_trip(payload: &[u8]) {
+async fn udp_round_trip(payload: &[u8], reply: &[u8]) {
     let (server, client) = handlers();
     let (client_end, server_end) = tcp_pair().await;
     let accepted =
@@ -361,11 +371,9 @@ async fn udp_round_trip(payload: &[u8]) {
     assert_eq!(source, "192.0.2.53:53".parse().unwrap());
     assert_eq!(buf.filled(), payload);
 
-    poll_fn(|cx| {
-        Pin::new(&mut *sessions).poll_write_session_message(cx, session, b"answer", &source)
-    })
-    .await
-    .unwrap();
+    poll_fn(|cx| Pin::new(&mut *sessions).poll_write_session_message(cx, session, reply, &source))
+        .await
+        .unwrap();
     poll_fn(|cx| Pin::new(&mut *sessions).poll_flush_message(cx))
         .await
         .unwrap();
@@ -379,5 +387,5 @@ async fn udp_round_trip(payload: &[u8]) {
     .await
     .expect("the reply came back")
     .unwrap();
-    assert_eq!(buf.filled(), b"answer");
+    assert_eq!(buf.filled(), reply);
 }
