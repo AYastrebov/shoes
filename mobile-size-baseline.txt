@@ -60,6 +60,19 @@
 #                     protocol that reaches servers WireGuard's UDP cannot.
 #                     Measured on the same runner toolchain as the line
 #                     above.
+#  10077592 +227896  CI's measurement of #151, Phobos obfuscation for the
+#                     WireGuard outbound, which crossed the band. Phobos
+#                     itself is +42552 of it: ea46233 against the PR on one
+#                     local toolchain (rustc 1.97.1, NDK 30.0), 10039672 ->
+#                     10082224 -- .text +30840, .eh_frame +6928, .rodata
+#                     +2944, .data.rel.ro +688. That is the awgtun codec
+#                     (keystream, STUN and RTP framing, config parsing) and
+#                     the endpoint socket's wrap/unwrap and generation gate.
+#                     The other ~185 KB had landed since the line above
+#                     without raising it: CI measured 9997992 at 0432432,
+#                     and the 17 commits from there to ea46233, the DNS
+#                     cache rework mostly, put mobile itself within ~12 KB
+#                     of the ceiling.
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -72,4 +85,4 @@
 # Judged worth paying: the net 4376 bytes is 0.03% of the library, against a
 # MOBILE.md precedent that declined a 1.0 MiB saving because the build
 # complexity cost more than the megabyte was worth.
-9849696
+10077592
