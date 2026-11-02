@@ -129,6 +129,12 @@ pub trait AsyncReadSessionMessage {
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         None
     }
+
+    /// The router has dropped this id's session (expired, failed, refused,
+    /// or closed): the stream forgets the route, so it stops counting
+    /// against the stream's limits and the next packet to that destination
+    /// starts a new one.
+    fn release_session(&mut self, _session_id: MessageSessionId) {}
 }
 
 /// Session-based message writing trait. Used by protocols like XUDP that have session IDs.
@@ -722,6 +728,10 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for Bo
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         (**self).take_closed_session()
     }
+
+    fn release_session(&mut self, session_id: MessageSessionId) {
+        (**self).release_session(session_id)
+    }
 }
 
 impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for &mut T {
@@ -735,6 +745,10 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for &m
 
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         (**self).take_closed_session()
+    }
+
+    fn release_session(&mut self, session_id: MessageSessionId) {
+        (**self).release_session(session_id)
     }
 }
 
