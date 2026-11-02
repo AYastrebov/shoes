@@ -355,3 +355,9 @@ strip = true
 inherits = "release"
 opt-level = "s"
 panic = "abort"
+
+[patch.crates-io]
+# TCP loss recovery in the TUN stack: smoltcp 0.14.0 plus upstream smoltcp fixes (RTO
+# bounds, fast-retransmit retry, zero-window probe timers, scaled-window clamp) and
+# two commits preserving ACK sequencing during retransmission (upstream cfal/shoes#197).
+smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "042e568bfa39d0f111a23a4718ec257e474fd1e7" }
