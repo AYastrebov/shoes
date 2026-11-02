@@ -504,7 +504,7 @@ impl RealityServerConnection {
         let HandshakeState::ClientHelloValidated { info } =
             std::mem::replace(&mut self.handshake_state, HandshakeState::Initial)
         else {
-            unreachable!()
+            return Err(wrong_state());
         };
 
         let cipher_suite = info.cipher_suite;
@@ -801,7 +801,7 @@ impl RealityServerConnection {
             handshake_hash_with_server_finished,
         } = old_state
         else {
-            unreachable!()
+            return Err(wrong_state());
         };
 
         // Extract the encrypted Finished record (copy to Vec for decryption)
@@ -903,7 +903,7 @@ impl RealityServerConnection {
         // Check if we have application keys
         let (app_read_key, app_read_iv) = match (&self.app_read_key, &self.app_read_iv) {
             (Some(key), Some(iv)) => (key, iv),
-            _ => unreachable!(), // Wrong state
+            _ => return Err(wrong_state()),
         };
 
         // Process all complete TLS records in the buffer
@@ -1143,6 +1143,13 @@ pub fn feed_reality_server_connection(
         i += n;
     }
     Ok(())
+}
+
+/// A step called in a handshake state its caller should have ruled out. An
+/// error rather than a panic: in a mobile build a panic aborts the process,
+/// and the state is reached only through this connection's own dispatch.
+fn wrong_state() -> io::Error {
+    io::Error::other("REALITY: a handshake step was reached in the wrong state")
 }
 
 #[cfg(test)]

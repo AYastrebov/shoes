@@ -488,7 +488,7 @@ impl RealityClientConnection {
             auth_key,
         } = &self.handshake_state
         else {
-            unreachable!()
+            return Err(wrong_state());
         };
 
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
@@ -629,7 +629,7 @@ impl RealityClientConnection {
             cert_verify_offset,
         } = &self.handshake_state
         else {
-            unreachable!()
+            return Err(wrong_state());
         };
 
         let (server_hs_key, server_hs_iv) =
@@ -940,7 +940,7 @@ impl RealityClientConnection {
     fn process_application_data(&mut self) -> io::Result<()> {
         let (app_read_key, app_read_iv) = match (&self.app_read_key, &self.app_read_iv) {
             (Some(key), Some(iv)) => (key, iv),
-            _ => unreachable!(), // Wrong state
+            _ => return Err(wrong_state()),
         };
 
         while self.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
@@ -1180,6 +1180,13 @@ pub fn feed_reality_client_connection(
         i += n;
     }
     Ok(())
+}
+
+/// A step called in a handshake state its caller should have ruled out. An
+/// error rather than a panic: in a mobile build a panic aborts the process,
+/// and the state is reached only through this connection's own dispatch.
+fn wrong_state() -> io::Error {
+    io::Error::other("REALITY: a handshake step was reached in the wrong state")
 }
 
 #[cfg(test)]
