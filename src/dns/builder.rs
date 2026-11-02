@@ -58,24 +58,23 @@ impl DnsRegistry {
 
     /// Get the resolver for a TUN entry's dns field.
     ///
-    /// Unlike listeners, a TUN without a `dns:` block gets its own system
-    /// resolver that never reuses a completed answer. The honoured-dns change
+    /// Unlike listeners, a TUN without a `dns:` block gets a FRESH system
+    /// resolver rather than the caching default. The honoured-dns change
     /// promised "without the block nothing changes", and the caching
-    /// default's flat age (record TTLs ignored) would break it: a
-    /// WireGuard/AmneziaWG tunnel rebuild would resolve a failed-over
+    /// default's flat age (record TTLs ignored; 60 seconds) would break it:
+    /// a WireGuard/AmneziaWG tunnel rebuild would resolve a failed-over
     /// endpoint hostname to its dead pre-failover address for that long,
     /// where the old in-place resolver followed the provider on the next
     /// lookup.
     ///
-    /// It does share lookups in flight (a zero result age): a burst of new
-    /// flows to one proxy server, as when an app starts, ran one blocking
-    /// `getaddrinfo` per flow and now runs one. A lookup that starts after
-    /// another finished still asks the system, so failover is followed as
-    /// before.
+    /// Nor does it share lookups in flight: a lookup begun on a network
+    /// that has just gone away can hang until the OS gives up, and a flow
+    /// or tunnel rebuild after a Wi-Fi/cellular switch that joined it would
+    /// inherit the failure instead of asking the new network.
     pub fn get_for_tun(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(_) => self.get_for_server(dns),
-            None => Arc::new(CachingNativeResolver::with_timeout(0)),
+            None => Arc::new(NativeResolver::new()),
         }
     }
 
@@ -171,7 +170,7 @@ impl HickoryResolverPlan {
             .parsed_url
             .to_parsed_server(resolved_ip)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let mut entry = ParsedDnsServerEntry::new(
+        let entry = ParsedDnsServerEntry::new(
             server,
             self.chain_group.clone(),
             self.bootstrap_resolver.clone(),
@@ -179,8 +178,8 @@ impl HickoryResolverPlan {
             self.timeout_secs,
             self.connect_timeout_secs,
             self.options.attempts,
+            self.native_cache_secs,
         );
-        entry.native_cache_secs = self.native_cache_secs;
         Ok(entry)
     }
 
@@ -700,7 +699,8 @@ async fn build_entry_and_plan(
                 super::IpStrategy::default(),
                 10, // Default timeout for bootstrap
                 5,  // Default connect timeout for bootstrap
-                2,  // Default attempts for bootstrap
+                2,  // Default attempts for bootstrap,
+                0,
             );
             build_resolver(vec![bootstrap_entry])?
         }
@@ -736,13 +736,12 @@ async fn build_entry_and_plan(
 
 #[cfg(test)]
 mod tests {
-    /// The no-dns TUN default must never reuse a completed answer: the
-    /// caching default's flat age would pin a failed-over WG/AWG endpoint to
-    /// its dead address across rebuilds. It is its own resolver, not the
-    /// shared default, and its result age is zero, so it only shares lookups
-    /// in flight.
+    /// The no-dns TUN default must be the plain system resolver: the caching
+    /// default's flat age would pin a failed-over WG/AWG endpoint to its dead
+    /// address across rebuilds, and sharing lookups in flight would hand a
+    /// lookup stranded by a network change to every flow after it.
     #[test]
-    fn a_tun_without_dns_gets_a_fresh_resolver_that_never_reuses_answers() {
+    fn a_tun_without_dns_gets_a_fresh_uncached_resolver() {
         let mut registry = super::DnsRegistry::new();
         let default = registry.get_or_create_default();
         let tun = registry.get_for_tun(None);
@@ -751,8 +750,9 @@ mod tests {
             "the TUN default must not be the caching default"
         );
         assert!(
-            format!("{tun:?}").contains("result_timeout_secs: 0"),
-            "the TUN default reuses no answer: {tun:?}"
+            format!("{tun:?}").contains("NativeResolver")
+                && !format!("{tun:?}").contains("Caching"),
+            "the TUN default is the plain system resolver: {tun:?}"
         );
     }
 
@@ -833,6 +833,7 @@ mod tests {
             5,
             5,
             1,
+            0,
         )
     }
 
@@ -1020,6 +1021,7 @@ mod tests {
             5,
             5,
             1,
+            0,
         );
         let entry_b = ParsedDnsServerEntry::new(
             ParsedDnsServer::Udp {
@@ -1031,6 +1033,7 @@ mod tests {
             5,
             5,
             1,
+            0,
         );
 
         let result = build_resolver(vec![entry_a, entry_b]).unwrap();

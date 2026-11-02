@@ -129,6 +129,15 @@ refs.
 Known and deliberately left, so that nobody rediscovers it as a surprise.
 Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
 
+- **hickory is pinned to a git fork** (2026-11-02, DNS cache port). The
+  `[patch.crates-io]` entries take hickory-net, -proto and -resolver from
+  cfal/hickory-dns at `3fa0a0e3` (0.26.3 plus hickory-dns#3861) so a DNS
+  connection that dies under a request fails over. Two costs: `cargo audit`
+  matches advisories against crates.io sources, so a RUSTSEC advisory for
+  hickory 0.26.x may not fail the daily audit while the git source is
+  pinned (check hickory's advisories by hand when bumping); and the pin
+  must go once a hickory release carries #3861, returning to crates.io.
+
 - **Dependabot alerts are still off** (2026-08-20 audit). The other half of
   that entry is done: `cargo audit --deny warnings` runs on a daily
   `schedule:` trigger in `lint.yml`, added after the chacha20 yank failed

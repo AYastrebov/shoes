@@ -9,10 +9,10 @@ closed-connection failover.** Upstream's native DNS cache rework (#220,
   (one `getaddrinfo` where a burst ran one each, on a blocking thread),
   keys it by host rather than host and port, and keeps an answer 60
   seconds rather than five minutes;
-- a TUN without `dns:` shares lookups in flight too but still reuses no
-  finished answer, so a failed-over WireGuard/AmneziaWG endpoint is
-  followed on the next lookup as before;
-- an explicit `url: system` server can set `native_cache_secs`;
+- an explicit `url: system` server can set `native_cache_secs` (it asks
+  the OS every time otherwise, as before); a TUN without `dns:` keeps its
+  plain system resolver, so a lookup stranded by a network change is not
+  shared with the flows after it;
 - hickory comes from cfal's fork of 0.26.3 with hickory-dns#3861: a
   DoT/DoH/DoH3 connection that dies under a request is reported closed,
   so the server pool fails over and the refreshing resolver rebuilds,

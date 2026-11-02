@@ -61,6 +61,10 @@ pub struct ParsedDnsServerEntry {
 }
 
 impl ParsedDnsServerEntry {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per field, so every construction site names its cache age"
+    )]
     pub fn new(
         server: ParsedDnsServer,
         chain: Arc<ClientChainGroup>,
@@ -69,6 +73,7 @@ impl ParsedDnsServerEntry {
         timeout_secs: u32,
         connect_timeout_secs: u32,
         attempts: usize,
+        native_cache_secs: u32,
     ) -> Self {
         Self {
             server,
@@ -78,7 +83,7 @@ impl ParsedDnsServerEntry {
             timeout_secs,
             connect_timeout_secs,
             attempts,
-            native_cache_secs: 0,
+            native_cache_secs,
         }
     }
 }
