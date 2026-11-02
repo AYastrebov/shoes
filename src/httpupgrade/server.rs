@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
 use crate::async_stream::AsyncStream;
-use crate::http_parse::{ParsedHttpData, parse_request_line};
+use crate::http_parse::{ParsedHttpData, header_has_token, parse_request_line};
 use crate::prepend_stream::PrependStream;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
@@ -58,12 +58,6 @@ async fn refuse(
     std::io::Error::other(reason)
 }
 
-fn header_is(headers: &std::collections::HashMap<String, String>, key: &str, value: &str) -> bool {
-    headers
-        .get(key)
-        .is_some_and(|v| v.eq_ignore_ascii_case(value))
-}
-
 #[async_trait]
 impl TcpServerHandler for HttpUpgradeTcpServerHandler {
     async fn setup_server_stream(
@@ -106,7 +100,7 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
             .await);
         }
 
-        if !header_is(&request_headers, "connection", "upgrade") {
+        if !header_has_token(&request_headers, "connection", "upgrade") {
             return Err(refuse(
                 &mut server_stream,
                 NOT_FOUND,
@@ -115,7 +109,7 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
             .await);
         }
 
-        if !header_is(&request_headers, "upgrade", "websocket") {
+        if !header_has_token(&request_headers, "upgrade", "websocket") {
             return Err(refuse(
                 &mut server_stream,
                 NOT_FOUND,
@@ -261,6 +255,23 @@ mod tests {
             response,
             b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n"
         );
+    }
+
+    /// A request that splits Connection over two lines, as a proxy in the
+    /// path may, is an upgrade: the parser joins the lines into one list and
+    /// the check looks for the token in it, not for the whole value.
+    #[tokio::test]
+    async fn a_request_with_connection_split_over_two_lines_is_upgraded() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler = handler_with(Some("/download"), received.clone());
+        let (result, response) = respond_to(
+            &handler,
+            b"GET /download HTTP/1.1\r\nHost: cdn.example.com\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nPAYLOAD",
+        )
+        .await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(response.starts_with(b"HTTP/1.1 101"));
+        assert_eq!(&*received.lock().unwrap(), b"PAYLOAD");
     }
 
     /// The bytes that arrived in the same packet as the header block are the

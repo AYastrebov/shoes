@@ -89,6 +89,11 @@ pub struct XudpMessageStream {
 
     next_route_id: MessageSessionId,
 
+    /// Set when the route limit first drops a packet and cleared by the
+    /// next admission, so a client spraying new destinations logs once per
+    /// episode rather than once per packet.
+    route_cap_reported: bool,
+
     /// Resolver cache for hostname targets
     resolver_cache: ResolverCache,
 
@@ -111,6 +116,7 @@ impl XudpMessageStream {
             routes: HashMap::new(),
             closed_routes: VecDeque::new(),
             next_route_id: 1,
+            route_cap_reported: false,
             resolver_cache: ResolverCache::new(resolver),
             incoming_frame: None,
             is_eof: false,
@@ -168,12 +174,22 @@ impl XudpMessageStream {
             return Some(*route);
         }
         if self.routes.len() >= MAX_XUDP_ROUTES {
-            log::warn!(
-                "[XUDP READ] Dropping a packet for new destination {target} at the \
-                 {MAX_XUDP_ROUTES}-route limit"
-            );
+            if self.route_cap_reported {
+                log::debug!(
+                    "[XUDP READ] Dropping a packet for new destination {target} at the \
+                     {MAX_XUDP_ROUTES}-route limit"
+                );
+            } else {
+                self.route_cap_reported = true;
+                log::warn!(
+                    "[XUDP READ] Dropping a packet for new destination {target} at the \
+                     {MAX_XUDP_ROUTES}-route limit; further drops are logged at debug \
+                     until one is admitted again"
+                );
+            }
             return None;
         }
+        self.route_cap_reported = false;
         let route = self.next_route_id;
         self.next_route_id = self.next_route_id.checked_add(1)?;
         session.routes.insert(target.clone(), route);
@@ -392,6 +408,20 @@ impl AsyncReadSessionMessage for XudpMessageStream {
 
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         self.closed_routes.pop_front()
+    }
+
+    /// The router expired, refused or failed this route: it stops counting
+    /// against MAX_XUDP_ROUTES, and the wire session's next packet to that
+    /// destination gets a new route. Without this, only a client's End
+    /// freed a route, and a long-lived session reaching many destinations
+    /// hit the limit for good.
+    fn release_session(&mut self, route: MessageSessionId) {
+        let Some(wire_session_id) = self.routes.remove(&route) else {
+            return;
+        };
+        if let Some(session) = self.wire_sessions.get_mut(&wire_session_id) {
+            session.routes.retain(|_, r| *r != route);
+        }
     }
 }
 
@@ -838,5 +868,63 @@ mod tests {
         }
         let (_, _, data) = read(&mut stream).await;
         assert_eq!(data, b"known", "the one past the limit was dropped");
+    }
+
+    /// A route the router releases (expired, refused) stops counting against
+    /// the limit, and the next packet to its destination gets a new route.
+    /// Before, only an End freed a route, so a long-lived session reaching
+    /// many destinations was refused every new one for good.
+    #[tokio::test]
+    async fn a_released_route_frees_room_under_the_limit() {
+        let (near, mut far) = tokio::io::duplex(1 << 20);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
+        far.write_all(&frame_for(
+            1,
+            SessionStatus::New,
+            Some(dns_server()),
+            b"first",
+        ))
+        .await
+        .unwrap();
+        let mut frames = BytesMut::new();
+        for i in 1..MAX_XUDP_ROUTES as u32 {
+            let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i);
+            frames.extend_from_slice(&frame_for(
+                1,
+                SessionStatus::Keep,
+                Some(NetLocation::new(Address::Ipv4(ip), 53)),
+                b"x",
+            ));
+        }
+        far.write_all(&frames).await.unwrap();
+
+        let (first_route, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"first");
+        for _ in 1..MAX_XUDP_ROUTES {
+            read(&mut stream).await;
+        }
+        assert_eq!(stream.routes.len(), MAX_XUDP_ROUTES);
+
+        stream.release_session(first_route);
+        let fresh = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::new(10, 9, 9, 9)), 53);
+        let mut frames = BytesMut::new();
+        frames.extend_from_slice(&frame_for(1, SessionStatus::Keep, Some(fresh), b"fresh"));
+        frames.extend_from_slice(&frame_for(
+            1,
+            SessionStatus::Keep,
+            Some(dns_server()),
+            b"back",
+        ));
+        far.write_all(&frames).await.unwrap();
+
+        let (_, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"fresh", "the released route made room");
+        stream.release_session(first_route + 1);
+        let (route, _, data) = read(&mut stream).await;
+        assert_eq!(data, b"back");
+        assert_ne!(
+            route, first_route,
+            "the released destination got a new route"
+        );
     }
 }

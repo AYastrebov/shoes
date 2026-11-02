@@ -362,6 +362,7 @@ enum SessionScript {
 struct ScriptedSessionInner {
     script: VecDeque<SessionScript>,
     closed: VecDeque<MessageSessionId>,
+    released: Vec<MessageSessionId>,
     replies: Vec<(MessageSessionId, SocketAddr, Vec<u8>)>,
     read_waker: Option<Waker>,
 }
@@ -376,6 +377,7 @@ fn scripted_sessions(
     let inner = Arc::new(Mutex::new(ScriptedSessionInner {
         script: script.into(),
         closed: VecDeque::new(),
+        released: Vec::new(),
         replies: Vec::new(),
         read_waker: None,
     }));
@@ -409,6 +411,10 @@ impl AsyncReadSessionMessage for ScriptedSessionServer {
 
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         self.inner.lock().unwrap().closed.pop_front()
+    }
+
+    fn release_session(&mut self, session_id: MessageSessionId) {
+        self.inner.lock().unwrap().released.push(session_id);
     }
 }
 
@@ -495,6 +501,39 @@ async fn test_a_closed_route_drops_its_remote_at_once() {
         !state.lock().unwrap().shutdown_polled,
         "dropped outright, not through the graceful shutdown"
     );
+    router.abort();
+}
+
+/// A route the router refuses, or whose session expires, is handed back to
+/// the stream. Before, only a client's End freed an XUDP route, so a
+/// long-lived wire session reaching many destinations filled the stream's
+/// route limit for good although the router held none of them.
+#[tokio::test]
+async fn test_a_refused_or_expired_route_is_released_to_the_stream() {
+    let state = Arc::new(Mutex::new(FakeRemoteState::default()));
+    let (stream, inner) = scripted_sessions(vec![
+        SessionScript::Packet(1, "192.0.2.1:9".parse().unwrap(), b"one".to_vec()),
+        SessionScript::Packet(2, "192.0.2.2:9".parse().unwrap(), b"two".to_vec()),
+    ]);
+    let limits = RouterLimits {
+        max_sessions: 1,
+        session_timeout: Duration::from_millis(200),
+        ..RouterLimits::default()
+    };
+    let router = tokio::spawn(run_with_fake_remotes(
+        ServerStream::Session(Box::new(stream)),
+        limits,
+        state.clone(),
+    ));
+
+    wait_until("the route over the cap is released", || {
+        inner.lock().unwrap().released == [2]
+    })
+    .await;
+    wait_until("the expired route is released", || {
+        inner.lock().unwrap().released == [2, 1]
+    })
+    .await;
     router.abort();
 }
 

@@ -3,7 +3,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
-use crate::http_parse::ParsedHttpData;
+use crate::http_parse::{ParsedHttpData, header_has_token};
 use crate::prepend_stream::PrependStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
@@ -93,9 +93,11 @@ impl HttpUpgradeTcpClientHandler {
             )));
         }
 
+        // Token match, not equality: a repeated field arrives joined into one
+        // list (`Upgrade, keep-alive`), and that is still an upgrade.
         for (key, expected) in [("connection", "upgrade"), ("upgrade", "websocket")] {
-            let value = response_headers.get(key).map(String::as_str).unwrap_or("");
-            if !value.eq_ignore_ascii_case(expected) {
+            if !header_has_token(&response_headers, key, expected) {
+                let value = response_headers.get(key).map(String::as_str).unwrap_or("");
                 return Err(std::io::Error::other(format!(
                     "httpupgrade: response header {key} was {value:?}, expected {expected:?}"
                 )));
@@ -330,6 +332,32 @@ mod tests {
         )
         .await;
         assert!(message.to_lowercase().contains("upgrade"), "got {message}");
+    }
+
+    /// Connection is a list, and a repeated field arrives joined into one: a
+    /// 101 that splits it over two lines, in either order, is an upgrade.
+    /// Equality on the whole value refused it once the parser stopped
+    /// keeping only the last line.
+    #[tokio::test]
+    async fn a_101_with_connection_split_over_two_lines_is_accepted() {
+        for response in [
+            &b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\nPAYLOAD"[..],
+            &b"HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nPAYLOAD"[..],
+        ] {
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let handler = client(None, None, received.clone());
+            let (near, mut far) = duplex(8192);
+            let task = tokio::spawn(async move {
+                handler
+                    .setup_client_tcp_stream(Box::new(TestStream(near)), target())
+                    .await
+            });
+            let mut request = vec![0u8; 512];
+            let _ = far.read(&mut request).await.unwrap();
+            far.write_all(response).await.unwrap();
+            task.await.unwrap().unwrap();
+            assert_eq!(&*received.lock().unwrap(), b"PAYLOAD");
+        }
     }
 
     /// UDP-over-TCP is the inner protocol's business; this transport only

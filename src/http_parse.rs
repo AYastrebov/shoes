@@ -94,6 +94,17 @@ pub fn parse_request_line(first_line: &str) -> Option<(&str, &str)> {
     Some((method, target))
 }
 
+/// Whether a comma-separated header such as `Connection: keep-alive, Upgrade`
+/// carries `token`. A repeated field is already one such list here, so
+/// this is how list-valued headers (`Connection`, `Upgrade`) are checked.
+pub fn header_has_token(headers: &HashMap<String, String>, key: &str, token: &str) -> bool {
+    headers.get(key).is_some_and(|value| {
+        value
+            .split(',')
+            .any(|item| item.trim().eq_ignore_ascii_case(token))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

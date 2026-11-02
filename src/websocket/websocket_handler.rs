@@ -11,7 +11,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
-use crate::http_parse::{MAX_LINE_LEN, ParsedHttpData, parse_request_line};
+use crate::http_parse::{MAX_LINE_LEN, ParsedHttpData, header_has_token, parse_request_line};
 use crate::prepend_stream::PrependStream;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -53,20 +53,6 @@ async fn refuse(
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
     std::io::Error::other(reason)
-}
-
-/// Whether a comma-separated header such as `Connection: keep-alive, Upgrade`
-/// carries `token`.
-fn header_has_token(
-    headers: &std::collections::HashMap<String, String>,
-    key: &str,
-    token: &str,
-) -> bool {
-    headers.get(key).is_some_and(|value| {
-        value
-            .split(',')
-            .any(|item| item.trim().eq_ignore_ascii_case(token))
-    })
 }
 
 #[async_trait]

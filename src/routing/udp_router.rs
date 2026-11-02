@@ -162,6 +162,14 @@ impl ServerStream {
         }
     }
 
+    /// Tell a session stream its route is gone; nothing to do for a
+    /// targeted stream, whose packets carry no route.
+    fn release_session(&mut self, session_id: MessageSessionId) {
+        if let ServerStream::Session(stream) = self {
+            stream.release_session(session_id);
+        }
+    }
+
     fn poll_write_message(
         &mut self,
         cx: &mut Context<'_>,
@@ -572,8 +580,11 @@ impl<'a> UdpRouter<'a> {
                 }
                 None => {
                     // No session - check blocked before creating
+                    // A refused packet's route is released, or a session
+                    // stream would keep counting it against its own limit.
                     if self.blocked.get(&packet.destination).is_some() {
                         debug!("UDP proxying blocked to {}", packet.destination);
+                        self.server.release_session(packet.session_id);
                         continue;
                     }
 
@@ -582,10 +593,12 @@ impl<'a> UdpRouter<'a> {
                             "Too many pending creates, dropping new session creation for {}",
                             packet.destination
                         );
+                        self.server.release_session(packet.session_id);
                         continue;
                     }
 
                     let Ok(budget_permit) = self.admit_session(&packet.destination) else {
+                        self.server.release_session(packet.session_id);
                         continue;
                     };
 
@@ -991,6 +1004,7 @@ impl<'a> UdpRouter<'a> {
                     }
                     (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
                         map.remove(sid);
+                        self.server.release_session(*sid);
                     }
                     _ => unreachable!(),
                 }
@@ -1145,6 +1159,7 @@ impl<'a> UdpRouter<'a> {
             }
             (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
                 map.remove(sid);
+                self.server.release_session(*sid);
             }
             _ => unreachable!(),
         }
