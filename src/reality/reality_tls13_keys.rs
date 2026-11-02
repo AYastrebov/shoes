@@ -60,12 +60,6 @@ pub fn hkdf_expand(
         ctx.update(&[i as u8]);
         let tag = ctx.sign();
 
-        log::debug!(
-            "HKDF iteration {}: output={:02x?}",
-            i,
-            &tag.as_ref()[..tag.as_ref().len().min(16)]
-        );
-
         prev = tag.as_ref().to_vec();
         output.extend_from_slice(tag.as_ref());
     }
@@ -330,15 +324,6 @@ pub fn derive_application_secrets(
         handshake_hash,
     )?;
 
-    log::debug!(
-        "  client_app_traffic: {:?}",
-        &client_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ClientAppSecret(full)={:02x?}",
-        client_application_traffic_secret
-    );
-
     // Server Application Traffic Secret
     let server_application_traffic_secret = derive_secret_with_algorithm(
         hmac_algorithm,
@@ -346,15 +331,6 @@ pub fn derive_application_secrets(
         b"s ap traffic",
         handshake_hash,
     )?;
-
-    log::debug!(
-        "  server_app_traffic: {:?}",
-        &server_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ServerAppSecret(full)={:02x?}",
-        server_application_traffic_secret
-    );
 
     Ok((
         client_application_traffic_secret,
