@@ -66,20 +66,26 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
         let (field_length, bytes_used) = read_varint(&addon_bytes[addon_cursor..])?;
         addon_cursor += bytes_used;
 
-        // Validate field_length is within bounds
-        if addon_cursor + field_length as usize > addon_bytes.len() {
-            return Err(std::io::Error::other(format!(
-                "Field {} length {} exceeds remaining addon bytes (cursor: {}, total: {})",
-                field_number,
-                field_length,
-                addon_cursor,
-                addon_bytes.len()
-            )));
-        }
+        // Validate field_length is within bounds. Checked: the length is a
+        // 64-bit varint, and an unchecked sum wrapped in release builds,
+        // passed this test, and panicked on the slice below.
+        let field_end = usize::try_from(field_length)
+            .ok()
+            .and_then(|length| addon_cursor.checked_add(length))
+            .filter(|end| *end <= addon_bytes.len())
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "Field {} length {} exceeds remaining addon bytes (cursor: {}, total: {})",
+                    field_number,
+                    field_length,
+                    addon_cursor,
+                    addon_bytes.len()
+                ))
+            })?;
 
         // Read field data
-        let field_data = &addon_bytes[addon_cursor..addon_cursor + field_length as usize];
-        addon_cursor += field_length as usize;
+        let field_data = &addon_bytes[addon_cursor..field_end];
+        addon_cursor = field_end;
 
         match field_number {
             1 => {
@@ -257,5 +263,26 @@ mod tests {
         assert!(read_varint(&[0x80]).is_err());
         assert!(read_varint(&[]).is_err());
         assert!(read_varint(&[0xff, 0xff, 0x80]).is_err());
+    }
+
+    /// A field length near u64::MAX is an error, not a panic: the bounds
+    /// check added the length to the cursor unchecked, which wrapped in
+    /// release builds, passed, and panicked on the slice (upstream
+    /// cfal/shoes#149). The UUID is checked before this is read, so only an
+    /// authenticated client could send it.
+    #[tokio::test]
+    async fn an_addon_length_that_overflows_the_cursor_is_an_error() {
+        // Field 1 (flow), wire type 2, then a 10-byte varint for u64::MAX.
+        let mut addons = vec![0x0a];
+        addons.extend_from_slice(&[0xff; 9]);
+        addons.push(0x01);
+        let (mut near, mut far) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut far, &addons)
+            .await
+            .unwrap();
+        let mut reader = crate::stream_reader::StreamReader::new();
+        let result =
+            super::parse_addons_from_reader(&mut reader, &mut near, addons.len() as u8).await;
+        assert!(result.is_err());
     }
 }
