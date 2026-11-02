@@ -850,7 +850,7 @@ protocol:
   server_fingerprints: [string]
   sni_hostname: string
   alpn_protocols: [string]
-  tls_buffer_size: int
+  tls_buffer_size: int         # Optional; min 16384 with vision
   cert: string                 # Client certificate for mTLS
   key: string                  # Client key for mTLS
   vision: false                # Enable Vision (requires VLESS inner protocol)
