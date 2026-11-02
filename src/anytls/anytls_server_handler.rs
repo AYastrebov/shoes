@@ -28,6 +28,10 @@ use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::write_all;
+
+/// How much of the authentication padding is skipped per read: well inside
+/// the StreamReader's buffer.
+const PADDING_SKIP_CHUNK: usize = 16 * 1024;
 use aws_lc_rs::digest::{SHA256, digest};
 
 /// AnyTLS server handler implementing TcpServerHandler
@@ -156,11 +160,14 @@ impl TcpServerHandler for AnyTlsServerHandler {
 
         let padding_len = reader.read_u16_be(&mut server_stream).await?;
 
-        // Skip padding bytes (consume them from the reader)
-        if padding_len > 0 {
-            let _ = reader
-                .read_slice(&mut *server_stream, padding_len as usize)
-                .await?;
+        // Skip the padding a chunk at a time: it may be up to 65535 bytes,
+        // and the reader's buffer holds 32 KiB, so one read of all of it
+        // refused a legal client (upstream cfal/shoes 4b49092e).
+        let mut padding_left = padding_len as usize;
+        while padding_left > 0 {
+            let chunk = padding_left.min(PADDING_SKIP_CHUNK);
+            reader.read_slice(&mut *server_stream, chunk).await?;
+            padding_left -= chunk;
         }
 
         // Get any remaining unparsed data that may have been buffered
@@ -260,6 +267,41 @@ mod tests {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(hash_result.as_ref());
         hash
+    }
+
+    /// Padding of the full u16 range, arriving in small pieces, is accepted:
+    /// the server read all of it at once into a 32 KiB buffer and refused
+    /// anything longer. Adapted from upstream cfal/shoes 4b49092e's
+    /// `authentication_accepts_full_u16_padding_with_fragmented_input`.
+    #[tokio::test]
+    async fn authentication_accepts_full_u16_padding_with_fragmented_input() {
+        use crate::async_stream::testing::TestStream;
+        let handler = AnyTlsServerHandler::new(
+            vec![("user".to_string(), "secret123".to_string())],
+            PaddingFactory::default_factory(),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            false,
+            None,
+        );
+        let (io, mut peer) = tokio::io::duplex(127);
+        let sending = tokio::spawn(async move {
+            peer.write_all(&compute_password_hash("secret123"))
+                .await
+                .unwrap();
+            peer.write_all(&u16::MAX.to_be_bytes()).await.unwrap();
+            peer.write_all(&vec![0; u16::MAX as usize]).await.unwrap();
+            peer
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.setup_server_stream(Box::new(TestStream(io))),
+        )
+        .await
+        .expect("authentication finished")
+        .expect("full-range padding is accepted");
+        assert!(matches!(result, TcpServerSetupResult::AlreadyHandled));
+        sending.await.unwrap();
     }
 
     #[test]
