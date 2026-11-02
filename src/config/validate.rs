@@ -1896,7 +1896,7 @@ fn validate_client_proxy_config(
 }
 
 /// Keys and prefixes are checked as the config is parsed (`WgKey`,
-/// `IpPrefix`); what is left is the MTU.
+/// `IpPrefix`); what is left is the MTU and the Phobos block.
 fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> std::io::Result<()> {
     if config.mtu < 576 {
         return Err(std::io::Error::new(
@@ -1904,7 +1904,66 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
             format!("WireGuard mtu {} is too small (minimum 576)", config.mtu),
         ));
     }
+    if let Some(phobos) = &config.phobos {
+        // Converted now, with the reference's ranges (`config.c` in
+        // Ground-Zerro/Phobos, through awgtun), so a bad value is a startup
+        // error and not a tunnel that never answers. The error names the
+        // field and never the key.
+        let converted = crate::amneziawg::convert_phobos_config(phobos)?;
+        let frame = crate::amneziawg::phobos_frame_overhead(&converted);
+        if let Some(max_mtu) = phobos_max_mtu(converted.masking.max_message_len(), frame)
+            && usize::from(config.mtu) > max_mtu
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "WireGuard mtu {} is too large for Phobos {:?} masking: a full-size \
+                     packet could not be sent (mtu at most {max_mtu})",
+                    config.mtu, converted.masking
+                ),
+            ));
+        }
+        if let Some(warning) = phobos_mtu_warning(config.mtu, frame) {
+            log::warn!("{warning}");
+        }
+    }
     Ok(())
+}
+
+/// The largest IPv4 UDP payload: 65535 less the 20-byte IP and 8-byte UDP
+/// headers. The endpoint may resolve to either family, and IPv4's is the
+/// smaller limit.
+const MAX_UDP_PAYLOAD: usize = 65_507;
+
+/// The largest `mtu` whose full-size packet a Phobos tunnel can send, if
+/// any `u16` mtu could not be. A full-size transport message is mtu + 32
+/// (WireGuard's header and tag), and it must fit both the masking's own
+/// limit (`max_message`, STUN's 16-bit DATA length) and, framed, one UDP
+/// datagram. The random tail is never added at that size. Past this, every
+/// large packet is refused by the codec or fails with EMSGSIZE, so it is a
+/// config error rather than a warning.
+fn phobos_max_mtu(max_message: Option<usize>, frame: usize) -> Option<usize> {
+    let by_udp = MAX_UDP_PAYLOAD - frame;
+    let message = max_message.map_or(by_udp, |codec| codec.min(by_udp));
+    let max_mtu = message - 32;
+    (max_mtu < usize::from(u16::MAX)).then_some(max_mtu)
+}
+
+/// The fragmentation warning for a WireGuard tunnel behind a Phobos frame
+/// of `frame` bytes, when full-size packets cross a 1500-byte path. A
+/// transport packet reaches the wire at mtu + 32 (WireGuard) + 28 (UDP,
+/// IPv4) + the frame; the random tail is never added at that size.
+fn phobos_mtu_warning(mtu: u16, frame: usize) -> Option<String> {
+    let wire_size = usize::from(mtu) + 60 + frame;
+    if wire_size <= 1500 {
+        return None;
+    }
+    Some(format!(
+        "WireGuard mtu {mtu} behind a {frame}-byte Phobos frame puts full-size packets at \
+         {wire_size} bytes on the wire, past a standard 1500-byte path MTU -- every large \
+         packet will fragment. Lower mtu to {}.",
+        1440usize.saturating_sub(frame)
+    ))
 }
 
 /// The fragmentation warning for `mtu` and `s4`, if full-size packets cross
@@ -3444,6 +3503,7 @@ mod tests {
                         allowed_ips: OneOrSome::One("0.0.0.0/0".parse().unwrap()),
                         persistent_keepalive: None,
                         mtu: 1280,
+                        phobos: None,
                     },
                 )),
                 quic_settings: Some(ClientQuicConfig::default()),
@@ -5910,6 +5970,135 @@ mod amneziawg_mtu_tests {
         )
         .unwrap();
         let _ = validate_amneziawg_config(&config);
+    }
+}
+
+#[cfg(test)]
+mod phobos_validation_tests {
+    use crate::config::load_config_str;
+
+    fn validate(protocol: &str, phobos: &str) -> std::io::Result<()> {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: "203.0.113.9:51822"
+        protocol:
+          type: {protocol}
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          phobos:
+{phobos}
+"#
+        );
+        let configs = load_config_str(&yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    #[test]
+    fn a_wireguard_outbound_with_phobos_loads() {
+        validate(
+            "wireguard",
+            "            key: \"synthetic-preset-key\"\n            masking: STUN\n            max_dummy: 16",
+        )
+        .unwrap();
+    }
+
+    /// The reference refuses `max-dummy` above 1024 (`config.c`,
+    /// `MAX_DUMMY_LENGTH_TOTAL`). The refusal names the field, never the
+    /// key.
+    #[test]
+    fn an_out_of_range_value_is_refused_without_the_key() {
+        let secret = "synthetic-preset-key";
+        let err = validate(
+            "wireguard",
+            &format!("            key: \"{secret}\"\n            max_dummy: 2000"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max-dummy"), "{err}");
+        assert!(!err.contains(secret), "{err}");
+    }
+
+    /// A Phobos server forwards to plain WireGuard and decodes only the plain
+    /// message types, so `amneziawg` has no `phobos` block to accept.
+    #[test]
+    fn phobos_on_amneziawg_is_refused() {
+        let err = validate("amneziawg", "            key: \"k\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phobos"), "{err}");
+    }
+
+    /// The full-size packet must fit the masking's own limit and one IPv4
+    /// UDP datagram (65507 bytes): mtu + 32 + frame. STUN's frame is 24 and
+    /// its DATA length would allow 65503, but UDP allows only 65451; RTP's
+    /// frame is 12, and none has no frame.
+    #[test]
+    fn an_mtu_whose_packets_cannot_be_sent_is_refused() {
+        for (masking, max) in [("stun", 65_451u32), ("media", 65_463), ("none", 65_475)] {
+            assert!(
+                validate_with_mtu(max, masking).is_ok(),
+                "{masking} mtu {max} must load"
+            );
+            let err = validate_with_mtu(max + 1, masking).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("mtu at most {max}")),
+                "{masking}: {err}"
+            );
+        }
+        assert_eq!(super::phobos_max_mtu(Some(65_535), 24), Some(65_451));
+        assert_eq!(super::phobos_max_mtu(None, 0), Some(65_475));
+    }
+
+    fn validate_with_mtu(mtu: u32, masking: &str) -> std::io::Result<()> {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: "203.0.113.9:51822"
+        protocol:
+          type: wireguard
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          mtu: {mtu}
+          phobos:
+            key: "k"
+            masking: {masking}
+"#
+        );
+        let configs = load_config_str(&yaml)?;
+        super::create_server_configs(configs).map(|_| ())
+    }
+
+    #[test]
+    fn the_mtu_warning_counts_the_frame() {
+        assert_eq!(super::phobos_mtu_warning(1280, 24), None);
+        assert_eq!(
+            super::phobos_mtu_warning(1416, 24),
+            None,
+            "1500 exactly fits"
+        );
+        let warning = super::phobos_mtu_warning(1420, 24).unwrap();
+        assert!(warning.contains("Lower mtu to 1416"), "{warning}");
+        assert_eq!(super::phobos_mtu_warning(1420, 12), None, "RTP's 12 fit");
+        let rtp = super::phobos_mtu_warning(1430, 12).unwrap();
+        assert!(rtp.contains("Lower mtu to 1428"), "{rtp}");
+        assert_eq!(super::phobos_mtu_warning(1440, 0), None);
     }
 }
 

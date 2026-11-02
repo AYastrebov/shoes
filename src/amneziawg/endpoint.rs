@@ -22,14 +22,42 @@
 //! Rebinding is enough on its own: WireGuard peers roam. The server updates the
 //! endpoint it has for us as soon as an authenticated packet arrives from the
 //! new address, so the first packet after the swap repairs the path without a
-//! new handshake.
+//! new handshake. A Phobos server is the exception: it drops everything but a
+//! handshake from an address it has not seen complete one, so the tunnel
+//! sends a handshake after a rebind there (`tunnel.rs`, the encapsulate loop).
+//!
+//! With Phobos configured, this socket is also where the obfuscation is
+//! applied: [`send`](EndpointSocket::send) wraps and
+//! [`recv`](EndpointSocket::recv) unwraps, so the tunnel's loops only ever
+//! see WireGuard messages.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use awgtun::phobos::Unwrapped;
 use log::{debug, info, warn};
+use parking_lot::Mutex as ParkingMutex;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, watch};
+
+use super::phobos::PhobosLayer;
+
+/// Wrapped-datagram buffers kept for reuse. A send takes one and puts it
+/// back, so the pool holds at most one per task that sends concurrently
+/// (receive, encapsulate, timer, Phobos control). This bounds it with room
+/// to spare. A buffer past the bound is dropped, and one whose send was
+/// cancelled is never returned. Both only cost a later allocation.
+const WIRE_POOL_MAX: usize = 8;
+
+/// One bound socket, and which one it is. The generation travels with the
+/// socket in a single `watch` value, so a sender reads both from the same
+/// snapshot and cannot judge one socket while sending on another.
+struct Bound {
+    socket: UdpSocket,
+    /// 0 for the socket `connect` bound, one more for each rebind.
+    generation: u64,
+}
 
 /// A UDP socket to the tunnel's peer that can be replaced underneath its users.
 pub struct EndpointSocket {
@@ -37,8 +65,23 @@ pub struct EndpointSocket {
     /// The socket in use. `watch` rather than a lock plus a notify because it
     /// closes the race between reading the socket and waiting for a change:
     /// a swap that lands in between is still seen by the next `changed()`.
-    socket: watch::Sender<Arc<UdpSocket>>,
+    socket: watch::Sender<Arc<Bound>>,
     rebind_requested: Notify,
+    /// Phobos obfuscation for every datagram, when configured.
+    phobos: Option<PhobosLayer>,
+    /// See [`WIRE_POOL_MAX`]. Empty and untouched without Phobos.
+    wire_pool: ParkingMutex<Vec<Vec<u8>>>,
+    /// The newest socket generation a handshake initiation has gone out on.
+    /// Behind Phobos, a generation newer than this carries nothing but an
+    /// initiation (see [`send`](Self::send)). The first socket needs none:
+    /// before a session, the tunnel has nothing else to send.
+    initiated_generation: AtomicU64,
+}
+
+/// Whether a WireGuard datagram is a handshake initiation: type 1 in the
+/// little-endian type field, with the three reserved bytes zero.
+fn is_initiation(datagram: &[u8]) -> bool {
+    datagram.len() >= 4 && datagram[..4] == [1, 0, 0, 0]
 }
 
 impl crate::network_change::NetworkChangeListener for EndpointSocket {
@@ -51,14 +94,23 @@ impl crate::network_change::NetworkChangeListener for EndpointSocket {
 
 impl EndpointSocket {
     /// Bind a socket to the peer and register it for network-change notices.
-    pub async fn connect(endpoint: SocketAddr) -> std::io::Result<Arc<Self>> {
+    pub async fn connect(
+        endpoint: SocketAddr,
+        phobos: Option<PhobosLayer>,
+    ) -> std::io::Result<Arc<Self>> {
         let socket = Self::bind(endpoint).await?;
-        let (tx, _) = watch::channel(Arc::new(socket));
+        let (tx, _) = watch::channel(Arc::new(Bound {
+            socket,
+            generation: 0,
+        }));
 
         let endpoint_socket = Arc::new(Self {
             endpoint,
             socket: tx,
             rebind_requested: Notify::new(),
+            phobos,
+            wire_pool: ParkingMutex::new(Vec::new()),
+            initiated_generation: AtomicU64::new(0),
         });
 
         let listener: Arc<dyn crate::network_change::NetworkChangeListener> =
@@ -117,12 +169,110 @@ impl EndpointSocket {
         self.rebind_requested.notify_one();
     }
 
-    /// Send one datagram over the current socket.
+    /// The Phobos layer, when this tunnel has one.
+    pub fn phobos(&self) -> Option<&PhobosLayer> {
+        self.phobos.as_ref()
+    }
+
+    /// Send a Phobos control datagram (a STUN Binding message) as it is.
+    /// Control traffic is never wrapped: it is the cover protocol itself.
+    pub async fn send_control(&self, datagram: &[u8]) -> std::io::Result<usize> {
+        self.send_raw(datagram).await
+    }
+
+    /// Whether the current socket still owes a Phobos server its handshake
+    /// initiation: a rebind has replaced it, and no initiation has gone out
+    /// on the replacement yet. Always false without Phobos.
+    pub fn needs_initiation(&self) -> bool {
+        self.phobos.is_some()
+            && self.initiated_generation.load(Ordering::Acquire) < self.socket.borrow().generation
+    }
+
+    /// Send one WireGuard datagram, Phobos-wrapped when configured.
+    ///
+    /// Behind Phobos, a socket a rebind brought in sends nothing but a
+    /// handshake initiation until one has gone out on it. The server drops
+    /// everything else from an address it has not seen complete a handshake
+    /// (`threading.c`, `process_packet`), so this is the datagram it would
+    /// have discarded, held back here instead: `Ok(0)`, nothing sent. The
+    /// socket and its generation come from one snapshot, so a rebind landing
+    /// mid-call cannot let a transport message reach the new socket first.
+    /// The gate opens only after the initiation's send has succeeded: while
+    /// it is pending, and after it fails, the generation still owes one.
+    /// The tunnel sends the initiation as soon as [`needs_initiation`]
+    /// says so (`tunnel.rs`, the encapsulate loop).
+    ///
+    /// A Binding Request the codec puts ahead of a handshake initiation is
+    /// sent first, as the reference does. Its failure is only logged: it
+    /// carries nothing the server needs, and the datagram behind it meets
+    /// the same path and reports for both. A datagram the codec cannot frame
+    /// (shorter than a WireGuard header, or longer than STUN's 16-bit DATA
+    /// length) is an `InvalidInput` error, never a silent success.
+    /// Validation keeps the tunnel's own messages under the limit.
+    ///
+    /// [`needs_initiation`]: Self::needs_initiation
+    pub async fn send(&self, datagram: &[u8]) -> std::io::Result<usize> {
+        let bound = self.socket.borrow().clone();
+        let Some(layer) = &self.phobos else {
+            return self.send_on(&bound, datagram).await;
+        };
+        let initiation = is_initiation(datagram);
+        if !initiation && self.initiated_generation.load(Ordering::Acquire) < bound.generation {
+            debug!(
+                "Phobos: holding back a {}-byte datagram until the handshake \
+                 initiation from the rebound socket",
+                datagram.len()
+            );
+            return Ok(0);
+        }
+        let mut wire = self.wire_pool.lock().pop().unwrap_or_default();
+        let result = match layer.wrap(datagram, &mut wire) {
+            Ok(preamble) => {
+                if let Some(request) = preamble
+                    && let Err(e) = self.send_on(&bound, &request).await
+                {
+                    debug!("Phobos binding request send failed: {e}");
+                }
+                let sent = self.send_on(&bound, &wire).await;
+                // The gate opens only once the initiation is on the
+                // socket. Marked earlier, a sender passing it while this
+                // send was still pending (behind the Binding Request, or an
+                // ENOBUFS retry) could queue its datagram ahead of the
+                // initiation, and a failed send would leave the gate open
+                // with nothing sent (shoes#151 review).
+                if initiation && sent.is_ok() {
+                    self.initiated_generation
+                        .fetch_max(bound.generation, Ordering::AcqRel);
+                }
+                sent
+            }
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Phobos cannot frame a {}-byte datagram: {e}",
+                    datagram.len()
+                ),
+            )),
+        };
+        let mut pool = self.wire_pool.lock();
+        if pool.len() < WIRE_POOL_MAX {
+            pool.push(wire);
+        }
+        result
+    }
+
+    /// Send one datagram over the current socket, as given.
+    async fn send_raw(&self, datagram: &[u8]) -> std::io::Result<usize> {
+        let bound = self.socket.borrow().clone();
+        self.send_on(&bound, datagram).await
+    }
+
+    /// Send one datagram on `bound`, as given.
     ///
     /// A failure that means the route is gone schedules a rebind, so a tunnel
     /// recovers even when the app never reports the network change itself.
-    pub async fn send(&self, datagram: &[u8]) -> std::io::Result<usize> {
-        let socket = self.socket.borrow().clone();
+    async fn send_on(&self, bound: &Bound, datagram: &[u8]) -> std::io::Result<usize> {
+        let socket = &bound.socket;
         let mut result = socket.send(datagram).await;
 
         // ENOBUFS is the kernel's send queue momentarily full, not a lost
@@ -153,13 +303,49 @@ impl EndpointSocket {
         result
     }
 
-    /// Receive one datagram, following the socket across a rebind.
+    /// Receive one WireGuard datagram into the front of `buf`, following the
+    /// socket across a rebind.
+    ///
+    /// With Phobos configured, control traffic is handled here and never
+    /// returned: a STUN Binding Request from the server is answered, and
+    /// anything else that unwraps to no WireGuard message is skipped, since
+    /// its sender chose its contents.
     pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(layer) = &self.phobos else {
+            return self.recv_raw(buf).await;
+        };
+        loop {
+            let n = self.recv_raw(buf).await?;
+            let base = buf.as_ptr() as usize;
+            // The message is decoded in place, somewhere inside `buf`; its
+            // position is all that is needed past the borrow.
+            let message = match layer.unwrap(&mut buf[..n], self.endpoint) {
+                Unwrapped::WireGuard(message) => {
+                    Some((message.as_ptr() as usize - base, message.len()))
+                }
+                Unwrapped::Reply(reply) => {
+                    if let Err(e) = self.send_raw(&reply).await {
+                        debug!("Phobos binding response send failed: {e}");
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some((start, len)) = message {
+                buf.copy_within(start..start + len, 0);
+                return Ok(len);
+            }
+        }
+    }
+
+    /// Receive one datagram as it arrived, following the socket across a
+    /// rebind.
+    async fn recv_raw(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut changes = self.socket.subscribe();
         loop {
-            let socket = changes.borrow_and_update().clone();
+            let bound = changes.borrow_and_update().clone();
             tokio::select! {
-                result = socket.recv(buf) => return result,
+                result = bound.socket.recv(buf) => return result,
                 // The socket was replaced. The pending recv belonged to an
                 // address that no longer exists, so drop it and read from the
                 // new one.
@@ -222,8 +408,12 @@ impl EndpointSocket {
                         // send_replace, not send: `send` fails and leaves the
                         // value untouched when no receiver happens to be parked,
                         // which is most of the time — the tunnel tasks subscribe
-                        // only for the duration of a recv.
-                        self.socket.send_replace(Arc::new(socket));
+                        // only for the duration of a recv. Only this task
+                        // swaps, so reading the generation first is not a
+                        // race.
+                        let generation = self.socket.borrow().generation + 1;
+                        self.socket
+                            .send_replace(Arc::new(Bound { socket, generation }));
                         on_rebound();
                         // Drain the stored permit: Notify holds at most one,
                         // but requests that piled up during this rebind --
@@ -273,7 +463,7 @@ impl EndpointSocket {
     /// The address the current socket is bound to.
     #[cfg(test)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.borrow().local_addr()
+        self.socket.borrow().socket.local_addr()
     }
 }
 
@@ -329,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn a_rebind_moves_the_socket_and_keeps_the_peer() {
         let (peer_socket, peer_addr) = peer().await;
-        let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
+        let endpoint = EndpointSocket::connect(peer_addr, None).await.unwrap();
         let before = endpoint.local_addr().unwrap();
 
         tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
@@ -371,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn recv_follows_the_socket_across_a_rebind() {
         let (peer_socket, peer_addr) = peer().await;
-        let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
+        let endpoint = EndpointSocket::connect(peer_addr, None).await.unwrap();
         tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
 
         // Park a receive on the pre-rebind socket, then move it. Without the
@@ -422,7 +612,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (_peer_socket, peer_addr) = peer().await;
-        let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
+        let endpoint = EndpointSocket::connect(peer_addr, None).await.unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -450,7 +640,7 @@ mod tests {
     async fn a_network_change_rebinds_a_registered_endpoint() {
         use crate::network_change::{NetworkChangeListener, is_registered};
         let (_peer_socket, peer_addr) = peer().await;
-        let live = EndpointSocket::connect(peer_addr).await.unwrap();
+        let live = EndpointSocket::connect(peer_addr, None).await.unwrap();
         let listener: Arc<dyn NetworkChangeListener> = live.clone();
         assert!(is_registered(&listener));
         tokio::spawn(live.clone().run_rebind_task(|| {}));
@@ -466,5 +656,131 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Behind Phobos, a rebound socket sends nothing but an initiation until
+    /// one has gone out on it. Driven at the socket, where the gate is, so a
+    /// transport message sent straight after the swap is the case under
+    /// test, with no scheduling to luck past it (shoes#151 review).
+    #[tokio::test]
+    async fn behind_phobos_a_rebound_socket_sends_an_initiation_first() {
+        use awgtun::phobos::{PhobosCodec, PhobosConfig, Unwrapped};
+
+        let (peer_socket, peer_addr) = peer().await;
+        let config = PhobosConfig::new(b"synthetic-preset-key".to_vec()).unwrap();
+        let layer = PhobosLayer::new(config.clone()).unwrap();
+        let endpoint = EndpointSocket::connect(peer_addr, Some(layer))
+            .await
+            .unwrap();
+        let mut server = PhobosCodec::new(config).unwrap();
+
+        let message = |msg_type: u8| {
+            let mut m = vec![msg_type, 0, 0, 0];
+            m.extend(4..64u8);
+            m
+        };
+        let mut buf = [0u8; 2048];
+        let mut next_type = async |server: &mut PhobosCodec| {
+            let (n, from) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                peer_socket.recv_from(&mut buf),
+            )
+            .await
+            .expect("the peer received nothing")
+            .unwrap();
+            match server.unwrap(&mut buf[..n], from) {
+                Unwrapped::WireGuard(m) => (m[0], from),
+                other => panic!("not a WireGuard message: {other:?}"),
+            }
+        };
+
+        // The first socket is not gated: a tunnel's first message is an
+        // initiation anyway.
+        assert!(!endpoint.needs_initiation());
+        endpoint.send(&message(4)).await.unwrap();
+        let (first, before) = next_type(&mut server).await;
+        assert_eq!(first, 4);
+
+        let before_local = endpoint.local_addr().unwrap();
+        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
+        endpoint.request_rebind();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while endpoint.local_addr().unwrap() == before_local {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rebind never happened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(endpoint.needs_initiation());
+        assert_eq!(endpoint.send(&message(4)).await.unwrap(), 0, "held back");
+        endpoint.send(&message(1)).await.unwrap();
+        assert!(!endpoint.needs_initiation());
+        endpoint.send(&message(4)).await.unwrap();
+
+        let (after, from) = next_type(&mut server).await;
+        assert_ne!(from, before, "the datagram came from the old socket");
+        assert_eq!(after, 1, "the first message from the new socket");
+        assert_eq!(next_type(&mut server).await.0, 4);
+    }
+
+    /// An initiation that fails to go out does not open the gate: the
+    /// generation still owes one, and transport stays held back. Marked
+    /// before the send, as it first was, the failure left the gate open
+    /// with nothing sent (shoes#151 review).
+    #[tokio::test]
+    async fn a_failed_initiation_keeps_the_rebound_socket_gated() {
+        use awgtun::phobos::{Masking, PhobosConfig};
+
+        let (_peer_socket, peer_addr) = peer().await;
+        let mut config = PhobosConfig::new(b"synthetic-preset-key".to_vec()).unwrap();
+        config.masking = Masking::Stun;
+        let endpoint = EndpointSocket::connect(peer_addr, Some(PhobosLayer::new(config).unwrap()))
+            .await
+            .unwrap();
+
+        let before_local = endpoint.local_addr().unwrap();
+        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
+        endpoint.request_rebind();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while endpoint.local_addr().unwrap() == before_local {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rebind never happened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Longer than STUN's 16-bit DATA length: the send fails for certain.
+        let mut too_long = vec![1u8, 0, 0, 0];
+        too_long.resize(65_536, 7);
+        assert!(endpoint.send(&too_long).await.is_err());
+        assert!(
+            endpoint.needs_initiation(),
+            "a failed initiation opened the gate"
+        );
+        assert_eq!(endpoint.send(&[4, 0, 0, 0, 1, 2, 3, 4]).await.unwrap(), 0);
+
+        let mut initiation = vec![1u8, 0, 0, 0];
+        initiation.resize(148, 7);
+        endpoint.send(&initiation).await.unwrap();
+        assert!(!endpoint.needs_initiation());
+    }
+
+    /// A datagram the codec cannot frame is an error, not `Ok(0)`: the
+    /// caller's failure accounting has to see it.
+    #[tokio::test]
+    async fn a_datagram_phobos_cannot_frame_is_an_error() {
+        use awgtun::phobos::{Masking, PhobosConfig};
+
+        let (_peer_socket, peer_addr) = peer().await;
+        let mut config = PhobosConfig::new(b"k".to_vec()).unwrap();
+        config.masking = Masking::Stun;
+        let endpoint = EndpointSocket::connect(peer_addr, Some(PhobosLayer::new(config).unwrap()))
+            .await
+            .unwrap();
+        let err = endpoint.send(&[1, 0, 0]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

@@ -1,0 +1,90 @@
+# WireGuard client outbound behind a Phobos server.
+#
+# Phobos (github.com/Ground-Zerro/Phobos) runs plain WireGuard behind an
+# obfuscating UDP proxy, and publishes only the proxy's ports, one per
+# preset. The address below is the preset's port, not WireGuard's.
+#
+# Three SOCKS5 inbounds, one per masking. The `key` must match the preset
+# exactly. A wrong key is never reported: the server drops everything,
+# which looks exactly like an unreachable server.
+#
+# The fields are the preset's client keys, with `-` written `_`
+# (max-dummy -> max_dummy). `target` and `source-lport` from a Phobos client
+# file are not needed: the first is the address below, and the second names a
+# loopback port shoes doesn't use.
+
+# --- STUN masking ---
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "phobos.example.com:51822"
+        protocol:
+          type: wireguard
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="  # replace with your key
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="  # replace with your key
+          local_addresses: "10.8.0.2/32"
+          allowed_ips:
+            - "0.0.0.0/0"
+            - "::/0"
+          persistent_keepalive: 25
+          # A STUN frame adds 24 bytes: keep mtu <= 1416 on a 1500-byte path.
+          mtu: 1280
+          phobos:
+            key: "replace-with-the-preset-key"
+            masking: stun
+            # Random bytes appended to cookie and transport messages under
+            # 1024 bytes, fewer than this many. Handshakes always get up
+            # to 511.
+            max_dummy: 4
+
+# --- MEDIA (RTP) masking ---
+- address: 127.0.0.1:1081
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "phobos.example.com:51823"
+        protocol:
+          type: wireguard
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="  # replace with your key
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="  # replace with your key
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          mtu: 1280
+          phobos:
+            key: "replace-with-the-preset-key"
+            masking: media
+            # Under media, only the first 16 bytes are XORed unless this
+            # says otherwise. Must match the server.
+            obfuscate_bytes: 16
+            # RTP stream parameters; 0 or unset picks a random preset.
+            # A non-zero media_pt or media_ssrc must match the server's.
+            media_pt: 96
+            media_clock: 30        # frames per second
+
+# --- No masking: XOR and random tail only ---
+- address: 127.0.0.1:1082
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "phobos.example.com:51824"
+        protocol:
+          type: wireguard
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="  # replace with your key
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="  # replace with your key
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          mtu: 1280
+          phobos:
+            key: "replace-with-the-preset-key"
+            # none, or auto / tls, which a UDP client treats the same.
+            masking: none

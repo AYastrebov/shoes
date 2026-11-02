@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**WireGuard reaches Phobos servers.** A `phobos:` block on the `wireguard`
+outbound speaks the obfuscation a
+[Phobos](https://github.com/Ground-Zerro/Phobos) server puts in front of
+its WireGuard: each datagram XORed with a key-derived stream, given a
+random tail, and framed as STUN or RTP (`masking: stun | media | none`).
+The fields are the preset's client keys with `-` written `_`, with the
+reference's ranges and defaults (`max_dummy: 4`; `obfuscate_bytes` 16 under
+`media`). The codec is awgtun's (awgtun#9), and the runtime applies it at
+the endpoint socket. That covers every datagram, the reference's STUN
+Binding exchange (a request before each initiation and on a 10 s or 5 s
+timer while the session is up, and an answer to the server's), and a
+handshake rather than a keepalive after a rebind, because the server drops
+everything else from an address it hasn't seen complete one. It's not
+accepted on `amneziawg`, since the server forwards to plain WireGuard.
+Tested end to end against an in-process server double under each masking,
+across a rebind, and with a wrong key as the control
+(`docs/specs/2026-11-02-phobos-obfuscation.md`).
+
 **DNS: shared system lookups, a 60-second native cache, and hickory's
 closed-connection failover.** Upstream's native DNS cache rework (#220,
 #222, #227), first left out as an improvement:
