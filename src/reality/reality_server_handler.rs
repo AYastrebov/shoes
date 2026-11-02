@@ -53,7 +53,7 @@ pub struct RealityServerTarget {
 ///   - Auth succeeded: build REALITY response matching dest's structure
 #[inline]
 pub async fn setup_reality_server_stream(
-    mut server_stream: Box<dyn AsyncStream>,
+    server_stream: Box<dyn AsyncStream>,
     target: &RealityServerTarget,
     parsed_client_hello: ParsedClientHello,
     resolver: &Arc<dyn Resolver>,
@@ -299,12 +299,21 @@ pub async fn setup_reality_server_stream(
     reality_conn.build_server_response(&dest_records)?;
 
     let mut connection = CryptoConnection::new_reality_server(reality_conn);
-    if !client_pending.is_empty() {
-        let mut pending = &client_pending[..];
-        while !pending.is_empty() {
-            connection.read_tls(&mut pending)?;
-        }
-    }
+    // The preread bytes are replayed through the stream, so the handshake
+    // reads and processes them a bounded chunk at a time like the socket's,
+    // and what follows the handshake stays queued for the TLS reader.
+    // Feeding them into the connection at once overflowed its ciphertext
+    // buffer (a panic) when a client coalesced a large flight with its
+    // ClientHello. Upstream likewise hands them to its handshake as
+    // `preread` rather than to the connection.
+    let mut server_stream: Box<dyn AsyncStream> = if client_pending.is_empty() {
+        server_stream
+    } else {
+        Box::new(crate::prepend_stream::PrependStream::new(
+            server_stream,
+            Some(client_pending.to_vec().into_boxed_slice()),
+        ))
+    };
     perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
 
     let tls_stream = CryptoTlsStream::new(server_stream, connection);
@@ -440,5 +449,113 @@ mod tests {
         let mut got = [0u8; 5];
         client_far.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"reply");
+    }
+
+    /// An authenticated ClientHello coalesced with more than the REALITY
+    /// connection's ciphertext buffer holds is an error, not a panic: the
+    /// preread bytes are replayed through the handshake's bounded reads
+    /// instead of being fed to the connection at once. Adapted from
+    /// upstream cfal/shoes#165's
+    /// `authenticated_non_vision_oversized_preread_returns_error_without_panicking`.
+    #[tokio::test]
+    async fn an_oversized_preread_after_an_authenticated_hello_is_an_error_not_a_panic() {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::port_forward_handler::PortForwardServerHandler;
+        use crate::reality::{RealityClientConfig, RealityClientConnection};
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use aws_lc_rs::agreement;
+
+        let private_key = [1; 32];
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key: public_key.as_ref().try_into().unwrap(),
+            short_id: [0; 8],
+            server_name: "localhost".into(),
+            cipher_suites: Vec::new(),
+            client_version: None,
+        })
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+
+        // The camouflage destination: a real TLS 1.3 server whose flight the
+        // REALITY response is shaped after.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest = NetLocation::new(
+            crate::address::Address::Hostname("localhost".into()),
+            listener.local_addr().unwrap().port(),
+        );
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let decoy_config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+        let mut decoy = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap(),
+        );
+        crate::crypto::feed_crypto_connection(&mut decoy, &hello).unwrap();
+        decoy.process_new_packets().unwrap();
+        let mut response = Vec::new();
+        decoy.write_tls(&mut response).unwrap();
+
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let target = RealityServerTarget {
+            private_key,
+            short_ids: vec![[0; 8]],
+            dest: dest.clone(),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+            effective_selector: selector.clone(),
+            inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                vec![dest],
+                selector,
+            ))),
+            dest_client_chain: ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(
+                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
+                        .unwrap(),
+                ))],
+                Vec::new(),
+            ),
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+
+        // 36000 bytes of one-byte application-data records after the hello:
+        // more than the 33290-byte ciphertext buffer.
+        let (io, mut peer) = tokio::io::duplex(65540);
+        let mut flight = hello.clone();
+        flight.extend_from_slice(&[0x17, 0x03, 0x03, 0, 1, 0].repeat(6000));
+        peer.write_all(&flight).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(TestStream(io));
+        let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+        assert!(parsed.client_reader.unparsed_data().len() > 33290);
+
+        let decoy_io = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut forwarded_hello = vec![0; hello.len()];
+            socket.read_exact(&mut forwarded_hello).await.unwrap();
+            assert_eq!(forwarded_hello, hello);
+            socket.write_all(&response).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                setup_reality_server_stream(io, &target, parsed, &resolver),
+                decoy_io,
+            )
+        })
+        .await
+        .unwrap();
+        let error = result.err().expect("invalid encrypted records must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
     }
 }
