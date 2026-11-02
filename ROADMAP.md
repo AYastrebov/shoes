@@ -113,10 +113,10 @@ REALITY fixes, lost TLS writer wakeups and AnyTLS stale-session recovery
 hardening PR #149 and its `fix/protocol-correctness` branch (2026-10-31):
 the crash and resource fixes whose defect is here were ported (TUIC reply
 fragmenting, UDP association and AnyTLS stream caps, the VLESS addon
-bound); still to judge and port from it are Vision+XUDP server padding,
-AnyTLS auth padding over 32 KiB, Shadowsocks' initial-message limit,
-SOCKS and WebSocket negative replies, and REALITY key material in debug
-logs. #149's VMess nonce-exhaustion error is not to be taken (it cuts
+bound), and in a follow-up its correctness fixes (Vision+XUDP server
+padding, AnyTLS auth padding, Shadowsocks' initial-message limit, SOCKS
+and WebSocket negative replies, REALITY key material in debug logs, the
+Vision client buffer floor). #149's VMess nonce-exhaustion error is not to be taken (it cuts
 streams at about 1 GiB; v2ray and Xray wrap), nor #144's early AnyTLS
 SYNACK while upstream has not taken it. The remote is `upstream`; the
 next pass starts from `git log dd2f370a..upstream/master` and those two
