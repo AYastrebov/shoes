@@ -104,6 +104,14 @@ The rest of that pass, correctness rather than crashes:
   the server's floor; a smaller one split Vision's first record.
 `write_all` also fails with WriteZero on a write that takes nothing,
 rather than looping.
+Two last small ones: a failed connect's reply to a client that is not
+reading (SOCKS5's REP) is bounded at 5 seconds, and REALITY's handshake
+steps return an error rather than panic if reached in the wrong state.
+Left on purpose: a size cap on VMess's auth-id replay filter (only valid
+auth ids enter it, and a cap would either reopen replays or lock users
+out), ShadowTLS yielding after many empty records (each poll is already
+bounded by its buffer), and SlideBuffer's release-mode asserts (an
+out-of-bounds slice already panics).
 
 **A repeatable live check, and the first live runs of the OpenConnect and
 mieru clients against real servers.** `tests/live_socks.rs` drives the
