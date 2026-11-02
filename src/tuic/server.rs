@@ -54,11 +54,40 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
-type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+type UdpSessionMap = Arc<UdpSessions>;
 
 /// UDP associations one connection may hold at once. Each is a socket and a
 /// task until it idles out; upstream cfal/shoes#149 picked the same bound.
 const MAX_UDP_SESSIONS: usize = 4096;
+
+/// A connection's associations, and the slots that bound how many it has.
+///
+/// A slot is taken before an association's routing and DNS are awaited and
+/// travels inside the session, so it comes back however the session goes
+/// (swept, removed, dropped after losing an insert race). A count checked
+/// before those awaits was not a bound: concurrent uni streams could all see
+/// room and all insert.
+struct UdpSessions {
+    map: DashMap<u16, UdpSession>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl UdpSessions {
+    fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_UDP_SESSIONS)),
+        }
+    }
+}
+
+impl std::ops::Deref for UdpSessions {
+    type Target = DashMap<u16, UdpSession>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
 
 /// Connection-level UDP fragment reassembly cache, keyed by (assoc_id, packet_id).
 ///
@@ -124,7 +153,7 @@ async fn process_connection(
     // 1. multiple threads can read different sessions concurrently
     // 2. multiple threads can modify different sessions concurrently
     // 3. the outer write lock is only needed for adding/removing sessions
-    let udp_session_map = Arc::new(DashMap::new());
+    let udp_session_map = Arc::new(UdpSessions::new());
 
     // Clone what we need for each loop before creating async blocks
     let bi_connection = connection.clone();
@@ -416,6 +445,20 @@ struct UdpSession {
     last_activity: std::time::Instant,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
+    /// This association's place under MAX_UDP_SESSIONS, returned when the
+    /// session is dropped. `None` only in tests.
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// A session's reply loop ends with it, however it leaves: swept, removed
+/// after a send error, or dropped after losing the race to insert. Only the
+/// sweep and DISSOCIATE cancelled it before, so the other two left the loop
+/// and its socket running until the connection ended. Hysteria2's sessions
+/// do the same.
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
 }
 
 /// Drop every association that has been silent longer than `udp_timeout`,
@@ -595,6 +638,7 @@ impl UdpSession {
             route,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            slot: None,
         };
 
         crate::connections::spawn(async move {
@@ -628,6 +672,7 @@ impl UdpSession {
             route,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            slot: None,
         };
 
         crate::connections::spawn(async move {
@@ -1141,12 +1186,15 @@ async fn process_udp_packet(
         match udp_session_map.get(&assoc_id) {
             Some(s) => s,
             None => {
-                // TODO: it's possible that a new session starts with a fragmented packet, and we
-                // receive this initial packet out of order so there's no address.
+                // A later fragment of an association whose first was dropped
+                // (refused, blocked, unresolvable) or has not arrived yet.
+                // Not a protocol error: in uni-stream mode an Err closes the
+                // connection, TCP streams included.
+                // TODO: a new session may start with a fragmented packet whose
+                // first fragment arrives out of order; that packet is lost.
                 if remote_location.is_none() {
-                    return Err(std::io::Error::other(
-                        "Ignoring packet with unknown session and empty address",
-                    ));
+                    debug!("Dropping a fragment for unknown association {assoc_id}");
+                    return Ok(());
                 }
 
                 let remote_location = remote_location.clone().unwrap();
@@ -1155,13 +1203,13 @@ async fn process_udp_packet(
                 // out, and the id is the client's to choose, so without a cap
                 // one authenticated client could open 65536 of them and run
                 // the process out of descriptors (upstream cfal/shoes#149).
-                if udp_session_map.len() >= MAX_UDP_SESSIONS {
+                let Ok(slot) = udp_session_map.slots.clone().try_acquire_owned() else {
                     debug!(
                         "Dropping a packet for new association {assoc_id}: the connection \
                          already has {MAX_UDP_SESSIONS}"
                     );
                     return Ok(());
-                }
+                };
 
                 // A routing outcome is not a protocol error. In uni-stream
                 // mode an Err here closes the whole connection, TCP streams
@@ -1206,7 +1254,7 @@ async fn process_udp_packet(
                     }
                 };
 
-                let session = if is_uni_stream {
+                let mut session = if is_uni_stream {
                     UdpSession::start_with_uni_streams(
                         assoc_id,
                         connection.clone(),
@@ -1223,6 +1271,7 @@ async fn process_udp_packet(
                         cancel_token,
                     )
                 };
+                session.slot = Some(slot);
 
                 // it's possible that the session is already on the map since we last checked.
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
@@ -1567,11 +1616,53 @@ mod sweep_tests {
                 .checked_sub(idle)
                 .expect("an idle time the clock can hold"),
             cancel_token: parent.child_token(),
+            slot: None,
         }
     }
 
     /// TU-D3: an association lives `udp_timeout` idle, no shorter and no
     /// longer, and the reaped one's reply loop is ended with it.
+    /// A slot travels with its session: while every slot is held a new
+    /// association gets none, and removing a session gives its slot back.
+    /// The check this replaced was a count read before routing and DNS were
+    /// awaited, which concurrent uni streams could all pass.
+    #[tokio::test]
+    async fn a_removed_association_gives_its_slot_back() {
+        let parent = CancellationToken::new();
+        let sessions = UdpSessions::new();
+        let held: Vec<_> = (1..MAX_UDP_SESSIONS)
+            .map(|_| sessions.slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        let mut session = detached_session(&parent, Duration::ZERO);
+        session.slot = Some(sessions.slots.clone().try_acquire_owned().unwrap());
+        sessions.insert(7, session);
+
+        assert!(
+            sessions.slots.clone().try_acquire_owned().is_err(),
+            "all held"
+        );
+        sessions.remove(&7);
+        assert!(
+            sessions.slots.clone().try_acquire_owned().is_ok(),
+            "the removed association's slot came back"
+        );
+        drop(held);
+    }
+
+    /// A session dropped any way ends its reply loop: only the sweep and
+    /// DISSOCIATE cancelled it before, so a session removed after a send
+    /// error, or dropped after losing the insert race, left its loop and
+    /// socket running until the connection ended.
+    #[tokio::test]
+    async fn dropping_an_association_cancels_its_reply_loop() {
+        let parent = CancellationToken::new();
+        let session = detached_session(&parent, Duration::ZERO);
+        let token = session.cancel_token.clone();
+        drop(session);
+        assert!(token.is_cancelled());
+        assert!(!parent.is_cancelled(), "the connection carries on");
+    }
+
     /// A datagram size the peer can choose no larger than a fragment
     /// header is an error, not a panic: the subtraction was unchecked, and a
     /// size equal to the later fragments' header divided by zero (an abort

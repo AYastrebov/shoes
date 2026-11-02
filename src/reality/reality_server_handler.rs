@@ -488,7 +488,17 @@ mod tests {
             crate::address::Address::Hostname("localhost".into()),
             listener.local_addr().unwrap().port(),
         );
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        // A hundred names make the flight's first encrypted record well over
+        // 512 bytes, which the handler reads as the whole handshake
+        // ("combined mode"). With one name it sat near 512 by the luck of
+        // the key and signature lengths, and under it the handler waited for
+        // records the decoy never sent: a flake.
+        let cert = rcgen::generate_simple_self_signed(
+            (0..100)
+                .map(|index| format!("host-{index}.example.test"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let decoy_config =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()

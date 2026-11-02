@@ -396,8 +396,18 @@ impl AnyTlsSession {
                     let mut streams = self.streams.write().await;
                     use std::collections::hash_map::Entry;
                     match streams.entry(stream_id) {
+                        // A FIN takes the id out of `streams` while its handler
+                        // may still be running (waiting on the upstream's EOF),
+                        // so an id with a live task is a duplicate too. Taken
+                        // as new, its insert below replaced the old task
+                        // handle: the task ran on detached, uncounted against
+                        // the cap and out of reach of the session's close.
                         Entry::Occupied(_) => {
                             log::warn!("Duplicate SYN for stream {}", stream_id);
+                            None
+                        }
+                        Entry::Vacant(_) if tasks.contains_key(&stream_id) => {
+                            log::warn!("SYN for stream {stream_id} while its handler still runs");
                             None
                         }
                         Entry::Vacant(_) if tasks.len() >= MAX_STREAMS_PER_SESSION => {
@@ -1475,6 +1485,49 @@ mod tests {
         // Session should still be alive
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!session.is_closed());
+
+        session.close().await;
+        run_task.abort();
+    }
+
+    /// A SYN for an id whose handler still runs (its FIN already took it out
+    /// of `streams`) is a duplicate: taken as new, its task handle replaced
+    /// the running one, which then ran detached, outside the stream cap and
+    /// out of reach of the session's close.
+    #[tokio::test]
+    async fn test_a_syn_for_an_id_whose_handler_still_runs_is_a_duplicate() {
+        let (client, mut server) = duplex(8192);
+        let padding = PaddingFactory::default_factory();
+        let session = AnyTlsSession::new_server_test(client, padding);
+
+        // Stream 1's handler, still running after its FIN.
+        let running = tokio::spawn(std::future::pending::<()>());
+        let running_id = running.id();
+        session.stream_tasks.lock().await.insert(1, running);
+
+        let session_clone = Arc::clone(&session);
+        let run_task = tokio::spawn(async move {
+            let _ = session_clone.run().await;
+        });
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        settings.insert("padding-md5", PaddingFactory::default_factory().md5());
+        let mut flight =
+            Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes())).encode();
+        flight.extend_from_slice(&Frame::control(Command::Syn, 1).encode());
+        server.write_all(&flight).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        {
+            let tasks = session.stream_tasks.lock().await;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[&1].id(), running_id, "the running handler is kept");
+        }
+        assert!(
+            !session.streams.read().await.contains_key(&1),
+            "no second stream was made"
+        );
 
         session.close().await;
         run_task.abort();
