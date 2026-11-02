@@ -42,6 +42,12 @@ impl ConnectFailure {
     }
 }
 
+/// How long the failure reply, its flush and the shutdown after it may take.
+/// A client that is not reading would otherwise hold the connection, its
+/// task and its descriptor until TCP itself gave up (upstream cfal/shoes
+/// 212d50ca bounds its terminal replies the same way).
+const FAILURE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The reply an inbound protocol owes its client when the connection fails,
 /// such as SOCKS5's non-zero REP (RFC 1928 section 6).
 pub type ConnectFailureReply = fn(ConnectFailure) -> Box<[u8]>;
@@ -137,11 +143,14 @@ pub async fn forward_tcp(request: ForwardRequest) -> std::io::Result<()> {
     let mut client_stream = match result {
         Ok(s) => s,
         Err(e) => {
-            if let (Some(reply), Some(failure)) = (connection_failure_response, failure) {
-                let _ = write_all(&mut server_stream, &reply(failure)).await;
-                let _ = server_stream.flush().await;
-            }
-            let _ = server_stream.shutdown().await;
+            let _ = timeout(FAILURE_REPLY_TIMEOUT, async {
+                if let (Some(reply), Some(failure)) = (connection_failure_response, failure) {
+                    let _ = write_all(&mut server_stream, &reply(failure)).await;
+                    let _ = server_stream.flush().await;
+                }
+                let _ = server_stream.shutdown().await;
+            })
+            .await;
             return e.map_or(Ok(()), Err);
         }
     };
@@ -275,6 +284,47 @@ mod tests {
     use crate::tcp::chain_builder::build_client_chain_group;
 
     use super::*;
+
+    /// A failed connect's reply to a client that never reads is abandoned
+    /// after FAILURE_REPLY_TIMEOUT, not held until TCP gives up.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_reply_to_a_client_that_never_reads_is_bounded() {
+        // Nothing listens here once the listener is dropped: the connect is
+        // refused, so the failure path runs.
+        let refused = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        // One byte of room and nobody reading: the 10-byte reply blocks.
+        let (near, _far) = tokio::io::duplex(1);
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            forward_tcp(ForwardRequest {
+                remote_location: NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    refused.port(),
+                ),
+                server_stream: Box::new(crate::async_stream::testing::TestStream(near)),
+                server_need_initial_flush: false,
+                connection_success_response: None,
+                connection_failure_response: Some(|_| vec![5, 5, 0, 1, 0, 0, 0, 0, 0, 0].into()),
+                initial_remote_data: None,
+                proxy_selector: allow_everything(resolver.clone()),
+                resolver,
+                sniff: None,
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "the failure reply was not bounded");
+        assert!(
+            started.elapsed() >= FAILURE_REPLY_TIMEOUT,
+            "it gave the reply its time: {:?}",
+            started.elapsed()
+        );
+    }
 
     /// Accepts one connection, reads it to EOF and reports everything it got.
     async fn spawn_recorder() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
