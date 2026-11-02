@@ -570,6 +570,19 @@ impl ShadowsocksStream {
         Ok(())
     }
 
+    /// Payload bytes the first write can carry beside the salt and header in
+    /// one write cache; the arithmetic `process_write_header` does.
+    fn initial_payload_capacity(&self) -> usize {
+        let cache = self.write_cache.len() - self.salt_len;
+        match self.stream_type {
+            ShadowsocksStreamType::Aead => cache - METADATA_SIZE,
+            ShadowsocksStreamType::AEAD2022Server => {
+                cache - (1 + 8 + self.salt_len + 2 + TAG_LEN) - TAG_LEN
+            }
+            ShadowsocksStreamType::AEAD2022Client => cache - (1 + 8 + 2 + TAG_LEN) - TAG_LEN,
+        }
+    }
+
     fn process_write_header(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.stream_type {
             ShadowsocksStreamType::Aead => {
@@ -593,9 +606,15 @@ impl ShadowsocksStream {
                 Ok(handled_len)
             }
             ShadowsocksStreamType::AEAD2022Server => {
-                assert!(!self.is_initial_read);
-
-                let decrypt_iv = self.decrypt_iv.take().unwrap();
+                // The response header echoes the request's salt, so there is
+                // nothing to answer before the request is read. An assert
+                // here aborted a mobile build (upstream cfal/shoes 0094b1b5).
+                let Some(decrypt_iv) = self.decrypt_iv.take() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "a shadowsocks 2022 response before the request was read",
+                    ));
+                };
 
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
                 self.write_cache_end_offset = self.salt_len;
@@ -903,11 +922,17 @@ impl AsyncWriteMessage for ShadowsocksStream {
         let this = self.get_mut();
 
         if this.is_initial_write {
-            let handled_len = this.process_write_header(buf)?;
-            this.is_initial_write = false;
-            if handled_len != buf.len() {
+            // Checked before anything is encrypted. The header used to
+            // encrypt what fit, and the size was judged after: a message
+            // too large left a partial chunk and a spent nonce in the
+            // stream, and the next message arrived behind it as garbage
+            // (upstream cfal/shoes 0094b1b5).
+            if buf.len() > this.initial_payload_capacity() {
                 return Poll::Ready(Err(message_too_large(buf.len())));
             }
+            let handled_len = this.process_write_header(buf)?;
+            this.is_initial_write = false;
+            debug_assert_eq!(handled_len, buf.len());
             return Poll::Ready(Ok(()));
         }
 
@@ -1040,6 +1065,61 @@ mod tests {
                 .await
                 .unwrap_err();
         assert_eq!(later.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A first message too large for its chunk is refused before anything is
+    /// encrypted, so the next message arrives intact. The header used to
+    /// encrypt what fit and judge the size after, leaving a partial chunk
+    /// ahead of the next message (upstream cfal/shoes 0094b1b5).
+    #[tokio::test]
+    async fn test_a_refused_first_message_leaves_the_stream_clean() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let mut writer = stream(tcp, ShadowsocksStreamType::Aead);
+            let mut reader = stream(accepted, ShadowsocksStreamType::Aead);
+
+            let too_big = vec![1u8; writer.initial_payload_capacity() + 1];
+            let refused =
+                std::future::poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, &too_big))
+                    .await
+                    .unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+
+            let message = vec![2u8; 100];
+            std::future::poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, &message))
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let mut received = vec![0u8; message.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                reader.read_exact(&mut received),
+            )
+            .await
+            .expect("the message arrived")
+            .unwrap();
+            assert_eq!(received, message);
+        })
+        .await
+        .expect("the refused message did not wedge the stream");
+    }
+
+    /// A 2022 server stream writing before it has read the request is an
+    /// error: the response header echoes the request's salt. It was an
+    /// assert, an abort in a mobile build.
+    #[tokio::test]
+    async fn test_a_2022_response_before_the_request_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut server = stream(tcp, ShadowsocksStreamType::AEAD2022Server);
+        let error = server.write_all(b"early").await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
