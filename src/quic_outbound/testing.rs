@@ -133,10 +133,13 @@ static ISSUED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(Mutex::defaul
 pub fn reserve_udp_port() -> SocketAddr {
     const ATTEMPTS: usize = 64;
 
+    // Probes stay bound until a fresh port is found: dropped at once, the
+    // OS (Windows above all) hands the same port straight back, and every
+    // attempt lands on one already issued.
+    let mut held = Vec::with_capacity(ATTEMPTS);
     for _ in 0..ATTEMPTS {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding a probe socket");
         let addr = probe.local_addr().expect("probe address");
-        drop(probe);
 
         if ISSUED_PORTS
             .lock()
@@ -145,6 +148,7 @@ pub fn reserve_udp_port() -> SocketAddr {
         {
             return addr;
         }
+        held.push(probe);
     }
 
     panic!("the operating system offered no unused ephemeral port in {ATTEMPTS} attempts");
@@ -157,10 +161,10 @@ pub fn reserve_udp_port() -> SocketAddr {
 pub fn reserve_tcp_port() -> SocketAddr {
     const ATTEMPTS: usize = 64;
 
+    let mut held = Vec::with_capacity(ATTEMPTS);
     for _ in 0..ATTEMPTS {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("binding a probe socket");
         let addr = probe.local_addr().expect("probe address");
-        drop(probe);
 
         if ISSUED_PORTS
             .lock()
@@ -169,6 +173,7 @@ pub fn reserve_tcp_port() -> SocketAddr {
         {
             return addr;
         }
+        held.push(probe);
     }
 
     panic!("the operating system offered no unused ephemeral port in {ATTEMPTS} attempts");

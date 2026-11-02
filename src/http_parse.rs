@@ -47,7 +47,17 @@ impl ParsedHttpData {
                 }
                 let header_key = tokens[0].trim().to_lowercase();
                 let header_value = tokens[1].trim().to_string();
-                headers.insert(header_key, header_value);
+                // A repeated field is one list (RFC 9110 §5.3): `Connection:
+                // Upgrade` then `Connection: keep-alive` is both, not the
+                // last one. Overwriting lost the first and refused a valid
+                // WebSocket 101.
+                headers
+                    .entry(header_key)
+                    .and_modify(|existing| {
+                        existing.push_str(", ");
+                        existing.push_str(&header_value);
+                    })
+                    .or_insert(header_value);
             }
 
             line_count += 1;
@@ -116,6 +126,26 @@ mod tests {
         far.write_all(bytes).await.unwrap();
         let mut stream: Box<dyn AsyncStream> = Box::new(TestStream(near));
         ParsedHttpData::parse(&mut stream).await
+    }
+
+    /// A field repeated is one list, in order (RFC 9110 §5.3): a `Connection:
+    /// Upgrade` line followed by `Connection: keep-alive` is both.
+    #[tokio::test]
+    async fn a_repeated_field_is_one_list() {
+        let parsed = parse_from(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+              Connection: keep-alive\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parsed.headers.get("connection").map(String::as_str),
+            Some("Upgrade, keep-alive")
+        );
+        assert_eq!(
+            parsed.headers.get("upgrade").map(String::as_str),
+            Some("websocket")
+        );
     }
 
     #[tokio::test]

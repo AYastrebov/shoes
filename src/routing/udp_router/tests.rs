@@ -351,8 +351,16 @@ async fn run_with_fake_remotes(
 /// A scripted session-based server stream (XUDP's shape): hands the router
 /// packets under route ids, and reports routes the client has ended
 /// through `take_closed_session`.
+/// What the scripted session stream does on a poll: hand over a packet,
+/// or learn of an End (close the route and keep polling, as the XUDP
+/// stream does inside one read).
+enum SessionScript {
+    Packet(MessageSessionId, SocketAddr, Vec<u8>),
+    End(MessageSessionId),
+}
+
 struct ScriptedSessionInner {
-    script: VecDeque<(MessageSessionId, SocketAddr, Vec<u8>)>,
+    script: VecDeque<SessionScript>,
     closed: VecDeque<MessageSessionId>,
     replies: Vec<(MessageSessionId, SocketAddr, Vec<u8>)>,
     read_waker: Option<Waker>,
@@ -363,7 +371,7 @@ struct ScriptedSessionServer {
 }
 
 fn scripted_sessions(
-    script: Vec<(MessageSessionId, SocketAddr, Vec<u8>)>,
+    script: Vec<SessionScript>,
 ) -> (ScriptedSessionServer, Arc<Mutex<ScriptedSessionInner>>) {
     let inner = Arc::new(Mutex::new(ScriptedSessionInner {
         script: script.into(),
@@ -386,9 +394,14 @@ impl AsyncReadSessionMessage for ScriptedSessionServer {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<(MessageSessionId, SocketAddr)>> {
         let mut inner = self.inner.lock().unwrap();
-        if let Some((route, destination, payload)) = inner.script.pop_front() {
-            buf.put_slice(&payload);
-            return Poll::Ready(Ok((route, destination)));
+        while let Some(step) = inner.script.pop_front() {
+            match step {
+                SessionScript::Packet(route, destination, payload) => {
+                    buf.put_slice(&payload);
+                    return Poll::Ready(Ok((route, destination)));
+                }
+                SessionScript::End(route) => inner.closed.push_back(route),
+            }
         }
         inner.read_waker = Some(cx.waker().clone());
         Poll::Pending
@@ -451,7 +464,8 @@ async fn test_a_closed_route_drops_its_remote_at_once() {
         ..Default::default()
     }));
     let destination: SocketAddr = "192.0.2.1:9".parse().unwrap();
-    let (stream, inner) = scripted_sessions(vec![(1, destination, b"one".to_vec())]);
+    let (stream, inner) =
+        scripted_sessions(vec![SessionScript::Packet(1, destination, b"one".to_vec())]);
     let limits = RouterLimits {
         session_timeout: Duration::from_secs(600),
         ..RouterLimits::default()
@@ -481,6 +495,48 @@ async fn test_a_closed_route_drops_its_remote_at_once() {
         !state.lock().unwrap().shutdown_polled,
         "dropped outright, not through the graceful shutdown"
     );
+    router.abort();
+}
+
+/// An End the stream meets inside a read that then returns Pending (the
+/// XUDP stream consumes control frames within one read) drops the route on
+/// that same wakeup. Nothing else wakes this router, so a drain done only
+/// before the poll would leave the remote and its budget held.
+#[tokio::test]
+async fn test_an_end_only_read_drops_the_route_on_the_same_wakeup() {
+    let state = Arc::new(Mutex::new(FakeRemoteState {
+        shutdown_may_finish: false,
+        ..Default::default()
+    }));
+    let destination: SocketAddr = "192.0.2.1:9".parse().unwrap();
+    let (stream, inner) =
+        scripted_sessions(vec![SessionScript::Packet(1, destination, b"one".to_vec())]);
+    let limits = RouterLimits {
+        session_timeout: Duration::from_secs(600),
+        ..RouterLimits::default()
+    };
+    let router = tokio::spawn(run_with_fake_remotes(
+        ServerStream::Session(Box::new(stream)),
+        limits,
+        state.clone(),
+    ));
+
+    // The session is up and the router is idle; the End arrives as the one
+    // thing the next read finds.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!state.lock().unwrap().dropped, "the session is live");
+    {
+        let mut inner = inner.lock().unwrap();
+        inner.script.push_back(SessionScript::End(1));
+        if let Some(waker) = inner.read_waker.take() {
+            waker.wake();
+        }
+    }
+    wait_until("the route ended within the read is dropped", || {
+        state.lock().unwrap().dropped
+    })
+    .await;
+    assert!(!state.lock().unwrap().shutdown_polled);
     router.abort();
 }
 
