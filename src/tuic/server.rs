@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use log::{debug, error};
+use log::{debug, error, warn};
 use lru::LruCache;
 use parking_lot::Mutex;
 use subtle::ConstantTimeEq;
@@ -55,6 +55,10 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+
+/// UDP associations one connection may hold at once. Each is a socket and a
+/// task until it idles out; upstream cfal/shoes#149 picked the same bound.
+const MAX_UDP_SESSIONS: usize = 4096;
 
 /// Connection-level UDP fragment reassembly cache, keyed by (assoc_id, packet_id).
 ///
@@ -755,10 +759,6 @@ async fn run_udp_remote_to_local_datagram_loop(
 ) -> std::io::Result<()> {
     use bytes::BufMut;
 
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
-
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
@@ -798,6 +798,12 @@ async fn run_udp_remote_to_local_datagram_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
+        // Read for every reply: path MTU discovery moves it, and a size
+        // cached at the start turned a shrink into TooLarge on every send.
+        let max_datagram_size = connection
+            .max_datagram_size()
+            .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
+
         let address_bytes: Bytes = reply_source(&mut cached_src, src_addr);
         let address_bytes_len = address_bytes.len();
 
@@ -808,64 +814,144 @@ async fn run_udp_remote_to_local_datagram_loop(
         // + payload_size (2 bytes) + address_bytes
         let header_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes_len;
 
-        if header_overhead + payload_len <= max_datagram_size {
-            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
+        let (first_capacity, other_capacity, fragment_count) = match fragment_plan(
+            max_datagram_size,
+            header_overhead,
+            OTHER_FRAGMENT_OVERHEAD,
+            payload_len,
+        )? {
+            FragmentPlan::Send {
+                first_capacity,
+                other_capacity,
+                fragment_count,
+            } => (first_capacity, other_capacity, fragment_count),
+            FragmentPlan::TooManyFragments { needed } => {
+                // One reply the association cannot carry, not an association
+                // that cannot carry replies: drop it and keep the loop.
+                log::warn!(
+                    "Dropping a {payload_len} byte reply for association {assoc_id}: it needs \
+                     {needed} fragments, over the 255 the protocol allows"
+                );
+                continue;
+            }
+        };
+
+        let mut offset = 0;
+        for fragment_id in 0..fragment_count {
+            let (fragment_payload_len, header_size) = if fragment_id == 0 {
+                (first_capacity.min(payload_len), header_overhead)
+            } else {
+                (
+                    other_capacity.min(payload_len - offset),
+                    OTHER_FRAGMENT_OVERHEAD,
+                )
+            };
+
+            let mut datagram = BytesMut::with_capacity(header_size + fragment_payload_len);
             datagram.put_u8(5); // tuic version
-            datagram.put_u8(COMMAND_TYPE_PACKET); // command type
+            datagram.put_u8(COMMAND_TYPE_PACKET);
             datagram.extend_from_slice(&assoc_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
-            datagram.put_u8(1); // frag_total = 1
-            datagram.put_u8(0); // frag_id = 0
-            datagram.extend_from_slice(&(payload_len as u16).to_be_bytes());
-            datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
-
-            connection
-                .send_datagram(datagram.freeze())
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
-        } else {
-            // Calculate header sizes for first fragment and subsequent fragments.
-            let first_overhead = header_overhead; // full address included in the first fragment
-            let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1; // 0xff marker instead of full address
-            let first_capacity = max_datagram_size - first_overhead;
-            let other_capacity = max_datagram_size - other_overhead;
-
-            let remaining = payload_len.saturating_sub(first_capacity);
-            let additional_fragments = remaining.div_ceil(other_capacity);
-            let fragment_count = 1 + additional_fragments;
-
-            let mut offset = 0;
-            for fragment_id in 0..fragment_count {
-                let (fragment_payload_len, header_size) = if fragment_id == 0 {
-                    let len = std::cmp::min(first_capacity, payload_len);
-                    (len, first_overhead)
-                } else {
-                    let len = std::cmp::min(other_capacity, payload_len - offset);
-                    (len, other_overhead)
-                };
-
-                let mut datagram = BytesMut::with_capacity(header_size + fragment_payload_len);
-                datagram.extend_from_slice(&[5, COMMAND_TYPE_PACKET]);
-                datagram.extend_from_slice(&assoc_id.to_be_bytes());
-                datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_count as u8, fragment_id as u8]);
-                datagram.extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
-                if fragment_id == 0 {
-                    datagram.extend_from_slice(&address_bytes);
-                } else {
-                    datagram.put_u8(0xff);
-                }
-                datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
-                connection.send_datagram(datagram.freeze()).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to send datagram fragment {fragment_id}: {e}"
-                    ))
-                })?;
-                offset += fragment_payload_len;
+            datagram.extend_from_slice(&[fragment_count, fragment_id]);
+            datagram.extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
+            if fragment_id == 0 {
+                datagram.extend_from_slice(&address_bytes);
+            } else {
+                datagram.put_u8(0xff);
             }
+            datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
+            if !send_reply_datagram(&connection, datagram.freeze())? {
+                log::debug!(
+                    "Dropping the rest of a {payload_len} byte reply for association \
+                     {assoc_id}: fragment {fragment_id} is over the path's datagram size"
+                );
+                break;
+            }
+            offset += fragment_payload_len;
         }
     }
 }
+
+/// Header bytes of every fragment after the first: version, command,
+/// assoc_id, packet_id, frag_total, frag_id, payload size, and the 0xff
+/// marker standing in for the address.
+const OTHER_FRAGMENT_OVERHEAD: usize = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1;
+
+/// What splitting a reply across datagrams came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentPlan {
+    /// Send it: the first fragment carries up to `first_capacity` payload
+    /// bytes (it also carries the address), every later one `other_capacity`.
+    Send {
+        first_capacity: usize,
+        other_capacity: usize,
+        fragment_count: u8,
+    },
+    /// This one reply will not fit the 255 fragments the protocol counts.
+    TooManyFragments { needed: usize },
+}
+
+/// How a reply payload is split across datagrams.
+///
+/// `max_datagram_size` is bounded by what the peer advertised
+/// (`max_datagram_frame_size`), so it may be smaller than a header. The
+/// subtraction used to be unchecked: a size equal to the later fragments'
+/// header divided by zero, a panic that aborts a mobile build, and smaller
+/// ones wrapped. A datagram with no room for a payload is a property of the
+/// connection, so it is the `Err`; a reply needing more than 255 fragments
+/// is a property of the reply, so it is a value and costs that reply alone.
+/// The Hysteria2 server's `fragment_plan` is the same rule with one header
+/// size.
+fn fragment_plan(
+    max_datagram_size: usize,
+    first_overhead: usize,
+    other_overhead: usize,
+    payload_len: usize,
+) -> std::io::Result<FragmentPlan> {
+    let room = |overhead: usize| {
+        max_datagram_size
+            .checked_sub(overhead)
+            .filter(|room| *room > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "a datagram of {max_datagram_size} bytes has no room for a payload \
+                         after a {overhead} byte header"
+                    ),
+                )
+            })
+    };
+    let first_capacity = room(first_overhead)?;
+    let other_capacity = room(other_overhead)?;
+
+    let rest = payload_len.saturating_sub(first_capacity);
+    let fragment_count = 1 + rest.div_ceil(other_capacity);
+    if fragment_count > u8::MAX as usize {
+        return Ok(FragmentPlan::TooManyFragments {
+            needed: fragment_count,
+        });
+    }
+    Ok(FragmentPlan::Send {
+        first_capacity,
+        other_capacity,
+        fragment_count: fragment_count as u8,
+    })
+}
+
+/// Send one reply datagram. `Ok(false)` when it is over the size the path
+/// takes now: that costs this reply, not the association, since the size is
+/// read again for the next one. Any other failure ends the loop.
+fn send_reply_datagram(connection: &quinn::Connection, datagram: Bytes) -> std::io::Result<bool> {
+    match connection.send_datagram(datagram) {
+        Ok(()) => Ok(true),
+        Err(quinn::SendDatagramError::TooLarge) => Ok(false),
+        Err(e) => Err(std::io::Error::other(format!(
+            "Failed to send datagram: {e}"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_unidirectional_loop(
     connection: quinn::Connection,
@@ -1065,6 +1151,21 @@ async fn process_udp_packet(
 
                 let remote_location = remote_location.clone().unwrap();
 
+                // Each association holds a socket and a task until it idles
+                // out, and the id is the client's to choose, so without a cap
+                // one authenticated client could open 65536 of them and run
+                // the process out of descriptors (upstream cfal/shoes#149).
+                if udp_session_map.len() >= MAX_UDP_SESSIONS {
+                    debug!(
+                        "Dropping a packet for new association {assoc_id}: the connection \
+                         already has {MAX_UDP_SESSIONS}"
+                    );
+                    return Ok(());
+                }
+
+                // A routing outcome is not a protocol error. In uni-stream
+                // mode an Err here closes the whole connection, TCP streams
+                // included, so these drop the packet and say so.
                 let action = client_proxy_selector
                     .judge(remote_location.clone().into(), resolver)
                     .await;
@@ -1075,29 +1176,35 @@ async fn process_udp_packet(
                         remote_location,
                     }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
-                        return Err(std::io::Error::other(format!(
-                            "Blocked UDP forward to {remote_location}"
-                        )));
+                        debug!("Blocked UDP forward to {remote_location}");
+                        return Ok(());
                     }
                     Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "Failed to judge UDP forward to {remote_location}: {e}"
-                        )));
+                        warn!("Failed to judge UDP forward to {remote_location}: {e}");
+                        return Ok(());
                     }
                 };
 
                 let resolved_address =
-                    resolve_single_address(resolver, updated_location.location())
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
+                    match resolve_single_address(resolver, updated_location.location()).await {
+                        Ok(address) => address,
+                        Err(e) => {
+                            warn!(
                                 "Failed to resolve initial remote location {}: {e}",
                                 updated_location.location()
-                            ))
-                        })?;
+                            );
+                            return Ok(());
+                        }
+                    };
 
                 // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                let client_socket = match crate::socket_util::new_udp_socket(true, None) {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        warn!("Dropping a packet for association {assoc_id}: no UDP socket: {e}");
+                        return Ok(());
+                    }
+                };
 
                 let session = if is_uni_stream {
                     UdpSession::start_with_uni_streams(
@@ -1138,14 +1245,16 @@ async fn process_udp_packet(
         }
         let remote_location = remote_location.as_ref().unwrap();
 
-        let (socket_addr, is_updated) = session
+        let (socket_addr, is_updated) = match session
             .resolve_address(remote_location, client_proxy_selector, resolver)
             .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!("Dropping a UDP packet to {remote_location}: {e}");
+                return Ok(());
+            }
+        };
 
         // send_socket is dual-stack IPv6, so an IPv4 target must be sent as an
         // IPv4-mapped address (a bare v4 destination fails with EINVAL on macOS/BSD).
@@ -1189,14 +1298,16 @@ async fn process_udp_packet(
             None => return Ok(()),
         };
 
-        let (socket_addr, is_updated) = session
+        let (socket_addr, is_updated) = match session
             .resolve_address(&remote_location, client_proxy_selector, resolver)
             .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!("Dropping a UDP packet to {remote_location}: {e}");
+                return Ok(());
+            }
+        };
 
         // send_socket is dual-stack IPv6, so an IPv4 target must be sent as an
         // IPv4-mapped address (a bare v4 destination fails with EINVAL on macOS/BSD).
@@ -1461,6 +1572,62 @@ mod sweep_tests {
 
     /// TU-D3: an association lives `udp_timeout` idle, no shorter and no
     /// longer, and the reaped one's reply loop is ended with it.
+    /// A datagram size the peer can choose no larger than a fragment
+    /// header is an error, not a panic: the subtraction was unchecked, and a
+    /// size equal to the later fragments' header divided by zero (an abort
+    /// in a mobile build).
+    #[test]
+    fn a_datagram_with_no_room_after_the_header_is_an_error_not_a_panic() {
+        for max in [0, 5, OTHER_FRAGMENT_OVERHEAD - 1, OTHER_FRAGMENT_OVERHEAD] {
+            assert!(super::fragment_plan(max, 20, OTHER_FRAGMENT_OVERHEAD, 1000).is_err());
+        }
+        // Room after the later header but none after the first's address.
+        assert!(super::fragment_plan(20, 20, OTHER_FRAGMENT_OVERHEAD, 1000).is_err());
+    }
+
+    /// More than 255 fragments is that reply dropped, not a truncated count.
+    #[test]
+    fn a_reply_needing_more_than_255_fragments_is_dropped_not_truncated() {
+        let max = OTHER_FRAGMENT_OVERHEAD + 4;
+        assert_eq!(
+            super::fragment_plan(max, OTHER_FRAGMENT_OVERHEAD, OTHER_FRAGMENT_OVERHEAD, 1100)
+                .unwrap(),
+            super::FragmentPlan::TooManyFragments { needed: 275 }
+        );
+    }
+
+    /// The first fragment's capacity is after the address, the rest after
+    /// the marker; a reply that fits is one fragment.
+    #[test]
+    fn fragments_are_planned_around_both_header_sizes() {
+        let plan = |payload| super::fragment_plan(1200, 30, OTHER_FRAGMENT_OVERHEAD, payload);
+        assert_eq!(
+            plan(1170).unwrap(),
+            super::FragmentPlan::Send {
+                first_capacity: 1170,
+                other_capacity: 1200 - OTHER_FRAGMENT_OVERHEAD,
+                fragment_count: 1,
+            }
+        );
+        assert_eq!(
+            plan(0).unwrap(),
+            super::FragmentPlan::Send {
+                first_capacity: 1170,
+                other_capacity: 1200 - OTHER_FRAGMENT_OVERHEAD,
+                fragment_count: 1,
+            }
+        );
+        let super::FragmentPlan::Send { fragment_count, .. } = plan(1170 + 1189).unwrap() else {
+            panic!("fits");
+        };
+        assert_eq!(fragment_count, 2);
+        let super::FragmentPlan::Send { fragment_count, .. } = plan(1170 + 1189 + 1).unwrap()
+        else {
+            panic!("fits");
+        };
+        assert_eq!(fragment_count, 3);
+    }
+
     #[tokio::test]
     async fn the_sweep_reaps_only_the_association_past_udp_timeout() {
         let parent = CancellationToken::new();
