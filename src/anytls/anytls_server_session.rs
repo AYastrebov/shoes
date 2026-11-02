@@ -537,10 +537,13 @@ impl AnyTlsSession {
 
                 let settings = StringMap::from_bytes(&frame.data);
 
-                // Check padding-md5
+                // Send our scheme unless the client already has it. A client
+                // that names no scheme gets it too, as anytls-go's server
+                // does (an absent md5 is not ours); only a mismatch did
+                // before (upstream cfal/shoes 4b49092e).
                 if settings
                     .get("padding-md5")
-                    .is_some_and(|client_md5| client_md5 != self.padding.md5())
+                    .is_none_or(|client_md5| client_md5 != self.padding.md5())
                 {
                     // Send updated padding scheme
                     let update_frame = Frame::with_data(
@@ -1658,6 +1661,49 @@ mod tests {
             MAX_STREAMS_PER_SESSION
         );
         assert!(!session.is_closed());
+
+        session.close().await;
+        run_task.abort();
+    }
+
+    /// A client that names no padding scheme is sent ours, as anytls-go's
+    /// server does; only a client naming a different one was before.
+    #[tokio::test]
+    async fn test_a_client_naming_no_padding_scheme_is_sent_ours() {
+        let (client, mut server) = duplex(1 << 16);
+        let padding = PaddingFactory::default_factory();
+        let session = AnyTlsSession::new_server_test(client, padding);
+        let session_clone = Arc::clone(&session);
+        let run_task = tokio::spawn(async move {
+            let _ = session_clone.run().await;
+        });
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        let settings_frame =
+            Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
+        server.write_all(&settings_frame.encode()).await.unwrap();
+
+        let mut received = BytesMut::new();
+        let update = timeout(Duration::from_secs(2), async {
+            loop {
+                let mut chunk = [0u8; 4096];
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "the session closed");
+                received.extend_from_slice(&chunk[..n]);
+                while let Some(frame) = FrameCodec::decode(&mut received).unwrap() {
+                    if frame.cmd == Command::UpdatePaddingScheme {
+                        return frame.data;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the scheme was sent");
+        assert_eq!(
+            update.as_ref(),
+            PaddingFactory::default_factory().raw_scheme()
+        );
 
         session.close().await;
         run_task.abort();
