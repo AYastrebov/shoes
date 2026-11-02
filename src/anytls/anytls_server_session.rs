@@ -47,6 +47,20 @@ const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// cfal/shoes#149 uses the same bound).
 const MAX_STREAMS_PER_SESSION: usize = 256;
 
+/// Streams that still hold something: an id registered in `streams` (its
+/// FIN not yet sent, which waits on the writer and so on the peer reading)
+/// or one whose handler still runs (an incoming FIN removes the id before
+/// the handler ends). Counting only running handlers let a peer that stops
+/// reading pile up registrations past the cap, its handlers ending at once
+/// on bad destinations while their FINs never went out.
+fn streams_in_use<V, T>(streams: &HashMap<u32, V>, tasks: &HashMap<u32, T>) -> usize {
+    tasks.len()
+        + streams
+            .keys()
+            .filter(|stream_id| !tasks.contains_key(stream_id))
+            .count()
+}
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -394,6 +408,7 @@ impl AnyTlsSession {
                 // This prevents race conditions with duplicate SYNs
                 let stream_opt = {
                     let mut streams = self.streams.write().await;
+                    let in_use = streams_in_use(&streams, &tasks);
                     use std::collections::hash_map::Entry;
                     match streams.entry(stream_id) {
                         // A FIN takes the id out of `streams` while its handler
@@ -410,7 +425,7 @@ impl AnyTlsSession {
                             log::warn!("SYN for stream {stream_id} while its handler still runs");
                             None
                         }
-                        Entry::Vacant(_) if tasks.len() >= MAX_STREAMS_PER_SESSION => {
+                        Entry::Vacant(_) if in_use >= MAX_STREAMS_PER_SESSION => {
                             over_limit = true;
                             None
                         }
@@ -1488,6 +1503,54 @@ mod tests {
 
         session.close().await;
         run_task.abort();
+    }
+
+    /// Registrations whose handlers are gone still count: a peer that stops
+    /// reading keeps their FINs from going out, so their ids stay in
+    /// `streams`. Counting only running handlers admitted SYN after SYN.
+    #[tokio::test]
+    async fn test_registered_streams_without_handlers_count_against_the_limit() {
+        let (client, mut server) = duplex(1 << 16);
+        let padding = PaddingFactory::default_factory();
+        let session = AnyTlsSession::new_server_test(client, padding);
+        {
+            let mut streams = session.streams.write().await;
+            for stream_id in 1..=MAX_STREAMS_PER_SESSION as u32 {
+                let (tx, _rx) = mpsc::channel(1);
+                streams.insert(stream_id, tx);
+            }
+        }
+
+        let session_clone = Arc::clone(&session);
+        let run_task = tokio::spawn(async move {
+            let _ = session_clone.run().await;
+        });
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        settings.insert("padding-md5", PaddingFactory::default_factory().md5());
+        let over = MAX_STREAMS_PER_SESSION as u32 + 1;
+        let mut flight =
+            Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes())).encode();
+        flight.extend_from_slice(&Frame::control(Command::Syn, over).encode());
+        server.write_all(&flight).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            session.stream_tasks.lock().await.is_empty(),
+            "no handler started"
+        );
+        assert!(!session.streams.read().await.contains_key(&over));
+
+        session.close().await;
+        run_task.abort();
+    }
+
+    #[test]
+    fn streams_in_use_counts_each_id_once() {
+        let streams: HashMap<u32, ()> = [(1, ()), (2, ())].into();
+        let tasks: HashMap<u32, ()> = [(2, ()), (3, ())].into();
+        assert_eq!(streams_in_use(&streams, &tasks), 3);
     }
 
     /// A SYN for an id whose handler still runs (its FIN already took it out

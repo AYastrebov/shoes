@@ -63,8 +63,10 @@ const MAX_UDP_SESSIONS: usize = 4096;
 /// A connection's associations, and the slots that bound how many it has.
 ///
 /// A slot is taken before an association's routing and DNS are awaited and
-/// travels inside the session, so it comes back however the session goes
-/// (swept, removed, dropped after losing an insert race). A count checked
+/// travels inside the session's reply worker, so it comes back once that
+/// worker is gone however the session went (swept, removed, dropped after
+/// losing an insert race), and not while a blocked worker still holds its
+/// socket. A count checked
 /// before those awaits was not a bound: concurrent uni streams could all see
 /// room and all insert.
 struct UdpSessions {
@@ -445,19 +447,26 @@ struct UdpSession {
     last_activity: std::time::Instant,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
-    /// This association's place under MAX_UDP_SESSIONS, returned when the
-    /// session is dropped. `None` only in tests.
-    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The reply worker, aborted with the session. Cancelling the token
+    /// stops it only while it waits on its socket; one blocked in
+    /// `open_uni` or a write (a peer withholding stream or flow-control
+    /// credit) held its socket and its slot on regardless. `None` only in
+    /// tests.
+    task: Option<tokio::task::AbortHandle>,
 }
 
 /// A session's reply loop ends with it, however it leaves: swept, removed
 /// after a send error, or dropped after losing the race to insert. Only the
 /// sweep and DISSOCIATE cancelled it before, so the other two left the loop
-/// and its socket running until the connection ended. Hysteria2's sessions
-/// do the same.
+/// and its socket running until the connection ended. The abort reaches a
+/// worker the token cannot (blocked sending), as upstream's unmerged
+/// `fix/protocol-correctness` does with the same handle.
 impl Drop for UdpSession {
     fn drop(&mut self) {
         self.cancel_token.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -629,24 +638,22 @@ impl UdpSession {
         client_socket: Arc<UdpSocket>,
         route: UdpRouteCache,
         parent_cancel_token: &CancellationToken,
+        slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
+        let send_socket = client_socket.clone();
+        let worker_cancel_token = session_cancel_token.clone();
 
-        let session = UdpSession {
-            send_socket: client_socket.clone(),
-            route,
-            last_activity: std::time::Instant::now(),
-            cancel_token: session_cancel_token.clone(),
-            slot: None,
-        };
-
-        crate::connections::spawn(async move {
+        // The slot lives in the worker, so it comes back when the worker is
+        // gone, not merely when the session leaves the map.
+        let task = crate::connections::spawn(async move {
+            let _slot = slot;
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 connection,
                 client_socket,
-                session_cancel_token,
+                worker_cancel_token,
             )
             .await
             {
@@ -654,7 +661,13 @@ impl UdpSession {
             }
         });
 
-        session
+        UdpSession {
+            send_socket,
+            route,
+            last_activity: std::time::Instant::now(),
+            cancel_token: session_cancel_token,
+            task: Some(task.abort_handle()),
+        }
     }
 
     fn start_with_datagram(
@@ -663,24 +676,22 @@ impl UdpSession {
         client_socket: Arc<UdpSocket>,
         route: UdpRouteCache,
         parent_cancel_token: &CancellationToken,
+        slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
+        let send_socket = client_socket.clone();
+        let worker_cancel_token = session_cancel_token.clone();
 
-        let session = UdpSession {
-            send_socket: client_socket.clone(),
-            route,
-            last_activity: std::time::Instant::now(),
-            cancel_token: session_cancel_token.clone(),
-            slot: None,
-        };
-
-        crate::connections::spawn(async move {
+        // The slot lives in the worker, so it comes back when the worker is
+        // gone, not merely when the session leaves the map.
+        let task = crate::connections::spawn(async move {
+            let _slot = slot;
             if let Err(e) = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
                 client_socket,
-                session_cancel_token,
+                worker_cancel_token,
             )
             .await
             {
@@ -688,7 +699,13 @@ impl UdpSession {
             }
         });
 
-        session
+        UdpSession {
+            send_socket,
+            route,
+            last_activity: std::time::Instant::now(),
+            cancel_token: session_cancel_token,
+            task: Some(task.abort_handle()),
+        }
     }
 
     /// Where `location` goes, and whether it is a new target to remember.
@@ -1254,13 +1271,14 @@ async fn process_udp_packet(
                     }
                 };
 
-                let mut session = if is_uni_stream {
+                let session = if is_uni_stream {
                     UdpSession::start_with_uni_streams(
                         assoc_id,
                         connection.clone(),
                         Arc::new(client_socket),
                         UdpRouteCache::new(remote_location.clone(), resolved_address),
                         cancel_token,
+                        slot,
                     )
                 } else {
                     UdpSession::start_with_datagram(
@@ -1269,9 +1287,9 @@ async fn process_udp_packet(
                         Arc::new(client_socket),
                         UdpRouteCache::new(remote_location.clone(), resolved_address),
                         cancel_token,
+                        slot,
                     )
                 };
-                session.slot = Some(slot);
 
                 // it's possible that the session is already on the map since we last checked.
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
@@ -1616,25 +1634,34 @@ mod sweep_tests {
                 .checked_sub(idle)
                 .expect("an idle time the clock can hold"),
             cancel_token: parent.child_token(),
-            slot: None,
+            task: None,
         }
     }
 
     /// TU-D3: an association lives `udp_timeout` idle, no shorter and no
     /// longer, and the reaped one's reply loop is ended with it.
-    /// A slot travels with its session: while every slot is held a new
-    /// association gets none, and removing a session gives its slot back.
-    /// The check this replaced was a count read before routing and DNS were
-    /// awaited, which concurrent uni streams could all pass.
+    /// A slot lives in its association's reply worker, and removing the
+    /// association aborts the worker, so the slot comes back even from a
+    /// worker blocked where cancellation does not reach (a QUIC send the
+    /// peer withholds credit for). The session held the slot before, so
+    /// DISSOCIATE returned it while the blocked worker kept its socket: a
+    /// way past the cap.
     #[tokio::test]
-    async fn a_removed_association_gives_its_slot_back() {
+    async fn removing_an_association_with_a_blocked_worker_returns_its_slot_once_the_worker_is_gone()
+     {
         let parent = CancellationToken::new();
         let sessions = UdpSessions::new();
         let held: Vec<_> = (1..MAX_UDP_SESSIONS)
             .map(|_| sessions.slots.clone().try_acquire_owned().unwrap())
             .collect();
+        let slot = sessions.slots.clone().try_acquire_owned().unwrap();
+        // Ignores its token, as a worker parked in `open_uni` does.
+        let worker = tokio::spawn(async move {
+            let _slot = slot;
+            std::future::pending::<()>().await;
+        });
         let mut session = detached_session(&parent, Duration::ZERO);
-        session.slot = Some(sessions.slots.clone().try_acquire_owned().unwrap());
+        session.task = Some(worker.abort_handle());
         sessions.insert(7, session);
 
         assert!(
@@ -1642,9 +1669,13 @@ mod sweep_tests {
             "all held"
         );
         sessions.remove(&7);
+        let ended = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("removing the association ended its blocked worker");
+        assert!(ended.unwrap_err().is_cancelled(), "the worker was aborted");
         assert!(
             sessions.slots.clone().try_acquire_owned().is_ok(),
-            "the removed association's slot came back"
+            "the slot came back with the worker"
         );
         drop(held);
     }
