@@ -59,6 +59,11 @@ pub async fn setup_reality_server_stream(
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<TcpServerSetupResult> {
     let client_hello_frame = &parsed_client_hello.client_hello_frame;
+    // Bytes read along with the ClientHello (a client's early flight, or
+    // TCP coalescing). They belong to whoever gets the connection next:
+    // the camouflage destination on fallback, the REALITY handshake
+    // otherwise. They were dropped before (upstream cfal/shoes#165).
+    let client_pending = Bytes::copy_from_slice(parsed_client_hello.client_reader.unparsed_data());
     log::debug!(
         "REALITY ClientHello frame length: {}",
         client_hello_frame.len()
@@ -95,7 +100,13 @@ pub async fn setup_reality_server_stream(
 
     if !parsed_client_hello.supports_tls13 {
         log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
-        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
+        start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            vec![],
+            Bytes::new(),
+            client_pending,
+        );
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "REALITY: Client does not support TLS 1.3, forwarding to dest",
@@ -167,6 +178,7 @@ pub async fn setup_reality_server_stream(
                             dest_stream,
                             new_records,
                             deframer.into_remaining_data(),
+                            client_pending,
                         );
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
@@ -185,6 +197,7 @@ pub async fn setup_reality_server_stream(
                         dest_stream,
                         new_records,
                         deframer.into_remaining_data(),
+                        client_pending,
                     );
                     return Err(std::io::Error::other(format!(
                         "REALITY: Failed to parse dest ServerHello: {}, forwarding to dest",
@@ -229,7 +242,13 @@ pub async fn setup_reality_server_stream(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
         );
-        start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
+        start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
+            client_pending,
+        );
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "REALITY: Dest TLS handshake incomplete, forwarding to dest",
@@ -250,7 +269,13 @@ pub async fn setup_reality_server_stream(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
             );
-            start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
+            start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_data,
+                client_pending,
+            );
 
             // Return auth error with forwarding note so clients see a meaningful error
             // instead of connecting to the camouflage site and getting "reality verification failed".
@@ -274,6 +299,12 @@ pub async fn setup_reality_server_stream(
     reality_conn.build_server_response(&dest_records)?;
 
     let mut connection = CryptoConnection::new_reality_server(reality_conn);
+    if !client_pending.is_empty() {
+        let mut pending = &client_pending[..];
+        while !pending.is_empty() {
+            connection.read_tls(&mut pending)?;
+        }
+    }
     perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
 
     let tls_stream = CryptoTlsStream::new(server_stream, connection);
@@ -310,12 +341,20 @@ pub async fn setup_reality_server_stream(
 /// Forwards any already-read dest records to the client, then spawns
 /// bidirectional copy for the rest of the connection.
 fn start_forward_to_dest(
-    mut client_stream: Box<dyn AsyncStream>,
+    client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
+    client_pending: Bytes,
 ) {
     crate::connections::spawn(async move {
+        // The preread bytes go through the bidirectional copy, read first,
+        // so a client whose write is blocked cannot keep the destination's
+        // response from reaching it.
+        let mut client_stream = crate::prepend_stream::PrependStream::new(
+            client_stream,
+            (!client_pending.is_empty()).then(|| client_pending.to_vec().into_boxed_slice()),
+        );
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
@@ -344,7 +383,7 @@ fn start_forward_to_dest(
         );
 
         let result = crate::copy_bidirectional::copy_bidirectional(
-            &mut *client_stream,
+            &mut client_stream,
             &mut dest_stream,
             !remaining_data.is_empty(), // flush the client if we wrote remaining data
             false,
@@ -357,4 +396,49 @@ fn start_forward_to_dest(
             log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+    use super::*;
+    use crate::async_stream::testing::TestStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Bytes read along with the ClientHello reach the destination on the
+    /// fallback path, ahead of what the client writes next; before, they
+    /// were dropped and a destination waiting for them hung
+    /// (upstream cfal/shoes#165).
+    #[tokio::test]
+    async fn preread_client_bytes_are_forwarded_to_dest_on_fallback() {
+        let (client_near, mut client_far) = tokio::io::duplex(4096);
+        let (dest_near, mut dest_far) = tokio::io::duplex(4096);
+        start_forward_to_dest(
+            Box::new(TestStream(client_near)),
+            Box::new(TestStream(dest_near)),
+            vec![Bytes::from_static(b"record")],
+            Bytes::new(),
+            Bytes::from_static(b"early"),
+        );
+
+        let mut got = [0u8; 6];
+        client_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"record", "dest records reach the client first");
+
+        client_far.write_all(b"later").await.unwrap();
+        let mut got = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dest_far.read_exact(&mut got),
+        )
+        .await
+        .expect("the dest received the preread bytes and the write after them")
+        .unwrap();
+        assert_eq!(&got, b"earlylater");
+
+        dest_far.write_all(b"reply").await.unwrap();
+        let mut got = [0u8; 5];
+        client_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"reply");
+    }
 }
