@@ -608,7 +608,18 @@ async fn a_terminate_request_is_acked_before_the_session_ends() {
 /// bounded, so the next address is tried with most of the negotiation
 /// deadline left. The stall is a listener whose backlog is full, after
 /// which the kernel drops further SYNs instead of answering them.
+///
+/// Only Linux drops them. A BSD kernel (macOS) resets a connection on a full
+/// backlog instead, sometimes after completing its handshake: the connect
+/// then succeeds, the first write breaks, and that is a failure after the
+/// TCP connect, which the connector rightly does not retry elsewhere. There
+/// the test failed about one run in four, and when it passed it had fallen
+/// back on a reset, never on the stall it is about.
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "only Linux drops SYNs on a full backlog; elsewhere there is no stall to bound"
+)]
 async fn a_stalled_first_address_is_abandoned_for_the_next() {
     let server = testing::start(Options::default()).await;
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
@@ -627,6 +638,18 @@ async fn a_stalled_first_address_is_abandoned_for_the_next() {
             fillers.push(c);
         }
     }
+    // The premise, checked: a connect to the full listener neither completes
+    // nor is refused. Without this, a kernel that resets instead would pass
+    // the test on a fast fallback and say nothing about the bound.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            tokio::net::TcpStream::connect(stalled)
+        )
+        .await
+        .is_err(),
+        "a connect to the full listener did not stall, so there is nothing to bound"
+    );
     let resolver: Arc<dyn Resolver> = Arc::new(DeadThenLive {
         dead: stalled,
         live: server.address,
