@@ -164,6 +164,7 @@ pub async fn setup_socks_server_stream_inner(
     if !methods.contains(&supported_method) {
         // RFC 1928 section 3: the client MUST close on X'FF', so say it.
         write_all(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
+        server_stream.flush().await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",
@@ -171,6 +172,11 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     write_all(&mut server_stream, &[VER_SOCKS5, supported_method]).await?;
+    // A client may wait for each reply before it sends more (RFC 1928's
+    // order, and what this client now does), so a reply cannot wait for the
+    // final flush: inside ShadowTLS, which buffered until then, the
+    // handshake stalled (upstream cfal/shoes#192).
+    server_stream.flush().await?;
 
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
@@ -216,6 +222,7 @@ pub async fn setup_socks_server_stream_inner(
         if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
             // RFC 1929: a non-zero STATUS, then the server MUST close.
             write_all(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SOCKS authentication failed",
@@ -223,6 +230,7 @@ pub async fn setup_socks_server_stream_inner(
         }
 
         write_all(&mut server_stream, &[VER_AUTH, RESULT_SUCCESS]).await?;
+        server_stream.flush().await?;
     }
 
     let connection_request = stream_reader.read_slice(&mut server_stream, 3).await?;
@@ -239,6 +247,7 @@ pub async fn setup_socks_server_stream_inner(
             None => {
                 let response = build_error_response(REPLY_COMMAND_NOT_SUPPORTED);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "UDP ASSOCIATE not enabled",
@@ -258,6 +267,7 @@ pub async fn setup_socks_server_stream_inner(
     if connection_request[1] != CMD_CONNECT {
         let response = build_error_response(REPLY_COMMAND_NOT_SUPPORTED);
         write_all(&mut server_stream, &response).await?;
+        server_stream.flush().await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid command code: {}", connection_request[1]),
@@ -436,6 +446,7 @@ async fn handle_udp_associate(
                 log::error!("Failed to bind UDP socket: {}", e);
                 let response = build_error_response(REPLY_GENERAL_FAILURE);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(e);
             }
         };
@@ -557,36 +568,27 @@ async fn monitor_tcp_close(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
 #[derive(Debug)]
 pub struct SocksTcpClientHandler {
-    prefix_data: Vec<u8>,
-    has_auth: bool,
+    method: u8,
+    auth_request: Option<Vec<u8>>,
 }
 
 impl SocksTcpClientHandler {
     pub fn new(auth_info: Option<&(String, String)>) -> Self {
-        let mut data = vec![
-            VER_SOCKS5,
-            1, // number of methods,
-            if auth_info.is_some() {
+        let auth_request = auth_info.map(|(username, password)| {
+            let mut request = vec![VER_AUTH, username.len() as u8];
+            request.extend_from_slice(username.as_bytes());
+            request.push(password.len() as u8);
+            request.extend_from_slice(password.as_bytes());
+            request
+        });
+
+        Self {
+            method: if auth_request.is_some() {
                 METHOD_USERNAME
             } else {
                 METHOD_NONE
             },
-        ];
-        if let Some((username, password)) = auth_info {
-            data.extend(&[VER_AUTH, username.len() as u8]);
-            data.extend_from_slice(username.as_bytes());
-            data.push(password.len() as u8);
-            data.extend_from_slice(password.as_bytes());
-        }
-        data.extend(&[
-            VER_SOCKS5,
-            CMD_CONNECT,
-            0x0, // reserved
-        ]);
-
-        Self {
-            prefix_data: data,
-            has_auth: auth_info.is_some(),
+            auth_request,
         }
     }
 }
@@ -598,9 +600,12 @@ impl TcpClientHandler for SocksTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(remote_location.location())?;
-        write_all(&mut client_stream, &location_bytes).await?;
+        // Each request waits for the previous reply. RFC 1928 sends the
+        // request only once method negotiation is done, and a server such
+        // as Cloudflare WARP's local proxy drops bytes that arrive early:
+        // sent in one burst, the connection timed out (upstream
+        // cfal/shoes#192). One round trip more, two with a password.
+        write_all(&mut client_stream, &[VER_SOCKS5, 1, self.method]).await?;
         client_stream.flush().await?;
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
@@ -620,8 +625,16 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 "SOCKS server rejected auth method",
             ));
         }
+        if auth_method != self.method {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SOCKS server selected auth method {auth_method}, which was not offered"),
+            ));
+        }
 
-        if self.has_auth {
+        if let Some(auth_request) = &self.auth_request {
+            write_all(&mut client_stream, auth_request).await?;
+            client_stream.flush().await?;
             let auth_version = stream_reader.read_u8(&mut client_stream).await?;
             if auth_version != VER_AUTH {
                 return Err(std::io::Error::new(
@@ -638,6 +651,15 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 ));
             }
         }
+
+        let mut connect_request = vec![
+            VER_SOCKS5,
+            CMD_CONNECT,
+            0x0, // reserved
+        ];
+        connect_request.extend(write_location_to_vec(remote_location.location())?);
+        write_all(&mut client_stream, &connect_request).await?;
+        client_stream.flush().await?;
 
         let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
@@ -1021,5 +1043,285 @@ mod tests {
         let encoded = write_location_to_vec(&longest).unwrap();
         assert_eq!(encoded[1], 255);
         assert_eq!(encoded.len(), 2 + 255 + 2);
+    }
+}
+
+/// The negotiation, step by step, on both sides (upstream cfal/shoes#192).
+#[cfg(test)]
+mod negotiation_tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+    use super::*;
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::quic_outbound::testing::{direct_selector, test_resolver};
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// RFC 1929 request carrying `credentials()`.
+    const AUTH_REQUEST: &[u8] = b"\x01\x04user\x04pass";
+    /// CONNECT request for `destination()`.
+    const CONNECT_REQUEST: &[u8] = b"\x05\x01\x00\x03\x0bexample.com\x01\xbb";
+    /// CONNECT success reply with bound address 127.0.0.1:0.
+    const CONNECT_REPLY: &[u8] = b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00";
+
+    fn credentials() -> Option<(String, String)> {
+        Some(("user".to_string(), "pass".to_string()))
+    }
+
+    fn destination() -> NetLocation {
+        NetLocation::from_str("example.com:443", None).unwrap()
+    }
+
+    /// Fails the test instead of hanging when a handshake step stalls.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(1), future)
+            .await
+            .expect("handshake step stalled")
+    }
+
+    async fn read_bytes(stream: &mut DuplexStream, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        bounded(stream.read_exact(&mut bytes)).await.unwrap();
+        bytes
+    }
+
+    /// The server half over a transport that delivers nothing until flushed.
+    fn spawn_server(
+        auth_info: Option<(String, String)>,
+        stream: DuplexStream,
+    ) -> tokio::task::JoinHandle<io::Result<TcpServerSetupResult>> {
+        tokio::spawn(async move {
+            let resolver = test_resolver();
+            let selector = direct_selector(resolver.clone());
+            setup_socks_server_stream_inner(
+                auth_info.as_ref(),
+                None,
+                &selector,
+                &resolver,
+                Box::new(FlushGatedStream::new(stream)),
+                StreamReader::new(),
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn server_flushes_each_negotiation_reply() {
+        for auth_info in [None, credentials()] {
+            let with_auth = auth_info.is_some();
+            let (mut client, server_stream) = tokio::io::duplex(1024);
+            let setup = spawn_server(auth_info, server_stream);
+
+            let method = if with_auth {
+                METHOD_USERNAME
+            } else {
+                METHOD_NONE
+            };
+            client.write_all(&[VER_SOCKS5, 1, method]).await.unwrap();
+            assert_eq!(read_bytes(&mut client, 2).await, [VER_SOCKS5, method]);
+            if with_auth {
+                client.write_all(AUTH_REQUEST).await.unwrap();
+                assert_eq!(read_bytes(&mut client, 2).await, [VER_AUTH, RESULT_SUCCESS]);
+            }
+            client.write_all(CONNECT_REQUEST).await.unwrap();
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            } = bounded(setup).await.unwrap().unwrap()
+            else {
+                panic!("expected TCP forwarding");
+            };
+            assert_eq!(remote_location, destination());
+        }
+    }
+
+    #[tokio::test]
+    async fn server_flushes_command_not_supported_reply() {
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let setup = spawn_server(None, server_stream);
+
+        client
+            .write_all(&[VER_SOCKS5, 1, METHOD_NONE])
+            .await
+            .unwrap();
+        read_bytes(&mut client, 2).await;
+        client
+            .write_all(&[VER_SOCKS5, CMD_UDP_ASSOCIATE, 0])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bytes(&mut client, 10).await,
+            build_error_response(REPLY_COMMAND_NOT_SUPPORTED)
+        );
+        let error = bounded(setup).await.unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    fn spawn_client(
+        auth_info: Option<(String, String)>,
+        stream: Box<dyn AsyncStream>,
+    ) -> tokio::task::JoinHandle<io::Result<TcpClientSetupResult>> {
+        tokio::spawn(async move {
+            SocksTcpClientHandler::new(auth_info.as_ref())
+                .setup_client_tcp_stream(stream, destination().into())
+                .await
+        })
+    }
+
+    async fn assert_nothing_sent(stream: &mut DuplexStream) {
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut byte)).await;
+        assert!(read.is_err(), "client sent data before the previous reply");
+    }
+
+    #[tokio::test]
+    async fn client_waits_for_each_negotiation_reply() {
+        for auth_info in [None, credentials()] {
+            let with_auth = auth_info.is_some();
+            let (client_stream, mut server) = tokio::io::duplex(1024);
+            let setup = spawn_client(
+                auth_info,
+                Box::new(crate::async_stream::testing::TestStream(client_stream)),
+            );
+
+            let method = if with_auth {
+                METHOD_USERNAME
+            } else {
+                METHOD_NONE
+            };
+            assert_eq!(read_bytes(&mut server, 3).await, [VER_SOCKS5, 1, method]);
+            assert_nothing_sent(&mut server).await;
+            server.write_all(&[VER_SOCKS5, method]).await.unwrap();
+
+            if with_auth {
+                assert_eq!(
+                    read_bytes(&mut server, AUTH_REQUEST.len()).await,
+                    AUTH_REQUEST
+                );
+                assert_nothing_sent(&mut server).await;
+                server.write_all(&[VER_AUTH, RESULT_SUCCESS]).await.unwrap();
+            }
+
+            assert_eq!(
+                read_bytes(&mut server, CONNECT_REQUEST.len()).await,
+                CONNECT_REQUEST
+            );
+            // Bytes after the CONNECT reply belong to the tunnel.
+            server
+                .write_all(&[CONNECT_REPLY, b"banner"].concat())
+                .await
+                .unwrap();
+
+            let result = bounded(setup).await.unwrap().unwrap();
+            assert_eq!(result.early_data.as_deref(), Some(&b"banner"[..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unoffered_methods_without_sending_more() {
+        for (auth_info, selected_method) in [
+            (None, METHOD_INVALID),
+            (None, METHOD_USERNAME),
+            (credentials(), METHOD_INVALID),
+            (credentials(), METHOD_NONE),
+        ] {
+            let (client_stream, mut server) = tokio::io::duplex(1024);
+            let setup = spawn_client(
+                auth_info,
+                Box::new(crate::async_stream::testing::TestStream(client_stream)),
+            );
+
+            read_bytes(&mut server, 3).await;
+            server
+                .write_all(&[VER_SOCKS5, selected_method])
+                .await
+                .unwrap();
+
+            let error = bounded(setup).await.unwrap().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let mut rest = Vec::new();
+            bounded(server.read_to_end(&mut rest)).await.unwrap();
+            assert!(rest.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn client_stops_after_rejected_credentials() {
+        let (client_stream, mut server) = tokio::io::duplex(1024);
+        let setup = spawn_client(
+            credentials(),
+            Box::new(crate::async_stream::testing::TestStream(client_stream)),
+        );
+
+        read_bytes(&mut server, 3).await;
+        server
+            .write_all(&[VER_SOCKS5, METHOD_USERNAME])
+            .await
+            .unwrap();
+        read_bytes(&mut server, AUTH_REQUEST.len()).await;
+        server.write_all(&[VER_AUTH, 0x01]).await.unwrap();
+
+        let error = bounded(setup).await.unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let mut rest = Vec::new();
+        bounded(server.read_to_end(&mut rest)).await.unwrap();
+        assert!(
+            rest.is_empty(),
+            "client sent CONNECT after failed authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_reads_replies_split_across_writes() {
+        let (client_stream, mut server) = tokio::io::duplex(1024);
+        let setup = spawn_client(
+            credentials(),
+            Box::new(crate::async_stream::testing::TestStream(client_stream)),
+        );
+
+        for (request_len, reply) in [
+            (3, &[VER_SOCKS5, METHOD_USERNAME][..]),
+            (AUTH_REQUEST.len(), &[VER_AUTH, RESULT_SUCCESS][..]),
+            (CONNECT_REQUEST.len(), CONNECT_REPLY),
+        ] {
+            read_bytes(&mut server, request_len).await;
+            for byte in reply {
+                server.write_all(&[*byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let result = bounded(setup).await.unwrap().unwrap();
+        assert!(result.early_data.is_none());
+    }
+
+    /// The client over a flush-gated transport: every request it sends is
+    /// flushed, else the server never sees it.
+    #[tokio::test]
+    async fn client_flushes_each_request_over_a_gated_transport() {
+        let (client_stream, mut server) = tokio::io::duplex(1024);
+        let setup = spawn_client(
+            credentials(),
+            Box::new(FlushGatedStream::new(client_stream)),
+        );
+        assert_eq!(
+            read_bytes(&mut server, 3).await,
+            [VER_SOCKS5, 1, METHOD_USERNAME]
+        );
+        server
+            .write_all(&[VER_SOCKS5, METHOD_USERNAME])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bytes(&mut server, AUTH_REQUEST.len()).await,
+            AUTH_REQUEST
+        );
+        server.write_all(&[VER_AUTH, RESULT_SUCCESS]).await.unwrap();
+        assert_eq!(
+            read_bytes(&mut server, CONNECT_REQUEST.len()).await,
+            CONNECT_REQUEST
+        );
+        server.write_all(CONNECT_REPLY).await.unwrap();
+        bounded(setup).await.unwrap().unwrap();
     }
 }
