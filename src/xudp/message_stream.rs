@@ -60,6 +60,14 @@ struct WireSession {
     routes: HashMap<NetLocation, MessageSessionId>,
 }
 
+/// Where a route leads back to: its wire session, and the destination it
+/// is keyed under there, so releasing one is a lookup rather than a scan
+/// (upstream keeps the same pair as `RoutedSession`).
+struct RoutedSession {
+    wire_session_id: u16,
+    destination: NetLocation,
+}
+
 /// A decoded payload frame: the client's session id, the payload, and the
 /// target as the client named it (may be a hostname).
 struct InboundFrame {
@@ -81,8 +89,8 @@ pub struct XudpMessageStream {
     /// Open wire sessions by the client's session id.
     wire_sessions: HashMap<u16, WireSession>,
 
-    /// Every open route, back to its wire session.
-    routes: HashMap<MessageSessionId, u16>,
+    /// Every open route, back to its wire session and destination.
+    routes: HashMap<MessageSessionId, RoutedSession>,
 
     /// Routes whose wire session the client ended, for the router to drop.
     closed_routes: VecDeque<MessageSessionId>,
@@ -193,7 +201,13 @@ impl XudpMessageStream {
         let route = self.next_route_id;
         self.next_route_id = self.next_route_id.checked_add(1)?;
         session.routes.insert(target.clone(), route);
-        self.routes.insert(route, wire_session_id);
+        self.routes.insert(
+            route,
+            RoutedSession {
+                wire_session_id,
+                destination: target.clone(),
+            },
+        );
         Some(route)
     }
 
@@ -416,11 +430,19 @@ impl AsyncReadSessionMessage for XudpMessageStream {
     /// freed a route, and a long-lived session reaching many destinations
     /// hit the limit for good.
     fn release_session(&mut self, route: MessageSessionId) {
-        let Some(wire_session_id) = self.routes.remove(&route) else {
+        let Some(routed) = self.routes.remove(&route) else {
             return;
         };
-        if let Some(session) = self.wire_sessions.get_mut(&wire_session_id) {
-            session.routes.retain(|_, r| *r != route);
+        let Some(session) = self.wire_sessions.get_mut(&routed.wire_session_id) else {
+            return;
+        };
+        session.routes.remove(&routed.destination);
+        // The wire session stays open (its target serves addressless Keep
+        // frames), so its table would keep the size of its busiest moment:
+        // under churn across many wire ids that is far more than the live
+        // routes. Halve it once it is a quarter full; an emptied one frees.
+        if session.routes.len() * 4 <= session.routes.capacity() {
+            session.routes.shrink_to(session.routes.len() * 2);
         }
     }
 }
@@ -474,7 +496,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         }
 
         // A route the client has ended gets no response.
-        let Some(&wire_session_id) = self.routes.get(&session_id) else {
+        let Some(wire_session_id) = self.routes.get(&session_id).map(|r| r.wire_session_id) else {
             log::debug!("[XUDP SESSION WRITE] Dropping a response for closed route {session_id}");
             return Poll::Ready(Ok(()));
         };
@@ -926,5 +948,37 @@ mod tests {
             route, first_route,
             "the released destination got a new route"
         );
+    }
+
+    /// Releasing a wire session's routes gives back its table, not only the
+    /// entries: the session stays open for addressless Keep frames, and
+    /// under churn across many wire ids tables sized for 1024 routes each
+    /// would otherwise pile up beyond the live-route limit.
+    #[test]
+    fn released_routes_give_back_the_wire_sessions_table() {
+        let (near, _far) = tokio::io::duplex(64);
+        let mut stream = XudpMessageStream::new(Box::new(TestStream(near)), test_resolver());
+        stream.start_wire_session(1, dns_server());
+        let routes: Vec<_> = (0..MAX_XUDP_ROUTES as u32)
+            .map(|i| {
+                let ip = std::net::Ipv4Addr::from(0x0a00_0000 + i);
+                let target = NetLocation::new(Address::Ipv4(ip), 53);
+                stream.admit_route(1, &target).unwrap()
+            })
+            .collect();
+        assert!(stream.wire_sessions[&1].routes.capacity() >= MAX_XUDP_ROUTES);
+
+        for route in routes {
+            stream.release_session(route);
+        }
+        let session = &stream.wire_sessions[&1];
+        assert!(session.routes.is_empty());
+        assert!(
+            session.routes.capacity() < 16,
+            "an emptied table is freed, capacity {}",
+            session.routes.capacity()
+        );
+        assert_eq!(session.target, dns_server(), "the Keep target survives");
+        assert!(stream.routes.is_empty());
     }
 }
