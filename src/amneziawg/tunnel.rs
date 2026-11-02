@@ -322,12 +322,6 @@ impl TunnelRuntime {
     ) -> std::io::Result<Arc<Self>> {
         // Built first so a bad Phobos config fails before anything binds.
         let phobos = phobos.map(PhobosLayer::new).transpose()?;
-        // Set by a rebind, taken by the encapsulate loop: a Phobos server
-        // drops everything but a handshake from an address it has not seen
-        // complete one, so after a rebind the first thing sent must be an
-        // initiation. A flag rather than a queued marker, so a full queue
-        // cannot leave the next packets going out as data the server drops.
-        let handshake_pending = phobos.as_ref().map(|_| Arc::new(AtomicBool::new(false)));
 
         // Create the awgtun tunnel
         let private_key_copy = private_key.clone();
@@ -462,18 +456,8 @@ impl TunnelRuntime {
             let offered = packets_offered.clone();
             let trailers = trailers_on.clone();
             let failures = send_failures.clone();
-            let pending = handshake_pending.clone();
             tokio::spawn(async move {
-                encapsulate_loop(
-                    tunn,
-                    udp,
-                    ip_to_tunnel_rx,
-                    offered,
-                    trailers,
-                    failures,
-                    pending,
-                )
-                .await;
+                encapsulate_loop(tunn, udp, ip_to_tunnel_rx, offered, trailers, failures).await;
             })
         };
 
@@ -500,7 +484,6 @@ impl TunnelRuntime {
             let rebinds = rebinds_completed.clone();
             let announce = ip_to_tunnel_tx.clone();
             let announce_offered = outbound_offered.clone();
-            let pending = handshake_pending.clone();
             tokio::spawn(udp_socket.clone().run_rebind_task(move || {
                 rebinds.fetch_add(1, Ordering::Relaxed);
                 // AmneziaWG 3.1 sizes its random trailers from a high-water
@@ -524,12 +507,10 @@ impl TunnelRuntime {
                 // Counted like any other packet offered to the queue, so the
                 // watchdog does not quietly narrow what it considers traffic.
                 //
-                // Behind Phobos the announcement must be a handshake instead
-                // (see `handshake_pending`); the empty payload is still queued,
-                // to wake an idle loop.
-                if let Some(pending) = &pending {
-                    pending.store(true, Ordering::Release);
-                }
+                // Behind Phobos the announcement is a handshake instead: the
+                // rebound socket reports `needs_initiation` until one has gone
+                // out on it, and the encapsulate loop checks that before every
+                // packet. The empty payload still wakes an idle loop.
                 announce_offered.fetch_add(1, Ordering::Relaxed);
                 let _ = announce.try_send(Vec::new());
             }))
@@ -900,7 +881,6 @@ async fn encapsulate_loop(
     packets_offered: Arc<AtomicUsize>,
     trailers_on: Arc<AtomicBool>,
     send_failures: Arc<AtomicUsize>,
-    handshake_pending: Option<Arc<AtomicBool>>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
     let mut packet = Vec::new();
@@ -913,14 +893,16 @@ async fn encapsulate_loop(
         packets_offered.fetch_add(1, Ordering::Relaxed);
 
         // Phobos, after a rebind: an initiation from the new address before
-        // anything else, even with a live session. `force_resend` makes awgtun
-        // send one regardless of a handshake already in flight from the old
-        // address; the current session stays usable until the new one
+        // anything else, even with a live session. The socket holds back any
+        // other message until one has gone out (EndpointSocket::send), so
+        // this is what lets traffic resume. Asked before every packet, so a
+        // full queue cannot starve it. The socket counts the initiation as
+        // sent once it is handed over; one the network loses is resent by
+        // awgtun's own handshake retry (`rekey_timeout`). `force_resend`
+        // makes awgtun send one regardless of a handshake in flight from the
+        // old address; the current session stays usable until the new one
         // replaces it.
-        if handshake_pending
-            .as_ref()
-            .is_some_and(|pending| pending.swap(false, Ordering::AcqRel))
-        {
+        if udp.needs_initiation() {
             let (result, decoys) = locked_call(&tunn, |tunn| {
                 tunn.format_handshake_initiation(&mut out, true)
             });

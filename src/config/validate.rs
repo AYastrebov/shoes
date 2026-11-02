@@ -1910,6 +1910,25 @@ fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> st
         // error and not a tunnel that never answers. The error names the
         // field and never the key.
         let converted = crate::amneziawg::convert_phobos_config(phobos)?;
+        // STUN's DATA length is 16 bits, so a full-size transport message
+        // (mtu + 32) past awgtun's `Masking::max_message_len` cannot be
+        // framed at all. Refused here rather than discovered per packet.
+        let message = usize::from(config.mtu) + 32;
+        if let Some(max) = converted.masking.max_message_len()
+            && message > max
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "WireGuard mtu {} is too large for Phobos {:?} masking: a full-size \
+                     message is {message} bytes, and it carries at most {max} \
+                     (mtu at most {})",
+                    config.mtu,
+                    converted.masking,
+                    max - 32
+                ),
+            ));
+        }
         let frame = crate::amneziawg::phobos_frame_overhead(&converted);
         if let Some(warning) = phobos_mtu_warning(config.mtu, frame) {
             log::warn!("{warning}");
@@ -6004,6 +6023,51 @@ mod phobos_validation_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("phobos"), "{err}");
+    }
+
+    /// STUN's 16-bit DATA length carries a WireGuard message of at most
+    /// 65535 bytes, so mtu 65503 is the largest that frames. RTP has no such
+    /// field and is not bounded here.
+    #[test]
+    fn an_mtu_stun_cannot_frame_is_refused() {
+        for (masking, mtu, ok) in [
+            ("stun", 65_503u32, true),
+            ("stun", 65_504, false),
+            ("media", 65_535, true),
+        ] {
+            let result = validate_with_mtu(mtu, masking);
+            assert_eq!(result.is_ok(), ok, "{masking} mtu {mtu}: {result:?}");
+            if let Err(err) = result {
+                assert!(err.to_string().contains("mtu at most 65503"), "{err}");
+            }
+        }
+    }
+
+    fn validate_with_mtu(mtu: u32, masking: &str) -> std::io::Result<()> {
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: "203.0.113.9:51822"
+        protocol:
+          type: wireguard
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          mtu: {mtu}
+          phobos:
+            key: "k"
+            masking: {masking}
+"#
+        );
+        let configs = load_config_str(&yaml)?;
+        super::create_server_configs(configs).map(|_| ())
     }
 
     #[test]

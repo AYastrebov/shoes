@@ -1266,6 +1266,8 @@ unreachable server.
 
 A STUN frame adds 24 bytes and an RTP frame 12, so keep `mtu <= 1416`
 (STUN) or `1428` (RTP) on a 1500-byte path; shoes warns when it is not.
+Under STUN, an `mtu` over 65503 is refused: its 16-bit DATA length cannot
+carry a larger message.
 After a network change, the tunnel sends a new handshake rather than a
 keepalive, because the server drops anything else from an address it
 hasn't seen complete one. `phobos` is not accepted on `amneziawg`: the

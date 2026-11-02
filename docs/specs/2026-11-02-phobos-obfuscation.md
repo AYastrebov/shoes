@@ -117,11 +117,20 @@ changes.
   `REJECT_AFTER_TIME`). The reference stops too, when the server drops its
   idle client entry, and a phone should not power its radio every 10 s
   for a tunnel nobody uses.
-- **Rebind:** the announcement stays an empty payload through the encapsulate
-  loop, which keeps send ordering in one place. With Phobos on, the loop
-  answers an empty payload with `format_handshake_initiation(out, true)`
-  instead of `encapsulate`. The netstack never sends an empty IP packet, so
-  the empty payload is unambiguous.
+- **Rebind:** each socket carries a generation, 0 for the first and one
+  more per rebind, in the same `watch` value as the socket. `send` takes
+  both from one snapshot. From a generation that no initiation has gone out
+  on yet, it holds back every other WireGuard message (`Ok(0)`, nothing
+  sent), which is exactly what the server would discard. The encapsulate
+  loop asks `needs_initiation()` before every packet and, when it is owed,
+  sends `format_handshake_initiation(out, true)` first. The announcement's
+  empty payload still wakes an idle loop.
+
+  A flag set by the rebind callback was the first version. Review
+  (shoes#151) caught that the socket is published before the callback
+  runs, so a transport message from the timer or encapsulate task could
+  reach the new socket first. Gating by generation at the socket closes
+  that window for every sender at once.
 
 RTP sequence numbers are taken under the codec lock, but two tasks may send
 in the other order. That is reordering, which RTP over UDP sees anyway. The
@@ -158,10 +167,13 @@ second names a loopback port shoes doesn't need.
 - A key mismatch produces no error at all. The server drops everything,
   which looks exactly like an unreachable server. CONFIG.md says so.
 - A malformed datagram from the network is dropped silently, since its
-  sender chose the contents. A `wrap` that refuses a datagram (too short, or
-  too long for a STUN DATA attribute) is logged at debug and the datagram is
-  not sent. Neither can happen with the tunnel's own messages under its MTU
-  check.
+  sender chose the contents. A datagram `wrap` refuses (too short, or longer
+  than STUN's 16-bit DATA length) is an `InvalidInput` error, so the send
+  path's failure accounting sees it. The tunnel's own messages can't reach
+  either case past validation.
+- STUN carries a WireGuard message of at most 65535 bytes
+  (`Masking::max_message_len`, awgtun). An `mtu` whose full-size message
+  (`mtu + 32`) exceeds that is refused when the config loads.
 - Validation warns when `mtu + 60 + frame` exceeds 1500, in the shape of the
   AmneziaWG `s4` warning.
 
@@ -177,7 +189,9 @@ second names a loopback port shoes doesn't need.
   must see no plain-decodable handshake.
 - **Rebind:** after a rebind with a live session, the first WireGuard message
   the double decodes from the new address is an initiation (type 1), not a
-  transport message.
+  transport message. At the socket, deterministically: a transport message
+  sent straight after the swap is held back, and the initiation leaves the
+  new socket first.
 - Each new test is shown to fail with its defect planted.
 - **Live, not yet run:** the reference `wg-obfuscator`, built from source in
   a container, in front of `wireguard-go`, through the built binary
