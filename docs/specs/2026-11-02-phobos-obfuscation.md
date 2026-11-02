@@ -12,7 +12,7 @@ Written 2026-11-02 against `mobile` at `ea46233`.
 
 | Source | Version read | Licence | Used for |
 | --- | --- | --- | --- |
-| [awgtun](https://github.com/AYastrebov/awgtun) `docs/phobos.md` and `awgtun::phobos` | `ea3f9a5` (PR #9) | BSD-3-Clause | The wire format and the codec. Written from the spec, passes Phobos's published vectors, and checked against Phobos's own C decoder |
+| [awgtun](https://github.com/AYastrebov/awgtun) `docs/phobos.md` and `awgtun::phobos` | `6992ff7` (master, #9 merged) | BSD-3-Clause | The wire format and the codec. Written from the spec, passes Phobos's published vectors, and checked against Phobos's own C decoder |
 | [Ground-Zerro/Phobos](https://github.com/Ground-Zerro/Phobos) | `22aedef` (2026-10-12) | AGPL-3.0, GPL-3.0 in `src/phobos-obfuscator` | Server behaviour: `src/phobos-obfuscator/threading.c` (`process_packet`, `process_from_client`, the per-client state machine), `masking_stun.c`, `masking_media.c`, `config.c` (keys and ranges). The Android client `mobil/wireguard-phobos/tunnel/.../obfuscator/ObfuscatorConfigParser.kt` for the client-side key names |
 
 No code is copied. The wire format lives in awgtun, and this document
