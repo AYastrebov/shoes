@@ -468,10 +468,6 @@ async fn run_udp_remote_to_local_loop(
     last_activity: Arc<AtomicU64>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| no_datagram_support(session_id))?;
-
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
@@ -515,6 +511,12 @@ async fn run_udp_remote_to_local_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+
+        // Read for every reply: path MTU discovery moves it, and a size
+        // cached at the start turned a shrink into TooLarge on every send.
+        let max_datagram_size = connection
+            .max_datagram_size()
+            .ok_or_else(|| no_datagram_support(session_id))?;
 
         // Every reply is labelled with its real source, as upstream's
         // receiveLoop does when no hook rewrote the address. The socket is
@@ -565,11 +567,25 @@ async fn run_udp_remote_to_local_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[start..end]);
 
-            connection.send_datagram(datagram.freeze()).map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to send datagram fragment {fragment_id}: {e}"
-                ))
-            })?;
+            match connection.send_datagram(datagram.freeze()) {
+                Ok(()) => {}
+                // Over the size the path takes now: this reply is lost, the
+                // session is not (the size is read again for the next one).
+                // Ending the loop left the session registered with no reply
+                // path, one-way until the client fell silent.
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    debug!(
+                        "Dropping the rest of a {payload_len} byte reply for session \
+                         {session_id}: fragment {fragment_id} is over the path's datagram size"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "Failed to send datagram fragment {fragment_id}: {e}"
+                    )));
+                }
+            }
         }
     }
 }
@@ -584,6 +600,10 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a session may go without traffic in either direction.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// UDP sessions one connection may hold at once. Each is a socket and a task
+/// until it idles out; upstream cfal/shoes#149 picked the same bound.
+const MAX_UDP_SESSIONS: usize = 4096;
 
 /// Drop every session that has been silent longer than `idle_timeout_secs`.
 ///
@@ -692,6 +712,18 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        // Each session holds a socket and a task for up to IDLE_TIMEOUT, and
+        // the id is the client's to choose, so without a cap one
+        // authenticated client could run the process out of descriptors
+        // (upstream cfal/shoes#149).
+        if sessions.len() >= MAX_UDP_SESSIONS && !sessions.contains_key(&session_id) {
+            debug!(
+                "Dropping a packet for new UDP session {session_id}: the connection already \
+                 has {MAX_UDP_SESSIONS}"
+            );
+            continue;
+        }
+
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
@@ -730,7 +762,13 @@ async fn run_udp_local_to_remote_loop(
                 // the remote_location could be changed later on with a different client_socket
                 // configuration.
                 // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                let client_socket = match crate::socket_util::new_udp_socket(true, None) {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        warn!("Dropping a packet for UDP session {session_id}: no socket: {e}");
+                        continue;
+                    }
+                };
 
                 let session = UdpSession::start(
                     session_id,
