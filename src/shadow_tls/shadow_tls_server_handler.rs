@@ -571,6 +571,10 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
             "ServerHello message length exceeds frame",
         ));
     }
+    // A record may carry later handshake messages after the ServerHello;
+    // they are not part of it, and reading on into them took the next
+    // message's bytes for extensions (upstream cfal/shoes#187).
+    let mut reader = BufReader::new(reader.read_slice(message_len)?);
 
     // Legacy version (should be 0x0303 for TLS 1.2/1.3)
     let version_major = reader.read_u8()?;
@@ -612,6 +616,12 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
             ));
         }
 
+        if reader.remaining() != extensions_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trailing data after ServerHello extensions",
+            ));
+        }
         let extensions_data = reader.read_slice(extensions_len)?;
         let mut ext_reader = BufReader::new(extensions_data);
 
@@ -670,6 +680,10 @@ pub fn parse_validated_server_hello(
 
     Ok(parsed)
 }
+
+#[cfg(test)]
+#[path = "tests/server_hello.rs"]
+mod server_hello_tests;
 
 #[allow(clippy::too_many_arguments)]
 #[inline]

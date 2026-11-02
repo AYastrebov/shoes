@@ -7,9 +7,6 @@ const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
-// TLS ciphers
-const TLS13_CIPHER_AES_128_CCM_8_SHA256: u16 = 0x1305;
-
 /// VISION protocol filter state
 ///
 /// This structure maintains only the state needed for TLS record filtering
@@ -126,18 +123,19 @@ impl VisionFilter {
                     if parsed.is_tls13 {
                         log::debug!("VISION: Detected TLS 1.3 via supported_versions extension");
 
-                        // Check if cipher is supported for XTLS
-                        // Following Xray-core: all TLS 1.3 ciphers EXCEPT 0x1305 support XTLS
-                        if parsed.cipher_suite == TLS13_CIPHER_AES_128_CCM_8_SHA256 {
-                            log::warn!(
-                                "VISION: TLS 1.3 detected but cipher 0x{:04x} (TLS_AES_128_CCM_8_SHA256) not supported for XTLS",
-                                parsed.cipher_suite
-                            );
-                        } else {
-                            // Assume all other TLS 1.3 ciphers support XTLS
+                        // Xray and Mihomo allow the GCM, ChaCha20 and CCM
+                        // suites (0x1301 to 0x1304), not CCM_8 and not a
+                        // suite they do not know; an unknown suite was taken
+                        // for supported here (upstream cfal/shoes#187).
+                        if matches!(parsed.cipher_suite, 0x1301..=0x1304) {
                             self.supports_xtls = true;
                             log::debug!(
                                 "VISION: TLS 1.3 with supported cipher 0x{:04x} - XTLS enabled",
+                                parsed.cipher_suite
+                            );
+                        } else {
+                            log::warn!(
+                                "VISION: TLS 1.3 detected but cipher 0x{:04x} not supported for XTLS",
                                 parsed.cipher_suite
                             );
                         }
@@ -204,6 +202,48 @@ mod tests {
 
         assert!(filter.is_tls());
         assert!(!filter.supports_xtls()); // Not enabled until TLS 1.3 ServerHello
+    }
+
+    /// A TLS 1.3 ServerHello built the way `parse_server_hello` reads it:
+    /// a 32-byte session id, the given cipher, and a supported_versions
+    /// extension selecting 1.3.
+    fn tls13_server_hello(cipher: u16) -> Vec<u8> {
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[42; 32]);
+        body.push(32);
+        body.extend_from_slice(&[7; 32]);
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(0);
+        let extensions: &[u8] = b"\x00\x2b\x00\x02\x03\x04";
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        let mut handshake = vec![2];
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+        let mut record = vec![0x16, 3, 3];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// DIRECT is for the suites Xray and Mihomo allow, 0x1301 to 0x1304:
+    /// CCM_8 and a suite nobody knows are not promoted to it (upstream
+    /// cfal/shoes#187; before, every suite but 0x1305 was).
+    #[test]
+    fn direct_is_allowed_only_for_the_four_known_tls13_suites() {
+        for (cipher, expected) in [
+            (0x1301u16, true),
+            (0x1302, true),
+            (0x1303, true),
+            (0x1304, true),
+            (0x1305, false),
+            (0x1306, false),
+            (0xc02f, false),
+        ] {
+            let mut filter = VisionFilter::new();
+            filter.filter_record(&tls13_server_hello(cipher));
+            assert_eq!(filter.supports_xtls(), expected, "cipher 0x{cipher:04x}");
+        }
     }
 
     #[test]

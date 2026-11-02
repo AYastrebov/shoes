@@ -1375,8 +1375,12 @@ where
                             assert!(
                                 self.inner_write_deframer.pending_bytes() == unprocessed_buf_len
                             );
-                            // clear since the user will re-feed
-                            self.inner_write_deframer.clear();
+                            // Discard the unaccepted tail, which the user
+                            // will re-feed, but keep the TLS recognition:
+                            // a reset deframer took the tail for an unknown
+                            // prefix and fell back to END
+                            // (upstream cfal/shoes#187).
+                            self.inner_write_deframer.discard_buffered();
                             return Poll::Ready(Ok(processed_len - existing_inner_len));
                         }
                         Poll::Ready(Ok(())) => {
