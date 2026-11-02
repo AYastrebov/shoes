@@ -109,8 +109,18 @@ everything to upstream `dd2f370a` and ported ten (the changelog lists
 them). Left as not applying: the DNS cache rework (an improvement), the
 TLS record ownership rewrite beyond the preread bytes, the rustls-fork
 REALITY fixes, lost TLS writer wakeups and AnyTLS stale-session recovery
-(neither path exists here). The remote is `upstream`; the next pass
-starts from `git log dd2f370a..upstream/master`.
+(neither path exists here). A second pass the same day looked past master at upstream's open
+hardening PR #149 and its `fix/protocol-correctness` branch (2026-10-31):
+the crash and resource fixes whose defect is here were ported (TUIC reply
+fragmenting, UDP association and AnyTLS stream caps, the VLESS addon
+bound); still to judge and port from it are Vision+XUDP server padding,
+AnyTLS auth padding over 32 KiB, Shadowsocks' initial-message limit,
+SOCKS and WebSocket negative replies, and REALITY key material in debug
+logs. #149's VMess nonce-exhaustion error is not to be taken (it cuts
+streams at about 1 GiB; v2ray and Xray wrap), nor #144's early AnyTLS
+SYNACK while upstream has not taken it. The remote is `upstream`; the
+next pass starts from `git log dd2f370a..upstream/master` and those two
+refs.
 
 ## Recorded debt
 
