@@ -106,7 +106,9 @@ What is done instead: upstream's fix commits are judged one by one
 against this tree, and a defect that is here is fixed here, with
 upstream's regression tests where they fit. The 2026-11-02 pass covered
 everything to upstream `dd2f370a` and ported ten (the changelog lists
-them). Left as not applying: the DNS cache rework (an improvement), the
+them); its DNS cache rework (#220, #222, #227), first left out as an
+improvement, was ported after a closer look, hickory fork pin included.
+Left as not applying: the
 TLS record ownership rewrite beyond the preread bytes, the rustls-fork
 REALITY fixes, lost TLS writer wakeups and AnyTLS stale-session recovery
 (neither path exists here). A second pass the same day looked past master at upstream's open
