@@ -39,7 +39,7 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
     AsyncReadTargetedMessage, AsyncSessionMessageStream, AsyncShutdownMessage,
     AsyncShutdownMessageExt, AsyncTargetedMessageStream, AsyncWriteMessage,
-    AsyncWriteSessionMessage, AsyncWriteSourcedMessage,
+    AsyncWriteSessionMessage, AsyncWriteSourcedMessage, MessageSessionId,
 };
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::{Resolver, resolve_single_address};
@@ -154,12 +154,20 @@ impl ServerStream {
         }
     }
 
+    /// A route the client has ended, for the router to drop.
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        match self {
+            ServerStream::Targeted(_) => None,
+            ServerStream::Session(stream) => stream.take_closed_session(),
+        }
+    }
+
     fn poll_write_message(
         &mut self,
         cx: &mut Context<'_>,
         data: &[u8],
         source: &SocketAddr,
-        session_id: u16,
+        session_id: MessageSessionId,
     ) -> Poll<io::Result<()>> {
         match self {
             ServerStream::Targeted(stream) => {
@@ -212,7 +220,7 @@ impl std::fmt::Debug for ServerStream {
 /// Packet info extracted from server stream
 struct InboundPacket {
     destination: NetLocation,
-    session_id: u16,
+    session_id: MessageSessionId,
 }
 
 /// Result of session creation
@@ -240,7 +248,7 @@ type RemoteFactory = Box<dyn Fn(&NetLocation) -> SessionCreateFuture + Send + Sy
 struct PendingSessionCreate {
     lookup_key: LookupKey,
     destination: NetLocation,
-    session_id: u16,
+    session_id: MessageSessionId,
     initial_data: Vec<u8>,
     future: SessionCreateFuture,
     /// Taken before the create starts, so a burst cannot overshoot the budget
@@ -464,6 +472,8 @@ impl<'a> UdpRouter<'a> {
         let mut remote_writes_progress = false;
 
         loop {
+            self.cancel_closed_routes();
+
             // Read packet from server directly into pool buffer
             let mut read_buf = ReadBuf::new(&mut buf);
             let packet = match self.server.poll_read_message(cx, &mut read_buf) {
@@ -1063,12 +1073,57 @@ impl<'a> UdpRouter<'a> {
         let _ = self.poll_pending_create(cx, index);
     }
 
+    /// Drop the routes whose wire session the client ended (an XUDP End):
+    /// their remotes close at once, without the graceful shutdown a
+    /// session that expired gets, and a reused session id can no longer
+    /// land on the old remote (upstream cfal/shoes, "cancel closed XUDP
+    /// routes").
+    fn cancel_closed_routes(&mut self) {
+        while let Some(route) = self.server.take_closed_session() {
+            let SessionLookup::BySessionId(map) = &mut self.session_lookup else {
+                return;
+            };
+            match map.get(&route) {
+                Some(KeyState::Active(id)) => {
+                    let id = *id;
+                    self.cancel_session(id);
+                }
+                Some(KeyState::Pending) => {
+                    map.remove(&route);
+                    self.pending_creates
+                        .retain(|pending| pending.session_id != route);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Remove a session and close its remote at once.
+    #[inline]
+    fn cancel_session(&mut self, id: SessionKey) {
+        drop(self.take_session(id));
+    }
+
     /// Remove a session (split-borrow friendly version)
     #[inline]
     fn remove_session(&mut self, id: SessionKey) {
-        let Some(mut session) = self.sessions.swap_remove(&id) else {
+        let Some(mut session) = self.take_session(id) else {
             return;
         };
+
+        // Queue remote stream for graceful shutdown. The permit goes with it:
+        // the socket stays open until the shutdown finishes, and a budget
+        // that came back before then would admit a new session while the old
+        // descriptor was still held, which under churn is over the cap.
+        self.pending_shutdowns
+            .push_back((session.remote, session.budget_permit.take()));
+    }
+
+    /// Take a session out of the maps and its expiry timer; the caller
+    /// decides what happens to its remote.
+    #[inline]
+    fn take_session(&mut self, id: SessionKey) -> Option<RoutingSession> {
+        let mut session = self.sessions.swap_remove(&id)?;
 
         debug!("Session removed: {}", session.destination);
 
@@ -1078,22 +1133,17 @@ impl<'a> UdpRouter<'a> {
         }
 
         // Remove from lookup map
-        match (&mut self.session_lookup, session.lookup_key) {
+        match (&mut self.session_lookup, &session.lookup_key) {
             (SessionLookup::ByDestination(map), LookupKey::Destination(dest)) => {
-                map.remove(&dest);
+                map.remove(dest);
             }
             (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
-                map.remove(&sid);
+                map.remove(sid);
             }
             _ => unreachable!(),
         }
 
-        // Queue remote stream for graceful shutdown. The permit goes with it:
-        // the socket stays open until the shutdown finishes, and a budget
-        // that came back before then would admit a new session while the old
-        // descriptor was still held, which under churn is over the cap.
-        self.pending_shutdowns
-            .push_back((session.remote, session.budget_permit.take()));
+        Some(session)
     }
 
     /// Process expired sessions

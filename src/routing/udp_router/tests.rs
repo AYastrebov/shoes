@@ -348,6 +348,142 @@ async fn run_with_fake_remotes(
     router.await
 }
 
+/// A scripted session-based server stream (XUDP's shape): hands the router
+/// packets under route ids, and reports routes the client has ended
+/// through `take_closed_session`.
+struct ScriptedSessionInner {
+    script: VecDeque<(MessageSessionId, SocketAddr, Vec<u8>)>,
+    closed: VecDeque<MessageSessionId>,
+    replies: Vec<(MessageSessionId, SocketAddr, Vec<u8>)>,
+    read_waker: Option<Waker>,
+}
+
+struct ScriptedSessionServer {
+    inner: Arc<Mutex<ScriptedSessionInner>>,
+}
+
+fn scripted_sessions(
+    script: Vec<(MessageSessionId, SocketAddr, Vec<u8>)>,
+) -> (ScriptedSessionServer, Arc<Mutex<ScriptedSessionInner>>) {
+    let inner = Arc::new(Mutex::new(ScriptedSessionInner {
+        script: script.into(),
+        closed: VecDeque::new(),
+        replies: Vec::new(),
+        read_waker: None,
+    }));
+    (
+        ScriptedSessionServer {
+            inner: inner.clone(),
+        },
+        inner,
+    )
+}
+
+impl AsyncReadSessionMessage for ScriptedSessionServer {
+    fn poll_read_session_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<(MessageSessionId, SocketAddr)>> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((route, destination, payload)) = inner.script.pop_front() {
+            buf.put_slice(&payload);
+            return Poll::Ready(Ok((route, destination)));
+        }
+        inner.read_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        self.inner.lock().unwrap().closed.pop_front()
+    }
+}
+
+impl AsyncWriteSessionMessage for ScriptedSessionServer {
+    fn poll_write_session_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        session_id: MessageSessionId,
+        buf: &[u8],
+        target: &SocketAddr,
+    ) -> Poll<io::Result<()>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .replies
+            .push((session_id, *target, buf.to_vec()));
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncFlushMessage for ScriptedSessionServer {
+    fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncShutdownMessage for ScriptedSessionServer {
+    fn poll_shutdown_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncPing for ScriptedSessionServer {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl AsyncSessionMessageStream for ScriptedSessionServer {}
+
+/// A route the client ended is dropped at once, remote and all: not on the
+/// session timeout, and not through the graceful shutdown an expired
+/// session gets. Before, the router never heard of the End, and a reused
+/// session id landed on the old remote (upstream cfal/shoes, "cancel
+/// closed XUDP routes").
+#[tokio::test]
+async fn test_a_closed_route_drops_its_remote_at_once() {
+    let state = Arc::new(Mutex::new(FakeRemoteState {
+        shutdown_may_finish: false,
+        ..Default::default()
+    }));
+    let destination: SocketAddr = "192.0.2.1:9".parse().unwrap();
+    let (stream, inner) = scripted_sessions(vec![(1, destination, b"one".to_vec())]);
+    let limits = RouterLimits {
+        session_timeout: Duration::from_secs(600),
+        ..RouterLimits::default()
+    };
+    let router = tokio::spawn(run_with_fake_remotes(
+        ServerStream::Session(Box::new(stream)),
+        limits,
+        state.clone(),
+    ));
+
+    // The session exists once the router has handed the packet to its remote.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!state.lock().unwrap().dropped, "the session is live");
+
+    {
+        let mut inner = inner.lock().unwrap();
+        inner.closed.push_back(1);
+        if let Some(waker) = inner.read_waker.take() {
+            waker.wake();
+        }
+    }
+    wait_until("the closed route's remote is dropped", || {
+        state.lock().unwrap().dropped
+    })
+    .await;
+    assert!(
+        !state.lock().unwrap().shutdown_polled,
+        "dropped outright, not through the graceful shutdown"
+    );
+    router.abort();
+}
+
 async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
