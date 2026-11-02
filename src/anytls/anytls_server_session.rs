@@ -41,6 +41,12 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// lifetime of the bidirectional copy that follows a successful setup.
 const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Streams one session may handle at once. Each SYN spawns a task and a
+/// channel, and the client picks the ids, so without a cap one
+/// authenticated client could open them without limit (upstream
+/// cfal/shoes#149 uses the same bound).
+const MAX_STREAMS_PER_SESSION: usize = 256;
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -377,6 +383,13 @@ impl AnyTlsSession {
 
                 let stream_id = frame.stream_id;
 
+                // The task table is held from the count to the insert below,
+                // so the cap cannot be overrun by SYNs in between and a
+                // stream that ends at once cannot remove its entry before it
+                // is made.
+                let mut tasks = self.stream_tasks.lock().await;
+                let mut over_limit = false;
+
                 // Check if stream already exists and register atomically
                 // This prevents race conditions with duplicate SYNs
                 let stream_opt = {
@@ -385,6 +398,10 @@ impl AnyTlsSession {
                     match streams.entry(stream_id) {
                         Entry::Occupied(_) => {
                             log::warn!("Duplicate SYN for stream {}", stream_id);
+                            None
+                        }
+                        Entry::Vacant(_) if tasks.len() >= MAX_STREAMS_PER_SESSION => {
+                            over_limit = true;
                             None
                         }
                         Entry::Vacant(entry) => {
@@ -428,8 +445,19 @@ impl AnyTlsSession {
                     });
 
                     // Track the task for cancellation on session close
-                    let mut tasks = self.stream_tasks.lock().await;
                     tasks.insert(stream_id, handle);
+                } else if over_limit {
+                    drop(tasks);
+                    log::debug!(
+                        "Refusing AnyTLS stream {stream_id}: the session already has \
+                         {MAX_STREAMS_PER_SESSION}"
+                    );
+                    // A v2 client hears why; any client gets the FIN that
+                    // closes its side of the stream.
+                    self.send_synack(stream_id, Some("too many concurrent streams"))
+                        .await?;
+                    self.write_control_frame(&Frame::control(Command::Fin, stream_id))
+                        .await?;
                 }
             }
 
@@ -1446,6 +1474,73 @@ mod tests {
 
         // Session should still be alive
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!session.is_closed());
+
+        session.close().await;
+        run_task.abort();
+    }
+
+    /// Past MAX_STREAMS_PER_SESSION live streams a SYN is refused with an
+    /// error SYNACK and a FIN rather than given a task and a channel: the
+    /// client picks the ids, and every one used to be accepted (upstream
+    /// cfal/shoes#149).
+    #[tokio::test]
+    async fn test_a_syn_past_the_stream_limit_is_refused() {
+        let (client, mut server) = duplex(1 << 20);
+        let padding = PaddingFactory::default_factory();
+        let session = AnyTlsSession::new_server_test(client, padding);
+
+        let session_clone = Arc::clone(&session);
+        let run_task = tokio::spawn(async move {
+            let _ = session_clone.run().await;
+        });
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        settings.insert("padding-md5", PaddingFactory::default_factory().md5());
+        let mut flight =
+            Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes())).encode();
+        // The streams never name a destination, so each holds its task
+        // until the setup timeout, well past this test.
+        let over = MAX_STREAMS_PER_SESSION as u32 + 1;
+        for stream_id in 1..=over {
+            flight.extend_from_slice(&Frame::control(Command::Syn, stream_id).encode());
+        }
+        server.write_all(&flight).await.unwrap();
+
+        let mut received = BytesMut::new();
+        let (mut refused, mut fin) = (None, false);
+        timeout(Duration::from_secs(5), async {
+            while refused.is_none() || !fin {
+                let mut chunk = [0u8; 4096];
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "the session closed instead of refusing one stream");
+                received.extend_from_slice(&chunk[..n]);
+                while let Some(frame) = FrameCodec::decode(&mut received).unwrap() {
+                    match frame.cmd {
+                        Command::SynAck => {
+                            assert_eq!(frame.stream_id, over, "only the stream past the limit");
+                            refused = Some(frame.data);
+                        }
+                        Command::Fin => {
+                            assert_eq!(frame.stream_id, over);
+                            fin = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the stream past the limit was refused");
+        assert!(
+            !refused.unwrap().is_empty(),
+            "the SYNACK carries the reason"
+        );
+        assert_eq!(
+            session.stream_tasks.lock().await.len(),
+            MAX_STREAMS_PER_SESSION
+        );
         assert!(!session.is_closed());
 
         session.close().await;
