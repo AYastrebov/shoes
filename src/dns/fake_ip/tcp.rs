@@ -1,4 +1,5 @@
-//! DNS over TCP to port 53, answered the way the UDP path answers it (FI-1).
+//! DNS over TCP to port 53, answered the way the UDP path answers it (FI-1),
+//! for the TUN and for listeners with fake IP on alike.
 //!
 //! With fake IP on, a UDP query to port 53 is answered from the pool before
 //! routing. A resolver that falls back to TCP -- a truncated answer, or one
@@ -11,8 +12,10 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -22,8 +25,28 @@ use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 
-pub(super) async fn handle_dns_over_tcp<S>(
-    mut local: S,
+/// How long the handler waits on each side, so neither a client that goes
+/// quiet nor an upstream that never answers holds the task.
+#[derive(Clone, Copy, Debug)]
+struct Waits {
+    /// For the client's next query; a quiet connection is closed, as a DNS
+    /// server closes one (Unbound's `tcp-idle-timeout` default; RFC 7766
+    /// section 6.2.3 leaves the value to the server).
+    client_idle: Duration,
+    /// For the connection to the resolver the client addressed.
+    upstream_connect: Duration,
+    /// For that resolver's answer to one forwarded query.
+    upstream_answer: Duration,
+}
+
+const WAITS: Waits = Waits {
+    client_idle: Duration::from_secs(30),
+    upstream_connect: Duration::from_secs(15),
+    upstream_answer: Duration::from_secs(15),
+};
+
+pub(crate) async fn handle_dns_over_tcp<S>(
+    local: S,
     target: NetLocation,
     responder: Arc<FakeIpResponder>,
     proxy_selector: Arc<ClientProxySelector>,
@@ -32,16 +55,46 @@ pub(super) async fn handle_dns_over_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    serve(local, target, responder, proxy_selector, resolver, WAITS).await
+}
+
+async fn serve<S>(
+    mut local: S,
+    target: NetLocation,
+    responder: Arc<FakeIpResponder>,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    waits: Waits,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut upstream: Option<Box<dyn AsyncStream>> = None;
     // Queries are taken one at a time. A client may pipeline them; it gets
-    // its answers in order, which RFC 7766 allows.
-    while let Some(query) = read_message(&mut local).await? {
+    // its answers in order, which RFC 7766 allows. A client quiet for
+    // `client_idle` is let go, the connection closed cleanly.
+    while let Some(query) = timeout(waits.client_idle, read_message(&mut local))
+        .await
+        .unwrap_or(Ok(None))?
+    {
         let response = match responder.handle_query(&query) {
             DnsDecision::Answer(response) => response,
             DnsDecision::Forward => {
                 let upstream = match &mut upstream {
                     Some(upstream) => upstream,
-                    None => upstream.insert(connect(&target, &proxy_selector, &resolver).await?),
+                    None => upstream.insert(
+                        timeout(
+                            waits.upstream_connect,
+                            connect(&target, &proxy_selector, &resolver),
+                        )
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("connecting to {target} timed out"),
+                            )
+                        })??,
+                    ),
                 };
                 write_message(upstream, &query).await?;
                 // A zone transfer answers in as many messages as the zone
@@ -53,12 +106,20 @@ where
                     tokio::io::copy_bidirectional(&mut local, upstream).await?;
                     return Ok(());
                 }
-                read_message(upstream).await?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("{target} closed before answering"),
-                    )
-                })?
+                timeout(waits.upstream_answer, read_message(upstream))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("{target} did not answer in time"),
+                        )
+                    })??
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("{target} closed before answering"),
+                        )
+                    })?
             }
         };
         write_message(&mut local, &response).await?;
@@ -241,6 +302,81 @@ mod tests {
 
         drop(far);
         task.await.unwrap().unwrap();
+    }
+
+    fn allow_all(resolver: &Arc<dyn Resolver>) -> Arc<ClientProxySelector> {
+        Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+                serde_yaml::from_str("- masks: 0.0.0.0/0\n  action: allow\n").unwrap(),
+                resolver.clone(),
+            ),
+        )
+    }
+
+    const SHORT: Waits = Waits {
+        client_idle: Duration::from_millis(200),
+        upstream_connect: Duration::from_millis(500),
+        upstream_answer: Duration::from_millis(200),
+    };
+
+    /// A client that sends nothing is let go after the idle wait, the
+    /// connection closed cleanly, rather than holding the task for good.
+    #[tokio::test]
+    async fn a_quiet_client_is_let_go() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let (near, mut far) = duplex(1024);
+        let task = tokio::spawn(serve(
+            near,
+            "192.0.2.53:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            responder(),
+            allow_all(&resolver),
+            resolver,
+            SHORT,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("let go after the idle wait")
+            .unwrap()
+            .unwrap();
+        let mut rest = Vec::new();
+        far.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "closed, nothing written");
+    }
+
+    /// A forwarded query whose resolver accepts and never answers fails
+    /// after the answer wait, rather than holding the task for good.
+    #[tokio::test]
+    async fn a_silent_upstream_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let (near, mut far) = duplex(65536);
+        let task = tokio::spawn(serve(
+            near,
+            NetLocation::from(upstream_addr),
+            responder(),
+            allow_all(&resolver),
+            resolver,
+            SHORT,
+        ));
+        write_message(&mut far, &query(1, "example.com.", RecordType::TXT))
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("gave up after the answer wait")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        hold.abort();
     }
 
     /// A message that ends mid-way is an error, a clean close is not.

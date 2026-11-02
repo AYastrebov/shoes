@@ -97,6 +97,67 @@ const MAX_PENDING_SERVER_WRITES_PER_SESSION: usize = 4;
 /// Max concurrent session creation attempts (limits resource usage under burst)
 const MAX_PENDING_CREATES: usize = 16;
 
+/// The address a locally made DNS answer comes from: the server the client
+/// addressed. A server named by hostname has no address to reply from
+/// without resolving it, which is what fake IP avoids, so the reply comes
+/// from that name's own fake address.
+/// `None` when that name cannot be given a fake address (the pool is
+/// exhausted): there is then no honest source to answer from.
+fn local_answer_source(
+    packet: &InboundPacket,
+    pool: &crate::dns::fake_ip::FakeIpPool,
+) -> Option<SocketAddr> {
+    if let Some(addr) = packet.destination.to_socket_addr_nonblocking() {
+        return Some(addr);
+    }
+    match packet.destination.address() {
+        Address::Hostname(name) => pool
+            .assign(name)
+            .map(|fake| SocketAddr::new(fake.into(), packet.destination.port())),
+        _ => None,
+    }
+}
+
+/// See [`MAPPING_REFRESH_INTERVAL`](crate::dns::fake_ip::MAPPING_REFRESH_INTERVAL).
+const FAKE_IP_TOUCH_INTERVAL: Duration = crate::dns::fake_ip::MAPPING_REFRESH_INTERVAL;
+
+/// Keep a live flow's fake address in use, so the pool does not hand it to
+/// another name while the client still sends to or hears from it: at most
+/// once per [`FAKE_IP_TOUCH_INTERVAL`], rather than a pool lock per datagram.
+/// Every path that keeps a session alive calls it (an immediate write, a
+/// queued write's completion, a reply from the remote); `now` is read only
+/// for a session keyed by a fake address.
+#[inline]
+fn touch_fake_ip(
+    fake_ip: Option<&crate::dns::fake_ip::FakeIpResponder>,
+    session: &mut RoutingSession,
+    now: impl FnOnce() -> Instant,
+) {
+    let Some(responder) = fake_ip else {
+        return;
+    };
+    let Some(ip) = crate::dns::fake_ip::fake_address(&session.destination, responder.pool()) else {
+        return;
+    };
+    let now = now();
+    if now.duration_since(session.fake_ip_touched) >= FAKE_IP_TOUCH_INTERVAL {
+        responder.pool().touch(ip);
+        session.fake_ip_touched = now;
+    }
+}
+
+/// DNS answers made locally (fake IP) that may wait for the client to read.
+/// Past this a new answer is dropped and the client's retry asks again.
+const MAX_LOCAL_ANSWERS: usize = 64;
+
+/// What fake IP makes of one inbound datagram.
+enum FakeIpVerdict {
+    /// Route it (restored, if it was a fake address).
+    Route,
+    /// A DNS query answered here, to be written back from `from`.
+    Answer(Vec<u8>, SocketAddr),
+}
+
 /// How often to check if pings are needed
 const PING_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -130,6 +191,8 @@ impl ServerStream {
                     Poll::Ready(Ok(dest)) => Poll::Ready(Ok(InboundPacket {
                         destination: dest,
                         session_id: 0,
+                        route_to: None,
+                        reply_as: None,
                     })),
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                     Poll::Pending => Poll::Pending,
@@ -145,6 +208,8 @@ impl ServerStream {
                         Poll::Ready(Ok(InboundPacket {
                             destination: NetLocation::new(address, addr.port()),
                             session_id,
+                            route_to: None,
+                            reply_as: None,
                         }))
                     }
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -229,6 +294,14 @@ impl std::fmt::Debug for ServerStream {
 struct InboundPacket {
     destination: NetLocation,
     session_id: MessageSessionId,
+    /// With fake IP, the name `destination` (a fake address) stands for:
+    /// the session is routed to it, judged as a name with no local lookup.
+    /// `destination` stays the session's key, so a fake-addressed flow never
+    /// merges with one the client addressed to the name itself.
+    route_to: Option<NetLocation>,
+    /// The fake address replies to a restored flow come from, as the client
+    /// expects.
+    reply_as: Option<SocketAddr>,
 }
 
 /// Result of session creation
@@ -256,6 +329,9 @@ type RemoteFactory = Box<dyn Fn(&NetLocation) -> SessionCreateFuture + Send + Sy
 struct PendingSessionCreate {
     lookup_key: LookupKey,
     destination: NetLocation,
+    /// What the rules judge: the restored name of a fake address, else
+    /// `destination`. A block is cached under it.
+    judged: NetLocation,
     session_id: MessageSessionId,
     initial_data: Vec<u8>,
     future: SessionCreateFuture,
@@ -284,6 +360,18 @@ pub struct UdpRouter<'a> {
     remote_flush_queue: VecDeque<SessionKey>,
     server_write_queue: VecDeque<PendingWrite>,
 
+    /// The server stream drops reply sources (one fixed destination): a name
+    /// is then judged as a name, with no local lookup first, and the stream
+    /// ends with its one session (blocked, failed, expired or closed) or
+    /// with the client, as such a stream's direct copy always did.
+    one_destination: bool,
+
+    /// The fake IP responder of this listener, when its `dns:` turns it on.
+    fake_ip: Option<Arc<crate::dns::fake_ip::FakeIpResponder>>,
+    /// DNS answers made here for the client, with the server address each
+    /// came "from" and its session: written ahead of the remotes' replies.
+    local_answers: VecDeque<(Vec<u8>, SocketAddr, MessageSessionId)>,
+
     needs_server_flush: bool,
 
     server_read_eof: bool,
@@ -302,6 +390,13 @@ pub struct UdpRouter<'a> {
     expiry_iteration: usize,
 
     last_server_write: Instant,
+    /// Datagrams seen either way, and when that count last moved: a
+    /// one-destination stream ends after the session timeout with neither
+    /// (no session to expire before the first datagram, or while every
+    /// datagram is a DNS query answered here). Compared on the ping tick,
+    /// so no clock is read per datagram.
+    activity: u64,
+    activity_seen: (u64, Instant),
 
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -332,6 +427,8 @@ impl<'a> UdpRouter<'a> {
         need_initial_flush: bool,
         limits: RouterLimits,
     ) -> Self {
+        let one_destination =
+            matches!(&*server, ServerStream::Targeted(stream) if !stream.replies_need_source());
         let session_lookup = match server {
             ServerStream::Targeted(_) => SessionLookup::ByDestination(FxHashMap::default()),
             ServerStream::Session(_) => SessionLookup::BySessionId(FxHashMap::default()),
@@ -348,6 +445,9 @@ impl<'a> UdpRouter<'a> {
             remote_write_queue: VecDeque::with_capacity(REMOTE_WRITE_POOL_SIZE),
             remote_flush_queue: VecDeque::with_capacity(REMOTE_WRITE_POOL_SIZE),
             server_write_queue: VecDeque::with_capacity(SERVER_WRITE_POOL_SIZE),
+            one_destination,
+            fake_ip: resolver.fake_ip().cloned(),
+            local_answers: VecDeque::new(),
             needs_server_flush: need_initial_flush,
             server_read_eof: false,
             server_write_eof: false,
@@ -359,6 +459,8 @@ impl<'a> UdpRouter<'a> {
             ping_timer: tokio::time::interval(PING_CHECK_INTERVAL),
             expiry_iteration: 0,
             last_server_write: Instant::now(),
+            activity: 0,
+            activity_seen: (0, Instant::now()),
             selector,
             resolver,
             #[cfg(test)]
@@ -414,6 +516,12 @@ impl<'a> UdpRouter<'a> {
         }
 
         self.server_read_eof = true;
+        // The client is done with a one-destination stream: it ends, as the
+        // direct copy ends when either side does, rather than holding its
+        // remote open until the session expires.
+        if self.one_destination {
+            self.set_server_write_eof();
+        }
 
         // Clean up pending creates - remove lookup entries and drop futures
         // TODO: is this correct? what if the user wanted to send a single packet and closed their
@@ -432,6 +540,34 @@ impl<'a> UdpRouter<'a> {
         }
     }
 
+    /// Whether the end of a session to `destination` ends this stream: on a
+    /// one-destination stream, yes, as for the direct copy; except DNS with
+    /// fake IP on, where the session carries only the queries the pool does
+    /// not answer, and the stream lives on for the ones it does, ending with
+    /// the client or its idle timeout.
+    fn session_ends_the_stream(&self, destination: &NetLocation) -> bool {
+        self.one_destination
+            && !(self.fake_ip.is_some() && destination.port() == crate::dns::fake_ip::DNS_PORT)
+    }
+
+    /// End a one-destination stream that has carried nothing either way for
+    /// the session timeout, as the direct copy does.
+    fn end_one_destination_if_idle(&mut self) {
+        let now = Instant::now();
+        if self.activity != self.activity_seen.0 {
+            self.activity_seen = (self.activity, now);
+        } else if now.duration_since(self.activity_seen.1) >= self.limits.session_timeout {
+            debug!("[UdpRouter] one-destination stream idle, ending it");
+            self.end_one_destination();
+        }
+    }
+
+    /// End a one-destination stream in both directions.
+    fn end_one_destination(&mut self) {
+        self.set_server_read_eof();
+        self.set_server_write_eof();
+    }
+
     /// Set server write EOF and clean up server write queue.
     /// Called when server write or flush returns an error.
     #[inline]
@@ -448,6 +584,7 @@ impl<'a> UdpRouter<'a> {
         // 1. We're in shutdown mode - no more server writes will happen
         // 2. Sessions will be cleaned up through expiry anyway
         // 3. Avoids borrow conflicts when called from contexts that hold session refs
+        self.local_answers.clear();
         for pending in self.server_write_queue.drain(..) {
             self.server_write_pool.release(pending.buf);
         }
@@ -516,6 +653,94 @@ impl<'a> UdpRouter<'a> {
                 self.set_server_read_eof();
                 break;
             }
+            self.activity = self.activity.wrapping_add(1);
+
+            // Fake IP: a query to port 53 is answered here whatever server it
+            // was sent to. A query the responder does not answer goes on to
+            // the server the client addressed, through the rules, as on the
+            // TUN. Decided while the responder is borrowed, acted on after:
+            // the per-packet path clones nothing and takes no pool lock for a
+            // datagram that is not a query.
+            let mut packet = packet;
+            let one_destination = self.one_destination;
+            let verdict = match &self.fake_ip {
+                Some(responder) if packet.destination.port() == crate::dns::fake_ip::DNS_PORT => {
+                    use crate::dns::fake_ip::{DnsDecision, refuse_or_mark_used};
+                    // A query sent to a fake address that stands for nothing
+                    // is dropped like any datagram to one, not answered; one
+                    // to a mapped fake address keeps that address in use.
+                    if refuse_or_mark_used(&packet.destination, responder.pool()) {
+                        self.release_route_if_unused(packet.session_id);
+                        // Its one destination goes nowhere: ended at once,
+                        // as on any other port.
+                        if one_destination {
+                            self.end_one_destination();
+                        }
+                        continue;
+                    }
+                    // Decided before any address is given out for the reply
+                    // source, so a forwarded query takes no pool slot for the
+                    // server's own name. A server named by hostname that
+                    // cannot be given a fake address is not answered for;
+                    // its query goes on to it like any other.
+                    // Parsed once: the decision and the answer share it.
+                    match responder.answerable(read_buf.filled()) {
+                        None => FakeIpVerdict::Route,
+                        Some(query) => {
+                            // A one-destination stream drops reply sources,
+                            // so a server named by hostname takes no slot.
+                            let source = if one_destination {
+                                Some(SocketAddr::new(
+                                    std::net::Ipv4Addr::UNSPECIFIED.into(),
+                                    packet.destination.port(),
+                                ))
+                            } else {
+                                local_answer_source(&packet, responder.pool())
+                            };
+                            match source {
+                                None => FakeIpVerdict::Route,
+                                Some(from) => match responder.answer(query) {
+                                    DnsDecision::Answer(answer) => {
+                                        FakeIpVerdict::Answer(answer, from)
+                                    }
+                                    DnsDecision::Forward => FakeIpVerdict::Route,
+                                },
+                            }
+                        }
+                    }
+                }
+                // Anything else is routed; a fake address is restored to its
+                // name when its session is made (below), once per flow.
+                _ => FakeIpVerdict::Route,
+            };
+            match verdict {
+                FakeIpVerdict::Route => {}
+                FakeIpVerdict::Answer(answer, from) => {
+                    // A one-destination stream ends with its session, so a
+                    // query answered here keeps that session (made by a query
+                    // forwarded earlier) alive: the stream is in use.
+                    if self.one_destination
+                        && let SessionLookup::ByDestination(map) = &self.session_lookup
+                        && let Some(KeyState::Active(id)) = map.get(&packet.destination)
+                        && let Some(session) = self.sessions.get_mut(id)
+                    {
+                        session.reset_expiry(
+                            &mut self.expiry_queue,
+                            *id,
+                            self.expiry_iteration,
+                            self.limits.session_timeout,
+                        );
+                    }
+                    if self.local_answers.len() < MAX_LOCAL_ANSWERS {
+                        self.local_answers
+                            .push_back((answer, from, packet.session_id));
+                    } else {
+                        debug!("[UdpRouter] dropping a DNS answer: {MAX_LOCAL_ANSWERS} queued");
+                        self.release_route_if_unused(packet.session_id);
+                    }
+                    continue;
+                }
+            }
 
             // Look up session
             let key_state = match &self.session_lookup {
@@ -552,6 +777,8 @@ impl<'a> UdpRouter<'a> {
                                 self.expiry_iteration,
                                 self.limits.session_timeout,
                             );
+                            let now = session.last_write;
+                            touch_fake_ip(self.fake_ip.as_deref(), session, || now);
                             if !session.in_remote_flush_queue {
                                 session.in_remote_flush_queue = true;
                                 self.remote_flush_queue.push_back(*id);
@@ -579,12 +806,44 @@ impl<'a> UdpRouter<'a> {
                     // Creation in progress - drop packet
                 }
                 None => {
+                    // A fake address becomes the name it stands for as the
+                    // session is made, once: a session that exists was
+                    // restored when it was created, and its replies carry
+                    // the fake address the client sent to. An address
+                    // standing for nothing is dropped, as the TUN drops it,
+                    // so the client resolves again rather than waiting on an
+                    // address that goes nowhere.
+                    let restored = self.fake_ip.as_ref().map(|responder| {
+                        crate::dns::fake_ip::restore_location(&packet.destination, responder.pool())
+                    });
+                    match restored {
+                        None | Some(crate::dns::fake_ip::Restored::Unchanged) => {}
+                        Some(crate::dns::fake_ip::Restored::Hostname(name)) => {
+                            packet.reply_as = packet.destination.to_socket_addr_nonblocking();
+                            packet.route_to = Some(name);
+                        }
+                        Some(crate::dns::fake_ip::Restored::Unmapped) => {
+                            self.release_route_if_unused(packet.session_id);
+                            // Its one destination goes nowhere: the stream
+                            // ends at once, as TCP refuses at once, so the
+                            // client resolves again rather than waiting out
+                            // the idle timeout.
+                            if self.one_destination {
+                                self.end_one_destination();
+                            }
+                            continue;
+                        }
+                    }
+
                     // No session - check blocked before creating
                     // A refused packet's route is released, or a session
                     // stream would keep counting it against its own limit.
-                    if self.blocked.get(&packet.destination).is_some() {
+                    // A restored flow is blocked by its name: the fake
+                    // address may stand for another name later.
+                    let judged = packet.route_to.as_ref().unwrap_or(&packet.destination);
+                    if self.blocked.get(judged).is_some() {
                         debug!("UDP proxying blocked to {}", packet.destination);
-                        self.server.release_session(packet.session_id);
+                        self.release_route_if_unused(packet.session_id);
                         continue;
                     }
 
@@ -593,12 +852,12 @@ impl<'a> UdpRouter<'a> {
                             "Too many pending creates, dropping new session creation for {}",
                             packet.destination
                         );
-                        self.server.release_session(packet.session_id);
+                        self.release_route_if_unused(packet.session_id);
                         continue;
                     }
 
                     let Ok(budget_permit) = self.admit_session(&packet.destination) else {
-                        self.server.release_session(packet.session_id);
+                        self.release_route_if_unused(packet.session_id);
                         continue;
                     };
 
@@ -641,6 +900,8 @@ impl<'a> UdpRouter<'a> {
                 Poll::Ready(Ok(())) => {
                     session.in_remote_write_queue -= 1;
                     session.last_write = Instant::now();
+                    let now = session.last_write;
+                    touch_fake_ip(self.fake_ip.as_deref(), session, || now);
                     session.reset_expiry(
                         &mut self.expiry_queue,
                         id,
@@ -756,6 +1017,8 @@ impl<'a> UdpRouter<'a> {
                         }
 
                         remote_read_progress = true;
+                        self.activity = self.activity.wrapping_add(1);
+                        touch_fake_ip(self.fake_ip.as_deref(), session, Instant::now);
                         session.reset_expiry(
                             &mut self.expiry_queue,
                             id,
@@ -835,6 +1098,27 @@ impl<'a> UdpRouter<'a> {
     fn drain_server_writes(&mut self, cx: &mut Context<'_>) -> bool {
         let mut server_write_progress = false;
 
+        while let Some((answer, from, session_id)) = self.local_answers.pop_front() {
+            match self
+                .server
+                .poll_write_message(cx, &answer, &from, session_id)
+            {
+                Poll::Ready(Ok(())) => {
+                    server_write_progress = true;
+                    self.release_route_if_unused(session_id);
+                }
+                Poll::Pending => {
+                    self.local_answers.push_front((answer, from, session_id));
+                    return server_write_progress;
+                }
+                Poll::Ready(Err(e)) => {
+                    warn!("server write error: {}", e);
+                    self.set_server_write_eof();
+                    return server_write_progress;
+                }
+            }
+        }
+
         while let Some(pending) = self.server_write_queue.pop_front() {
             let PendingWrite { id, buf, len } = pending;
 
@@ -903,6 +1187,7 @@ impl<'a> UdpRouter<'a> {
         let PendingSessionCreate {
             lookup_key,
             destination,
+            judged,
             session_id,
             initial_data,
             future: _,
@@ -942,6 +1227,11 @@ impl<'a> UdpRouter<'a> {
                     remote,
                     budget_permit,
                 );
+
+                // A failed remote is removed on every one-destination stream,
+                // so the next datagram makes a fresh one; whether that ends
+                // the stream is `take_session`'s call.
+                session.ends_on_either_side = self.one_destination;
 
                 // TODO: part of constructor, we now know the id in advance
                 let expiry_key = self.expiry_queue.insert(id, self.limits.session_timeout);
@@ -990,23 +1280,37 @@ impl<'a> UdpRouter<'a> {
             outcome @ (Ok(CreateOutcome::Blocked) | Err(_)) => {
                 match outcome {
                     Ok(_) => {
-                        debug!("UDP proxying blocked to {destination}");
-                        self.blocked.put(destination.clone(), ());
+                        debug!("UDP proxying blocked to {judged}");
+                        self.blocked.put(judged, ());
                     }
                     // Not cached: a failure here is the socket's or the
                     // remote's, and the next packet should try again.
                     Err(e) => warn!("Failed to create session for {}: {}", destination, e),
                 }
-                // Remove from pending in lookup
+                // A stream with one fixed destination has nothing else to
+                // carry: it ends, as the direct path ends when it is refused
+                // or cannot connect, rather than dropping every datagram in
+                // silence or leaving the client waiting on no remote. Not a
+                // DNS stream answered here: the query that failed was one of
+                // many, the rest are answered from the pool, and ending
+                // would throw away answers still queued.
+                if self.session_ends_the_stream(&destination) {
+                    self.end_one_destination();
+                }
+                // Remove from pending in lookup. The route is released only
+                // once nothing is queued under it: a query answered here on
+                // the same route may still be waiting to be written.
                 match (&mut self.session_lookup, &lookup_key) {
                     (SessionLookup::ByDestination(map), LookupKey::Destination(dest)) => {
                         map.remove(dest);
                     }
                     (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
                         map.remove(sid);
-                        self.server.release_session(*sid);
                     }
                     _ => unreachable!(),
+                }
+                if let LookupKey::SessionId(sid) = lookup_key {
+                    self.release_route_if_unused(sid);
                 }
                 false
             }
@@ -1014,15 +1318,41 @@ impl<'a> UdpRouter<'a> {
     }
 
     /// Resolve, judge and connect: how a session gets its remote.
-    fn connect_future(&self, destination: &NetLocation) -> SessionCreateFuture {
+    fn connect_future(
+        &self,
+        destination: &NetLocation,
+        reply_as: Option<SocketAddr>,
+    ) -> SessionCreateFuture {
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination.clone();
+        let lazy_name =
+            self.one_destination && matches!(destination.address(), Address::Hostname(_));
 
         Box::pin(async move {
-            let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
-            // Create ResolvedLocation with pre-resolved address
-            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
+            // A name restored from a fake address is judged as a name: a
+            // rule or a direct route resolves it if it must, and a proxy gets
+            // the name, so nothing is looked up here first. Its replies come
+            // from the fake address the client sent to.
+            let (resolved_location, resolved_addr) = match reply_as {
+                Some(reply_as) => (ResolvedLocation::from(dest_for_future), reply_as),
+                // The stream drops the reply source, so there is no address
+                // to look up; the chain resolves the name if it must.
+                None if lazy_name => {
+                    let unused = SocketAddr::new(
+                        std::net::Ipv4Addr::UNSPECIFIED.into(),
+                        dest_for_future.port(),
+                    );
+                    (ResolvedLocation::from(dest_for_future), unused)
+                }
+                None => {
+                    let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
+                    (
+                        ResolvedLocation::with_resolved(dest_for_future, resolved_addr),
+                        resolved_addr,
+                    )
+                }
+            };
             let decision = selector.judge(resolved_location, &resolver).await?;
 
             match decision {
@@ -1056,7 +1386,12 @@ impl<'a> UdpRouter<'a> {
         let InboundPacket {
             destination,
             session_id,
+            route_to,
+            reply_as,
         } = packet;
+        // The session is keyed by what the client addressed and routed to
+        // the name a fake address stands for.
+        let target = route_to.unwrap_or_else(|| destination.clone());
 
         let lookup_key = match &mut self.session_lookup {
             SessionLookup::ByDestination(map) => {
@@ -1075,22 +1410,42 @@ impl<'a> UdpRouter<'a> {
 
         #[cfg(test)]
         let future = match &self.remote_factory {
-            Some(factory) => factory(&destination),
-            None => self.connect_future(&destination),
+            Some(factory) => factory(&target),
+            None => self.connect_future(&target, reply_as),
         };
         #[cfg(not(test))]
-        let future = self.connect_future(&destination);
+        let future = self.connect_future(&target, reply_as);
 
         let index = self.pending_creates.len();
         self.pending_creates.push(PendingSessionCreate {
             lookup_key,
             destination,
+            judged: target,
             session_id,
             initial_data,
             future,
             budget_permit,
         });
         let _ = self.poll_pending_create(cx, index);
+    }
+
+    /// Hand a session stream's route back when this router holds nothing on
+    /// it: a DNS query answered here, or a datagram to an unmapped fake
+    /// address, admits a route (an XUDP stream counts it against its limit)
+    /// but creates no session, so nothing else would release it. A route
+    /// with a live or pending session, or with answers still queued, is kept.
+    fn release_route_if_unused(&mut self, route: MessageSessionId) {
+        if let SessionLookup::BySessionId(map) = &self.session_lookup
+            && !map.contains_key(&route)
+            // Several queries may share a route: its answers still queued
+            // are written under it, so it stays until the last one is.
+            && !self
+                .local_answers
+                .iter()
+                .any(|(_, _, queued)| *queued == route)
+        {
+            self.server.release_session(route);
+        }
     }
 
     /// Drop the routes whose wire session the client ended (an XUDP End):
@@ -1144,6 +1499,14 @@ impl<'a> UdpRouter<'a> {
     #[inline]
     fn take_session(&mut self, id: SessionKey) -> Option<RoutingSession> {
         let mut session = self.sessions.swap_remove(&id)?;
+        // A one-destination stream's session ends (expired, or its remote
+        // closed or failed): so does the stream, as the direct copy does
+        // after the same idle time, rather than re-creating the remote from
+        // a new port, which a peer that pins the source port would refuse.
+        // A DNS stream answered here outlives it; see `session_ends_the_stream`.
+        if self.session_ends_the_stream(&session.destination) {
+            self.end_one_destination();
+        }
 
         debug!("Session removed: {}", session.destination);
 
@@ -1152,16 +1515,19 @@ impl<'a> UdpRouter<'a> {
             self.expiry_queue.remove(&key);
         }
 
-        // Remove from lookup map
+        // Remove from lookup map; the route goes once nothing is queued
+        // under it, as above.
         match (&mut self.session_lookup, &session.lookup_key) {
             (SessionLookup::ByDestination(map), LookupKey::Destination(dest)) => {
                 map.remove(dest);
             }
             (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
                 map.remove(sid);
-                self.server.release_session(*sid);
             }
             _ => unreachable!(),
+        }
+        if let LookupKey::SessionId(sid) = session.lookup_key {
+            self.release_route_if_unused(sid);
         }
 
         Some(session)
@@ -1256,6 +1622,16 @@ impl<'a> Future for UdpRouter<'a> {
         this.expiry_iteration = this.expiry_iteration.wrapping_add(1);
 
         let ping_triggered = this.ping_timer.poll_tick(cx).is_ready();
+        if this.one_destination {
+            // The idle check needs the timer to wake this task with nothing
+            // else going on, so the tick is polled until it is pending,
+            // which registers the wakeup. Other routers are woken by their
+            // traffic and keep the one poll they had.
+            while ping_triggered && this.ping_timer.poll_tick(cx).is_ready() {}
+            if ping_triggered {
+                this.end_one_destination_if_idle();
+            }
+        }
 
         // Each direction runs independently to exhaustion.
         this.poll_outbound(cx, ping_triggered);

@@ -422,6 +422,36 @@ async fn handle_h2mux_tcp(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
+    // Fake IP: DNS to port 53 is answered from the pool, as the TCP forward
+    // answers it, whatever server the client addressed; a query to a fake
+    // address standing for nothing is refused like any connection to one.
+    if let Some(responder) = resolver.fake_ip().cloned()
+        && destination.port() == crate::dns::fake_ip::DNS_PORT
+    {
+        if crate::dns::fake_ip::refuse_or_mark_used(&destination, responder.pool()) {
+            let _ = stream
+                .write_error_response("Connection blocked by rules")
+                .await;
+            let _ = stream.shutdown().await;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("Connection to {destination} blocked: the fake address stands for nothing"),
+            ));
+        }
+        let result = crate::dns::fake_ip::handle_dns_over_tcp(
+            &mut stream,
+            destination,
+            responder,
+            proxy_selector,
+            resolver,
+        )
+        .await;
+        let _ = stream.shutdown().await;
+        return result;
+    }
+
+    // A fake address is restored to its name by `judge`; one standing for
+    // nothing is blocked there.
     let action = proxy_selector
         .judge(destination.clone().into(), &resolver)
         .await?;
@@ -466,6 +496,20 @@ async fn handle_h2mux_udp(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
+
+    if resolver.fake_ip().is_some() {
+        // Through the router, which answers DNS before any rule and ends
+        // this one-destination stream when the rules block its destination.
+        let server_stream = VlessMessageStream::new(Box::new(stream));
+        return crate::tcp::tcp_server::run_one_destination_udp_with_fake_ip(
+            Box::new(server_stream),
+            destination,
+            proxy_selector,
+            resolver,
+            false,
+        )
+        .await;
+    }
 
     let action = proxy_selector.judge(destination.into(), &resolver).await?;
 
@@ -553,5 +597,98 @@ mod tests {
         let mut expected = vec![0x00, 35];
         expected.extend_from_slice(b"brutal is not enabled by the server");
         assert_eq!(response, expected);
+    }
+
+    /// A resolver with fake IP on, over a pool of 198.18.0.0/16.
+    fn fake_ip_resolver() -> Arc<dyn Resolver> {
+        use crate::dns::fake_ip::{
+            BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+        };
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+        Arc::new(FakeIpResolver::new(
+            Arc::new(crate::quic_outbound::testing::LoopbackResolver),
+            Arc::new(FakeIpResponder::new(
+                pool,
+                BypassList::new(std::iter::empty::<&str>(), false),
+            )),
+        ))
+    }
+
+    /// Rules that block everything: what reaches them is not answered.
+    fn block_all() -> Arc<ClientProxySelector> {
+        use crate::address::NetLocationMask;
+        use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+        Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![],
+            ConnectAction::new_block(),
+        )]))
+    }
+
+    /// One h2mux TCP stream to `destination`, the client sending `sent` and
+    /// closing; what the client reads back, status byte first.
+    async fn h2mux_tcp_exchange(destination: &str, sent: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        use super::super::h2mux_server_stream::tests::{read_response_body, stream_pair};
+        use tokio::task::JoinSet;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut drivers = JoinSet::new();
+            let (stream, mut response, mut request) = stream_pair(65535, &mut drivers).await;
+            let resolver = fake_ip_resolver();
+            let handler = tokio::spawn(handle_h2mux_tcp(
+                stream,
+                NetLocation::from(destination.parse::<std::net::SocketAddr>().unwrap()),
+                block_all(),
+                resolver,
+            ));
+            request.send_data(sent.into(), true).unwrap();
+            let body = read_response_body(&mut response).await;
+            (handler.await.unwrap(), body)
+        })
+        .await
+        .expect("the exchange ends")
+    }
+
+    fn framed_a_query(name: &str) -> Vec<u8> {
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let mut message = Message::new(7, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        let query = message.to_vec().unwrap();
+        let mut framed = (query.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        framed
+    }
+
+    /// DNS over an h2mux TCP stream is answered from the pool, as the TCP
+    /// forward answers it, ahead of the rules (which block everything here).
+    #[tokio::test]
+    async fn dns_over_h2mux_tcp_is_answered_from_the_pool() {
+        use hickory_resolver::proto::op::Message;
+        use hickory_resolver::proto::rr::RData;
+        let (result, body) = h2mux_tcp_exchange("8.8.8.8:53", framed_a_query("echo.test.")).await;
+        result.unwrap();
+        assert_eq!(body[0], crate::h2mux::h2mux_protocol::STATUS_SUCCESS);
+        let length = u16::from_be_bytes([body[1], body[2]]) as usize;
+        let answer = Message::from_vec(&body[3..3 + length]).unwrap();
+        let fake = answer
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .expect("an A record");
+        assert_eq!(fake.octets()[..2], [198, 18], "{fake} is from the pool");
+    }
+
+    /// DNS to a fake address standing for nothing is refused, not answered.
+    #[tokio::test]
+    async fn dns_over_h2mux_tcp_to_an_unmapped_fake_address_is_refused() {
+        let (result, body) =
+            h2mux_tcp_exchange("198.18.250.250:53", framed_a_query("echo.test.")).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(body[0], crate::h2mux::h2mux_protocol::STATUS_ERROR);
     }
 }

@@ -27,6 +27,14 @@ pub struct DnsRegistry {
     groups: FxHashMap<String, Arc<dyn Resolver>>,
     /// Default resolver, created lazily only if needed.
     default_resolver: Option<Arc<dyn Resolver>>,
+    /// The fake IP responder of each group that has one, shared by every
+    /// listener naming the group. Kept apart from `groups` so a group used
+    /// as another's bootstrap is the plain resolver.
+    fake_ips: FxHashMap<String, Arc<crate::dns::fake_ip::FakeIpResponder>>,
+    /// One responder per inline `fake_ip`, under the context name validation
+    /// gave the `dns:` block: the same object however often the block's
+    /// resolver is asked for.
+    inline_fake_ips: FxHashMap<String, Arc<crate::dns::fake_ip::FakeIpResponder>>,
 }
 
 impl DnsRegistry {
@@ -35,6 +43,8 @@ impl DnsRegistry {
         Self {
             groups: FxHashMap::default(),
             default_resolver: None,
+            fake_ips: FxHashMap::default(),
+            inline_fake_ips: FxHashMap::default(),
         }
     }
 
@@ -74,21 +84,58 @@ impl DnsRegistry {
     pub fn get_for_tun(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(_) => self.get_for_server(dns),
-            None => Arc::new(NativeResolver::new()),
+            // The plain system resolver, as before `dns:` blocks; wrapped
+            // when the TUN's own fake_ip gives it a pool.
+            None => self.with_fake_ip(Arc::new(NativeResolver::new()), dns),
+        }
+    }
+
+    /// The responder `dns` names: its own context, else its group's.
+    fn responder_for(
+        &self,
+        dns: Option<&DnsConfig>,
+    ) -> Option<Arc<crate::dns::fake_ip::FakeIpResponder>> {
+        let dns = dns?;
+        if let Some(context) = &dns.fake_ip_context {
+            return Some(
+                self.inline_fake_ips
+                    .get(context)
+                    .cloned()
+                    .expect("inline fake_ip context should be built (validated)"),
+            );
+        }
+        dns.resolved_group()
+            .and_then(|group_name| self.fake_ips.get(group_name).cloned())
+    }
+
+    fn with_fake_ip(
+        &self,
+        resolver: Arc<dyn Resolver>,
+        dns: Option<&DnsConfig>,
+    ) -> Arc<dyn Resolver> {
+        match self.responder_for(dns) {
+            Some(responder) => Arc::new(crate::dns::fake_ip::FakeIpResolver::new(
+                resolver, responder,
+            )),
+            None => resolver,
         }
     }
 
     /// Get resolver for a server config's dns field.
     /// After validation, dns.servers should be a single group name or None.
+    ///
+    /// With fake IP on, the resolver comes wrapped in a `FakeIpResolver`
+    /// carrying the block's own context, else the named group's shared one.
     pub fn get_for_server(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
-        match dns.and_then(|c| c.resolved_group()) {
+        let resolver = match dns.and_then(|c| c.resolved_group()) {
             Some(group_name) => self
                 .groups
                 .get(group_name)
                 .cloned()
                 .expect("dns group should exist (validated)"),
             None => self.get_or_create_default(),
-        }
+        };
+        self.with_fake_ip(resolver, dns)
     }
 }
 
@@ -583,11 +630,26 @@ fn try_build_hickory_pool(
 /// - Builds client chain groups from expanded client chains
 /// - Resolves hostnames in DNS URLs using bootstrap resolvers
 /// - Creates HickoryResolver instances
-pub async fn build_dns_registry(groups: Vec<ExpandedDnsGroup>) -> std::io::Result<DnsRegistry> {
+pub async fn build_dns_registry(
+    groups: Vec<ExpandedDnsGroup>,
+    inline_fake_ips: Vec<(String, crate::config::FakeIpConfig)>,
+) -> std::io::Result<DnsRegistry> {
     let mut registry = DnsRegistry::new();
+
+    for (context, config) in inline_fake_ips {
+        let responder = crate::dns::fake_ip::responder_from_config(&config, &context)?;
+        registry.inline_fake_ips.insert(context, responder);
+    }
 
     for group in groups {
         let resolver = build_resolver_from_specs(&group.specs, &registry, &group.name).await?;
+        if let Some(config) = &group.fake_ip {
+            let responder = crate::dns::fake_ip::responder_from_config(
+                config,
+                &format!("dns_group '{}'", group.name),
+            )?;
+            registry.fake_ips.insert(group.name.clone(), responder);
+        }
         registry.register(group.name, resolver);
     }
 
@@ -778,7 +840,9 @@ mod tests {
                 format!("- address: '127.0.0.1:1080'\n  protocol: {{type: socks}}\n  {dns}\n");
             let configs =
                 crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
-            let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
+            let mut registry = build_dns_registry(configs.dns_groups, configs.inline_fake_ips)
+                .await
+                .unwrap();
             let crate::config::Config::Server(server) = &configs.configs[0] else {
                 panic!("expected a server")
             };
@@ -793,6 +857,331 @@ mod tests {
                 ),
                 None => assert!(!debug.contains("CachingNativeResolver"), "{dns}: {debug}"),
             }
+        }
+    }
+
+    /// Listeners naming a group with `fake_ip` share its pool; a listener's
+    /// own `fake_ip` gets a pool of its own; a group without one gives none.
+    #[tokio::test]
+    async fn fake_ip_pools_are_shared_by_group_and_private_inline() {
+        let yaml = "\
+- dns_group: fake
+  dns_servers: system
+  fake_ip: {network: 198.18.0.0/16}
+- address: '127.0.0.1:1080'
+  protocol: {type: socks}
+  dns: {servers: fake}
+- address: '127.0.0.1:1081'
+  protocol: {type: socks}
+  dns: {servers: fake}
+- address: '127.0.0.1:1082'
+  protocol: {type: socks}
+  dns: {servers: system, fake_ip: {network: 198.19.0.0/16}}
+- address: '127.0.0.1:1083'
+  protocol: {type: socks}
+  dns: {servers: system}
+";
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        let mut registry = build_dns_registry(configs.dns_groups, configs.inline_fake_ips)
+            .await
+            .unwrap();
+        let responders: Vec<_> = configs
+            .configs
+            .iter()
+            .map(|config| {
+                let crate::config::Config::Server(server) = config else {
+                    panic!("expected a server")
+                };
+                registry
+                    .get_for_server(server.dns.as_ref())
+                    .fake_ip()
+                    .cloned()
+            })
+            .collect();
+        let shared_a = responders[0].as_ref().expect("the group's pool");
+        let shared_b = responders[1].as_ref().expect("the group's pool");
+        assert!(Arc::ptr_eq(shared_a, shared_b), "one pool for the group");
+        let private = responders[2].as_ref().expect("its own pool");
+        assert!(!Arc::ptr_eq(shared_a, private));
+        assert!(responders[3].is_none(), "no fake_ip, no pool");
+    }
+
+    /// A one-item list naming a group is that group: it shares the group's
+    /// pool, and a TUN naming a fake-IP group that way shares it too.
+    #[tokio::test]
+    async fn a_one_item_list_naming_a_group_is_that_group() {
+        let yaml = "\
+- dns_group: fake
+  dns_servers: system
+  fake_ip: {}
+- address: '127.0.0.1:1080'
+  protocol: {type: socks}
+  dns: {servers: fake}
+- address: '127.0.0.1:1081'
+  protocol: {type: socks}
+  dns: {servers: [fake]}
+";
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        let mut registry = build_dns_registry(configs.dns_groups, configs.inline_fake_ips)
+            .await
+            .unwrap();
+        let pools: Vec<_> = configs
+            .configs
+            .iter()
+            .map(|config| {
+                let crate::config::Config::Server(server) = config else {
+                    panic!("expected a server")
+                };
+                registry
+                    .get_for_server(server.dns.as_ref())
+                    .fake_ip()
+                    .cloned()
+                    .unwrap()
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&pools[0], &pools[1]));
+    }
+
+    /// A TUN's top-level `fake_ip` is its dns block's: the registry builds
+    /// one context for the session, the same object on every ask; naming a
+    /// group with a pool shares the group's; set in both places is refused.
+    #[tokio::test]
+    async fn a_tun_shares_or_owns_a_pool_like_a_listener() {
+        let device = if cfg!(target_os = "macos") {
+            "utun99"
+        } else {
+            "shoestest0"
+        };
+        let yaml = format!(
+            "- dns_group: fake\n  dns_servers: udp://1.1.1.1\n  fake_ip: {{}}\n\
+             - address: '127.0.0.1:1080'\n  protocol: {{type: socks}}\n  dns: {{servers: fake}}\n\
+             - device_name: {device}\n  address: 10.0.0.1\n  netmask: 255.255.255.0\n  \
+             udp_enabled: true\n  dns: {{servers: [fake]}}\n\
+             - device_name: {device}\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n  \
+             udp_enabled: true\n  fake_ip: {{network: 198.19.0.0/16}}\n"
+        );
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+        assert_eq!(
+            configs.inline_fake_ips.len(),
+            1,
+            "one inline context, the second TUN's"
+        );
+        let mut registry = build_dns_registry(configs.dns_groups, configs.inline_fake_ips)
+            .await
+            .unwrap();
+        let mut responders = Vec::new();
+        for config in &configs.configs {
+            let resolver = match config {
+                crate::config::Config::Server(server) => {
+                    registry.get_for_server(server.dns.as_ref())
+                }
+                crate::config::Config::TunServer(tun) => {
+                    assert!(tun.fake_ip.is_none(), "moved onto the dns block");
+                    registry.get_for_tun(tun.dns.as_ref())
+                }
+                _ => panic!("unexpected config"),
+            };
+            responders.push(resolver.fake_ip().cloned().expect("a pool"));
+        }
+        assert!(
+            Arc::ptr_eq(&responders[0], &responders[1]),
+            "the group's pool, shared"
+        );
+        assert!(
+            !Arc::ptr_eq(&responders[0], &responders[2]),
+            "the TUN's own pool"
+        );
+        let crate::config::Config::TunServer(own) = &configs.configs[2] else {
+            panic!()
+        };
+        let again = registry
+            .get_for_tun(own.dns.as_ref())
+            .fake_ip()
+            .cloned()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&responders[2], &again),
+            "the same context on a second ask"
+        );
+
+        let twice = format!(
+            "- device_name: {device}\n  address: 10.0.0.1\n  netmask: 255.255.255.0\n  \
+             udp_enabled: true\n  fake_ip: {{}}\n  dns: {{fake_ip: {{}}}}\n"
+        );
+        let err = crate::config::create_server_configs(serde_yaml::from_str(&twice).unwrap())
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("set it once"), "{err}");
+    }
+
+    /// A group with fake_ip named inside a longer list, or listed by another
+    /// group, would lose its pool silently: refused, with the group named.
+    #[test]
+    fn a_fake_ip_group_composed_into_another_is_refused() {
+        for (yaml, needle) in [
+            (
+                "- dns_group: fake\n  dns_servers: udp://1.1.1.1\n  fake_ip: {}\n\
+                 - address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  \
+                 dns: {servers: [fake, udp://9.9.9.9]}\n",
+                "name it alone",
+            ),
+            (
+                "- dns_group: fake\n  dns_servers: udp://1.1.1.1\n  fake_ip: {}\n\
+                 - dns_group: outer\n  dns_servers: [fake]\n\
+                 - address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  dns: {servers: outer}\n",
+                "cannot be composed",
+            ),
+        ] {
+            let err = crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("accepted:\n{yaml}"));
+            assert!(err.to_string().contains(needle), "{err}");
+            assert!(err.to_string().contains("'fake'"), "{err}");
+        }
+    }
+
+    /// AnyTLS and NaiveProxy carry their streams and UDP outside the paths
+    /// that answer port 53: fake IP on them would never hand out an address,
+    /// an option accepted and not implemented, so it is refused, bare or
+    /// inside the TLS, Reality or WebSocket that carries them in practice.
+    #[test]
+    fn fake_ip_on_anytls_and_naiveproxy_listeners_is_refused() {
+        const ANYTLS: &str = "{type: anytls, users: [{name: u, password: p}]}";
+        const NAIVE: &str = "{type: naiveproxy, users: [{username: u, password: p}]}";
+        let in_tls = |inner: &str| {
+            format!(
+                "{{type: tls, tls_targets: {{a.test: {{cert: c, key: k, protocol: {inner}}}}}}}"
+            )
+        };
+        let in_reality = |inner: &str| {
+            format!(
+                "{{type: tls, reality_targets: {{a.test: {{private_key: k, short_ids: [''], \
+                 dest: 'a.test:443', protocol: {inner}}}}}}}"
+            )
+        };
+        let in_ws = |inner: &str| format!("{{type: ws, targets: [{{protocol: {inner}}}]}}");
+        for (protocol, needle) in [
+            (ANYTLS.to_string(), "an AnyTLS listener"),
+            (NAIVE.to_string(), "a NaiveProxy listener"),
+            (in_tls(ANYTLS), "an AnyTLS listener"),
+            (in_tls(NAIVE), "a NaiveProxy listener"),
+            (in_reality(NAIVE), "a NaiveProxy listener"),
+            (in_tls(&in_ws(ANYTLS)), "an AnyTLS listener"),
+        ] {
+            let yaml = format!(
+                "- address: '127.0.0.1:4443'\n  protocol: {protocol}\n  \
+                 dns: {{servers: udp://1.1.1.1, fake_ip: {{}}}}\n"
+            );
+            let err = crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("accepted:\n{yaml}"));
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+    }
+
+    /// A tproxy listener's UDP session is keyed by the fake address and
+    /// refreshes its mapping at most once a minute: with fake IP on, an idle
+    /// timeout must stay that minute inside the pool's ten-minute reuse
+    /// guard. The numbers are written out, so a bound computed wrongly from
+    /// the constants fails here rather than agreeing with itself.
+    #[test]
+    fn a_tproxy_udp_timeout_past_the_reuse_guard_is_refused_with_fake_ip() {
+        let yaml = |udp_timeout: u64| {
+            format!(
+                "- address: '127.0.0.1:51271'\n  transport: udp\n  \
+                 protocol: {{type: tproxy, udp_timeout: {udp_timeout}}}\n  \
+                 dns: {{servers: udp://1.1.1.1, fake_ip: {{}}}}\n"
+            )
+        };
+        for refused in [541, 600] {
+            let err =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml(refused)).unwrap())
+                    .err()
+                    .unwrap_or_else(|| panic!("{refused} s accepted"));
+            assert!(err.to_string().contains("udp_timeout"), "{err}");
+        }
+        // Elsewhere a tproxy listener is refused whatever its timeout: it
+        // reads the original destination only Linux's TPROXY records.
+        #[cfg(target_os = "linux")]
+        crate::config::create_server_configs(serde_yaml::from_str(&yaml(540)).unwrap())
+            .expect("540 s, the guard less one refresh interval, accepted");
+    }
+
+    /// A dns block with neither servers nor fake_ip would silently mean the
+    /// default resolver: refused.
+    #[test]
+    fn an_empty_dns_block_is_refused() {
+        let yaml = "- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  dns: {}\n";
+        let err = crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap())
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains("no servers and no fake_ip"),
+            "{err}"
+        );
+    }
+
+    /// Fake IP on a QUIC listener is refused, inline or through its group:
+    /// its UDP relay routes outside the hooks that restore fake addresses.
+    #[test]
+    fn fake_ip_on_a_quic_listener_is_refused() {
+        let quic = |dns: &str| {
+            format!(
+                "- dns_group: fake\n  dns_servers: udp://1.1.1.1\n  fake_ip: {{}}\n\
+                 - address: '127.0.0.1:4443'\n  transport: quic\n  \
+                 quic_settings: {{cert: cert.pem, key: key.pem}}\n  \
+                 protocol: {{type: socks}}\n  {dns}\n"
+            )
+        };
+        for dns in [
+            "dns: {servers: fake}",
+            "dns: {servers: udp://1.1.1.1, fake_ip: {}}",
+        ] {
+            let yaml = quic(dns);
+            let err = crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("accepted:\n{yaml}"));
+            assert!(err.to_string().contains("QUIC listener"), "{err}");
+        }
+    }
+
+    /// A bad network on a listener's block is caught at validation, and a
+    /// TUN with a pool, its own or a group's, needs its UDP path.
+    #[test]
+    fn misplaced_or_malformed_fake_ip_is_refused() {
+        let tun = |dns: &str| {
+            format!(
+                "- dns_group: fake\n  dns_servers: udp://1.1.1.1\n  fake_ip: {{}}\n\
+                 - device_name: {name}\n  address: 10.0.0.1\n  netmask: 255.255.255.0\n  \
+                 udp_enabled: false\n  {dns}\n",
+                // A name each platform accepts (macOS wants utunN).
+                name = if cfg!(target_os = "macos") {
+                    "utun99"
+                } else {
+                    "shoestest0"
+                }
+            )
+        };
+        for (yaml, needle) in [
+            (tun("dns: {servers: fake}"), "requires udp_enabled"),
+            (
+                tun("dns: {servers: udp://1.1.1.1, fake_ip: {}}"),
+                "requires udp_enabled",
+            ),
+            (
+                "- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  \
+                 dns: {fake_ip: {network: not-a-cidr}}\n"
+                    .to_string(),
+                "fake_ip",
+            ),
+        ] {
+            let err = crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("accepted:\n{yaml}"));
+            assert!(err.to_string().contains(needle), "{err}");
         }
     }
 

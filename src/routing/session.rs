@@ -82,6 +82,15 @@ pub(super) struct RoutingSession {
     /// Last iteration when expiry was reset (to avoid redundant resets)
     pub(super) last_expiry_iteration: usize,
 
+    /// When the fake address this session is keyed by (if any) last marked
+    /// its mapping used; see `FAKE_IP_TOUCH_INTERVAL`.
+    pub(super) fake_ip_touched: Instant,
+
+    /// Removed when its remote ends either way, not both: the one session of
+    /// a one-destination stream, which the direct copy ends when either
+    /// direction does.
+    pub(super) ends_on_either_side: bool,
+
     /// This session's share of `RouterLimits::shared_budget`. It follows
     /// `remote`, because the budget counts descriptors and the descriptor is
     /// the remote's: see `remove_session`.
@@ -111,6 +120,8 @@ impl RoutingSession {
             remote_write_eof: false,
             last_write: Instant::now(),
             last_expiry_iteration: 0,
+            fake_ip_touched: Instant::now(),
+            ends_on_either_side: false,
             budget_permit,
         }
     }
@@ -118,7 +129,11 @@ impl RoutingSession {
     /// Check if session should be removed.
     #[inline]
     pub(super) fn should_remove(&self) -> bool {
-        self.remote_read_eof && self.remote_write_eof
+        if self.ends_on_either_side {
+            self.remote_read_eof || self.remote_write_eof
+        } else {
+            self.remote_read_eof && self.remote_write_eof
+        }
     }
 
     /// Reset session expiry timer (skips if already reset this iteration)

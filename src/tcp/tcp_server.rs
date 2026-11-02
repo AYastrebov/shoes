@@ -22,7 +22,9 @@ use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
 use crate::async_stream::AsyncMessageStream;
-use crate::async_stream::{AsyncShutdownMessageExt, AsyncStream};
+use crate::async_stream::{
+    AsyncReadMessage, AsyncShutdownMessageExt, AsyncStream, AsyncWriteMessage,
+};
 use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional_message::copy_bidirectional_message;
@@ -264,6 +266,21 @@ where
             stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
+        } if resolver.fake_ip().is_some() => {
+            run_one_destination_udp_with_fake_ip(
+                server_stream,
+                remote_location,
+                proxy_selector,
+                resolver,
+                server_need_initial_flush,
+            )
+            .await
+        }
+        TcpServerSetupResult::BidirectionalUdp {
+            remote_location,
+            stream: server_stream,
+            need_initial_flush: server_need_initial_flush,
+            proxy_selector,
         } => {
             let action = proxy_selector
                 .judge(remote_location.into(), &resolver)
@@ -326,6 +343,100 @@ where
         }
     }
 }
+
+/// A UDP stream to one destination, with fake IP on: the destination may be
+/// port 53 (answered from the pool), a fake address (routed by its name) or
+/// an unmapped one (dropped). The router does all three for SOCKS UDP; a
+/// stream with one fixed destination is that with the destination filled
+/// in, so it goes through the router too.
+pub(crate) async fn run_one_destination_udp_with_fake_ip(
+    stream: Box<dyn AsyncMessageStream>,
+    destination: crate::address::NetLocation,
+    proxy_selector: Arc<crate::client_proxy_selector::ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    need_initial_flush: bool,
+) -> std::io::Result<()> {
+    // The router ends this stream with its one session, and that session
+    // with the router's idle timeout, the direct copy's 200 seconds.
+    run_udp_routing(
+        ServerStream::Targeted(Box::new(OneDestination {
+            inner: stream,
+            destination,
+        })),
+        proxy_selector,
+        resolver,
+        need_initial_flush,
+    )
+    .await
+}
+
+/// A UDP stream to one destination, read as a stream whose every datagram
+/// names that destination, so the router can serve it. Replies carry no
+/// source on such a stream; the address the router gives is dropped.
+struct OneDestination {
+    inner: Box<dyn crate::async_stream::AsyncMessageStream>,
+    destination: crate::address::NetLocation,
+}
+
+impl crate::async_stream::AsyncReadTargetedMessage for OneDestination {
+    fn poll_read_targeted_message(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<crate::address::NetLocation>> {
+        let this = &mut *self;
+        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read_message(cx, buf))?;
+        std::task::Poll::Ready(Ok(this.destination.clone()))
+    }
+}
+
+impl crate::async_stream::AsyncWriteSourcedMessage for OneDestination {
+    fn poll_write_sourced_message(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        _source: &std::net::SocketAddr,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_message(cx, buf)
+    }
+
+    fn replies_need_source(&self) -> bool {
+        false
+    }
+}
+
+impl crate::async_stream::AsyncFlushMessage for OneDestination {
+    fn poll_flush_message(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush_message(cx)
+    }
+}
+
+impl crate::async_stream::AsyncShutdownMessage for OneDestination {
+    fn poll_shutdown_message(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown_message(cx)
+    }
+}
+
+impl crate::async_stream::AsyncPing for OneDestination {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<bool>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl crate::async_stream::AsyncTargetedMessageStream for OneDestination {}
 
 /// Unified function to run the appropriate UDP copy based on the setup result.
 /// Copy messages bidirectionally between server and client message streams.
@@ -561,5 +672,127 @@ mod tests {
                 &std::io::Error::from_raw_os_error(errno)
             ));
         }
+    }
+
+    /// A UDP stream to one destination (plain VLESS UDP, say) goes through
+    /// the router when fake IP is on: a DNS query to port 53 on it is
+    /// answered from the pool rather than carried to the server unanswered.
+    #[tokio::test]
+    async fn one_destination_udp_gets_fake_ip_through_the_router() {
+        use crate::async_stream::{
+            AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncShutdownMessage,
+        };
+        use crate::dns::fake_ip::{
+            BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+        };
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_resolver::proto::rr::{Name, RData, RecordType};
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::str::FromStr;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        struct Scripted {
+            incoming: VecDeque<Vec<u8>>,
+            written: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl AsyncReadMessage for Scripted {
+            fn poll_read_message(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                match self.incoming.pop_front() {
+                    Some(message) => {
+                        buf.put_slice(&message);
+                        Poll::Ready(Ok(()))
+                    }
+                    None => Poll::Pending,
+                }
+            }
+        }
+        impl AsyncWriteMessage for Scripted {
+            fn poll_write_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<()>> {
+                self.written.lock().unwrap().push(buf.to_vec());
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncFlushMessage for Scripted {
+            fn poll_flush_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncShutdownMessage for Scripted {
+            fn poll_shutdown_message(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncPing for Scripted {
+            fn supports_ping(&self) -> bool {
+                false
+            }
+            fn poll_write_ping(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<bool>> {
+                Poll::Ready(Ok(false))
+            }
+        }
+        impl AsyncMessageStream for Scripted {}
+
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+        let responder = Arc::new(FakeIpResponder::new(
+            pool.clone(),
+            BypassList::new(std::iter::empty::<&str>(), false),
+        ));
+        let resolver: Arc<dyn Resolver> = Arc::new(FakeIpResolver::new(
+            Arc::new(crate::quic_outbound::testing::LoopbackResolver),
+            responder,
+        ));
+        let mut query = Message::new(3, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_str("echo.test.").unwrap(),
+            RecordType::A,
+        ));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let stream = OneDestination {
+            inner: Box::new(Scripted {
+                incoming: VecDeque::from([query.to_vec().unwrap()]),
+                written: written.clone(),
+            }),
+            destination: crate::address::NetLocation::from_str("8.8.8.8:53", None).unwrap(),
+        };
+        let selector = crate::quic_outbound::testing::direct_selector(resolver.clone());
+        let routing = tokio::spawn(run_udp_routing(
+            ServerStream::Targeted(Box::new(stream)),
+            selector,
+            resolver,
+            false,
+        ));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while written.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no answer");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let answer = Message::from_vec(&written.lock().unwrap()[0]).unwrap();
+        let address = answer.answers.iter().find_map(|record| match &record.data {
+            RData::A(a) => Some(a.0),
+            _ => None,
+        });
+        assert!(address.is_some_and(|ip| pool.is_fake_ip(ip)), "{address:?}");
+        routing.abort();
     }
 }

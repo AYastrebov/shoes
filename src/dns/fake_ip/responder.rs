@@ -57,41 +57,48 @@ impl FakeIpResponder {
         &self.pool
     }
 
-    /// Decide what to do with one DNS query datagram.
-    ///
-    /// Anything not clearly a single-question standard query is forwarded
-    /// rather than guessed at — being wrong here means breaking name
-    /// resolution, and forwarding is always a correct fallback.
-    pub fn handle_query(&self, packet: &[u8]) -> DnsDecision {
-        let Ok(request) = Message::from_vec(packet) else {
-            return DnsDecision::Forward;
-        };
-
+    /// The query in `packet` if it is one this responder answers rather
+    /// than forwards, parsed once and decided without touching the pool:
+    /// the caller may need a reply source first, and a query that is
+    /// forwarded must take no slot. [`answer`](Self::answer) then builds the
+    /// reply from it. Anything not clearly a single-question standard A or
+    /// AAAA query for a name outside the bypass list is `None`: being wrong
+    /// here means breaking name resolution, and forwarding is always a
+    /// correct fallback.
+    pub fn answerable(&self, packet: &[u8]) -> Option<AnswerableQuery> {
+        let request = Message::from_vec(packet).ok()?;
         if request.metadata.message_type != MessageType::Query
             || request.metadata.op_code != OpCode::Query
         {
-            return DnsDecision::Forward;
+            return None;
         }
-
         // Multi-question queries have no well-defined semantics and are
         // vanishingly rare in practice; upstream can have them.
         let [query] = request.queries.as_slice() else {
-            return DnsDecision::Forward;
+            return None;
         };
-
-        let record_type = query.query_type();
-        if !matches!(record_type, RecordType::A | RecordType::AAAA) {
-            // HTTPS/SVCB, SRV, TXT, MX, PTR and friends all carry real data
-            // that a fake address cannot stand in for. Forwarding them keeps
-            // ECH, ALPN hints and service discovery working; the query still
-            // travels inside the tunnel, so nothing leaks.
-            return DnsDecision::Forward;
+        // HTTPS/SVCB, SRV, TXT, MX, PTR and friends all carry real data that
+        // a fake address cannot stand in for. Forwarding them keeps ECH, ALPN
+        // hints and service discovery working; the query still travels
+        // inside the tunnel, so nothing leaks.
+        if !matches!(query.query_type(), RecordType::A | RecordType::AAAA) {
+            return None;
         }
-
         let domain = normalize_name(&query.name().to_utf8());
         if domain.is_empty() || self.bypass.matches(&domain) {
-            return DnsDecision::Forward;
+            return None;
         }
+        Some(AnswerableQuery { request, domain })
+    }
+
+    /// Answer a query [`answerable`](Self::answerable) accepted. Forwards
+    /// after all when the pool has nothing to recycle.
+    pub fn answer(&self, query: AnswerableQuery) -> DnsDecision {
+        let AnswerableQuery { request, domain } = query;
+        let Some(question) = request.queries.first() else {
+            return DnsDecision::Forward;
+        };
+        let record_type = question.query_type();
 
         let mut response = Message::new(
             request.metadata.id,
@@ -101,7 +108,7 @@ impl FakeIpResponder {
         response.metadata.recursion_desired = request.metadata.recursion_desired;
         response.metadata.recursion_available = true;
         response.metadata.response_code = ResponseCode::NoError;
-        response.add_query(query.clone());
+        response.add_query(question.clone());
 
         if record_type == RecordType::A {
             let Some(ip) = self.assign(&domain) else {
@@ -112,7 +119,7 @@ impl FakeIpResponder {
                 return DnsDecision::Forward;
             };
             response.add_answer(Record::from_rdata(
-                query.name().clone(),
+                question.name().clone(),
                 FAKE_IP_TTL_SECS,
                 RData::A(rdata::A(ip)),
             ));
@@ -130,6 +137,23 @@ impl FakeIpResponder {
             Err(_) => DnsDecision::Forward,
         }
     }
+
+    /// Decide what to do with one DNS query datagram: [`answerable`]
+    /// (Self::answerable), then [`answer`](Self::answer).
+    pub fn handle_query(&self, packet: &[u8]) -> DnsDecision {
+        match self.answerable(packet) {
+            Some(query) => self.answer(query),
+            None => DnsDecision::Forward,
+        }
+    }
+}
+
+/// A DNS query the responder answers, parsed: what
+/// [`FakeIpResponder::answerable`] hands to [`FakeIpResponder::answer`].
+#[derive(Debug)]
+pub struct AnswerableQuery {
+    request: Message,
+    domain: String,
 }
 
 impl FakeIpResponder {
@@ -441,5 +465,37 @@ mod tests {
         let lower = parse(&responder.handle_query(&query_bytes("example.com.", RecordType::A)));
         assert_eq!(answer_ips(&upper), answer_ips(&lower));
         assert_eq!(responder.pool().entry_count(), 1);
+    }
+
+    /// `answerable` is `handle_query`'s verdict without the pool: the two
+    /// agree on every shape, and `answerable` assigns nothing.
+    #[test]
+    fn answerable_agrees_with_handle_query_and_takes_no_slot() {
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 8).unwrap());
+        let responder = FakeIpResponder::new(pool.clone(), BypassList::new(["*.lan"], false));
+        let query = |name: &str, kind: RecordType| {
+            let mut m = Message::new(1, MessageType::Query, OpCode::Query);
+            m.add_query(Query::query(Name::from_str(name).unwrap(), kind));
+            m.to_vec().unwrap()
+        };
+        let cases: Vec<(Vec<u8>, bool)> = vec![
+            (query("example.com.", RecordType::A), true),
+            (query("example.com.", RecordType::AAAA), true),
+            (query("example.com.", RecordType::TXT), false),
+            (query("printer.lan.", RecordType::A), false),
+            (b"not a dns message".to_vec(), false),
+        ];
+        for (packet, expected) in &cases {
+            assert_eq!(responder.answerable(packet).is_some(), *expected);
+        }
+        assert_eq!(pool.entry_count(), 0, "answerable takes no slot");
+        for (packet, expected) in &cases {
+            let answered = matches!(responder.handle_query(packet), DnsDecision::Answer(_));
+            assert_eq!(answered, *expected, "the two agree");
+        }
     }
 }

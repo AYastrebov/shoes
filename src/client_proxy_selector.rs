@@ -226,6 +226,37 @@ pub enum ConnectDecision<'a> {
     Block,
 }
 
+/// With fake IP on the listener (the resolver carries its responder), a
+/// destination that is a fake address becomes the name it stands for, at
+/// the same port and with no address of its own; an unmapped fake address
+/// is `None`, counted by `restore_location`. Anything else is unchanged.
+fn restore_fake_ip(
+    location: ResolvedLocation,
+    resolver: &Arc<dyn Resolver>,
+) -> Option<ResolvedLocation> {
+    let Some(responder) = resolver.fake_ip() else {
+        return Some(location);
+    };
+    use crate::dns::fake_ip::{Restored, restore_location};
+    // A sniffed location names the client's hostname and keeps the dialled
+    // address as its resolved one: with that address fake, the connection
+    // would have gone to the fake address itself. The pool's name is the
+    // target; the sniffed name was the client's to choose.
+    if let Some(resolved) = location.resolved_addr() {
+        let dialled = NetLocation::from(resolved);
+        match restore_location(&dialled, responder.pool()) {
+            Restored::Unchanged => {}
+            Restored::Hostname(name) => return Some(ResolvedLocation::new(name)),
+            Restored::Unmapped => return None,
+        }
+    }
+    match restore_location(location.location(), responder.pool()) {
+        Restored::Unchanged => Some(location),
+        Restored::Hostname(name) => Some(ResolvedLocation::new(name)),
+        Restored::Unmapped => None,
+    }
+}
+
 impl ClientProxySelector {
     pub fn new(rules: Vec<ConnectRule>) -> Self {
         Self::with_options(rules, false)
@@ -303,6 +334,15 @@ impl ClientProxySelector {
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
+        // A fake address becomes the name it stands for here, where every
+        // protocol passes, so none has to restore it itself; one standing
+        // for nothing is refused and never cached as a literal
+        // (docs/specs/2026-11-02-fake-dns-convergence.md, "One restoration
+        // site").
+        let Some(location) = restore_fake_ip(location, resolver) else {
+            return Ok(ConnectDecision::Block);
+        };
+
         // Derive resolved_ip from any pre-resolved address
         let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
 
@@ -352,7 +392,11 @@ impl ClientProxySelector {
         resolved_ip: Option<u128>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
-        let mut location = location;
+        let Some(mut location) = restore_fake_ip(location, resolver) else {
+            return Ok(ConnectDecision::Block);
+        };
+        // A restored name carries no address; the one given was the fake.
+        let resolved_ip = resolved_ip.filter(|_| location.resolved_addr().is_some());
         match match_rule(
             &self.rules,
             &mut location,

@@ -107,6 +107,13 @@ pub trait AsyncWriteSourcedMessage {
         buf: &[u8],
         source: &SocketAddr,
     ) -> Poll<std::io::Result<()>>;
+
+    /// Whether a reply's source address reaches the client. A stream with
+    /// one fixed destination drops it, so whoever routes it need not resolve
+    /// a destination name just to have an address to reply from.
+    fn replies_need_source(&self) -> bool {
+        true
+    }
 }
 
 /// Session-based message reading trait. Used by protocols like XUDP that have session IDs.
@@ -663,6 +670,10 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_sourced_message(cx, buf, source)
     }
+
+    fn replies_need_source(&self) -> bool {
+        (**self).replies_need_source()
+    }
 }
 
 impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for &mut T {
@@ -673,6 +684,10 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
         source: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_sourced_message(cx, buf, source)
+    }
+
+    fn replies_need_source(&self) -> bool {
+        (**self).replies_need_source()
     }
 }
 

@@ -89,6 +89,12 @@ quic_settings:
 
 # Routing rules (default: allow-all-direct)
 rules: string | [RuleConfig]
+
+# DNS for this listener (optional): a dns_group name or inline servers, and
+# fake IP (see "Fake IP on listeners")
+dns:
+  servers: string | [DnsServerSpec]
+  fake_ip: FakeIpConfig          # optional; a pool of this listener's own
 ```
 
 ## Server Protocols
@@ -675,6 +681,85 @@ Notes:
   NTP, STUN, and names the tunnel does not carry.
 - Restoration happens before routing rules are evaluated, so hostname rules
   match TUN traffic.
+
+### Fake IP on listeners
+
+A SOCKS, HTTP, mixed or tproxy listener can answer DNS with fake addresses
+too, when its `dns:` block (or the `dns_group` that block names) has a
+`fake_ip` with the same fields as the TUN's:
+
+```yaml
+# One pool shared by every listener naming the group, so a client whose DNS
+# and connections reach different listeners still gets its names back.
+- dns_group: fake-dns
+  dns_servers: "tls://1.1.1.1"
+  fake_ip:
+    network: "198.18.0.0/16"
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  dns: {servers: fake-dns}
+
+# Or a pool of this listener's own, whatever servers it names.
+- address: "0.0.0.0:1081"
+  protocol: {type: socks}
+  dns:
+    servers: "udp://1.1.1.1"
+    fake_ip: {}
+```
+
+- A query to port 53 that arrives through the listener (SOCKS UDP
+  ASSOCIATE, a SOCKS/HTTP CONNECT to port 53, tproxy) is answered from the
+  pool, whatever server it was addressed to. What the pool does not answer
+  goes on to that server through the rules, as on the TUN.
+- A connection or datagram to a fake address becomes the name it stands for
+  before sniffing and routing: hostname rules match, and a proxy receives the
+  name. Over UDP the replies come from the fake address the client sent to.
+- A fake address that stands for nothing (handed out before a restart, or
+  recycled since) is refused: TCP gets the inbound's refusal, UDP is
+  dropped. A DNS query sent to one is refused the same way, not answered.
+- DNS to port 53 is answered from the pool over UDP, DNS over TCP and h2mux
+  TCP streams alike. A DNS-over-TCP connection quiet for 30 seconds is
+  closed, and a forwarded query gives up after 15 seconds connecting to its
+  resolver or 15 waiting for the answer.
+- A flow to a fake address keeps its mapping in use while it carries
+  traffic, so the pool does not give that address to another name under a
+  live client.
+- A real DNS answer inside the fake network is dropped, since connecting to
+  it would be read as one of the pool's own addresses.
+- A TUN's top-level `fake_ip` is an alias of its `dns:` block's: a TUN may
+  name a group with `fake_ip` and share that pool with the listeners naming
+  it. Set in both places it is refused.
+- A group with `fake_ip` is named alone. Inside a longer `dns:` list
+  (`servers: [fake-dns, udp://9.9.9.9]`) or another group's `dns_servers` it
+  is refused, since the composed resolver would carry no pool.
+- A fake address is turned back into its name where the rules are judged,
+  which every protocol passes through, so h2mux and the rest get it without
+  a path of their own; the rules' decision cache holds the name, never the
+  address.
+- Not on QUIC listeners (Hysteria2, TUIC, `transport: quic`), inline or
+  through their group, until their UDP relays are shown to reply from the
+  fake address; and not on listeners carrying AnyTLS or NaiveProxy, bare or
+  inside TLS, Reality or WebSocket, which carry their streams outside the
+  paths that answer port 53.
+- A `dns:` block must name servers or set `fake_ip`; an empty one is
+  refused rather than silently meaning the default resolver.
+- A tproxy listener with fake IP on takes a `udp_timeout` of at most 540
+  seconds: the pool's 600-second reuse guard, less the minute by which a
+  live session's refresh of its mapping can lag. A session idle longer
+  could outlive the fake address it is keyed by, and another name given
+  that address would join it.
+- A UDP stream with one fixed destination (plain VLESS or h2mux UDP) goes
+  through the router when fake IP is on, and ends as it does without fake
+  IP: when the client closes it, when its destination is blocked, cannot
+  be reached or is a fake address standing for nothing, when the remote
+  ends or fails either way, or after 200 seconds without traffic either
+  way. A stream to port 53 is the exception: the pool answers most of its
+  queries, so a forwarded query that is blocked or fails is dropped alone
+  and the stream ends only with the client or its idle timeout. Queries
+  answered from the pool count as traffic.
+
+**Example:** see `examples/fake_dns.yaml`.
 
 **Platform notes:**
 - **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.

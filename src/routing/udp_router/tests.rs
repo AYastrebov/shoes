@@ -24,6 +24,9 @@ struct ScriptedInner {
     /// Registered when a read returns Pending; recording a reply wakes it
     /// so the router notices the stream has since closed.
     read_waker: Option<Waker>,
+    /// Acts as a stream with one fixed destination, which drops reply
+    /// sources.
+    drops_sources: bool,
 }
 
 impl ScriptedInner {
@@ -45,6 +48,7 @@ fn scripted(
         replies: Vec::new(),
         close_after_replies,
         read_waker: None,
+        drops_sources: false,
     }));
     (
         ScriptedServer {
@@ -95,6 +99,10 @@ impl AsyncWriteSourcedMessage for ScriptedServer {
             waker.wake();
         }
         Poll::Ready(Ok(()))
+    }
+
+    fn replies_need_source(&self) -> bool {
+        !self.inner.lock().unwrap().drops_sources
     }
 }
 
@@ -250,6 +258,12 @@ async fn test_a_session_that_never_hears_back_expires_on_the_listeners_timeout()
 #[derive(Default)]
 struct FakeRemoteState {
     writes_stay_pending: bool,
+    /// Writes fail, as a connected UDP socket's do after an ICMP refusal.
+    writes_fail: bool,
+    /// Datagrams the remote sends, read in order; `read_waker` is woken
+    /// when a test adds one.
+    inbound: VecDeque<Vec<u8>>,
+    read_waker: Option<Waker>,
     shutdown_may_finish: bool,
     shutdown_polled: bool,
     dropped: bool,
@@ -270,10 +284,25 @@ impl Drop for FakeRemote {
 impl AsyncReadMessage for FakeRemote {
     fn poll_read_message(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(datagram) = state.inbound.pop_front() {
+            buf.put_slice(&datagram);
+            return Poll::Ready(Ok(()));
+        }
+        state.read_waker = Some(cx.waker().clone());
         Poll::Pending
+    }
+}
+
+/// Have a `FakeRemote` send one datagram.
+fn remote_sends(state: &Arc<Mutex<FakeRemoteState>>, datagram: &[u8]) {
+    let mut state = state.lock().unwrap();
+    state.inbound.push_back(datagram.to_vec());
+    if let Some(waker) = state.read_waker.take() {
+        waker.wake();
     }
 }
 
@@ -283,7 +312,9 @@ impl AsyncWriteMessage for FakeRemote {
         _cx: &mut Context<'_>,
         _buf: &[u8],
     ) -> Poll<io::Result<()>> {
-        if self.0.lock().unwrap().writes_stay_pending {
+        if self.0.lock().unwrap().writes_fail {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionRefused)))
+        } else if self.0.lock().unwrap().writes_stay_pending {
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
@@ -426,11 +457,11 @@ impl AsyncWriteSessionMessage for ScriptedSessionServer {
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<io::Result<()>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .replies
-            .push((session_id, *target, buf.to_vec()));
+        let mut inner = self.inner.lock().unwrap();
+        // XUDP drops a write under a route it has released, silently.
+        if !inner.released.contains(&session_id) {
+            inner.replies.push((session_id, *target, buf.to_vec()));
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -577,6 +608,38 @@ async fn test_an_end_only_read_drops_the_route_on_the_same_wakeup() {
     .await;
     assert!(!state.lock().unwrap().shutdown_polled);
     router.abort();
+}
+
+/// A stream with one fixed destination that the rules block ends, as the
+/// direct path refused it, instead of dropping every datagram in silence
+/// while the client waits.
+#[tokio::test]
+async fn test_a_blocked_one_destination_stream_ends() {
+    use crate::address::NetLocationMask;
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    let block_all = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+        vec![NetLocationMask::ANY],
+        vec![],
+        ConnectAction::new_block(),
+    )]));
+    let destination = location("192.0.2.9:4000".parse().unwrap());
+    let (stream, inner) = scripted(vec![(destination, b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router = async move {
+        UdpRouter::new(
+            &mut server,
+            block_all,
+            test_resolver(),
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    };
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the router ends with the blocked stream")
+        .unwrap();
 }
 
 async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -1003,4 +1066,1031 @@ async fn test_the_router_exits_once_the_server_stream_dies() {
         result.is_ok(),
         "the router must terminate when the server stream is dead both ways"
     );
+}
+
+/// A resolver for a listener with fake IP on, as `DnsRegistry` hands out:
+/// names resolve to loopback, and the responder answers DNS from a pool.
+fn fake_ip_resolver() -> Arc<dyn Resolver> {
+    use crate::dns::fake_ip::{
+        BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+    };
+    let pool =
+        Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+    let responder = Arc::new(FakeIpResponder::new(
+        pool,
+        BypassList::new(std::iter::empty::<&str>(), false),
+    ));
+    Arc::new(FakeIpResolver::new(
+        Arc::new(crate::quic_outbound::testing::LoopbackResolver),
+        responder,
+    ))
+}
+
+fn dns_a_query(name: &str) -> Vec<u8> {
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_resolver::proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+    let mut message = Message::new(0x4242, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+    message.to_vec().unwrap()
+}
+
+fn answered_ipv4(reply: &[u8]) -> std::net::Ipv4Addr {
+    use hickory_resolver::proto::op::Message;
+    use hickory_resolver::proto::rr::RData;
+    let message = Message::from_vec(reply).unwrap();
+    message
+        .answers
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::A(a) => Some(a.0),
+            _ => None,
+        })
+        .expect("an A record")
+}
+
+/// A SOCKS-style listener with fake IP on: a query to port 53 is answered
+/// from the pool, from the server the client addressed; a datagram to the
+/// fake address reaches the name it stands for and its reply comes back
+/// from the fake address, not the real one; a datagram to an unmapped fake
+/// address goes nowhere.
+#[tokio::test]
+async fn test_fake_ip_answers_dns_and_routes_the_fake_address_by_name() {
+    let echo = spawn_udp_echo().await;
+    let resolver = fake_ip_resolver();
+    let dns_server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![(location(dns_server), dns_a_query("echo.test."))],
+        usize::MAX,
+    );
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router_resolver = resolver.clone();
+    let router = tokio::spawn(async move {
+        let selector = direct_selector(router_resolver.clone());
+        UdpRouter::new(
+            &mut server,
+            selector,
+            router_resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+
+    wait_for_replies(&inner, 1).await;
+    let (from, answer) = inner.lock().unwrap().replies[0].clone();
+    assert_eq!(
+        from, dns_server,
+        "the answer comes from the server addressed"
+    );
+    let fake = answered_ipv4(&answer);
+    assert!(
+        resolver.fake_ip().unwrap().pool().is_fake_ip(fake),
+        "{fake}"
+    );
+
+    let fake_addr = SocketAddr::new(fake.into(), echo.port());
+    push_packet(&inner, fake_addr, b"by name");
+    wait_for_replies(&inner, 2).await;
+    let (from, echoed) = inner.lock().unwrap().replies[1].clone();
+    assert_eq!(echoed, b"by name");
+    assert_eq!(from, fake_addr, "the reply comes from the fake address");
+
+    let unmapped: SocketAddr = "198.18.200.200:9".parse().unwrap();
+    push_packet(&inner, unmapped, b"nowhere");
+    assert_no_further_reply(&inner, 2).await;
+    router.abort();
+}
+
+/// A DNS query addressed to a server by name is answered too, from that
+/// name's own fake address: a SOCKS reply needs an address, and resolving
+/// the server's name for real is what fake IP avoids.
+#[tokio::test]
+async fn test_fake_ip_answers_a_query_addressed_to_a_server_by_name() {
+    let resolver = fake_ip_resolver();
+    let by_name = NetLocation::new(Address::Hostname("dns.google".into()), 53);
+    let (stream, inner) = scripted(vec![(by_name, dns_a_query("echo.test."))], usize::MAX);
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router_resolver = resolver.clone();
+    let router = tokio::spawn(async move {
+        let selector = direct_selector(router_resolver.clone());
+        UdpRouter::new(
+            &mut server,
+            selector,
+            router_resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+    wait_for_replies(&inner, 1).await;
+    let (from, answer) = inner.lock().unwrap().replies[0].clone();
+    let pool = resolver.fake_ip().unwrap().pool().clone();
+    let std::net::IpAddr::V4(from_ip) = from.ip() else {
+        panic!("{from}")
+    };
+    assert_eq!(pool.lookup(from_ip).as_deref(), Some("dns.google"));
+    assert_eq!(from.port(), 53);
+    assert!(pool.is_fake_ip(answered_ipv4(&answer)));
+    router.abort();
+}
+
+/// A fake-addressed flow and one the client addressed to the same name are
+/// two sessions: the fake one's replies come from the fake address even when
+/// the name's own flow was there first.
+#[tokio::test]
+async fn test_fake_ip_flow_does_not_merge_with_the_named_flow() {
+    let echo = spawn_udp_echo().await;
+    let resolver = fake_ip_resolver();
+    let fake = resolver
+        .fake_ip()
+        .unwrap()
+        .pool()
+        .assign("echo.test")
+        .unwrap();
+    let by_name = NetLocation::new(Address::Hostname("echo.test".into()), echo.port());
+    let (stream, inner) = scripted(vec![(by_name, b"named".to_vec())], usize::MAX);
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router_resolver = resolver.clone();
+    let router = tokio::spawn(async move {
+        let selector = direct_selector(router_resolver.clone());
+        UdpRouter::new(
+            &mut server,
+            selector,
+            router_resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+    wait_for_replies(&inner, 1).await;
+    let fake_addr = SocketAddr::new(fake.into(), echo.port());
+    push_packet(&inner, fake_addr, b"faked");
+    wait_for_replies(&inner, 2).await;
+    let (from, echoed) = inner.lock().unwrap().replies[1].clone();
+    assert_eq!(echoed, b"faked");
+    assert_eq!(from, fake_addr, "the fake flow's own source");
+    router.abort();
+}
+
+/// A query the pool does not answer, sent to a DNS server whose own address
+/// is fake, is routed to the server's name, not to the fake literal.
+#[tokio::test]
+async fn test_fake_ip_forwards_to_a_fake_dns_server_by_name() {
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_resolver::proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+    let resolver = fake_ip_resolver();
+    let server_ip = resolver
+        .fake_ip()
+        .unwrap()
+        .pool()
+        .assign("dns.test")
+        .unwrap();
+    let mut txt = Message::new(1, MessageType::Query, OpCode::Query);
+    txt.add_query(Query::query(
+        Name::from_str("echo.test.").unwrap(),
+        RecordType::TXT,
+    ));
+    let (stream, _inner) = scripted(
+        vec![(
+            location(SocketAddr::new(server_ip.into(), 53)),
+            txt.to_vec().unwrap(),
+        )],
+        usize::MAX,
+    );
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let seen = targets.clone();
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router = tokio::spawn(async move {
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        router.remote_factory = Some(Box::new(move |target| {
+            seen.lock().unwrap().push(target.clone());
+            Box::pin(async { Err(io::Error::other("test: not connecting")) })
+        }));
+        router.await
+    });
+    wait_until("the forward was attempted", || {
+        !targets.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        targets.lock().unwrap()[0],
+        NetLocation::new(Address::Hostname("dns.test".into()), 53)
+    );
+    router.abort();
+}
+
+/// On an XUDP stream a route that only carried a DNS query answered here,
+/// or a datagram to an unmapped fake address, is handed back: no session
+/// holds it, and kept it would count against the stream's route limit.
+#[tokio::test]
+async fn test_fake_ip_releases_routes_it_answered_or_dropped() {
+    let resolver = fake_ip_resolver();
+    let (stream, inner) = scripted_sessions(vec![
+        SessionScript::Packet(1, "8.8.8.8:53".parse().unwrap(), dns_a_query("echo.test.")),
+        SessionScript::Packet(2, "198.18.200.200:9".parse().unwrap(), b"nowhere".to_vec()),
+    ]);
+    let mut server = ServerStream::Session(Box::new(stream));
+    let router = tokio::spawn(async move {
+        UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+    wait_until("both routes are released", || {
+        let mut released = inner.lock().unwrap().released.clone();
+        released.sort();
+        released == [1, 2]
+    })
+    .await;
+    assert_eq!(
+        inner.lock().unwrap().replies.len(),
+        1,
+        "the query was answered"
+    );
+    router.abort();
+}
+
+/// A query to a server named by hostname is answered only if that name can
+/// be given a fake address to reply from. With one slot, the name takes it,
+/// the answer then cannot, and the query goes on to the server: never an
+/// answer from a made-up 0.0.0.0 source, which the old order (answer first)
+/// produced.
+#[tokio::test]
+async fn test_fake_ip_forwards_a_named_server_query_when_the_pool_is_full() {
+    use crate::dns::fake_ip::{
+        BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+    };
+    let pool =
+        Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 1).unwrap());
+    // One slot, empty: the server's name must take it before the answer
+    // can, or the answer would take it and leave no source to reply from.
+    let resolver: Arc<dyn Resolver> = Arc::new(FakeIpResolver::new(
+        Arc::new(crate::quic_outbound::testing::LoopbackResolver),
+        Arc::new(FakeIpResponder::new(
+            pool,
+            BypassList::new(std::iter::empty::<&str>(), false),
+        )),
+    ));
+    let by_name = NetLocation::new(Address::Hostname("dns.google".into()), 53);
+    let (stream, inner) = scripted(
+        vec![(by_name.clone(), dns_a_query("echo.test."))],
+        usize::MAX,
+    );
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let seen = targets.clone();
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router = tokio::spawn(async move {
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        router.remote_factory = Some(Box::new(move |target| {
+            seen.lock().unwrap().push(target.clone());
+            Box::pin(async { Err(io::Error::other("test: not connecting")) })
+        }));
+        router.await
+    });
+    wait_until("the query was forwarded", || {
+        !targets.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(targets.lock().unwrap()[0], by_name);
+    assert!(
+        inner.lock().unwrap().replies.is_empty(),
+        "nothing answered from 0.0.0.0"
+    );
+    router.abort();
+}
+
+/// Two queries answered here on one XUDP route are both delivered: the
+/// route is released after the last answer, not after the first.
+#[tokio::test]
+async fn test_fake_ip_keeps_a_route_until_its_last_answer() {
+    let resolver = fake_ip_resolver();
+    let (stream, inner) = scripted_sessions(vec![
+        SessionScript::Packet(1, "8.8.8.8:53".parse().unwrap(), dns_a_query("one.test.")),
+        SessionScript::Packet(1, "8.8.8.8:53".parse().unwrap(), dns_a_query("two.test.")),
+    ]);
+    let mut server = ServerStream::Session(Box::new(stream));
+    let router = tokio::spawn(async move {
+        UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+    wait_until("the route is released", || {
+        !inner.lock().unwrap().released.is_empty()
+    })
+    .await;
+    let inner = inner.lock().unwrap();
+    assert_eq!(inner.replies.len(), 2, "both answers delivered");
+    assert_eq!(inner.released, [1], "released once, after the last");
+    drop(inner);
+    router.abort();
+}
+
+/// A stream that drops reply sources (one fixed destination: plain VLESS
+/// UDP, h2mux) has its hostname judged as a name, with no local lookup to
+/// make a reply address it would throw away. Routed through the router for
+/// fake IP, it used to be resolved first: a local DNS lookup, and a name
+/// only the proxy can resolve failed.
+#[tokio::test]
+async fn test_a_stream_without_reply_sources_judges_names_without_a_lookup() {
+    use crate::address::NetLocationMask;
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::dns::fake_ip::{
+        BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Counting(AtomicUsize);
+    impl Resolver for Counting {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["192.0.2.1:53".parse().unwrap()]) })
+        }
+    }
+    let counting = Arc::new(Counting::default());
+    let pool =
+        Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 8).unwrap());
+    let resolver: Arc<dyn Resolver> = Arc::new(FakeIpResolver::new(
+        counting.clone(),
+        Arc::new(FakeIpResponder::new(
+            pool,
+            BypassList::new(std::iter::empty::<&str>(), false),
+        )),
+    ));
+    let block_all = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+        vec![NetLocationMask::ANY],
+        vec![],
+        ConnectAction::new_block(),
+    )]));
+    let only_far = NetLocation::new(Address::Hostname("only.far".into()), 4000);
+    let (stream, inner) = scripted(vec![(only_far, b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let mut server = ServerStream::Targeted(Box::new(stream));
+    let router = tokio::spawn(async move {
+        UdpRouter::new(
+            &mut server,
+            block_all,
+            resolver,
+            false,
+            RouterLimits::default(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(counting.0.load(Ordering::SeqCst), 0, "no local lookup");
+    router.abort();
+}
+
+/// A pool of `max_entries` and a resolver over it, as `DnsRegistry` hands
+/// out for a listener with fake IP on.
+fn small_fake_ip_resolver(
+    max_entries: usize,
+) -> (Arc<dyn Resolver>, Arc<crate::dns::fake_ip::FakeIpPool>) {
+    use crate::dns::fake_ip::{
+        BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+    };
+    let pool = Arc::new(
+        FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), max_entries).unwrap(),
+    );
+    let responder = Arc::new(FakeIpResponder::new(
+        pool.clone(),
+        BypassList::new(std::iter::empty::<&str>(), false),
+    ));
+    let resolver = Arc::new(FakeIpResolver::new(
+        Arc::new(crate::quic_outbound::testing::LoopbackResolver),
+        responder,
+    ));
+    (resolver, pool)
+}
+
+/// What a session's create comes to in `spawn_router_making`.
+#[derive(Clone, Copy)]
+enum Made {
+    /// A remote that takes every write and answers only when told to.
+    Remote,
+    /// A remote whose writes fail.
+    RefusingWrites,
+    /// The rules refused the target.
+    Blocked,
+    /// Resolving or connecting failed.
+    Failed,
+}
+
+/// A router over `server` whose sessions are made by `made(target)` instead
+/// of the connect path, each target recorded: the outcomes a test needs
+/// without sockets, so paused time can drive expiry and the reuse guard.
+/// What `spawn_router_making` hands back: the router's task, every target
+/// a session was asked for, and every remote made, in order.
+struct MadeRouter {
+    router: tokio::task::JoinHandle<io::Result<()>>,
+    targets: Arc<Mutex<Vec<NetLocation>>>,
+    remotes: Arc<Mutex<Vec<Arc<Mutex<FakeRemoteState>>>>>,
+}
+
+fn spawn_router_making(
+    server: ServerStream,
+    resolver: Arc<dyn Resolver>,
+    made: fn(&NetLocation) -> Made,
+) -> MadeRouter {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let recorded = targets.clone();
+    let remotes = Arc::new(Mutex::new(Vec::new()));
+    let made_remotes = remotes.clone();
+    let router = tokio::spawn(async move {
+        let mut server = server;
+        let mut router = UdpRouter::new(
+            &mut server,
+            direct_selector(resolver.clone()),
+            resolver,
+            false,
+            RouterLimits::default(),
+        );
+        router.remote_factory = Some(Box::new(move |target| {
+            recorded.lock().unwrap().push(target.clone());
+            let outcome = match made(target) {
+                kind @ (Made::Remote | Made::RefusingWrites) => {
+                    let state = Arc::new(Mutex::new(FakeRemoteState {
+                        shutdown_may_finish: true,
+                        writes_fail: matches!(kind, Made::RefusingWrites),
+                        ..FakeRemoteState::default()
+                    }));
+                    made_remotes.lock().unwrap().push(state.clone());
+                    let remote: Box<dyn AsyncMessageStream> = Box::new(FakeRemote(state));
+                    Ok(CreateOutcome::Remote(SessionCreateResult {
+                        remote,
+                        resolved_addr: "192.0.2.1:9".parse().unwrap(),
+                    }))
+                }
+                Made::Blocked => Ok(CreateOutcome::Blocked),
+                Made::Failed => Err(io::Error::other("no route to the target")),
+            };
+            Box::pin(async move { outcome })
+        }));
+        router.await
+    });
+    MadeRouter {
+        router,
+        targets,
+        remotes,
+    }
+}
+
+/// Let the spawned router run until it has nothing left to do now.
+async fn settle() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn dns_query(name: &str, record_type: hickory_resolver::proto::rr::RecordType) -> Vec<u8> {
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_resolver::proto::rr::Name;
+    use std::str::FromStr;
+    let mut message = Message::new(0x4343, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(Name::from_str(name).unwrap(), record_type));
+    message.to_vec().unwrap()
+}
+
+/// A query sent to a fake address that stands for nothing is dropped like
+/// any datagram to one, not answered from the pool.
+#[tokio::test]
+async fn test_fake_ip_drops_dns_to_an_unmapped_fake_address() {
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let unmapped: SocketAddr = "198.18.250.250:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![(location(unmapped), dns_a_query("echo.test."))],
+        usize::MAX,
+    );
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    assert_no_further_reply(&inner, 0).await;
+    assert!(targets.lock().unwrap().is_empty(), "nothing dialled");
+    router.abort();
+}
+
+/// A flow to a fake address in steady use keeps its mapping in use, so the
+/// pool's reuse guard does not hand the address to another name while the
+/// client still sends to it, though restoration ran once, at the start.
+#[tokio::test(start_paused = true)]
+async fn test_a_live_fake_ip_flow_keeps_its_address_from_being_recycled() {
+    let (resolver, pool) = small_fake_ip_resolver(1);
+    let fake = pool.assign("live.test").unwrap();
+    let flow = SocketAddr::new(fake.into(), 443);
+    let (stream, inner) = scripted(vec![(location(flow), b"first".to_vec())], usize::MAX);
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    settle().await;
+    for _ in 0..11 {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        push_packet(&inner, flow, b"again");
+        settle().await;
+    }
+    assert_eq!(targets.lock().unwrap().len(), 1, "one session throughout");
+    assert_eq!(
+        pool.assign("other.test"),
+        None,
+        "{fake} is in use and must not be recycled"
+    );
+    router.abort();
+}
+
+/// A blocked fake address is cached by the name it stood for: once the
+/// pool gives the address to another name, the flow goes to that name.
+#[tokio::test(start_paused = true)]
+async fn test_a_blocked_fake_address_is_cached_by_its_name() {
+    let (resolver, pool) = small_fake_ip_resolver(1);
+    let fake = pool.assign("blocked.test").unwrap();
+    let flow = SocketAddr::new(fake.into(), 443);
+    let (stream, inner) = scripted(vec![(location(flow), b"refused".to_vec())], usize::MAX);
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        resolver,
+        |target| match target.address() {
+            Address::Hostname(name) if name == "blocked.test" => Made::Blocked,
+            _ => Made::Remote,
+        },
+    );
+    settle().await;
+    tokio::time::sleep(crate::dns::fake_ip::MIN_REUSE_AGE + Duration::from_secs(1)).await;
+    assert_eq!(pool.assign("allowed.test"), Some(fake), "recycled");
+    push_packet(&inner, flow, b"allowed now");
+    settle().await;
+    let targets: Vec<String> = targets
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    assert_eq!(targets, ["blocked.test:443", "allowed.test:443"]);
+    router.abort();
+}
+
+/// A one-destination stream whose session cannot be made (resolving or
+/// connecting failed) ends, as the direct path does, rather than leave the
+/// client waiting on no remote.
+#[tokio::test]
+async fn test_a_one_destination_stream_ends_when_its_session_fails() {
+    let destination = location("192.0.2.9:4000".parse().unwrap());
+    let (stream, inner) = scripted(vec![(destination, b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets: _,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        test_resolver(),
+        |_| Made::Failed,
+    );
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the router ends with the failed stream")
+        .unwrap()
+        .unwrap();
+}
+
+/// A one-destination stream ends when the client closes it, as the direct
+/// copy does, rather than hold its remote until the session expires.
+#[tokio::test]
+async fn test_a_one_destination_stream_ends_when_the_client_closes() {
+    let destination = location("192.0.2.9:4000".parse().unwrap());
+    let (stream, inner) = scripted(vec![(destination, b"x".to_vec())], 0);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        test_resolver(),
+        |_| Made::Remote,
+    );
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the router ends with the client")
+        .unwrap()
+        .unwrap();
+    assert_eq!(targets.lock().unwrap().len(), 1, "the datagram was sent on");
+}
+
+/// A one-destination stream ends with its session's idle expiry, as the
+/// direct copy ends after the same idle time, rather than re-create the
+/// remote from a new source port when the client speaks again.
+#[tokio::test(start_paused = true)]
+async fn test_a_one_destination_stream_ends_when_its_session_expires() {
+    let destination = location("192.0.2.9:4000".parse().unwrap());
+    let (stream, inner) = scripted(vec![(destination, b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets: _,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        test_resolver(),
+        |_| Made::Remote,
+    );
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(SESSION_TIMEOUT_SECS - 1)).await;
+    settle().await;
+    assert!(!router.is_finished(), "still inside the idle timeout");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    settle().await;
+    assert!(router.is_finished(), "ended with its session");
+    router.await.unwrap().unwrap();
+}
+
+/// On a one-destination stream to a DNS server, queries answered from the
+/// pool keep the session a forwarded query made alive: the stream is in
+/// use, and it ends with that session.
+#[tokio::test(start_paused = true)]
+async fn test_answered_queries_keep_a_one_destination_session_alive() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![(location(server), dns_query("echo.test.", RecordType::TXT))],
+        usize::MAX,
+    );
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    settle().await;
+    assert_eq!(targets.lock().unwrap().len(), 1, "the TXT query went on");
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        push_packet(&inner, server, &dns_query("echo.test.", RecordType::A));
+        settle().await;
+    }
+    assert_eq!(
+        inner.lock().unwrap().replies.len(),
+        5,
+        "each A answered here"
+    );
+    assert!(
+        !router.is_finished(),
+        "in use for 300 s, past the session's idle timeout"
+    );
+    router.abort();
+}
+
+/// A one-destination stream that carries nothing ends after the session
+/// timeout, as the direct copy does, though it never made a session.
+#[tokio::test(start_paused = true)]
+async fn test_an_idle_one_destination_stream_ends_without_a_session() {
+    let (stream, inner) = scripted(vec![], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        test_resolver(),
+        |_| Made::Remote,
+    );
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(SESSION_TIMEOUT_SECS - 20)).await;
+    settle().await;
+    assert!(!router.is_finished(), "still inside the idle timeout");
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    settle().await;
+    assert!(router.is_finished(), "ended after the idle timeout");
+    assert!(targets.lock().unwrap().is_empty());
+    router.await.unwrap().unwrap();
+}
+
+/// A one-destination stream whose every datagram is a DNS query answered
+/// here is in use, though it has no session: it lasts while they come and
+/// ends the session timeout after the last.
+#[tokio::test(start_paused = true)]
+async fn test_answered_queries_alone_keep_a_one_destination_stream_open() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted(vec![], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        push_packet(&inner, server, &dns_query("echo.test.", RecordType::A));
+        settle().await;
+    }
+    assert_eq!(inner.lock().unwrap().replies.len(), 5, "each answered here");
+    assert!(targets.lock().unwrap().is_empty(), "nothing forwarded");
+    assert!(!router.is_finished(), "in use for 300 s");
+    // Idleness is measured on the 15 s ping tick: the end comes up to two
+    // ticks after the timeout.
+    tokio::time::sleep(Duration::from_secs(SESSION_TIMEOUT_SECS + 30)).await;
+    settle().await;
+    assert!(router.is_finished(), "ended after the last query went idle");
+}
+
+/// A one-destination stream drops reply sources, so a query to a server
+/// named by hostname is answered without spending a pool slot on that
+/// server's name: with one slot, the query's own name gets it.
+#[tokio::test]
+async fn test_a_one_destination_stream_spends_no_slot_on_the_servers_name() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, pool) = small_fake_ip_resolver(1);
+    let server = NetLocation::new(Address::Hostname("dns.google".into()), 53);
+    let (stream, inner) = scripted(
+        vec![(server, dns_query("echo.test.", RecordType::A))],
+        usize::MAX,
+    );
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets,
+        remotes: _,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    wait_for_replies(&inner, 1).await;
+    let answer = inner.lock().unwrap().replies[0].1.clone();
+    let fake = answered_ipv4(&answer);
+    assert_eq!(pool.lookup(fake).as_deref(), Some("echo.test"));
+    assert!(
+        targets.lock().unwrap().is_empty(),
+        "answered, not forwarded"
+    );
+    router.abort();
+}
+
+/// A one-destination stream ends when its remote fails one way, as the
+/// direct copy does, rather than waiting for the other way to end too.
+#[tokio::test]
+async fn test_a_one_destination_stream_ends_when_its_remote_fails_one_way() {
+    let destination = location("192.0.2.9:4000".parse().unwrap());
+    let (stream, inner) = scripted(vec![(destination, b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router,
+        targets: _,
+        remotes: _,
+    } = spawn_router_making(
+        ServerStream::Targeted(Box::new(stream)),
+        test_resolver(),
+        |_| Made::RefusingWrites,
+    );
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the router ends with its remote's failure")
+        .unwrap()
+        .unwrap();
+}
+
+/// A flow to a fake address that only hears from its remote (the client
+/// sent once, the remote keeps sending) still keeps the address in use.
+#[tokio::test(start_paused = true)]
+async fn test_replies_alone_keep_a_fake_address_from_being_recycled() {
+    let (resolver, pool) = small_fake_ip_resolver(1);
+    let fake = pool.assign("live.test").unwrap();
+    let flow = SocketAddr::new(fake.into(), 443);
+    let (stream, inner) = scripted(vec![(location(flow), b"hello".to_vec())], usize::MAX);
+    let MadeRouter {
+        router,
+        targets: _,
+        remotes,
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    settle().await;
+    let remote = remotes.lock().unwrap()[0].clone();
+    for _ in 0..11 {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        remote_sends(&remote, b"update");
+        settle().await;
+    }
+    assert_eq!(
+        inner.lock().unwrap().replies.len(),
+        11,
+        "every reply delivered"
+    );
+    assert_eq!(
+        pool.assign("other.test"),
+        None,
+        "{fake} is in use and must not be recycled"
+    );
+    router.abort();
+}
+
+/// An A query answered here and a TXT query blocked on the same XUDP route:
+/// the block must not release the route while the answer is still queued
+/// under it, or XUDP drops the answer.
+#[tokio::test]
+async fn test_a_blocked_query_keeps_the_route_for_an_answer_still_queued() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted_sessions(vec![
+        SessionScript::Packet(1, server, dns_query("one.test.", RecordType::A)),
+        SessionScript::Packet(1, server, dns_query("one.test.", RecordType::TXT)),
+    ]);
+    let MadeRouter { router, .. } =
+        spawn_router_making(ServerStream::Session(Box::new(stream)), resolver, |_| {
+            Made::Blocked
+        });
+    wait_until("the route is released", || {
+        !inner.lock().unwrap().released.is_empty()
+    })
+    .await;
+    let inner = inner.lock().unwrap();
+    assert_eq!(inner.replies.len(), 1, "the A answer was delivered");
+    assert_eq!(inner.released, [1], "released once, after the answer");
+    drop(inner);
+    router.abort();
+}
+
+/// Queries answered here for a DNS server whose own address is fake keep
+/// that address in use: it is not recycled while queries keep coming, so a
+/// later forwarded query still reaches the server's name.
+#[tokio::test(start_paused = true)]
+async fn test_answered_queries_keep_a_fake_dns_server_address() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, pool) = small_fake_ip_resolver(2);
+    let fake = pool.assign("dns.test").unwrap();
+    let server = SocketAddr::new(fake.into(), 53);
+    let (stream, inner) = scripted(vec![], usize::MAX);
+    let MadeRouter { router, .. } =
+        spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+            Made::Remote
+        });
+    for _ in 0..11 {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        push_packet(&inner, server, &dns_query("x.test.", RecordType::A));
+        settle().await;
+    }
+    assert_eq!(
+        inner.lock().unwrap().replies.len(),
+        11,
+        "each answered here"
+    );
+    assert_eq!(
+        pool.assign("other.test"),
+        None,
+        "the server's address {fake} is in use and must not be recycled"
+    );
+    router.abort();
+}
+
+/// A one-destination DNS stream with fake IP on is served partly here: a
+/// forwarded query the rules block is dropped like any other, and the
+/// stream lives on, its queued answer delivered, rather than ending as a
+/// stream whose only destination was refused does.
+#[tokio::test]
+async fn test_a_blocked_forwarded_query_does_not_end_a_one_destination_dns_stream() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![
+            (location(server), dns_query("one.test.", RecordType::A)),
+            (location(server), dns_query("one.test.", RecordType::TXT)),
+        ],
+        usize::MAX,
+    );
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router, targets, ..
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Blocked
+    });
+    wait_for_replies(&inner, 1).await;
+    assert_eq!(targets.lock().unwrap().len(), 1, "the TXT query was judged");
+    push_packet(&inner, server, &dns_query("two.test.", RecordType::A));
+    wait_for_replies(&inner, 2).await;
+    assert!(!router.is_finished(), "the stream carries on");
+    router.abort();
+}
+
+/// A one-destination stream to a fake address standing for nothing ends at
+/// once, as a TCP connection to one is refused at once, rather than
+/// dropping every datagram until the idle timeout.
+#[tokio::test]
+async fn test_a_one_destination_stream_to_an_unmapped_fake_address_ends() {
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let unmapped: SocketAddr = "198.18.250.250:443".parse().unwrap();
+    let (stream, inner) = scripted(vec![(location(unmapped), b"x".to_vec())], usize::MAX);
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router, targets, ..
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the stream ends at once")
+        .unwrap()
+        .unwrap();
+    assert!(targets.lock().unwrap().is_empty(), "nothing dialled");
+}
+
+/// A one-destination stream to an unmapped fake address on port 53 ends at
+/// once too: DNS takes its own path through the router, and it must not
+/// keep the stream open while the client keeps querying nowhere.
+#[tokio::test]
+async fn test_a_one_destination_dns_stream_to_an_unmapped_fake_address_ends() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let unmapped: SocketAddr = "198.18.250.250:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![(location(unmapped), dns_query("one.test.", RecordType::A))],
+        usize::MAX,
+    );
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router, targets, ..
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::Remote
+    });
+    tokio::time::timeout(Duration::from_secs(5), router)
+        .await
+        .expect("the stream ends at once")
+        .unwrap()
+        .unwrap();
+    assert!(inner.lock().unwrap().replies.is_empty(), "not answered");
+    assert!(targets.lock().unwrap().is_empty(), "nothing dialled");
+}
+
+/// On a one-destination DNS stream, a forwarding session whose remote
+/// fails is replaced by the next forwarded query, rather than kept alive
+/// by the answered ones and dropping every forwarded query after it.
+#[tokio::test]
+async fn test_a_one_destination_dns_stream_replaces_a_failed_upstream() {
+    use hickory_resolver::proto::rr::RecordType;
+    let (resolver, _pool) = small_fake_ip_resolver(64);
+    let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let (stream, inner) = scripted(
+        vec![(location(server), dns_query("one.test.", RecordType::TXT))],
+        usize::MAX,
+    );
+    inner.lock().unwrap().drops_sources = true;
+    let MadeRouter {
+        router, targets, ..
+    } = spawn_router_making(ServerStream::Targeted(Box::new(stream)), resolver, |_| {
+        Made::RefusingWrites
+    });
+    wait_until("the first forwarding session is made", || {
+        targets.lock().unwrap().len() == 1
+    })
+    .await;
+    push_packet(&inner, server, &dns_query("two.test.", RecordType::A));
+    wait_for_replies(&inner, 1).await;
+    push_packet(&inner, server, &dns_query("two.test.", RecordType::TXT));
+    wait_until(
+        "a fresh session is made for the next forwarded query",
+        || targets.lock().unwrap().len() == 2,
+    )
+    .await;
+    assert!(!router.is_finished(), "the DNS stream carries on");
+    router.abort();
 }

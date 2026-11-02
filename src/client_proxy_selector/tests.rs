@@ -1769,3 +1769,154 @@ async fn blocks_outright_never_disagrees_with_judge() {
         }
     }
 }
+
+/// Fake IP restoration lives in `judge`, where every protocol passes
+/// (docs/specs/2026-11-02-fake-dns-convergence.md): a fake address is judged
+/// as the name it stands for, one standing for nothing is blocked, and the
+/// decision cache holds the name, never the address.
+mod fake_ip_restoration {
+    use super::*;
+    use crate::dns::fake_ip::{
+        BypassList, FakeIpNetwork, FakeIpPool, FakeIpResolver, FakeIpResponder,
+    };
+
+    fn fake_ip_resolver() -> (Arc<dyn Resolver>, Ipv4Addr, Arc<FakeIpPool>) {
+        let pool =
+            Arc::new(FakeIpPool::new(FakeIpNetwork::parse("198.18.0.0/16").unwrap(), 64).unwrap());
+        let fake = pool.assign("example.com").unwrap();
+        let responder = Arc::new(FakeIpResponder::new(
+            pool.clone(),
+            BypassList::new(std::iter::empty::<&str>(), false),
+        ));
+        let inner = MockResolver::new().with_mapping(
+            "example.com",
+            443,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))],
+        );
+        (
+            Arc::new(FakeIpResolver::new(Arc::new(inner), responder)),
+            fake,
+            pool,
+        )
+    }
+
+    fn at(address: Address, port: u16) -> ResolvedLocation {
+        NetLocation::new(address, port).into()
+    }
+
+    #[tokio::test]
+    async fn a_fake_address_is_judged_as_its_name() {
+        let (resolver, fake, _) = fake_ip_resolver();
+        let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]);
+        let decision = selector
+            .judge(at(Address::Ipv4(fake), 443), &resolver)
+            .await
+            .unwrap();
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = decision
+        else {
+            panic!("allowed by the catch-all rule");
+        };
+        assert_eq!(
+            remote_location.location().address(),
+            &Address::Hostname("example.com".into())
+        );
+        assert_eq!(remote_location.location().port(), 443);
+        assert!(
+            remote_location.resolved_addr().is_none(),
+            "the fake address is not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_fake_address_is_blocked() {
+        let (resolver, _, _) = fake_ip_resolver();
+        let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]);
+        let unmapped = Ipv4Addr::new(198, 18, 250, 250);
+        for selector in [
+            &selector,
+            &selector_with_cache(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]),
+        ] {
+            let decision = selector
+                .judge(at(Address::Ipv4(unmapped), 443), &resolver)
+                .await
+                .unwrap();
+            assert!(matches!(decision, ConnectDecision::Block));
+        }
+    }
+
+    /// A sniffed location names the client's hostname and keeps the dialled
+    /// address as its resolved one. With that address fake, the connection
+    /// went to the fake address itself; now the pool's name is the target
+    /// and the fake address is dropped, and an unmapped one is blocked.
+    #[tokio::test]
+    async fn a_sniffed_location_dialled_at_a_fake_address_is_judged_as_the_pools_name() {
+        let (resolver, fake, _) = fake_ip_resolver();
+        let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]);
+        let sniffed = ResolvedLocation::with_resolved(
+            NetLocation::new(Address::Hostname("sniffed.example".into()), 443),
+            SocketAddr::new(fake.into(), 443),
+        );
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = selector.judge(sniffed, &resolver).await.unwrap()
+        else {
+            panic!("allowed")
+        };
+        assert_eq!(
+            remote_location.location().address(),
+            &Address::Hostname("example.com".into())
+        );
+        assert!(remote_location.resolved_addr().is_none());
+
+        let unmapped = ResolvedLocation::with_resolved(
+            NetLocation::new(Address::Hostname("sniffed.example".into()), 443),
+            "198.18.250.250:443".parse().unwrap(),
+        );
+        assert!(matches!(
+            selector.judge(unmapped, &resolver).await.unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    /// The cache is keyed by what was judged: the name. A fake address is
+    /// never a cache key, so a mapping that moves to another name later is
+    /// judged afresh, and an unmapped one is not remembered as blocked.
+    #[tokio::test]
+    async fn the_cache_holds_the_name_not_the_fake_address() {
+        let (resolver, fake, _) = fake_ip_resolver();
+        let selector = selector_with_cache(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]);
+        selector
+            .judge(at(Address::Ipv4(fake), 443), &resolver)
+            .await
+            .unwrap();
+        let cache = selector.cache.as_ref().expect("caching on");
+        assert!(
+            cache
+                .get(&NetLocation::new(
+                    Address::Hostname("example.com".into()),
+                    443
+                ))
+                .is_some(),
+            "the name is cached"
+        );
+        assert!(
+            cache
+                .get(&NetLocation::new(Address::Ipv4(fake), 443))
+                .is_none(),
+            "the fake address is not"
+        );
+        let unmapped = Ipv4Addr::new(198, 18, 250, 250);
+        selector
+            .judge(at(Address::Ipv4(unmapped), 443), &resolver)
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .get(&NetLocation::new(Address::Ipv4(unmapped), 443))
+                .is_none(),
+            "an unmapped address is not remembered as blocked"
+        );
+    }
+}

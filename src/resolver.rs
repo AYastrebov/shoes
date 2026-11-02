@@ -23,7 +23,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, broadcast};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 
-type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+pub(crate) type ResolveFuture =
+    Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
 const CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS: usize = 1_024;
@@ -38,6 +39,14 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
+
+    /// The fake IP responder of the inbounds this resolver serves, when their
+    /// `dns:` block or group turns fake IP on. Inbounds read it from here
+    /// because every path that routes a connection already holds the
+    /// resolver, so no constructor has to carry the pool separately.
+    fn fake_ip(&self) -> Option<&Arc<crate::dns::fake_ip::FakeIpResponder>> {
+        None
+    }
 }
 
 /// Resolver wrapper that enforces a timeout on DNS resolution.

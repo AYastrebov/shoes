@@ -28,6 +28,39 @@ keys now fails with `Revoked`, matched by SPKI SHA-256 from Go's list
 (golang/go#82345), so the Sectigo cross-signed copies are caught too.
 `webpki-roots` 1.0.11 holds none of the roots they chain to, so shoes was
 most likely not exposed; the list no longer depends on that.
+||||||| 713a8ecf
+
+**Fake IP on listeners, and one mechanism for it.** A SOCKS, HTTP, mixed
+or tproxy listener answers DNS from a fake pool when its `dns:` block, or
+the `dns_group` it names, has `fake_ip` with the TUN's fields: DNS to
+port 53 over the listener (SOCKS UDP ASSOCIATE, a CONNECT to port 53,
+tproxy) is answered from the pool whatever server it was sent to, a
+connection or datagram to a fake address is routed by the name it stands
+for, with UDP replies from the fake address, and an address standing for
+nothing is refused. A group's pool is shared by every listener naming
+it; a block's own `fake_ip` is a pool of its own, built once by the DNS
+registry. The TUN's top-level `fake_ip` is now an alias of its `dns:`
+block's, so a TUN may name a group with a pool and share it with the
+listeners naming it. A group with `fake_ip` must be named alone: inside a
+longer `dns:` list or another group's `dns_servers` it is refused rather
+than losing its pool silently. Restoration of a fake address into its
+name happens in one place, the rule judge every protocol passes through,
+so h2mux and any protocol added later get it without hooks of their own;
+the judge's cache holds the name, never the address. QUIC listeners
+refuse `fake_ip` until their UDP relays are shown to reply from the fake
+address, and listeners carrying AnyTLS or NaiveProxy, at any depth inside
+TLS, Reality or WebSocket, refuse it since nothing on their paths answers
+port 53. DNS over h2mux TCP is answered like DNS over TCP, and a query to
+a fake address standing for nothing is refused, not answered. DNS over
+TCP, the TUN's included, now closes a connection quiet for 30 seconds and
+gives a forwarded query 15 seconds to connect and 15 to be answered;
+before, either side going quiet held the task for good. One config is
+refused that was accepted: a tproxy listener with fake IP on and a
+`udp_timeout` over 540 seconds, the pool's reuse guard less the minute a
+live session's refresh of its mapping can lag. Not yet: an IPv6 range, HTTPS/SVCB suppression, a
+configurable TTL, overlap validation, forwarding unanswered queries
+through `dns.servers`, and mappings surviving an engine restart; the
+spec, `docs/specs/2026-11-02-fake-dns-convergence.md`, sequences them.
 
 ## v0.9.4
 

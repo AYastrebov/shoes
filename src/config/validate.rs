@@ -40,6 +40,9 @@ pub struct ValidatedConfigs {
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
+    /// Every inline `fake_ip`, under the context name its `dns:` block now
+    /// carries, for the registry to build one pool each.
+    pub inline_fake_ips: Vec<(String, crate::config::types::FakeIpConfig)>,
     /// Every outbound the config mentions, keyed and conflict-checked. Built
     /// here and installed where a service starts — never here, because this
     /// function also serves `--dry-run` and the config editor.
@@ -186,6 +189,19 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         }
     }
 
+    // A TUN's top-level `fake_ip` is its `dns:` block's: one mechanism, so a
+    // TUN may name a group with a pool and share it with the listeners that
+    // name it. Moved before the inline DNS is extracted.
+    for config in tun_configs.iter_mut() {
+        move_tun_fake_ip_onto_dns(config)?;
+    }
+    for config in server_configs.iter() {
+        validate_dns_block_is_not_empty(&config.dns, "server")?;
+    }
+    for config in tun_configs.iter() {
+        validate_dns_block_is_not_empty(&config.dns, "TUN")?;
+    }
+
     // Extract inline DNS configs from server/tun configs into dns_groups.
     // This replaces inline specs with group name references.
     let mut inline_dns_counter = 0u32;
@@ -194,6 +210,25 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     }
     for config in tun_configs.iter_mut() {
         extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
+    }
+
+    validate_fake_ip_groups_are_named_alone(&dns_groups)?;
+
+    // Every inline fake_ip gets a context name of its own, which the
+    // registry builds one pool for (spec, "One context, owned by the
+    // registry").
+    let mut inline_fake_ips = Vec::new();
+    for dns in server_configs
+        .iter_mut()
+        .map(|config| config.dns.as_mut())
+        .chain(tun_configs.iter_mut().map(|config| config.dns.as_mut()))
+        .flatten()
+    {
+        if let Some(fake_ip) = dns.fake_ip.clone() {
+            let name = format!("__fake_ip_{}", inline_fake_ips.len());
+            dns.fake_ip_context = Some(name.clone());
+            inline_fake_ips.push((name, fake_ip));
+        }
     }
 
     // Expand DNS group composition references for ALL groups (named + inline).
@@ -217,14 +252,22 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &group_names,
             &mut outbounds,
         )?;
+        let fake_ip = dns_groups
+            .get(&name)
+            .and_then(|group| group.fake_ip.clone());
+        if let Some(fake_ip) = &fake_ip {
+            validate_fake_ip_config(fake_ip, &format!("dns_group '{name}'"))?;
+        }
         final_dns_groups.push(ExpandedDnsGroup {
             name,
             specs: expanded_specs,
+            fake_ip,
         });
     }
 
     // Validate server configs (DNS is now just a group reference).
     for config in server_configs.iter_mut() {
+        validate_fake_ip_transport(config, &final_dns_groups)?;
         validate_server_config(
             config,
             &client_groups,
@@ -234,6 +277,9 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut outbounds,
         )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
+        if let Some(fake_ip) = config.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref()) {
+            validate_fake_ip_config(fake_ip, "server dns")?;
+        }
     }
 
     // Validate TUN configs. The dns-safety verdicts are computed once for
@@ -248,7 +294,11 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut outbounds,
         )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
+        if let Some(fake_ip) = config.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref()) {
+            validate_fake_ip_config(fake_ip, "TUN")?;
+        }
         validate_tun_dns_needs_no_system_resolver(&config.dns, &tun_dns_verdicts)?;
+        validate_tun_fake_ip_needs_udp(config, &final_dns_groups)?;
     }
 
     // Combine into Config list (only Server and TunServer variants)
@@ -258,6 +308,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     Ok(ValidatedConfigs {
         configs: result,
         dns_groups: final_dns_groups,
+        inline_fake_ips,
         outbounds,
     })
 }
@@ -625,6 +676,20 @@ fn topological_sort_dns_groups_by_bootstrap(
     })
 }
 
+/// Build the pool now and discard it: a bad CIDR or a zero max_entries
+/// becomes a startup error here rather than a failure in the data path,
+/// where the only symptom would be DNS quietly not working.
+fn validate_fake_ip_config(
+    fake_ip: &crate::config::types::FakeIpConfig,
+    owner: &str,
+) -> std::io::Result<()> {
+    let network = crate::dns::fake_ip::FakeIpNetwork::parse(&fake_ip.network)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{owner}: fake_ip: {e}")))?;
+    crate::dns::fake_ip::FakeIpPool::new(network, fake_ip.max_entries)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{owner}: fake_ip: {e}")))?;
+    Ok(())
+}
+
 /// Extracts inline DNS specs from a config into dns_groups with a generated name.
 /// Replaces config.dns.servers with a single group name reference.
 /// If servers is already a single group reference or empty, does nothing.
@@ -642,6 +707,16 @@ fn extract_inline_dns(
         return Ok(());
     }
 
+    // A one-item list naming a group is that group, as the scalar form is:
+    // extracted, it became a generated group of its own, which lost the
+    // named group's fake IP pool (and its TUN refusal).
+    if let NoneOrSome::Some(specs) = &config.servers
+        && let [spec] = specs.as_slice()
+        && spec.as_group_ref().is_some()
+    {
+        config.servers = NoneOrSome::One(spec.clone());
+    }
+
     // Already a single group reference - nothing to extract
     if let NoneOrSome::One(spec) = &config.servers
         && spec.as_group_ref().is_some()
@@ -656,12 +731,215 @@ fn extract_inline_dns(
     let group = DnsConfigGroup {
         dns_group: generated_name.clone(),
         dns_servers: std::mem::replace(&mut config.servers, NoneOrSome::Unspecified),
+        // An inline block's fake_ip stays on the block: a pool of its own.
+        fake_ip: None,
     };
     dns_groups.insert(generated_name.clone(), group);
 
     // Replace servers with the group reference
     config.servers = NoneOrSome::One(DnsServerSpec::Simple(generated_name));
 
+    Ok(())
+}
+
+/// Fake IP on a QUIC listener (Hysteria2, TUIC, anything on `transport:
+/// quic`) is refused, set inline or through the group its dns names. Their
+/// UDP relays route and label replies themselves, outside the router and
+/// the TCP forward where interception and restoration live, so a fake
+/// address another listener handed out would be passed on as a literal.
+fn validate_fake_ip_transport(
+    config: &ServerConfig,
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    // AnyTLS and NaiveProxy carry their streams and UDP themselves, outside
+    // the TCP forward and the router where port 53 is answered: fake IP on
+    // them would restore addresses (judge does) but never hand one out, an
+    // option accepted and not implemented. Both are inner protocols (TLS or
+    // Reality around them), so every nested protocol is looked at.
+    let unsupported = if matches!(config.transport, Transport::Quic) {
+        Some("a QUIC listener (Hysteria2, TUIC, transport: quic)")
+    } else if any_protocol(&config.protocol, &|protocol| {
+        matches!(protocol, ServerProxyConfig::Anytls { .. })
+    }) {
+        Some("an AnyTLS listener")
+    } else if any_protocol(&config.protocol, &|protocol| {
+        matches!(protocol, ServerProxyConfig::Naiveproxy { .. })
+    }) {
+        Some("a NaiveProxy listener")
+    } else {
+        None
+    };
+    let Some(dns) = &config.dns else {
+        return Ok(());
+    };
+    let group = dns
+        .resolved_group()
+        .and_then(|name| groups.iter().find(|group| group.name == name));
+    if dns.fake_ip.is_none() && !group.is_some_and(|group| group.fake_ip.is_some()) {
+        return Ok(());
+    }
+    if let Some(unsupported) = unsupported {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "fake_ip is not supported on {unsupported}, on its dns block or on the dns_group \
+                 it names"
+            ),
+        ));
+    }
+    // A UDP session is keyed by the fake address the client sent to and
+    // marks its mapping used at most once per refresh interval while it
+    // carries traffic, so the mapping can look that much older than the
+    // session's last datagram. Idle past the pool's reuse guard less that
+    // slack, its address may go to another name, whose traffic would then
+    // join the old session and reach the old name.
+    let longest = crate::dns::fake_ip::MAX_SESSION_IDLE.as_secs();
+    if let ServerProxyConfig::Tproxy { udp_timeout, .. } = config.protocol
+        && udp_timeout > longest
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "tproxy udp_timeout {udp_timeout} is over {longest} seconds with fake_ip on: \
+                 an idle session would outlive the fake address it is keyed by"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `protocol`, or any protocol nested in it (TLS, Reality and
+/// ShadowTLS targets, WebSocket and HTTP upgrade targets), is one `wanted`
+/// accepts.
+fn any_protocol(protocol: &ServerProxyConfig, wanted: &dyn Fn(&ServerProxyConfig) -> bool) -> bool {
+    if wanted(protocol) {
+        return true;
+    }
+    match protocol {
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => tls_targets
+            .values()
+            .map(|target| &target.protocol)
+            .chain(default_tls_target.iter().map(|target| &target.protocol))
+            .chain(shadowtls_targets.values().map(|target| &target.protocol))
+            .chain(reality_targets.values().map(|target| &target.protocol))
+            .any(|inner| any_protocol(inner, wanted)),
+        ServerProxyConfig::Websocket { targets } => targets
+            .iter()
+            .any(|target| any_protocol(&target.protocol, wanted)),
+        ServerProxyConfig::HttpUpgrade { targets } => targets
+            .iter()
+            .any(|target| any_protocol(&target.protocol, wanted)),
+        _ => false,
+    }
+}
+
+/// A `dns:` block with neither servers nor fake_ip does nothing: refused,
+/// since `servers` is optional now (for a block that sets only fake_ip)
+/// and an empty block would silently mean the default resolver.
+fn validate_dns_block_is_not_empty(dns: &Option<DnsConfig>, owner: &str) -> std::io::Result<()> {
+    if let Some(dns) = dns
+        && dns.servers.is_unspecified()
+        && dns.fake_ip.is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{owner}: dns block names no servers and no fake_ip; remove it or fill it"),
+        ));
+    }
+    Ok(())
+}
+
+/// A TUN's top-level `fake_ip` is an alias of its `dns:` block's: moved
+/// there, so the registry treats a TUN like any listener. Set in both
+/// places it is refused, since one would silently win.
+fn move_tun_fake_ip_onto_dns(config: &mut TunConfig) -> std::io::Result<()> {
+    let Some(fake_ip) = config.fake_ip.take() else {
+        return Ok(());
+    };
+    match config.dns.as_mut() {
+        Some(dns) if dns.fake_ip.is_some() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN: fake_ip is set both on the TUN and on its dns block; set it once",
+        )),
+        Some(dns) => {
+            dns.fake_ip = Some(fake_ip);
+            Ok(())
+        }
+        None => {
+            config.dns = Some(DnsConfig {
+                servers: NoneOrSome::Unspecified,
+                fake_ip: Some(fake_ip),
+                fake_ip_context: None,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Fake addresses reach a TUN over its UDP path, whether the pool is the
+/// TUN's own or a group's it names.
+fn validate_tun_fake_ip_needs_udp(
+    config: &TunConfig,
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    let Some(dns) = &config.dns else {
+        return Ok(());
+    };
+    let group = dns
+        .resolved_group()
+        .and_then(|name| groups.iter().find(|group| group.name == name));
+    let has_pool = dns.fake_ip.is_some() || group.is_some_and(|group| group.fake_ip.is_some());
+    if has_pool && !config.udp_enabled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN: fake_ip requires udp_enabled, since DNS queries arrive over UDP",
+        ));
+    }
+    Ok(())
+}
+
+/// A group with `fake_ip` is named alone: a `dns:` list with more than one
+/// entry that includes it, or a group whose `dns_servers` lists it, would
+/// compose its resolver and drop its pool with nothing said. Upstream asks
+/// for an explicit policy on such a composition; there is no use for one
+/// here, so it is refused (the project rule for an option that would do
+/// nothing).
+fn validate_fake_ip_groups_are_named_alone(
+    dns_groups: &HashMap<String, DnsConfigGroup>,
+) -> std::io::Result<()> {
+    for (name, group) in dns_groups {
+        for spec in group.dns_servers.iter() {
+            let Some(member) = spec.as_group_ref() else {
+                continue;
+            };
+            if dns_groups
+                .get(member)
+                .is_some_and(|member_group| member_group.fake_ip.is_some())
+            {
+                let message = if name.starts_with("__inline_dns_") {
+                    format!(
+                        "a dns list with more than one entry includes fake IP group '{member}'; \
+                         name it alone, so its pool is used"
+                    )
+                } else {
+                    format!(
+                        "dns_group '{name}' lists fake IP group '{member}'; a group with \
+                         fake_ip cannot be composed into another, name it directly"
+                    )
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2457,22 +2735,8 @@ fn validate_tun_config(
     }
 
     validate_sniff_config(&config.sniff, "TUN")?;
-
-    if let Some(ref fake_ip) = config.fake_ip {
-        // Build the pool now and discard it: a bad CIDR or a zero max_entries
-        // becomes a startup error here rather than a failure inside the VPN
-        // data path, where the only symptom would be DNS quietly not working.
-        let network = crate::dns::fake_ip::FakeIpNetwork::parse(&fake_ip.network)?;
-        crate::dns::fake_ip::FakeIpPool::new(network, fake_ip.max_entries)?;
-
-        // Fake addresses only ever reach us over the TUN's UDP path.
-        if !config.udp_enabled {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "TUN: fake_ip requires udp_enabled, since DNS queries arrive over UDP",
-            ));
-        }
-    }
+    // The TUN's fake_ip was moved onto its dns block before this runs and is
+    // validated there (validate_fake_ip_config, validate_tun_fake_ip_needs_udp).
 
     // Refused rather than ignored where it cannot be honoured. Offload is a
     // flag shoes sets when it opens a Linux device itself. A descriptor
@@ -4604,6 +4868,7 @@ mod tests {
     #[tokio::test]
     async fn test_dns_system_with_client_chain_rejected() {
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "system".to_string(),
@@ -4646,6 +4911,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "udp://8.8.8.8".to_string(),
@@ -4683,6 +4949,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "udp://8.8.8.8".to_string(),
@@ -4722,6 +4989,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "h3://1.1.1.1/dns-query".to_string(),
@@ -4759,6 +5027,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "h3://1.1.1.1/dns-query".to_string(),
@@ -4789,6 +5058,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "tcp://8.8.8.8".to_string(),
@@ -4820,6 +5090,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "tls://1.1.1.1".to_string(),
@@ -4851,6 +5122,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "https://1.1.1.1/dns-query".to_string(),
@@ -4877,6 +5149,7 @@ mod tests {
         // Group full-dns includes base-dns
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("udp://8.8.8.8".to_string()),
@@ -4884,6 +5157,7 @@ mod tests {
                 ]),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "full-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Group reference
@@ -4905,10 +5179,12 @@ mod tests {
         // C includes B, B includes A
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-a".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-b".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-a".to_string()),
@@ -4916,6 +5192,7 @@ mod tests {
                 ]),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-c".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-b".to_string()),
@@ -4937,10 +5214,12 @@ mod tests {
         // A includes B, B includes A - cycle!
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "group-a".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-b".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "group-b".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-a".to_string())),
             }),
@@ -4959,6 +5238,7 @@ mod tests {
     async fn test_dns_group_composition_unknown_ref() {
         // Reference to non-existent group
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            fake_ip: None,
             dns_group: "my-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent".to_string())),
         })];
@@ -4978,14 +5258,17 @@ mod tests {
         // Note: Using IP-based URLs to avoid network calls during tests
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "bootstrap-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tls://1.1.1.1".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "full-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Composition reference
@@ -5021,6 +5304,7 @@ mod tests {
         // Server config references an existing dns_group
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "my-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
@@ -5041,6 +5325,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
+                    fake_ip_context: None,
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
                 }),
                 sniff: None,
@@ -5070,6 +5356,7 @@ mod tests {
         // Server config with both group ref and URL in servers
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
@@ -5090,6 +5377,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
+                    fake_ip_context: None,
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("base-dns".to_string()), // group ref
                         DnsServerSpec::Simple("udp://1.1.1.1".to_string()), // URL
@@ -5127,10 +5416,12 @@ mod tests {
         // Server config with multiple group refs that need expansion
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "fast-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "secure-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
             }),
@@ -5151,6 +5442,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
+                    fake_ip_context: None,
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("fast-dns".to_string()),
                         DnsServerSpec::Simple("secure-dns".to_string()),
@@ -5203,6 +5496,8 @@ mod tests {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                fake_ip: None,
+                fake_ip_context: None,
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
             }),
             sniff: None,

@@ -126,6 +126,31 @@ refs.
 
 ## Recorded debt
 
+- **Fake DNS, the rest of the convergence** (spec
+  `docs/specs/2026-11-02-fake-dns-convergence.md`, delivery B to D). The
+  responder answers IPv4 only, forwards HTTPS/SVCB records with their
+  hints, has a fixed 1-second TTL and no overlap check against the TUN's
+  address, proxy literals, DNS upstreams or rule overrides; unanswered
+  queries go to the resolver the app addressed rather than through
+  `dns.servers`; a pool dies with its engine, so an Android handover
+  strands every address an app has cached until it resolves again.
+  Leaving it costs: a browser's HTTPS hint skipping the hostname route, a
+  forwarded query reaching the ISP, and a refused connection per cached
+  address after each handover. Fixing it touches the responder, validation,
+  `Resolver` (a raw exchange), and the registry's lifetime across engine
+  starts. The responder's counters (answered, forwarded, bypassed) belong
+  to delivery B; only refusals of unmapped addresses are counted today.
+- **A UDP stream with one fixed destination clones it per datagram under
+  fake IP.** `OneDestination` in `src/tcp/tcp_server.rs` hands the router
+  its destination with every datagram, as the targeted-stream trait asks,
+  and for a hostname destination (fixed VLESS UDP to `example.com:443`)
+  that is a `String` allocation each time, against the per-packet rule.
+  Fixing it touches either `Address::Hostname` (an `Arc<str>`, 140 uses in
+  37 files) or the router's per-datagram path, which would take a fixed
+  destination by reference. Leaving it costs one small allocation per
+  datagram on those streams only; without fake IP they take the direct
+  copy and pay nothing.
+
 Known and deliberately left, so that nobody rediscovers it as a surprise.
 Moved here from `AGENTS.md` on 2026-10-23; the audit each came from is named.
 
