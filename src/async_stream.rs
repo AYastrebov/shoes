@@ -944,3 +944,87 @@ mod tests {
         assert!(not_a_socket.plain_tcp().is_none());
     }
 }
+
+#[cfg(test)]
+pub mod test_streams {
+    use super::{AsyncPing, AsyncStream, SocketPassthrough};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    /// Sends written bytes only when flushed, like transports that buffer
+    /// writes: a handshake reply that is written and not flushed never
+    /// reaches the peer through this.
+    pub struct FlushGatedStream {
+        stream: DuplexStream,
+        pending: Vec<u8>,
+    }
+
+    impl FlushGatedStream {
+        pub fn new(stream: DuplexStream) -> Self {
+            Self {
+                stream,
+                pending: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for FlushGatedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushGatedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            while !this.pending.is_empty() {
+                let written =
+                    std::task::ready!(Pin::new(&mut this.stream).poll_write(cx, &this.pending))?;
+                if written == 0 {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                }
+                this.pending.drain(..written);
+            }
+            Pin::new(&mut this.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::task::ready!(self.as_mut().poll_flush(cx))?;
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for FlushGatedStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl SocketPassthrough for FlushGatedStream {}
+
+    impl AsyncStream for FlushGatedStream {}
+}

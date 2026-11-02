@@ -1106,6 +1106,9 @@ async fn setup_local_handshake(
             };
         }
 
+        // The client needs the whole server flight before it sends its next
+        // record (upstream cfal/shoes#192).
+        server_stream.flush().await?;
         let client_header_bytes = client_reader
             .read_slice(&mut server_stream, 5)
             .await?
