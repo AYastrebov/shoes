@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**DNS: shared system lookups, a 60-second native cache, and hickory's
+closed-connection failover.** Upstream's native DNS cache rework (#220,
+#222, #227), first left out as an improvement:
+- the system resolver's cache shares a lookup between concurrent callers
+  (one `getaddrinfo` where a burst ran one each, on a blocking thread),
+  keys it by host rather than host and port, and keeps an answer 60
+  seconds rather than five minutes;
+- a TUN without `dns:` shares lookups in flight too but still reuses no
+  finished answer, so a failed-over WireGuard/AmneziaWG endpoint is
+  followed on the next lookup as before;
+- an explicit `url: system` server can set `native_cache_secs`;
+- hickory comes from cfal's fork of 0.26.3 with hickory-dns#3861: a
+  DoT/DoH/DoH3 connection that dies under a request is reported closed,
+  so the server pool fails over and the refreshing resolver rebuilds,
+  where it was a `Busy` or a string cancellation nothing retried. This
+  completes the #242 port above.
+
 **Ten defects fixed upstream since the fork diverged, ported.** The fork
 and cfal/shoes parted on 2026-08-10 and both rewrote the same subsystems,
 so a merge is not possible and no upstream patch applies as it is; each
@@ -35,8 +52,7 @@ where they fit and tests of our own where they did not. What changed:
 - TUN: smoltcp comes from the cfal fork, 0.14.0 plus the upstream smoltcp
   TCP fixes since and two commits preserving ACK sequencing during
   retransmission (#197).
-Not ported, with why: upstream's native DNS cache rework (an
-improvement, not a defect), its TLS record ownership rewrite beyond the
+Not ported, with why: its TLS record ownership rewrite beyond the
 preread bytes (inferred, not observed), its REALITY rustls fork, lost
 TLS writer wakeups and AnyTLS stale-session recovery (our code has
 neither path), and the fixes already made here independently (Snell's
