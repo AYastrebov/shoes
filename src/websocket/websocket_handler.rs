@@ -236,6 +236,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         );
 
         server_stream.write_all(http_response.as_bytes()).await?;
+        // Clients wait for the 101 before sending frames, and inner handlers
+        // read first; a 101 held in a buffering transport (ShadowTLS) until
+        // some later flush stalled both (upstream cfal/shoes#192).
+        server_stream.flush().await?;
 
         let websocket_stream = WebsocketStream::new(
             server_stream,
@@ -377,6 +381,19 @@ pub async fn client_handshake(
         return Err(std::io::Error::other(format!(
             "Bad websocket response: {first_line}"
         )));
+    }
+    // RFC 6455 §4.1: a 101 without these two is a failed handshake, not an
+    // upgrade; a server that answered 101 to something else would be
+    // treated as a WebSocket peer (upstream cfal/shoes#255).
+    if !header_has_token(&response_headers, "upgrade", "websocket") {
+        return Err(std::io::Error::other(
+            "missing or invalid WebSocket Upgrade header in the 101 response",
+        ));
+    }
+    if !header_has_token(&response_headers, "connection", "upgrade") {
+        return Err(std::io::Error::other(
+            "missing or invalid WebSocket Connection header in the 101 response",
+        ));
     }
 
     let websocket_key_response = response_headers
@@ -553,6 +570,109 @@ mod tests {
             .unwrap();
         task.abort();
         String::from_utf8(request[..n].to_vec()).unwrap()
+    }
+
+    /// The client's verdict on a 101 whose headers are `extra_headers`,
+    /// with a correct Sec-WebSocket-Accept computed from the key it sent.
+    async fn client_verdict_on_101(extra_headers: &str) -> std::io::Result<()> {
+        let handler = WebsocketTcpClientHandler::new(
+            "proxy.example.com:443".to_string(),
+            Some("/ws".to_string()),
+            None,
+            WebsocketPingType::default(),
+            None,
+            Box::new(NeverCalled),
+        );
+        let (near, mut far) = duplex(8192);
+        let task = tokio::spawn(async move {
+            handler
+                .setup_client_stream_common(Box::new(TestStream(near)))
+                .await
+                .map(|_| ())
+        });
+        let mut request = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut far, &mut request)
+            .await
+            .unwrap();
+        let request = String::from_utf8(request[..n].to_vec()).unwrap();
+        let key = request
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+            .expect("the request carries a key")
+            .to_string();
+        let accept = create_websocket_key_response(key);
+        far.write_all(
+            format!("HTTP/1.1 101 Switching Protocols\r\n{extra_headers}Sec-WebSocket-Accept: {accept}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap()
+    }
+
+    /// A 101 without `Upgrade: websocket` or without `Connection: Upgrade`
+    /// is not an upgrade (RFC 6455 §4.1), however good its accept key.
+    #[tokio::test]
+    async fn a_101_without_the_upgrade_headers_is_refused() {
+        let err = client_verdict_on_101("Connection: Upgrade\r\n")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Upgrade header"), "{err}");
+        let err = client_verdict_on_101("Upgrade: websocket\r\n")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Connection header"), "{err}");
+        let err = client_verdict_on_101("Upgrade: h2c\r\nConnection: Upgrade\r\n")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Upgrade header"), "{err}");
+    }
+
+    /// The 101 is flushed before the inner handler runs: SOCKS reads the
+    /// client's greeting first, and the client waits for the 101 before it
+    /// sends anything, so a buffering transport held both forever
+    /// (upstream cfal/shoes#192).
+    #[tokio::test]
+    async fn upgrade_response_is_flushed_before_inner_handshake() {
+        use crate::async_stream::test_streams::FlushGatedStream;
+        use crate::quic_outbound::testing::{direct_selector, test_resolver};
+        use crate::socks_handler::SocksTcpServerHandler;
+
+        let resolver = test_resolver();
+        let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: None,
+            matching_headers: None,
+            ping_type: WebsocketPingType::Disabled,
+            early_data: None,
+            handler: Box::new(SocksTcpServerHandler::new(
+                None,
+                false,
+                "0.0.0.0".parse().unwrap(),
+                direct_selector(resolver.clone()),
+                resolver,
+            )),
+        }]);
+        let (mut client, server) = duplex(1024);
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(FlushGatedStream::new(server)))
+                .await
+        });
+        client
+            .write_all(upgrade_request("/", "13", "Upgrade").as_bytes())
+            .await
+            .unwrap();
+
+        let mut status = [0; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut status),
+        )
+        .await
+        .expect("upgrade response was not flushed")
+        .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 101");
+        setup.abort();
     }
 
     #[tokio::test]
