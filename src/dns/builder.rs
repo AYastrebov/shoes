@@ -58,18 +58,24 @@ impl DnsRegistry {
 
     /// Get the resolver for a TUN entry's dns field.
     ///
-    /// Unlike listeners, a TUN without a `dns:` block gets a FRESH system
-    /// resolver rather than the caching default. The honoured-dns change
+    /// Unlike listeners, a TUN without a `dns:` block gets its own system
+    /// resolver that never reuses a completed answer. The honoured-dns change
     /// promised "without the block nothing changes", and the caching
-    /// default's flat cap (record TTLs ignored; five minutes, once an hour)
-    /// would break it: a WireGuard/AmneziaWG tunnel rebuild would resolve a
-    /// failed-over endpoint hostname to its dead pre-failover address for
-    /// that long, where the old in-place resolver followed the provider on
-    /// the next lookup.
+    /// default's flat age (record TTLs ignored) would break it: a
+    /// WireGuard/AmneziaWG tunnel rebuild would resolve a failed-over
+    /// endpoint hostname to its dead pre-failover address for that long,
+    /// where the old in-place resolver followed the provider on the next
+    /// lookup.
+    ///
+    /// It does share lookups in flight (a zero result age): a burst of new
+    /// flows to one proxy server, as when an app starts, ran one blocking
+    /// `getaddrinfo` per flow and now runs one. A lookup that starts after
+    /// another finished still asks the system, so failover is followed as
+    /// before.
     pub fn get_for_tun(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(_) => self.get_for_server(dns),
-            None => Arc::new(NativeResolver::new()),
+            None => Arc::new(CachingNativeResolver::with_timeout(0)),
         }
     }
 
@@ -119,6 +125,7 @@ struct HickoryResolverPlan {
     options: HickoryResolverOptions,
     timeout_secs: u32,
     connect_timeout_secs: u32,
+    native_cache_secs: u32,
     description: String,
 }
 
@@ -164,7 +171,7 @@ impl HickoryResolverPlan {
             .parsed_url
             .to_parsed_server(resolved_ip)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(ParsedDnsServerEntry::new(
+        let mut entry = ParsedDnsServerEntry::new(
             server,
             self.chain_group.clone(),
             self.bootstrap_resolver.clone(),
@@ -172,7 +179,9 @@ impl HickoryResolverPlan {
             self.timeout_secs,
             self.connect_timeout_secs,
             self.options.attempts,
-        ))
+        );
+        entry.native_cache_secs = self.native_cache_secs;
+        Ok(entry)
     }
 
     fn is_pool_compatible_with(&self, other: &Self) -> bool {
@@ -481,6 +490,13 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
         };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
+            // An explicit `system` asks the OS each time unless the config
+            // sets an age (upstream cfal/shoes#227); the implicit default
+            // is the 60-second CachingNativeResolver.
+            ParsedDnsServer::System if entry.native_cache_secs > 0 => wrap_resolver(
+                CachingNativeResolver::with_timeout(entry.native_cache_secs.into()),
+                timeout_secs,
+            ),
             ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
             server => build_hickory_from_server(
                 server,
@@ -710,6 +726,7 @@ async fn build_entry_and_plan(
         options,
         timeout_secs: spec.timeout_secs,
         connect_timeout_secs: spec.connect_timeout_secs,
+        native_cache_secs: spec.native_cache_secs,
         description: spec.url.clone(),
     };
 
@@ -719,12 +736,13 @@ async fn build_entry_and_plan(
 
 #[cfg(test)]
 mod tests {
-    /// The no-dns TUN default must be the uncached system resolver: the
-    /// caching default's flat five-minute cap would pin a failed-over
-    /// WG/AWG endpoint to its dead address across rebuilds. Asserted by
-    /// pointer identity against the caching default.
+    /// The no-dns TUN default must never reuse a completed answer: the
+    /// caching default's flat age would pin a failed-over WG/AWG endpoint to
+    /// its dead address across rebuilds. It is its own resolver, not the
+    /// shared default, and its result age is zero, so it only shares lookups
+    /// in flight.
     #[test]
-    fn a_tun_without_dns_gets_a_fresh_uncached_resolver() {
+    fn a_tun_without_dns_gets_a_fresh_resolver_that_never_reuses_answers() {
         let mut registry = super::DnsRegistry::new();
         let default = registry.get_or_create_default();
         let tun = registry.get_for_tun(None);
@@ -732,10 +750,62 @@ mod tests {
             !std::sync::Arc::ptr_eq(&default, &tun),
             "the TUN default must not be the caching default"
         );
+        assert!(
+            format!("{tun:?}").contains("result_timeout_secs: 0"),
+            "the TUN default reuses no answer: {tun:?}"
+        );
     }
 
     use super::*;
     use crate::config::ExpandedDnsSpec;
+
+    /// Which native resolver each DNS shape gets: no block or an empty one,
+    /// the shared 60-second cache; an explicit `system`, no cache unless it
+    /// names an age. Adapted from upstream cfal/shoes#227.
+    #[tokio::test]
+    async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
+        for (dns, window) in [
+            ("", Some(60)),
+            ("dns: {servers: system}", None),
+            ("dns: {servers: {url: system}}", None),
+            ("dns: {servers: {url: system, native_cache_secs: 0}}", None),
+            (
+                "dns: {servers: {url: system, native_cache_secs: 7}}",
+                Some(7),
+            ),
+        ] {
+            let yaml =
+                format!("- address: '127.0.0.1:1080'\n  protocol: {{type: socks}}\n  {dns}\n");
+            let configs =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+            let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
+            let crate::config::Config::Server(server) = &configs.configs[0] else {
+                panic!("expected a server")
+            };
+            let resolver = registry.get_for_server(server.dns.as_ref());
+            let debug = format!("{resolver:?}");
+            match window {
+                Some(seconds) => assert!(
+                    debug.contains(&format!(
+                        "CachingNativeResolver {{ result_timeout_secs: {seconds} }}"
+                    )),
+                    "{dns}: {debug}"
+                ),
+                None => assert!(!debug.contains("CachingNativeResolver"), "{dns}: {debug}"),
+            }
+        }
+    }
+
+    /// `native_cache_secs` is for the OS resolver only.
+    #[test]
+    fn native_cache_secs_on_a_hickory_server_is_refused() {
+        let yaml = "- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  \
+                    dns: {servers: {url: 'udp://192.0.2.1', native_cache_secs: 5}}\n";
+        let err = crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap())
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("native_cache_secs"), "{err}");
+    }
     use crate::dns::parsed::{IpStrategy, ParsedDnsServer};
     use crate::resolver::NativeResolver;
     use crate::tcp::chain_builder::build_direct_chain_group;
@@ -776,6 +846,7 @@ mod tests {
             timeout_secs: 5,
             connect_timeout_secs: 5,
             attempts: 1,
+            native_cache_secs: 0,
         }
     }
 

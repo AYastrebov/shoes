@@ -721,6 +721,14 @@ fn expand_dns_specs(
         let parsed_url = ParsedDnsUrl::parse_with_server_name(url_str, server_name_override)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        // An OS lookup cache only means something for the OS resolver:
+        // hickory servers honour record TTLs themselves.
+        if spec.native_cache_secs().is_some() && !matches!(parsed_url, ParsedDnsUrl::System) {
+            return Err(std::io::Error::other(format!(
+                "native_cache_secs applies only to url: system, not '{url_str}'"
+            )));
+        }
+
         // Expand and validate client chains
         let client_chains_raw = spec.client_chains();
         let mut expanded_chains: Vec<ClientChain> = Vec::new();
@@ -807,6 +815,7 @@ fn expand_dns_specs(
             timeout_secs: spec.timeout_secs(),
             connect_timeout_secs: spec.connect_timeout_secs(),
             attempts: spec.attempts(),
+            native_cache_secs: spec.native_cache_secs().unwrap_or(0),
         });
     }
 
@@ -4545,6 +4554,7 @@ mod tests {
                 timeout_secs: 10,
                 connect_timeout_secs: 5,
                 attempts: 1,
+                native_cache_secs: None,
             }),
         })];
 
@@ -4588,6 +4598,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4624,6 +4635,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4662,6 +4674,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4698,6 +4711,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4727,6 +4741,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4757,6 +4772,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4787,6 +4803,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -4921,6 +4938,7 @@ mod tests {
                         timeout_secs: 10,
                         connect_timeout_secs: 5,
                         attempts: 1,
+                        native_cache_secs: None,
                     },
                 ]),
             }),

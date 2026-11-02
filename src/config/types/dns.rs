@@ -67,7 +67,19 @@ pub enum DnsServerSpec {
         /// Number of retry attempts for failed queries. Defaults to 1.
         #[serde(default = "default_attempts")]
         attempts: usize,
+        /// How long a `system` server reuses a completed OS lookup, in
+        /// seconds. `system` only; omitted or 0 caches nothing (lookups in
+        /// flight are still shared). Upstream cfal/shoes#227.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_cache_secs: Option<u32>,
     },
+}
+
+/// An explicit `null` is refused: omitting the field is how to leave it unset.
+fn deserialize_native_cache_secs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
 }
 
 impl<'de> Deserialize<'de> for DnsServerSpec {
@@ -99,6 +111,8 @@ impl<'de> Deserialize<'de> for DnsServerSpec {
             connect_timeout_secs: u32,
             #[serde(default = "default_attempts")]
             attempts: usize,
+            #[serde(default, deserialize_with = "deserialize_native_cache_secs")]
+            native_cache_secs: Option<u32>,
         }
 
         struct SpecVisitor;
@@ -127,6 +141,7 @@ impl<'de> Deserialize<'de> for DnsServerSpec {
                     timeout_secs,
                     connect_timeout_secs,
                     attempts,
+                    native_cache_secs,
                 } = Options::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
                 Ok(DnsServerSpec::WithOptions {
                     url,
@@ -137,6 +152,7 @@ impl<'de> Deserialize<'de> for DnsServerSpec {
                     timeout_secs,
                     connect_timeout_secs,
                     attempts,
+                    native_cache_secs,
                 })
             }
         }
@@ -159,6 +175,19 @@ impl DnsServerSpec {
             return Some(s);
         }
         None
+    }
+
+    /// The `system` lookup cache age, if one was written: kept apart from an
+    /// explicit zero so validation can refuse it on any other server.
+    pub fn native_cache_secs(&self) -> Option<u32> {
+        if let Self::WithOptions {
+            native_cache_secs, ..
+        } = self
+        {
+            *native_cache_secs
+        } else {
+            None
+        }
     }
 
     /// Get the URL string from this spec.
@@ -299,6 +328,8 @@ pub struct ExpandedDnsSpec {
     pub connect_timeout_secs: u32,
     /// Number of retry attempts for failed queries.
     pub attempts: usize,
+    /// How long a `system` server reuses a completed lookup; 0 for none.
+    pub native_cache_secs: u32,
 }
 
 /// A `bootstrap_url`: a dns_group named by it, or an IP-only URL, parsed.
@@ -332,6 +363,44 @@ pub struct ExpandedDnsGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `native_cache_secs` round-trips, and an omitted one stays distinct
+    /// from an explicit zero. Adapted from upstream cfal/shoes#227.
+    #[test]
+    fn native_cache_defaults_and_explicit_values_round_trip() {
+        for (yaml, expected) in [
+            ("system", None),
+            ("url: system", None),
+            ("url: system\nnative_cache_secs: 0", Some(0)),
+            ("url: system\nnative_cache_secs: 7", Some(7)),
+            ("url: system\nnative_cache_secs: 4294967295", Some(u32::MAX)),
+        ] {
+            let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(spec.native_cache_secs(), expected, "{yaml}");
+            let again = serde_yaml::to_string(&spec).unwrap();
+            assert_eq!(
+                serde_yaml::from_str::<DnsServerSpec>(&again)
+                    .unwrap()
+                    .native_cache_secs(),
+                expected,
+                "{yaml}"
+            );
+        }
+    }
+
+    /// A value that is not a u32, an explicit null and a misspelling are
+    /// refused rather than read as unset.
+    #[test]
+    fn native_cache_rejects_invalid_values_and_misspellings() {
+        for value in ["-1", "1.5", "4294967296", "null", "true", "[]", "'60'"] {
+            let yaml = format!("url: system\nnative_cache_secs: {value}");
+            assert!(
+                serde_yaml::from_str::<DnsServerSpec>(&yaml).is_err(),
+                "accepted {yaml}"
+            );
+        }
+        assert!(serde_yaml::from_str::<DnsServerSpec>("url: system\nnative_cache_sec: 0").is_err());
+    }
 
     #[test]
     fn test_dns_server_spec_simple() {
@@ -489,6 +558,7 @@ servers: my-dns-group
             timeout_secs: default_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             attempts: default_attempts(),
+            native_cache_secs: None,
         };
         assert!(!spec.as_group_ref().is_some());
         assert!(spec.as_group_ref().is_none());
