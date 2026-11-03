@@ -28,7 +28,6 @@ keys now fails with `Revoked`, matched by SPKI SHA-256 from Go's list
 (golang/go#82345), so the Sectigo cross-signed copies are caught too.
 `webpki-roots` 1.0.11 holds none of the roots they chain to, so shoes was
 most likely not exposed; the list no longer depends on that.
-||||||| 713a8ecf
 
 **Fake IP on listeners, and one mechanism for it.** A SOCKS, HTTP, mixed
 or tproxy listener answers DNS from a fake pool when its `dns:` block, or
@@ -287,7 +286,6 @@ the refusal never disagrees with `judge`. The stack's shared state (the
 connection channel, the fake-IP pool, the refusal) is now seeded before
 its thread starts, where setters after the start left a window in which a
 queued SYN was judged by an empty state.
-||||||| parent of 7caed90 (shoesd: bound a stop by a grace for open streams)
 
 An OpenConnect client outbound (`type: openconnect`): Cisco AnyConnect's
 protocol as ocserv and the openconnect client speak it, over TLS (CSTP).
