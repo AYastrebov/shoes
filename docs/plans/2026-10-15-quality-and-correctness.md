@@ -60,7 +60,9 @@ dependency sweep (#114 to #117), v0.9.0 after the Android stopped listener
 and session ids (#119 to #121), v0.9.1 after the SSTP client (#135),
 v0.9.2 for the SSTP `Host` header (#137), v0.9.3 after the OpenConnect
 client, the TUN SYN refusal and the bounded daemon stop (#140 to #142),
-v0.9.4 after the upstream port passes and WireGuard Phobos (#145 to #151).
+v0.9.4 after the upstream port passes and WireGuard Phobos (#145 to #151),
+v0.9.5 after fake IP on listeners and the preloaded intermediates (#152,
+#154).
 
 Reviewed 2026-10-22 (`docs/audits/2026-10-22-fix-wave-review.md`): every
 fix claimed above is present and tested; the gaps found beside them (TUIC

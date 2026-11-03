@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.9.5
+
+Fake IP on every listener, and certificate chains that verify without a
+pin; no FFI change. A SOCKS, HTTP, mixed or tproxy listener answers DNS
+from a fake pool and routes a fake address by the name it stands for,
+with the TUN on the same mechanism and able to share a group's pool
+(#152). A server that sends its leaf without Let's Encrypt's
+intermediate now verifies, and the eight eMudhra intermediates whose
+private keys are public are refused (#154). Two configs or chains are
+refused that were accepted: a tproxy listener with fake IP on and a
+`udp_timeout` over 540 seconds, and a chain carrying one of those
+eMudhra keys.
 
 **A server that leaves its intermediate out still verifies, when the
 intermediate is Let's Encrypt's.** webpki builds a path only from what
