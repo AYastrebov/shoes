@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.9.5
+
+Two TLS changes and fake IP on listeners since 0.9.4; no FFI change. A
+server that sends its Let's Encrypt leaf without the intermediate now
+verifies, from Let's Encrypt's intermediates shipped in the binary, which
+lets a Keenetic router's OpenConnect server be reached without a pin; and
+the eight eMudhra intermediates whose private keys are public are refused
+by key (#154). SOCKS, HTTP, mixed and tproxy listeners answer DNS from a
+fake IP pool, one mechanism with the TUN's, whose top-level `fake_ip` is
+now an alias of its `dns:` block's (#152). One config is refused that was
+accepted: a tproxy listener with fake IP on and a `udp_timeout` over 540
+seconds.
 
 **A server that leaves its intermediate out still verifies, when the
 intermediate is Let's Encrypt's.** webpki builds a path only from what
